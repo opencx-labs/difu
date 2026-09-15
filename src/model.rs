@@ -104,13 +104,25 @@ impl PrKey {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrSummary {
     pub key: PrKey,
     pub title: String,
     pub author: String,
     pub updated: String,
+    pub created: String,
+    pub stats: Option<PrStats>,
+    #[serde(skip)]
+    pub stats_error: bool,
     pub draft: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrStats {
+    pub additions: u64,
+    pub deletions: u64,
+    pub changed_files: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -3,7 +3,8 @@ use clap::Parser;
 use crossterm::{
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyEventKind,
+        Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
 };
@@ -66,12 +67,22 @@ fn main() -> Result<()> {
     };
     let prior = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+        let _ = execute!(
+            io::stdout(),
+            PopKeyboardEnhancementFlags,
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
         ratatui::restore();
         prior(info);
     }));
     let result = (|| -> Result<()> {
-        execute!(io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+        execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            EnableMouseCapture,
+            EnableBracketedPaste
+        )?;
         app.start(pr);
         while !app.quit && !terminated.load(std::sync::atomic::Ordering::Relaxed) {
             app.tick();
@@ -88,7 +99,12 @@ fn main() -> Result<()> {
         }
         Ok(())
     })();
-    let _ = execute!(io::stdout(), DisableMouseCapture, DisableBracketedPaste);
+    let _ = execute!(
+        io::stdout(),
+        PopKeyboardEnhancementFlags,
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     ratatui::restore();
     app.shutdown();
     result

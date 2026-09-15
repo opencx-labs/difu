@@ -6,6 +6,9 @@ revs = json.loads((root / 'revisions.json').read_text())
 args = sys.argv[1:]
 url = 'https://github.com/example/project/pull/1'
 if args[0] == 'search':
+    if (root / 'fail-search').exists():
+        print('Fixture GitHub unavailable', file=sys.stderr)
+        sys.exit(1)
     with (root / 'searches.jsonl').open('a') as log:
         log.write(json.dumps(args) + '\n')
     assert any(a.startswith(('--review-requested=', '--author=', '--repo=')) for a in args), 'Unscoped search'
@@ -15,7 +18,14 @@ if args[0] == 'search':
         url = 'https://github.com/example/second/pull/3'
     else:
         url = f'https://github.com/example/project/pull/{number}'
-    value = [dict(number=number, title=title, url=url, author=dict(login='author'), updatedAt='2026-09-15T00:00:00Z', isDraft=False)]
+    value = [dict(number=number, title=title, url=url, author=dict(login='author'), updatedAt='2026-09-15T00:00:00Z', createdAt='2026-09-10T12:30:00Z', isDraft=False)]
+elif args[0:2] == ['api', 'graphql'] and 'changedFiles' in args[-1]:
+    import re
+    aliases = re.findall(r'(r[0-9]+): repository', args[-1])
+    assert 0 < len(aliases) <= 25
+    with (root / 'stats-batches').open('a') as log:
+        log.write(str(len(aliases)) + '\n')
+    value = dict(data={alias: dict(pullRequest=dict(additions=1, deletions=1, changedFiles=1)) for alias in aliases})
 elif args[0:2] == ['api', 'graphql']:
     with (root / 'revision-polls').open('a') as log:
         log.write('poll\n')
@@ -33,4 +43,9 @@ elif '/comments?' in args[-1]:
     value = [[]]
 else:
     value = dict(title='Describe the behavior', body='PR description with `code`.', user=dict(login='author'), head=dict(sha=revs['head'], ref='feature'), base=dict(sha=revs['base'], ref='main'), state='open', merged=False, additions=1, deletions=1, changed_files=1)
+if (root / 'updated-title').exists():
+    if isinstance(value, list) and value and isinstance(value[0], dict) and 'title' in value[0]:
+        value[0]['title'] = 'Fresh title from GitHub'
+    elif isinstance(value, dict) and 'title' in value:
+        value['title'] = 'Fresh title from GitHub'
 print(json.dumps(value))

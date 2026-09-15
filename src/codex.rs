@@ -21,6 +21,61 @@ use std::{
 
 pub const INSTRUCTIONS: &str = include_str!("../prompts/guide.md");
 
+// Progress presentation does not change guide content or invalidate cached guides.
+const PROGRESS_INSTRUCTIONS: &str = "While working, occasionally send a brief commentary preamble starting with 'Progress: ' describing the concrete inspection or chapter-grouping task underway. Use one short sentence, without private reasoning, command output, or code excerpts. The JSON-only requirement applies to your final response; keep that final response strictly within the supplied schema.";
+
+fn progress_message(event: &Value) -> Option<String> {
+    let kind = event.get("type")?.as_str()?;
+    let item = event.get("item");
+    let item_kind = item.and_then(|i| i.get("type")).and_then(Value::as_str);
+    if matches!(kind, "item.started" | "item.updated" | "item.completed")
+        && item_kind == Some("agent_message")
+    {
+        // An explicit prefix works with CLI versions that omit message phase.
+        // Never put the final structured guide or full reasoning text in the footer.
+        let message = item?
+            .get("text")?
+            .as_str()?
+            .trim()
+            .strip_prefix("Progress: ")?;
+        let cleaned = crate::model::clean(message);
+        let single_line = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+        if single_line.is_empty() {
+            return None;
+        }
+        return Some(format!(
+            "Codex: {}",
+            single_line.chars().take(240).collect::<String>()
+        ));
+    }
+    if matches!(kind, "item.started" | "item.updated" | "item.completed")
+        && item_kind == Some("reasoning")
+    {
+        // Codex summary events may contain a bold heading followed by prose.
+        // Accept only that complete, short heading; never display the body or
+        // treat an unstructured reasoning paragraph as a status message.
+        let first_line = item?.get("text")?.as_str()?.trim_start().lines().next()?;
+        let (heading, _) = first_line.strip_prefix("**")?.split_once("**")?;
+        let heading = heading.trim();
+        if heading.is_empty()
+            || heading.chars().count() > 120
+            || heading.chars().any(char::is_control)
+        {
+            return None;
+        }
+        return Some(format!("Codex summary: {}", crate::model::clean(heading)));
+    }
+    let message = match kind {
+        "thread.started" => "Codex connected",
+        "turn.started" => "Reading the PR and planning chapters",
+        "item.started" if item_kind == Some("command_execution") => "Reading repository context",
+        "item.completed" if item_kind == Some("command_execution") => "Repository context read",
+        "turn.completed" => "Validating chapter coverage",
+        _ => return None,
+    };
+    Some(message.into())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Guide {
@@ -128,7 +183,7 @@ fn isolation_overrides(root: &Path, worktree: &Path, cancel: &Cancel) -> Result<
         "-c".into(),
         format!(
             "developer_instructions={}",
-            serde_json::to_string(INSTRUCTIONS)?
+            serde_json::to_string(&format!("{INSTRUCTIONS}\n\n{PROGRESS_INSTRUCTIONS}"))?
         ),
     ];
     let mut projects = Vec::new();
@@ -257,6 +312,8 @@ pub fn generate(
                     serde_json::to_string(&model.effort)?
                 ),
                 "-c",
+                "model_reasoning_summary=\"auto\"",
+                "-c",
                 "approval_policy=\"never\"",
                 "-c",
                 "web_search=\"disabled\"",
@@ -289,32 +346,10 @@ pub fn generate(
             Some(prompt.into_bytes()),
             cancel,
             move |line| {
-                if let Ok(event) = serde_json::from_str::<Value>(line) {
-                    let message = match event
-                        .get("type")
-                        .unwrap_or(&Value::Null)
-                        .as_str()
-                        .unwrap_or_default()
-                    {
-                        "thread.started" => "Codex connected",
-                        "turn.started" => "Reading the PR and planning chapters",
-                        "item.started"
-                            if event.pointer("/item/type").unwrap_or(&Value::Null)
-                                == "command_execution" =>
-                        {
-                            "Reading repository context"
-                        }
-                        "item.completed"
-                            if event.pointer("/item/type").unwrap_or(&Value::Null)
-                                == "command_execution" =>
-                        {
-                            "Repository context read"
-                        }
-                        "item.started" | "item.completed" => "Building the guide",
-                        "turn.completed" => "Validating chapter coverage",
-                        _ => return,
-                    };
-                    progress(message.into());
+                if let Ok(event) = serde_json::from_str::<Value>(line)
+                    && let Some(message) = progress_message(&event)
+                {
+                    progress(message);
                 }
             },
         )?;
@@ -486,6 +521,66 @@ mod tests {
             hunks: hunks.into_iter().map(String::from).collect(),
         }
     }
+    #[test]
+    fn progress_only_exposes_brief_commentary_not_final_json_or_reasoning() {
+        assert_eq!(
+            progress_message(
+                &json!({"type":"item.completed","item":{"type":"agent_message","text":"Progress: Checking routing\n and tests."}})
+            ),
+            Some("Codex: Checking routing and tests.".into())
+        );
+        for item in [
+            json!({"type":"agent_message","text":"{\"chapters\":[]}"}),
+            json!({"type":"reasoning","text":"Progress: private reasoning"}),
+            json!({"type":"command_execution","aggregated_output":"secret output"}),
+        ] {
+            let message = progress_message(&json!({"type":"item.completed","item":item}));
+            assert!(message.is_none_or(|s| s == "Repository context read"));
+        }
+        let message = progress_message(
+            &json!({"type":"item.updated","item":{"type":"agent_message","text":format!("Progress: {}", "é".repeat(500))}}),
+        );
+        assert_eq!(message.map(|s| s.chars().count()), Some(247));
+    }
+
+    #[test]
+    fn summary_progress_exposes_only_a_complete_short_heading() {
+        for kind in ["item.started", "item.updated", "item.completed"] {
+            assert_eq!(
+                progress_message(&json!({"type":kind,"item":{
+                    "type":"reasoning", "text":"**Inspecting request routing**\n\nPrivate reasoning body must never appear."
+                }})),
+                Some("Codex summary: Inspecting request routing".into())
+            );
+        }
+        assert_eq!(
+            progress_message(&json!({"type":"item.completed","item":{
+                "type":"reasoning", "text":"**Checking tests** Private body on the same line."
+            }})),
+            Some("Codex summary: Checking tests".into())
+        );
+        for text in [
+            "Unstructured reasoning paragraph".into(),
+            "**Incomplete heading".into(),
+            "****".into(),
+            "**Unsafe\u{1b} heading**".into(),
+            format!("**{}**", "é".repeat(121)),
+        ] {
+            assert!(
+                progress_message(&json!({"type":"item.completed","item":{
+                    "type":"reasoning", "text":text
+                }}))
+                .is_none()
+            );
+        }
+        assert!(
+            progress_message(&json!({"type":"turn.failed","item":{
+                "type":"reasoning", "text":"**Not a summary event**"
+            }}))
+            .is_none()
+        );
+    }
+
     #[test]
     fn validation_rejects_omissions_inventions_and_duplicate_assignments() -> Result<()> {
         let s = snapshot()?;

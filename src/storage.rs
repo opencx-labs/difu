@@ -1,4 +1,7 @@
-use crate::{codex::Guide, model::ModelChoice};
+use crate::{
+    codex::Guide,
+    model::{ModelChoice, PrSummary},
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,6 +54,21 @@ impl Storage {
     }
     pub fn save_config(&self, config: &Config) -> Result<()> {
         atomic_json(&self.config, config)
+    }
+    pub fn load_inbox(&self, key: &str) -> Result<Option<Vec<PrSummary>>> {
+        let path = self.cache.join(format!("inbox-{key}.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let inbox: Vec<PrSummary> =
+            serde_json::from_slice(&fs::read(path)?).context("Cannot read cached PR list")?;
+        for pr in &inbox {
+            pr.key.validate()?;
+        }
+        Ok(Some(inbox))
+    }
+    pub fn save_inbox(&self, key: &str, inbox: &[PrSummary]) -> Result<()> {
+        atomic_json(&self.cache.join(format!("inbox-{key}.json")), &inbox)
     }
     pub fn load_guide(&self, key: &str) -> Result<Option<Guide>> {
         let path = self.cache.join(format!("{key}.json"));

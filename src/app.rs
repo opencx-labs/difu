@@ -69,6 +69,7 @@ pub struct Review {
 
 pub enum Message {
     Inbox(u64, Result<Vec<PrSummary>, String>),
+    InboxStats(u64, Vec<(String, Option<PrStats>)>),
     Repositories(Result<Vec<String>, String>),
     Detail(String, Result<PrDetail, String>),
     Timeline(String, Result<Vec<TimelineItem>, String>),
@@ -108,6 +109,7 @@ pub enum Action {
     Help,
     ToggleLayout,
     Scroll(i32),
+    FastScroll(i32),
     Focus(Focus),
 }
 
@@ -176,6 +178,18 @@ fn result<T>(value: Result<T>) -> Result<T, String> {
     value.map_err(|e| format!("{e:#}"))
 }
 
+fn progress_priority(activity: &str) -> u8 {
+    if activity == "Validating chapter coverage" {
+        3
+    } else if activity.starts_with("Codex:") {
+        2
+    } else if activity.starts_with("Codex summary:") {
+        1
+    } else {
+        0
+    }
+}
+
 impl App {
     pub fn new(storage: Storage, config: Config) -> Self {
         let (sender, receiver) = mpsc::channel();
@@ -229,6 +243,9 @@ impl App {
                 title: format!("Loading {id}…"),
                 author: String::new(),
                 updated: String::new(),
+                created: String::new(),
+                stats: None,
+                stats_error: false,
                 draft: false,
             });
             self.pending_open = Some(id);
@@ -291,13 +308,75 @@ impl App {
             .filter(|(_, enabled)| **enabled)
             .map(|(name, _)| name.clone())
             .collect::<Vec<_>>();
+        let cache_key = crate::storage::hash(format!("v1:{tab:?}:{state:?}:{repositories:?}"));
+        match self.storage.load_inbox(&cache_key) {
+            Ok(Some(inbox)) => {
+                let previous = self.inbox.get(self.selected).map(|p| p.key.id());
+                self.inbox = inbox;
+                self.selected = previous
+                    .and_then(|id| self.inbox.iter().position(|p| p.key.id() == id))
+                    .unwrap_or(0);
+                self.select(self.selected);
+            }
+            Ok(None) => {}
+            Err(error) => self.notice = format!("Could not load cached PRs: {error:#}"),
+        }
+        let cached: HashMap<_, _> = self
+            .inbox
+            .iter()
+            .map(|pr| (pr.key.id(), pr.stats.clone()))
+            .collect();
+        let storage = self.storage.clone();
         self.inbox_cancel = Some(self.spawn(move |tx, cancel| {
-            let _ = tx.send(Message::Inbox(
-                id,
-                result(github::inbox(tab, state, &repositories, &cancel)),
-            ));
+            let mut inbox = match github::inbox(tab, state, &repositories, &cancel) {
+                Ok(inbox) => inbox,
+                Err(error) => {
+                    let _ = tx.send(Message::Inbox(id, Err(format!("{error:#}"))));
+                    return;
+                }
+            };
+            if cancel.cancelled() {
+                return;
+            }
+            for pr in &mut inbox {
+                pr.stats = cached.get(&pr.key.id()).cloned().flatten();
+            }
+            let _ = tx.send(Message::Inbox(id, Ok(inbox.clone())));
+            if let Err(error) = storage.save_inbox(&cache_key, &inbox) {
+                let _ = tx.send(Message::Notice(format!(
+                    "Could not cache PR list: {error:#}"
+                )));
+            }
+            for batch in inbox.chunks_mut(25) {
+                if cancel.cancelled() {
+                    return;
+                }
+                let keys: Vec<_> = batch.iter().map(|pr| pr.key.clone()).collect();
+                let stats = github::stats(&keys, &cancel).unwrap_or_default();
+                if cancel.cancelled() {
+                    return;
+                }
+                let mut updates = Vec::new();
+                for (index, pr) in batch.iter_mut().enumerate() {
+                    let value = stats.get(index).cloned().flatten();
+                    pr.stats_error = value.is_none();
+                    if value.is_some() {
+                        pr.stats = value.clone();
+                    }
+                    updates.push((pr.key.id(), value));
+                }
+                let _ = tx.send(Message::InboxStats(id, updates));
+            }
+            if !cancel.cancelled()
+                && let Err(error) = storage.save_inbox(&cache_key, &inbox)
+            {
+                let _ = tx.send(Message::Notice(format!(
+                    "Could not cache PR counts: {error:#}"
+                )));
+            }
         }));
     }
+
     pub fn state(&self) -> PrState {
         match self.inbox_tab {
             InboxTab::ReviewRequests => PrState::Open,
@@ -448,7 +527,7 @@ impl App {
         self.opened = Some(id.clone());
         self.home = false;
         self.view = View::Guide;
-        self.focus = Focus::Content;
+        self.focus = Focus::Navigation;
         self.scroll = 0;
         self.horizontal = 0;
         self.invalidate();
@@ -827,7 +906,6 @@ impl App {
                     return;
                 }
                 self.inbox_loading = false;
-                self.inbox_cancel = None;
                 match output {
                     Ok(inbox) => {
                         let previous = self.inbox.get(self.selected).map(|p| p.key.id());
@@ -848,6 +926,19 @@ impl App {
                     }
                 }
             }
+            Message::InboxStats(id, updates) => {
+                if id != self.inbox_id {
+                    return;
+                }
+                for (key, stats) in updates {
+                    if let Some(pr) = self.inbox.iter_mut().find(|pr| pr.key.id() == key) {
+                        pr.stats_error = stats.is_none();
+                        if stats.is_some() {
+                            pr.stats = stats;
+                        }
+                    }
+                }
+            }
             Message::Detail(id, output) => {
                 let r = self.reviews.entry(id.clone()).or_default();
                 r.loading = false;
@@ -858,6 +949,12 @@ impl App {
                         if let Some(summary) = self.inbox.iter_mut().find(|p| p.key.id() == id) {
                             summary.title = pr.title.clone();
                             summary.author = pr.author.clone();
+                            summary.stats = Some(PrStats {
+                                additions: pr.additions,
+                                deletions: pr.deletions,
+                                changed_files: pr.changed_files,
+                            });
+                            summary.stats_error = false;
                         }
                         if (r.snapshot.is_some() || r.preparing)
                             && r.detail.as_ref().is_some_and(|old| {
@@ -994,6 +1091,7 @@ impl App {
                     .get_mut(&id)
                     .and_then(|r| r.generation.as_mut())
                     && job.id == sequence
+                    && progress_priority(&activity) >= progress_priority(&job.activity)
                 {
                     job.activity = activity;
                 }
@@ -1049,7 +1147,11 @@ impl App {
                 self.view = view;
                 self.scroll = 0;
                 self.horizontal = 0;
-                self.focus = Focus::Content;
+                self.focus = if view == View::Overview {
+                    Focus::Content
+                } else {
+                    Focus::Navigation
+                };
                 self.invalidate();
             }
             Action::Back => {
@@ -1083,6 +1185,7 @@ impl App {
             }
             Action::SaveRepositories => self.save_repositories(),
             Action::SelectFile(file) => {
+                self.focus = Focus::Navigation;
                 self.file = file;
                 self.scroll = 0;
                 self.invalidate();
@@ -1160,6 +1263,10 @@ impl App {
                 self.invalidate();
             }
             Action::Scroll(delta) => self.move_scroll(delta),
+            Action::FastScroll(delta) => {
+                self.focus = Focus::Content;
+                self.move_scroll(delta);
+            }
             Action::Focus(focus) => self.focus = focus,
         }
     }
@@ -1185,6 +1292,20 @@ impl App {
                 .min(count.saturating_sub(1));
             self.scroll = 0;
             self.invalidate();
+        } else if self.focus == Focus::Navigation && self.view == View::Guide {
+            if let Some(doc) = &self.document {
+                let current = doc
+                    .sections
+                    .iter()
+                    .rposition(|s| s.start <= self.scroll)
+                    .unwrap_or(0);
+                let index = current
+                    .saturating_add_signed(delta as isize)
+                    .min(doc.sections.len().saturating_sub(1));
+                if let Some(section) = doc.sections.get(index) {
+                    self.scroll = section.start;
+                }
+            }
         } else {
             let max = self
                 .document
@@ -1209,6 +1330,12 @@ impl App {
             }
             KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.action(Action::Chapter(true))
+            }
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.action(Action::FastScroll(-10))
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SUPER) => {
+                self.action(Action::FastScroll(10))
             }
             KeyCode::Esc => {
                 if self.home {
@@ -1445,11 +1572,20 @@ impl App {
                 self.modal_key(KeyEvent::new(code, KeyModifiers::NONE));
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if self.modal.is_none() => {
-                self.focus = if self.content_rect.contains((event.column, event.row).into()) {
-                    Focus::Content
-                } else {
-                    Focus::Navigation
-                };
+                self.focus = self
+                    .hits
+                    .iter()
+                    .rev()
+                    .find_map(|(rect, action)| {
+                        if rect.contains((event.column, event.row).into())
+                            && let Action::Focus(focus) = action
+                        {
+                            Some(*focus)
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(self.focus);
                 self.move_scroll(if event.kind == MouseEventKind::ScrollDown {
                     3
                 } else {
@@ -1490,6 +1626,141 @@ impl Drop for App {
 mod tests {
     use super::*;
     use anyhow::Context;
+    #[test]
+    fn commentary_takes_priority_over_summary_and_tool_activity() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = App::new(
+            Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().into(),
+            },
+            Config::default(),
+        );
+        app.reviews.insert(
+            "pr".into(),
+            Review {
+                generation: Some(Generation {
+                    id: 7,
+                    cancel: Cancel::default(),
+                    started: Instant::now(),
+                    activity: "Starting Codex".into(),
+                }),
+                ..Review::default()
+            },
+        );
+        for (sequence, incoming, expected) in [
+            (
+                7,
+                "Codex summary: Reading types",
+                "Codex summary: Reading types",
+            ),
+            (
+                7,
+                "Reading repository context",
+                "Codex summary: Reading types",
+            ),
+            (
+                7,
+                "Codex summary: Checking callers",
+                "Codex summary: Checking callers",
+            ),
+            (
+                7,
+                "Codex: Grouping the routing changes",
+                "Codex: Grouping the routing changes",
+            ),
+            (
+                7,
+                "Codex summary: Reading tests",
+                "Codex: Grouping the routing changes",
+            ),
+            (
+                6,
+                "Codex: Stale generation",
+                "Codex: Grouping the routing changes",
+            ),
+            (
+                7,
+                "Validating chapter coverage",
+                "Validating chapter coverage",
+            ),
+        ] {
+            app.receive(Message::Progress("pr".into(), sequence, incoming.into()));
+            assert_eq!(
+                app.reviews
+                    .get("pr")
+                    .and_then(|r| r.generation.as_ref())
+                    .map(|g| g.activity.as_str()),
+                Some(expected)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_batches_ignore_stale_replies_and_keep_cached_counts_on_failure() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = App::new(
+            Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().into(),
+            },
+            Config::default(),
+        );
+        let key = detail("head").key;
+        let id = key.id();
+        let stats = PrStats {
+            additions: 42,
+            deletions: 7,
+            changed_files: 3,
+        };
+        app.inbox.push(PrSummary {
+            key,
+            title: "PR".into(),
+            author: "author".into(),
+            updated: String::new(),
+            created: "2026-09-10T12:00:00Z".into(),
+            stats: None,
+            stats_error: false,
+            draft: false,
+        });
+        app.inbox_id = 2;
+        app.receive(Message::InboxStats(
+            1,
+            vec![(id.clone(), Some(stats.clone()))],
+        ));
+        assert!(app.inbox.first().is_some_and(|p| p.stats.is_none()));
+        app.receive(Message::InboxStats(
+            2,
+            vec![(id.clone(), Some(stats.clone()))],
+        ));
+        assert_eq!(
+            app.inbox.first().and_then(|p| p.stats.as_ref()),
+            Some(&stats)
+        );
+        app.receive(Message::InboxStats(2, vec![(id, None)]));
+        assert!(
+            app.inbox
+                .first()
+                .is_some_and(|p| p.stats_error && p.stats.as_ref() == Some(&stats))
+        );
+        app.storage.save_inbox("fixture", &app.inbox)?;
+        let restored = app
+            .storage
+            .load_inbox("fixture")?
+            .context("Missing cache")?;
+        assert_eq!(
+            restored.first().and_then(|p| p.stats.as_ref()),
+            Some(&stats)
+        );
+        assert_eq!(
+            restored.first().map(|p| p.created.as_str()),
+            Some("2026-09-10T12:00:00Z")
+        );
+        assert!(app.storage.load_inbox("other-filter")?.is_none());
+        Ok(())
+    }
+
     #[test]
     fn inbox_results_cannot_cross_requests_or_replace_an_opened_pr() -> Result<()> {
         let dir = tempfile::tempdir()?;
