@@ -35,7 +35,12 @@ and [Codex CLI](https://formulae.brew.sh/cask/codex).
 brew install opencx-labs/tap/difu
 ```
 
-Homebrew adds the tap automatically.
+Homebrew adds the tap automatically and installs a prebuilt binary. **Rust is not
+required.** Git, `gh`, and Codex must already be installed and available on your
+`PATH`; the difu package does not install or bundle them.
+
+Prebuilt packages are available for Intel/AMD (x86_64) and ARM64 on macOS and
+Linux. You can also download them from [GitHub Releases](https://github.com/opencx-labs/difu/releases).
 
 ### Build from source
 
