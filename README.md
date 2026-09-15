@@ -29,21 +29,15 @@ and [Codex CLI](https://formulae.brew.sh/cask/codex).
 
 ## Installation
 
-### Homebrew — planned
-
-**`difu` is not yet available through Homebrew.** The intended installation command
-is:
+### Homebrew
 
 ```sh
-# Planned command — not available yet
-brew install difu
+brew install opencx-labs/tap/difu
 ```
 
-Making this work without adding a tap requires the formula to be accepted into
-Homebrew's official `homebrew/core` repository. Until it is published there, use
-the source installation below.
+Homebrew adds the tap automatically.
 
-### Build from source — available now
+### Build from source
 
 With Git and Rust 1.88+ installed:
 
