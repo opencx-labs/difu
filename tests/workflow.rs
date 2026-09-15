@@ -91,7 +91,13 @@ fn scripted_workflow() -> Result<()> {
         root.join("revisions.json"),
         serde_json::to_vec(&serde_json::json!({"head":head,"base":base}))?,
     )?;
+    git(root, &["clone", "--bare", "clone", "remote"])?;
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").context("Missing PATH")?)
+        .map(|p| p.join("git"))
+        .find(|p| p.is_file())
+        .context("Missing real Git")?;
     for (name, script) in [
+        ("git", include_str!("fixtures/git.py")),
         ("gh", include_str!("fixtures/gh.py")),
         ("codex", include_str!("fixtures/codex.py")),
     ] {
@@ -105,6 +111,7 @@ fn scripted_workflow() -> Result<()> {
     let output = Command::new(std::env::current_exe()?)
         .args(["--exact", "scripted_workflow", "--nocapture"])
         .env("DIFU_TEST_FIXTURE", root)
+        .env("DIFU_TEST_REAL_GIT", real_git)
         .env("PATH", path)
         .output()?;
     ensure!(
@@ -207,7 +214,7 @@ fn exercise(root: &Path) -> Result<()> {
     assert!(app.review().is_some_and(|r| r.preparation_failed
         && r.guide.is_some()
         && r.snapshot.as_ref().is_some_and(|s| s.head == original_head)));
-    assert!(render(&mut app, 180)?.contains("not available locally"));
+    assert!(render(&mut app, 180)?.contains("Automatic PR sync failed"));
     app.action(Action::Regenerate);
     wait(&mut app, |a| a.review().is_some_and(|r| !r.preparing))?;
     assert_eq!(fs::read_to_string(root.join("turns"))?, "turn\n");
@@ -366,7 +373,7 @@ fn exercise(root: &Path) -> Result<()> {
         serde_json::from_slice(&fs::read(root.join("revisions.json"))?)?;
     *revisions.get_mut("head").context("Missing head")? = serde_json::json!(rewritten);
     fs::write(root.join("revisions.json"), serde_json::to_vec(&revisions)?)?;
-    let mut rewritten_app = App::new(storage, config);
+    let mut rewritten_app = App::new(storage.clone(), config.clone());
     rewritten_app.start(Some(PrKey::from_url(
         "https://github.com/example/project/pull/1",
     )?));
@@ -375,5 +382,87 @@ fn exercise(root: &Path) -> Result<()> {
     })?;
     assert_eq!(fs::read_to_string(root.join("turns"))?, "turn\n");
     rewritten_app.shutdown();
+    // Missing remote commits sync automatically, preserve the working branch,
+    // and remain named so subsequent fetches advertise the downloaded history.
+    let original_checkout = git(&root.join("clone"), &["rev-parse", "HEAD"])?;
+    let remote = root.join("remote");
+    let old_base = revisions
+        .get("base")
+        .and_then(serde_json::Value::as_str)
+        .context("Missing base")?;
+    let base_tree = git(&remote, &["rev-parse", &format!("{old_base}^{{tree}}")])?;
+    let remote_base = git(
+        &remote,
+        &[
+            "commit-tree",
+            &base_tree,
+            "-p",
+            old_base,
+            "-m",
+            "remote base metadata",
+        ],
+    )?;
+    let tree = git(&remote, &["rev-parse", "HEAD^{tree}"])?;
+    let remote_commit = git(
+        &remote,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &remote_base,
+            "-m",
+            "remote message-only commit",
+        ],
+    )?;
+    git(
+        &remote,
+        &["update-ref", "refs/heads/feature", &remote_commit],
+    )?;
+    *revisions.get_mut("head").context("Missing head")? = serde_json::json!(remote_commit);
+    *revisions.get_mut("base").context("Missing base")? = serde_json::json!(remote_base);
+    fs::write(root.join("revisions.json"), serde_json::to_vec(&revisions)?)?;
+    let fetches_before = fs::read_to_string(root.join("fetches.jsonl"))?
+        .lines()
+        .count();
+    let mut synced = App::new(storage.clone(), config.clone());
+    synced.start(Some(PrKey::from_url(
+        "https://github.com/example/project/pull/1",
+    )?));
+    wait(&mut synced, |a| {
+        a.review().is_some_and(|r| r.guide.is_some())
+    })?;
+    assert_eq!(
+        fs::read_to_string(root.join("fetches.jsonl"))?
+            .lines()
+            .count(),
+        fetches_before + 1
+    );
+    assert_eq!(
+        git(
+            &root.join("clone"),
+            &["rev-parse", "refs/difu/example/project/pr/1/head"]
+        )?,
+        remote_commit
+    );
+    assert_eq!(
+        git(&root.join("clone"), &["rev-parse", "HEAD"])?,
+        original_checkout
+    );
+    assert_eq!(fs::read_to_string(root.join("turns"))?, "turn\n");
+    synced.shutdown();
+    let mut already_local = App::new(storage, config);
+    already_local.start(Some(PrKey::from_url(
+        "https://github.com/example/project/pull/1",
+    )?));
+    wait(&mut already_local, |a| {
+        a.review().is_some_and(|r| r.guide.is_some())
+    })?;
+    assert_eq!(
+        fs::read_to_string(root.join("fetches.jsonl"))?
+            .lines()
+            .count(),
+        fetches_before + 1
+    );
+    already_local.shutdown();
     Ok(())
 }

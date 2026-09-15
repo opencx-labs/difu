@@ -56,6 +56,8 @@ pub struct Review {
     pub loading: bool,
     pub preparing: bool,
     pub preparation_failed: bool,
+    pub preparation_started: Option<Instant>,
+    pub preparation_progress: Option<repo::SnapshotProgress>,
     pub preparation: Option<Cancel>,
     pub preparing_detail: Option<Arc<PrDetail>>,
     pub polling: bool,
@@ -73,6 +75,7 @@ pub enum Message {
     Checks(String, Result<Vec<Check>, String>),
     Poll(String, u64, Result<Option<PrDetail>, String>),
     Snapshot(String, u64, Result<(PathBuf, Snapshot), String>),
+    SnapshotProgress(String, u64, repo::SnapshotProgress),
     Progress(String, u64, String),
     Guide(String, u64, ModelChoice, Result<Guide, String>),
     Models(Result<Vec<ModelInfo>, String>),
@@ -485,6 +488,11 @@ impl App {
             return;
         };
         review.preparing = true;
+        review.preparation_started = Some(Instant::now());
+        review.preparation_progress = Some(repo::SnapshotProgress {
+            step: 1,
+            activity: "Checking the local clone".into(),
+        });
         review.preparation_failed = false;
         review.preparing_detail = Some(pr.clone());
         review.guide_error = None;
@@ -493,7 +501,20 @@ impl App {
         let cancel = self.spawn(move |tx, cancel| {
             let output = (|| {
                 let root = repo::validate(&path, &pr.key, &cancel)?;
-                let snapshot = repo::snapshot(&root, &pr, &cancel)?;
+                let progress_tx = tx.clone();
+                let progress_id = job_id.clone();
+                let snapshot = repo::snapshot_with_progress(
+                    &root,
+                    &pr,
+                    &cancel,
+                    Arc::new(move |progress| {
+                        let _ = progress_tx.send(Message::SnapshotProgress(
+                            progress_id.clone(),
+                            sequence,
+                            progress,
+                        ));
+                    }),
+                )?;
                 Ok((root, snapshot))
             })();
             let _ = tx.send(Message::Snapshot(job_id, sequence, result(output)));
@@ -912,6 +933,15 @@ impl App {
                         Err(e) => self.notice = format!("Revision refresh failed: {e}"),
                     }
                 }
+            }
+            Message::SnapshotProgress(id, sequence, progress) => {
+                if let Some(r) = self.reviews.get_mut(&id)
+                    && r.preparing
+                    && r.snapshot_id == sequence
+                {
+                    r.preparation_progress = Some(progress);
+                }
+                return;
             }
             Message::Snapshot(id, sequence, output) => {
                 if let Some(r) = self.reviews.get_mut(&id) {
