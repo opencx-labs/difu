@@ -123,6 +123,10 @@ repository shows an empty list; it never searches outside your whitelist.
   unified is selectable. Narrow windows temporarily use unified diffs and put
   chapter explanations above code, restoring your preference when widened.
 
+File headers stay visible while scrolling their diffs. Long paths wrap in file
+headers, chapter links, and the file tree. **Alt+Up / Alt+Down** jumps to the
+previous or next guide chapter.
+
 Guide generation has no automatic timeout. Its elapsed time and activity remain
 visible; cancel or retry explicitly. Every changed hunk must appear exactly once
 in the guide. Binary files, renames, and permission changes have metadata review
@@ -146,6 +150,7 @@ bindings.
 | Page Up / Page Down / Space | Scroll a page |
 | Home / End | Start / end |
 | Left / Right | Scroll code horizontally |
+| Alt+Up / Alt+Down | Previous / next guide chapter |
 | 1 / 2 / 3 | Home: Review requests / Authored / Repositories; inside a PR: Overview / Guide / Diff |
 | F1 | Help |
 | F2 | Model and reasoning picker |
