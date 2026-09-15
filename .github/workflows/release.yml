@@ -1,0 +1,118 @@
+name: Release packages
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - scripts/prepare-release.py
+      - Cargo.toml
+      - Cargo.lock
+      - src/**
+      - tests/**
+      - prompts/**
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install Linux build tools
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+      - name: Test and build
+        env:
+          DIFU_TARGET: ${{ matrix.target }}
+        run: |
+          cargo test --locked --target "$DIFU_TARGET"
+          cargo build --locked --release --target "$DIFU_TARGET"
+      - name: Package and smoke test
+        env:
+          DIFU_TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/$DIFU_TARGET/release/difu"
+          version="$($binary --version)"
+          version="${version#difu }"
+          if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo 'Release tag must match the Cargo package version' >&2
+            exit 1
+          fi
+          mkdir -p dist package smoke/empty-path
+          cp "$binary" LICENSE README.md package/
+          archive="difu-$version-$DIFU_TARGET.tar.gz"
+          tar -czf "dist/$archive" -C package difu LICENSE README.md
+          tar -xzf "dist/$archive" -C smoke
+          # The downloaded executable must start without a compiler or helpers.
+          test "$(env PATH="$PWD/smoke/empty-path" "$PWD/smoke/difu" --version)" = "difu $version"
+          set +e
+          output="$(env PATH="$PWD/smoke/empty-path" "$PWD/smoke/difu" </dev/null 2>&1)"
+          status=$?
+          set -e
+          test "$status" -eq 1
+          [[ "$output" == *'difu needs an interactive terminal'* ]]
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: difu-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  prepare:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: difu-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums and Homebrew formula
+        run: |
+          python3 scripts/prepare-release.py dist
+          ruby -c dist/difu.rb
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release
+          path: dist/*
+          if-no-files-found: error
+
+  draft:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: prepare
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release
+          path: dist
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DIFU_TAG: ${{ github.ref_name }}
+        run: gh release create "$DIFU_TAG" dist/* --verify-tag --draft --title "difu $DIFU_TAG" --generate-notes
