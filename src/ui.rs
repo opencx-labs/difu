@@ -1,7 +1,7 @@
 use crate::{
     app::{Action, App, Focus, Modal, View},
     diff::{DiffFile, DiffLine, Hunk, LineKind, split_rows},
-    model::{InboxTab, ModelChoice, PrState, clean},
+    model::{InboxTab, ModelChoice, PrState, PrSummary, clean},
 };
 use ratatui::{
     Frame,
@@ -887,6 +887,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let Some(doc) = app.document.take() else {
         return;
     };
+    if doc.guide_columns {
+        app.hits.push((
+            Rect::new(main.x, main.y, doc.left_width, main.height),
+            Action::Focus(Focus::Navigation),
+        ));
+    }
     app.scroll = app.scroll.min(doc.max_scroll(main.height as usize));
     for y in 0..main.height {
         let index = app.scroll + y as usize;
@@ -975,7 +981,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
     app.document = Some(doc);
-    let status = if let Some(review) = app.review() {
+    let status = if app.home && app.inbox_loading && !app.inbox.is_empty() {
+        "Showing cached PRs · Refreshing…".into()
+    } else if app.home && app.inbox_error.is_some() && !app.inbox.is_empty() {
+        "Showing cached PRs · Refresh failed · F5 retry".into()
+    } else if let Some(review) = app.review() {
         if let Some(job) = &review.generation {
             format!(
                 "◌ Generating guide · {}s · {}",
@@ -1046,9 +1056,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ("F4 Repos", Action::Repositories(false)),
             ("F5 Refresh", Action::Refresh),
             ("Enter Open", Action::OpenPr),
+            ("Cmd+↑/↓ 10 lines", Action::FastScroll(10)),
         ]
     } else {
         vec![
+            ("Alt+↑/↓ Chapters", Action::Chapter(true)),
+            ("Cmd+↑/↓ 10 lines", Action::FastScroll(10)),
             ("F1 Help", Action::Help),
             ("F2 Model", Action::Models),
             ("F5 Refresh", Action::Refresh),
@@ -1059,13 +1072,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ]
     };
     for (label, action) in footer {
+        if label == "Alt+↑/↓ Chapters" && app.view != View::Guide {
+            continue;
+        }
         if app.home
             && ((label == "F3 State" && app.inbox_tab == InboxTab::ReviewRequests)
                 || (label == "F4 Repos" && app.inbox_tab != InboxTab::Repositories))
         {
             continue;
         }
-        let width = label.len() as u16;
+        let width = label.width() as u16;
         if footer_x + width > area.width.saturating_sub(2) {
             break;
         }
@@ -1074,20 +1090,122 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.hits.push((rect, action));
         footer_x += width + 2;
     }
+    let focused = match (app.focus, app.home, app.view, has_guide) {
+        (Focus::Navigation, true, _, _) => "PR list",
+        (Focus::Navigation, false, View::Guide, true) => "Chapters",
+        (Focus::Navigation, false, _, _) => "Files",
+        (_, _, View::Overview, _) => "Overview",
+        _ => "Diff",
+    };
+    let mut focus_line = vec![span(format!("Focus: {focused} · Tab to switch"), ACCENT)];
     if !app.notice.is_empty() {
-        frame.render_widget(
-            Paragraph::new(crop(
-                &clean(&app.notice).replace('\n', " "),
-                0,
-                area.width.saturating_sub(4) as usize,
-            ))
-            .style(Style::default().fg(ACCENT)),
-            Rect::new(2, area.height - 1, area.width - 4, 1),
-        );
+        focus_line.push(span(
+            format!(" · {}", clean(&app.notice).replace('\n', " ")),
+            DIM,
+        ));
     }
+    frame.render_widget(
+        Paragraph::new(Line::from(focus_line)),
+        Rect::new(2, area.height - 1, area.width - 4, 1),
+    );
     if app.modal.is_some() {
         draw_modal(frame, app);
     }
+}
+
+fn inbox_rows(pr: &PrSummary, width: usize, selected: bool) -> Vec<TextRow> {
+    let width = width.max(1);
+    let mut rows = vec![
+        text(
+            crop(
+                &format!(
+                    "{} #{}  {}",
+                    if selected { "▸" } else { " " },
+                    pr.key.number,
+                    pr.key.repo
+                ),
+                0,
+                width,
+            ),
+            if selected { ACCENT } else { DIM },
+        ),
+        text(crop(&format!(" {}", pr.title), 0, width), TEXT),
+        text(
+            crop(
+                &format!(" {}{}", pr.author, if pr.draft { " · draft" } else { "" }),
+                0,
+                width,
+            ),
+            DIM,
+        ),
+    ];
+    let date = chrono::DateTime::parse_from_rfc3339(&pr.created)
+        .map(|date| date.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    rows.extend(
+        wrapped_text(&format!("Opened {date}"), width)
+            .into_iter()
+            .map(|s| text(s, DIM)),
+    );
+    if let Some(stats) = &pr.stats {
+        // Wrap colored tokens without losing digits in a narrow navigation pane.
+        let mut line = TextRow::default();
+        let mut used = 0;
+        for (token, color) in [
+            (
+                format!(
+                    "{} {}",
+                    stats.changed_files,
+                    if stats.changed_files == 1 {
+                        "file"
+                    } else {
+                        "files"
+                    }
+                ),
+                DIM,
+            ),
+            (format!("+{}", stats.additions), GREEN),
+            (format!("−{}", stats.deletions), RED),
+        ] {
+            if used > 0 && used + 2 + token.width() > width {
+                rows.push(line);
+                line = TextRow::default();
+                used = 0;
+            }
+            if used > 0 {
+                line.spans.push(span("  ", DIM));
+                used += 2;
+            }
+            for ch in token.chars() {
+                let cells = ch.width().unwrap_or(0);
+                if used + cells > width {
+                    rows.push(line);
+                    line = TextRow::default();
+                    used = 0;
+                }
+                line.spans.push(span(ch.to_string(), color));
+                used += cells;
+            }
+        }
+        rows.push(line);
+        if pr.stats_error {
+            rows.push(text("Stats stale · F5 retry", DIM));
+        }
+    } else {
+        rows.extend(
+            wrapped_text(
+                if pr.stats_error {
+                    "Stats unavailable · F5 retry"
+                } else {
+                    "Loading stats…"
+                },
+                width,
+            )
+            .into_iter()
+            .map(|s| text(s, DIM)),
+        );
+    }
+    rows
 }
 
 fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
@@ -1147,63 +1265,52 @@ fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
         }
         return;
     }
-    let visible = (rect.height.saturating_sub(2) / 4).max(1) as usize;
-    if app.selected < app.nav_scroll {
-        app.nav_scroll = app.selected;
-    }
-    if app.selected >= app.nav_scroll + visible {
-        app.nav_scroll = app.selected + 1 - visible;
-    }
-    for index in app.nav_scroll..(app.nav_scroll + visible).min(app.inbox.len()) {
-        let Some(pr) = app.inbox.get(index) else {
-            continue;
+    let width = usize::from(rect.width.saturating_sub(1));
+    let available = usize::from(rect.height.saturating_sub(2));
+    app.nav_scroll = app.nav_scroll.min(app.selected);
+    let mut start = app.selected;
+    let mut needed = app
+        .inbox
+        .get(start)
+        .map_or(0, |pr| inbox_rows(pr, width, true).len());
+    while start > app.nav_scroll {
+        let Some(pr) = app.inbox.get(start - 1) else {
+            break;
         };
-        let y = rect.y + 2 + ((index - app.nav_scroll) * 4) as u16;
+        let height = inbox_rows(pr, width, false).len() + 1;
+        if needed + height > available {
+            break;
+        }
+        needed += height;
+        start -= 1;
+    }
+    app.nav_scroll = start;
+    let mut y = rect.y.saturating_add(2);
+    for index in app.nav_scroll..app.inbox.len() {
         if y >= rect.bottom() {
             break;
         }
+        let Some(pr) = app.inbox.get(index) else {
+            break;
+        };
         let selected = index == app.selected;
-        let row_rect = Rect::new(
-            rect.x,
-            y,
-            rect.width.saturating_sub(1),
-            3.min(rect.bottom() - y),
-        );
+        let rows = inbox_rows(pr, width, selected);
+        let height = rows.len().min(usize::from(rect.bottom() - y)) as u16;
+        let row_rect = Rect::new(rect.x, y, rect.width.saturating_sub(1), height);
         frame.render_widget(
             Block::default().style(Style::default().bg(if selected { PANEL } else { BG })),
             row_rect,
         );
-        frame.render_widget(
-            Paragraph::new(crop(
-                &format!(
-                    "{} #{}  {}",
-                    if selected { "▸" } else { " " },
-                    pr.key.number,
-                    pr.key.repo
-                ),
-                0,
-                rect.width.saturating_sub(2) as usize,
-            ))
-            .style(Style::default().fg(if selected { ACCENT } else { DIM })),
-            Rect::new(rect.x, y, rect.width - 1, 1),
-        );
-        let title = crop(&pr.title, 0, rect.width.saturating_sub(3) as usize);
-        frame.render_widget(
-            Paragraph::new(format!(" {title}")).style(Style::default().fg(TEXT)),
-            Rect::new(rect.x, y + 1, rect.width - 1, 1),
-        );
-        if y + 2 < rect.bottom() {
-            frame.render_widget(
-                Paragraph::new(crop(
-                    &format!(" {}{}", pr.author, if pr.draft { " · draft" } else { "" }),
-                    0,
-                    rect.width.saturating_sub(2) as usize,
-                ))
-                .style(Style::default().fg(DIM)),
-                Rect::new(rect.x, y + 2, rect.width - 1, 1),
+        for (offset, row) in rows.iter().take(usize::from(height)).enumerate() {
+            paint(
+                frame,
+                Rect::new(rect.x, y + offset as u16, row_rect.width, 1),
+                row,
+                app,
             );
         }
         app.hits.push((row_rect, Action::SelectPr(index)));
+        y = y.saturating_add(height).saturating_add(1);
     }
 }
 
@@ -1389,6 +1496,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
             text("↑ ↓           Navigate PRs, files, or code", TEXT),
             text("Alt+↑ / ↓     Previous / next guide chapter", TEXT),
             text("Tab           Switch navigation / content focus", TEXT),
+            text("Cmd+Up/Down   Scroll content by ten lines", TEXT),
             text("Enter         Open the selected PR", TEXT),
             text("Page Up/Down  Scroll a page · Space scrolls down", TEXT),
             text("Home / End    Jump to start / end", TEXT),
@@ -1533,6 +1641,9 @@ mod tests {
             title: "Test".into(),
             author: "author".into(),
             updated: String::new(),
+            created: String::new(),
+            stats: None,
+            stats_error: false,
             draft: false,
         });
         app.reviews.insert(
@@ -1565,6 +1676,109 @@ mod tests {
         );
         app.action(Action::SetView(View::Guide));
         app
+    }
+
+    #[test]
+    fn inbox_metadata_wraps_keeps_colors_and_selected_row_clickable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        for width in [18, 42] {
+            let mut app = guide_app(dir.path());
+            let mut pr = app.inbox.first().context("Missing PR")?.clone();
+            pr.created = "2026-09-10T12:30:00Z".into();
+            pr.stats = Some(crate::model::PrStats {
+                additions: 6582,
+                deletions: 181,
+                changed_files: 97,
+            });
+            app.inbox = (1..=8)
+                .map(|number| {
+                    let mut p = pr.clone();
+                    p.key.number = number;
+                    p
+                })
+                .collect();
+            app.selected = 7;
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24))?;
+            terminal.draw(|f| draw_inbox(f, &mut app, Rect::new(0, 0, width, 24)))?;
+            let buffer = terminal.backend().buffer();
+            let contents: String = buffer.content.iter().map(|c| c.symbol()).collect();
+            assert!(contents.contains("2026-09-10"));
+            assert!(contents.contains("97 files"));
+            assert!(contents.contains("+6582"));
+            assert!(contents.contains("−181"));
+            assert!(
+                buffer
+                    .content
+                    .iter()
+                    .any(|c| c.symbol() == "+" && c.fg == GREEN)
+            );
+            assert!(
+                buffer
+                    .content
+                    .iter()
+                    .any(|c| c.symbol() == "−" && c.fg == RED)
+            );
+            let (hit, _) = app
+                .hits
+                .iter()
+                .find(|(_, action)| matches!(action, Action::SelectPr(7)))
+                .context("Selected PR clipped out")?;
+            assert!(hit.bottom() <= 24);
+            assert!(hit.height >= 5);
+            assert!(app.nav_scroll > 0);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn default_navigation_focus_and_fast_scroll_preserve_shortcut_meanings() -> Result<()> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 30))?;
+        app.action(Action::SetView(View::Guide));
+        assert_eq!(app.focus, Focus::Navigation);
+        terminal.draw(|f| draw(f, &mut app))?;
+        let output: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(output.contains("Alt+↑/↓ Chapters"));
+        assert!(output.contains("Cmd+↑/↓ 10 lines"));
+        assert!(output.contains("Focus: Chapters"));
+        let last = app
+            .document
+            .as_ref()
+            .and_then(|d| d.sections.last())
+            .context("Missing chapter")?
+            .start;
+        app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.scroll, last);
+        assert_eq!(app.focus, Focus::Navigation);
+        app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.scroll, 0);
+        app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER));
+        assert_eq!(app.scroll, 10);
+        assert_eq!(app.focus, Focus::Content);
+        app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
+        assert_eq!(app.scroll, 0);
+        app.action(Action::SetView(View::Diff));
+        assert_eq!(app.focus, Focus::Navigation);
+        terminal.draw(|f| draw(f, &mut app))?;
+        app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.file, 1);
+        terminal.draw(|f| draw(f, &mut app))?;
+        app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER));
+        assert_eq!(app.file, 1);
+        assert_eq!(app.scroll, 10);
+        app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
+        app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
+        assert_eq!(app.scroll, 0);
+        Ok(())
     }
 
     #[test]

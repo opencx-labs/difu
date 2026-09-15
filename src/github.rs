@@ -68,7 +68,7 @@ fn search_prs(scope: &str, state: PrState, cancel: &Cancel) -> Result<Vec<PrSumm
         "--sort=updated",
         "--order=desc",
         "--limit=1000",
-        "--json=number,title,url,author,updatedAt,isDraft",
+        "--json=number,title,url,author,updatedAt,createdAt,isDraft",
     ];
     match state {
         PrState::Open => args.push("--state=open"),
@@ -87,6 +87,9 @@ fn search_prs(scope: &str, state: PrState, cancel: &Cancel) -> Result<Vec<PrSumm
                 title: text(v, "title"),
                 author: text(v.get("author").unwrap_or(&Value::Null), "login"),
                 updated: text(v, "updatedAt"),
+                created: text(v, "createdAt"),
+                stats: None,
+                stats_error: false,
                 draft: v
                     .get("isDraft")
                     .unwrap_or(&Value::Null)
@@ -95,6 +98,30 @@ fn search_prs(scope: &str, state: PrState, cancel: &Cancel) -> Result<Vec<PrSumm
             })
         })
         .collect()
+}
+
+/// Resolve a bounded batch without downloading patches or Git objects.
+pub fn stats(keys: &[PrKey], cancel: &Cancel) -> Result<Vec<Option<PrStats>>> {
+    anyhow::ensure!(keys.len() <= 25, "Too many PRs in a metadata batch");
+    let mut query = String::from("query {");
+    for (index, key) in keys.iter().enumerate() {
+        key.validate()?;
+        query.push_str(&format!(
+            "r{index}: repository(owner:{}, name:{}) {{ pullRequest(number:{}) {{ additions deletions changedFiles }} }}",
+            serde_json::to_string(&key.owner)?, serde_json::to_string(&key.repo)?, key.number
+        ));
+    }
+    query.push('}');
+    let value = json(&["api", "graphql", "-f", &format!("query={query}")], cancel)?;
+    Ok(keys
+        .iter()
+        .enumerate()
+        .map(|(index, _)| {
+            value
+                .pointer(&format!("/data/r{index}/pullRequest"))
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+        })
+        .collect())
 }
 
 pub fn repositories(cancel: &Cancel) -> Result<Vec<String>> {

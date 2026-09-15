@@ -16,6 +16,7 @@ elif args[0] == 'app-server':
 else:
     assert any('"fixture.server" = { enabled = false, command = "false" }' in a for a in args)
     assert 'project_doc_max_bytes=0' in args
+    assert 'model_reasoning_summary="auto"' in args
     assert any(a.startswith('developer_instructions=') for a in args)
     assert '--ignore-user-config' in args and '--ignore-rules' in args
     assert args[args.index('--sandbox')+1] == 'read-only'

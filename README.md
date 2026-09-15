@@ -78,10 +78,17 @@ difu
 2. **Authored** — PRs you created.
 3. **Repositories** — PRs from repositories you explicitly whitelist.
 
+Each PR row shows its opened date, changed-file count, additions in green, and
+removals in red. Counts load in background batches; the list remains usable.
+Lists are cached per tab and filter selection. Returning home or switching tabs
+shows the saved list immediately while GitHub refreshes it in place. If a refresh
+fails, the cached list stays available; **F5** retries.
+
 Select a PR to preview its description, chronological activity, inline review
 comments, and checks. **Enter** drills into that PR and selects **Guide**, starting
 or retrieving its guide. Inside the PR, the tabs are **Overview / Guide / Diff**;
-**Esc** returns home. You can also launch directly:
+**Esc** returns home. Guide and Diff start with chapters or files focused; the
+footer names the focused pane, and **Tab** switches focus. You can also launch directly:
 
 ```sh
 difu https://github.com/owner/repo/pull/123
@@ -156,7 +163,8 @@ bindings.
 
 | Key | Action |
 | --- | --- |
-| Up / Down | Select a PR/file or scroll content |
+| Up / Down | Select a PR/file/chapter or scroll content |
+| Command+Up / Command+Down | Focus content and scroll ten lines |
 | Tab / Shift+Tab | Switch navigation/content focus |
 | Enter | Open selected PR |
 | Page Up / Page Down / Space | Scroll a page |
@@ -180,6 +188,19 @@ bindings.
 
 In the clone dialog, paste a path, use Ctrl+U to clear it, then Enter. Some
 terminals require Fn with function keys; the footer also offers clickable actions.
+
+Command shortcuts require a terminal that forwards the Command (Super) modifier.
+Difu enables the enhanced keyboard protocol while running and restores it on exit.
+Ghostty's default Command+arrow bindings jump between prompts and consume these
+keys. To forward them to terminal applications, use these Ghostty bindings:
+
+```ini
+keybind = super+arrow_up=csi:1;9A
+keybind = super+arrow_down=csi:1;9B
+```
+
+See [Ghostty keybindings](https://ghostty.org/docs/config/keybind) for configuration.
+On Linux, the equivalent modifier is Super; desktop shortcuts may also intercept it.
 
 ## Codex and caching
 
@@ -211,9 +232,16 @@ Existing guides from older releases are reused when their original inputs match.
 Cached guides are validated again before use. F6 bypasses the guide cache.
 Damaged cache entries produce an error and can be replaced with F6.
 
-Settings and guides use the OS's standard per-user directories:
+Guide generation shows brief Codex progress preambles alongside elapsed time
+when the model emits them. When commentary is absent, short headings from Codex's
+reasoning summaries provide progress updates. Difu requests automatic summaries
+for guide runs; the full reasoning text is never
+displayed. Tool activity remains visible until a preamble or heading arrives.
+These updates do not change the saved guide or invalidate existing guides.
 
-| OS | Settings | Guides |
+Settings, cached PR lists, and guides use the OS's standard per-user directories:
+
+| OS | Settings | Cache |
 | --- | --- | --- |
 | macOS | `~/Library/Application Support/difu/config.json` | `~/Library/Caches/difu/` |
 | Linux | `$XDG_CONFIG_HOME/difu/config.json` (default `~/.config`) | `$XDG_CACHE_HOME/difu/` (default `~/.cache`) |
@@ -221,7 +249,8 @@ Settings and guides use the OS's standard per-user directories:
 Settings remember clone paths, model/effort, diff preference, the repository
 whitelist, and which whitelisted repositories are enabled. Writes are atomic
 and files are created with owner-only permissions. Guide cache files contain PR
-explanations and hunk references; remove the cache directory to clear them.
+explanations and hunk references. PR-list cache files contain PR titles, authors,
+opened dates, and counts. Remove the cache directory to clear cached data.
 
 ## Worktrees and safety
 

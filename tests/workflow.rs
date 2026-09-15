@@ -155,6 +155,8 @@ fn exercise(root: &Path) -> Result<()> {
     let overview = render(&mut app, 160)?;
     assert!(overview.contains("Describe the behavior"));
     assert!(overview.contains("ACTIVITY"));
+    assert!(overview.contains("2026-09-10"));
+    assert!(overview.contains("1 file"));
     assert!(overview.contains("CHECKS"));
     assert!(overview.contains("1 Review requests"));
     assert!(overview.contains("2 Authored"));
@@ -164,6 +166,7 @@ fn exercise(root: &Path) -> Result<()> {
             .is_some_and(|r| r.checks.first().is_some_and(|c| c.state == "pending"))
     );
     app.action(Action::OpenPr);
+    assert_eq!(app.focus, difu::app::Focus::Navigation);
     wait(&mut app, |a| a.review().is_some_and(|r| r.guide.is_some()))?;
     // Revision checks are lightweight, spaced by 30 seconds, and pin open code.
     let revision_file = root.join("revisions.json");
@@ -339,6 +342,39 @@ fn exercise(root: &Path) -> Result<()> {
     assert!(searches.contains("--merged=false"));
     assert!(searches.contains("--merged\""));
     app.shutdown();
+    fs::write(root.join("updated-title"), "")?;
+    let mut cached = App::new(storage.clone(), config.clone());
+    cached.start(None);
+    assert!(
+        !cached.inbox.is_empty(),
+        "Cached list must be available before processing replies"
+    );
+    assert!(cached.inbox_loading);
+    assert_ne!(
+        cached.inbox.first().map(|p| p.title.as_str()),
+        Some("Fresh title from GitHub")
+    );
+    assert!(render(&mut cached, 160)?.contains("Showing cached PRs"));
+    wait(&mut cached, |a| !a.inbox_loading)?;
+    assert_eq!(
+        cached.inbox.first().map(|p| p.title.as_str()),
+        Some("Fresh title from GitHub")
+    );
+    cached.shutdown();
+    fs::remove_file(root.join("updated-title"))?;
+    fs::write(root.join("fail-search"), "")?;
+    let mut offline = App::new(storage.clone(), config.clone());
+    offline.start(None);
+    let cached_ids: Vec<_> = offline.inbox.iter().map(|p| p.key.id()).collect();
+    wait(&mut offline, |a| !a.inbox_loading)?;
+    assert!(offline.inbox_error.is_some());
+    assert_eq!(
+        offline.inbox.iter().map(|p| p.key.id()).collect::<Vec<_>>(),
+        cached_ids
+    );
+    assert!(render(&mut offline, 160)?.contains("Refresh failed"));
+    offline.shutdown();
+    fs::remove_file(root.join("fail-search"))?;
     // Old releases' cache entries migrate without another Codex turn.
     let review = app
         .reviews
