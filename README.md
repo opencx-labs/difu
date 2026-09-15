@@ -72,9 +72,16 @@ Difu reuses those logins; you do not enter an API key into the TUI.
 difu
 ```
 
-`difu` opens your direct review requests across GitHub repositories. Select a PR
-to preview its description, chronological activity, inline review comments, and
-checks. Enter opens the diff and starts its guide. You can also launch directly:
+`difu` opens a home screen with three inboxes:
+
+1. **Review requests** — open PRs explicitly requesting your review.
+2. **Authored** — PRs you created.
+3. **Repositories** — PRs from repositories you explicitly whitelist.
+
+Select a PR to preview its description, chronological activity, inline review
+comments, and checks. **Enter** drills into that PR and selects **Guide**, starting
+or retrieving its guide. Inside the PR, the tabs are **Overview / Guide / Diff**;
+**Esc** returns home. You can also launch directly:
 
 ```sh
 difu https://github.com/owner/repo/pull/123
@@ -84,7 +91,25 @@ difu 123 # uses the GitHub repository in your current directory
 The first time you open a repository, supply its existing local clone path.
 Difu remembers it. It fetches missing PR commits using your `gh` authentication;
 it never clones repositories automatically. GitHub.com is supported in v1.
-The inbox contains up to GitHub search's limit of 1,000 open direct review requests.
+Lists show the most recently updated PRs first. GitHub search returns up to
+1,000 results for Review requests or Authored, and up to 1,000 per enabled
+repository in the Repositories inbox.
+
+### States and repository filters
+
+Authored and Repositories default to **Open**. Click **Open / Merged / Closed /
+All**, or use **F3** to cycle states. Closed means closed without merging.
+
+On your first visit to Repositories, choose from a searchable list of personal
+and organization repositories available through your GitHub login. Nothing is
+whitelisted automatically. Type to search, use arrows and **Space** or click to
+toggle a repository, then **Enter** or **Save selection** to apply. **Esc** cancels
+unsaved changes. **Shift+F4** edits the whitelist later.
+
+**F4** opens repository filters. Enable individual whitelisted repositories or
+choose **All whitelisted** (**Ctrl+A**), then save. Both the whitelist and its
+enabled/disabled selections are remembered between launches. Disabling every
+repository shows an empty list; it never searches outside your whitelist.
 
 ## Reading a PR
 
@@ -121,16 +146,19 @@ bindings.
 | Page Up / Page Down / Space | Scroll a page |
 | Home / End | Start / end |
 | Left / Right | Scroll code horizontally |
-| 1 / 2 / 3 | Overview / Guide / Diff |
+| 1 / 2 / 3 | Home: Review requests / Authored / Repositories; inside a PR: Overview / Guide / Diff |
 | F1 | Help |
 | F2 | Model and reasoning picker |
+| F3 | Cycle PR states in Authored / Repositories |
+| F4 | Filter whitelisted repositories |
+| Shift+F4 | Edit the repository whitelist |
 | F5 | Refresh |
 | F6 | Regenerate / retry |
 | F7 | Choose a local clone path |
 | F8 | Cancel generation or snapshot preparation |
 | Ctrl+B | Side-by-side / unified preference |
 | Ctrl+O | Open the PR on GitHub |
-| Esc | Close dialog / return to overview / quit |
+| Esc | Close dialog / return home / quit |
 | Ctrl+C | Quit and clean up active work |
 
 In the clone dialog, paste a path, use Ctrl+U to clear it, then Enter. Some
@@ -170,7 +198,8 @@ Settings and guides use the OS's standard per-user directories:
 | macOS | `~/Library/Application Support/difu/config.json` | `~/Library/Caches/difu/` |
 | Linux | `$XDG_CONFIG_HOME/difu/config.json` (default `~/.config`) | `$XDG_CACHE_HOME/difu/` (default `~/.cache`) |
 
-Settings remember clone paths, model/effort, and diff preference. Writes are atomic
+Settings remember clone paths, model/effort, diff preference, the repository
+whitelist, and which whitelisted repositories are enabled. Writes are atomic
 and files are created with owner-only permissions. Guide cache files contain PR
 explanations and hunk references; remove the cache directory to clear them.
 

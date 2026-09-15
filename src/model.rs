@@ -1,5 +1,54 @@
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum InboxTab {
+    #[default]
+    ReviewRequests,
+    Authored,
+    Repositories,
+}
+impl InboxTab {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReviewRequests => "Review requests",
+            Self::Authored => "Authored",
+            Self::Repositories => "Repositories",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrState {
+    #[default]
+    Open,
+    Merged,
+    Closed,
+    All,
+}
+impl PrState {
+    pub const ALL: [Self; 4] = [Self::Open, Self::Merged, Self::Closed, Self::All];
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Open => "Open",
+            Self::Merged => "Merged",
+            Self::Closed => "Closed",
+            Self::All => "All",
+        }
+    }
+}
+
+pub fn validate_repository(value: &str) -> anyhow::Result<()> {
+    let (owner, repo) = value
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("Expected owner/repository"))?;
+    PrKey {
+        owner: owner.into(),
+        repo: repo.into(),
+        number: 1,
+    }
+    .validate()
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrKey {
     pub owner: String,

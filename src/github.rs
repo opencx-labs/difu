@@ -29,20 +29,54 @@ fn text(v: &Value, key: &str) -> String {
         .into()
 }
 
-pub fn inbox(cancel: &Cancel) -> Result<Vec<PrSummary>> {
-    let value = json(
-        &[
-            "search",
-            "prs",
-            "--review-requested=@me",
-            "--state=open",
-            "--sort=updated",
-            "--order=desc",
-            "--limit=1000",
-            "--json=number,title,url,author,updatedAt,isDraft",
-        ],
-        cancel,
-    )?;
+pub fn inbox(
+    tab: InboxTab,
+    state: PrState,
+    repositories: &[String],
+    cancel: &Cancel,
+) -> Result<Vec<PrSummary>> {
+    // Empty selections must never fall through to a global GitHub search.
+    if tab == InboxTab::Repositories {
+        let mut combined = Vec::new();
+        for repository in repositories {
+            validate_repository(repository)?;
+            if cancel.cancelled() {
+                bail!("Cancelled");
+            }
+            combined.extend(search_prs(&format!("--repo={repository}"), state, cancel)?);
+        }
+        combined.sort_by(|a, b| {
+            b.updated
+                .cmp(&a.updated)
+                .then_with(|| a.key.id().cmp(&b.key.id()))
+        });
+        combined.dedup_by(|a, b| a.key == b.key);
+        return Ok(combined);
+    }
+    let (scope, state) = match tab {
+        InboxTab::ReviewRequests => ("--review-requested=@me", PrState::Open),
+        _ => ("--author=@me", state),
+    };
+    search_prs(scope, state, cancel)
+}
+
+fn search_prs(scope: &str, state: PrState, cancel: &Cancel) -> Result<Vec<PrSummary>> {
+    let mut args = vec![
+        "search",
+        "prs",
+        scope,
+        "--sort=updated",
+        "--order=desc",
+        "--limit=1000",
+        "--json=number,title,url,author,updatedAt,isDraft",
+    ];
+    match state {
+        PrState::Open => args.push("--state=open"),
+        PrState::Merged => args.push("--merged"),
+        PrState::Closed => args.extend(["--state=closed", "--merged=false"]),
+        PrState::All => {}
+    }
+    let value = json(&args, cancel)?;
     value
         .as_array()
         .context("Invalid inbox response")?
@@ -61,6 +95,29 @@ pub fn inbox(cancel: &Cancel) -> Result<Vec<PrSummary>> {
             })
         })
         .collect()
+}
+
+pub fn repositories(cancel: &Cancel) -> Result<Vec<String>> {
+    let value = json(
+        &[
+            "api",
+            "--paginate",
+            "--slurp",
+            "user/repos?per_page=100&sort=full_name&direction=asc&affiliation=owner,collaborator,organization_member",
+        ],
+        cancel,
+    )?;
+    let mut repositories = Vec::new();
+    for page in value.as_array().context("Invalid repository list")? {
+        for item in page.as_array().context("Invalid repository page")? {
+            let name = text(item, "full_name");
+            validate_repository(&name)?;
+            repositories.push(name);
+        }
+    }
+    repositories.sort_by_key(|r| r.to_lowercase());
+    repositories.dedup();
+    Ok(repositories)
 }
 
 pub fn current_repository(cancel: &Cancel) -> Result<String> {
@@ -304,4 +361,23 @@ pub fn open_url(url: &str, cancel: &Cancel) -> Result<()> {
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::*;
+
+    #[test]
+    fn empty_repository_selection_never_queries_github() -> Result<()> {
+        assert!(
+            inbox(
+                InboxTab::Repositories,
+                PrState::All,
+                &[],
+                &Cancel::default()
+            )?
+            .is_empty()
+        );
+        Ok(())
+    }
 }

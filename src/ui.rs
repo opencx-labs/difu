@@ -1,7 +1,7 @@
 use crate::{
     app::{Action, App, Focus, Modal, View},
     diff::{DiffFile, DiffLine, Hunk, LineKind, split_rows},
-    model::{ModelChoice, clean},
+    model::{InboxTab, ModelChoice, PrState, clean},
 };
 use ratatui::{
     Frame,
@@ -671,11 +671,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
     let title = Rect::new(2, 1, area.width.saturating_sub(4), 1);
-    let identity = app
-        .inbox
-        .get(app.selected)
-        .map(|p| p.key.id())
-        .unwrap_or_else(|| "your review inbox".into());
+    let identity = app.key().unwrap_or_else(|| app.inbox_tab.label().into());
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -687,31 +683,115 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         title,
     );
     let mut x = 2;
-    for (label, view) in [
-        ("1 Overview", View::Overview),
-        ("2 Guide", View::Guide),
-        ("3 Diff", View::Diff),
-    ] {
+    let tabs = if app.home {
+        vec![
+            (
+                if area.width < 70 {
+                    "1 Reviews"
+                } else {
+                    "1 Review requests"
+                },
+                app.inbox_tab == InboxTab::ReviewRequests,
+                Action::SetInbox(InboxTab::ReviewRequests),
+            ),
+            (
+                "2 Authored",
+                app.inbox_tab == InboxTab::Authored,
+                Action::SetInbox(InboxTab::Authored),
+            ),
+            (
+                if area.width < 70 {
+                    "3 Repos"
+                } else {
+                    "3 Repositories"
+                },
+                app.inbox_tab == InboxTab::Repositories,
+                Action::SetInbox(InboxTab::Repositories),
+            ),
+        ]
+    } else {
+        vec![
+            (
+                "1 Overview",
+                app.view == View::Overview,
+                Action::SetView(View::Overview),
+            ),
+            (
+                "2 Guide",
+                app.view == View::Guide,
+                Action::SetView(View::Guide),
+            ),
+            (
+                "3 Diff",
+                app.view == View::Diff,
+                Action::SetView(View::Diff),
+            ),
+            ("Esc Home", false, Action::Back),
+        ]
+    };
+    for (label, selected, action) in tabs {
         if x + label.len() as u16 + 4 < area.width {
-            x = button(
-                frame,
-                app,
-                x,
-                3,
-                label,
-                app.view == view,
-                Action::SetView(view),
-            );
+            x = button(frame, app, x, 3, label, selected, action);
         }
     }
+    let filters = app.home && app.inbox_tab != InboxTab::ReviewRequests && area.height >= 14;
+    if filters {
+        let mut x = 2;
+        for state in PrState::ALL {
+            if x + state.label().len() as u16 + 4 < area.width {
+                x = button(
+                    frame,
+                    app,
+                    x,
+                    5,
+                    state.label(),
+                    app.state() == state,
+                    Action::SetState(state),
+                );
+            }
+        }
+        if app.inbox_tab == InboxTab::Repositories {
+            let enabled = app
+                .config
+                .review_repositories
+                .values()
+                .filter(|v| **v)
+                .count();
+            let label = format!(
+                "F4 Repos {enabled}/{}",
+                app.config.review_repositories.len()
+            );
+            let x = button(frame, app, 2, 6, &label, false, Action::Repositories(false));
+            if x + 24 < area.width {
+                button(
+                    frame,
+                    app,
+                    x,
+                    6,
+                    "Shift+F4 Whitelist",
+                    false,
+                    Action::Repositories(true),
+                );
+            }
+        }
+    }
+    let content_y = if filters {
+        if app.inbox_tab == InboxTab::Repositories {
+            8
+        } else {
+            7
+        }
+    } else {
+        5
+    };
     let content = Rect::new(
         2,
-        5,
+        content_y,
         area.width.saturating_sub(4),
-        area.height.saturating_sub(9),
+        area.height.saturating_sub(content_y + 4),
     );
     let has_guide = app.view == View::Guide && app.review().is_some_and(|r| r.guide.is_some());
-    let navigation = app.view == View::Overview || !has_guide;
+    let navigation = app.home || (app.view != View::Overview && !has_guide);
     let nav_width = if navigation {
         (content.width / 4)
             .clamp(18, 42)
@@ -745,7 +825,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Rect::new(nav.x, nav.y, nav.width + 1, nav.height),
         );
         app.hits.push((nav, Action::Focus(Focus::Navigation)));
-        if app.view == View::Overview {
+        if app.home {
             draw_inbox(frame, app, nav);
         } else {
             draw_files(frame, app, nav);
@@ -840,7 +920,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             format!("{}", app.config.model)
         }
     } else if app.inbox_loading {
-        "Loading review requests…".into()
+        format!("Loading {}…", app.inbox_tab.label().to_lowercase())
     } else {
         app.notice.clone()
     };
@@ -855,15 +935,40 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         Rect::new(2, area.height - 3, area.width - 4, 1),
     );
     let mut footer_x = 2;
-    for (label, action) in [
-        ("F1 Help", Action::Help),
-        ("F2 Model", Action::Models),
-        ("F5 Refresh", Action::Refresh),
-        ("F6 Generate", Action::Regenerate),
-        ("F8 Cancel", Action::Cancel),
-        ("Ctrl+B Split", Action::ToggleLayout),
-        ("Enter Open", Action::OpenPr),
-    ] {
+    let footer = if app.home {
+        vec![
+            ("F1 Help", Action::Help),
+            (
+                "F3 State",
+                Action::SetState(match app.state() {
+                    PrState::Open => PrState::Merged,
+                    PrState::Merged => PrState::Closed,
+                    PrState::Closed => PrState::All,
+                    PrState::All => PrState::Open,
+                }),
+            ),
+            ("F4 Repos", Action::Repositories(false)),
+            ("F5 Refresh", Action::Refresh),
+            ("Enter Open", Action::OpenPr),
+        ]
+    } else {
+        vec![
+            ("F1 Help", Action::Help),
+            ("F2 Model", Action::Models),
+            ("F5 Refresh", Action::Refresh),
+            ("F6 Generate", Action::Regenerate),
+            ("F8 Cancel", Action::Cancel),
+            ("Ctrl+B Split", Action::ToggleLayout),
+            ("Esc Home", Action::Back),
+        ]
+    };
+    for (label, action) in footer {
+        if app.home
+            && ((label == "F3 State" && app.inbox_tab == InboxTab::ReviewRequests)
+                || (label == "F4 Repos" && app.inbox_tab != InboxTab::Repositories))
+        {
+            continue;
+        }
         let width = label.len() as u16;
         if footer_x + width > area.width.saturating_sub(2) {
             break;
@@ -893,7 +998,14 @@ fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
     paint(
         frame,
         Rect::new(rect.x, rect.y, rect.width, 1),
-        &bold(format!("FOR YOUR REVIEW  {}", app.inbox.len()), DIM),
+        &bold(
+            format!(
+                "{}  {}",
+                app.inbox_tab.label().to_uppercase(),
+                app.inbox.len()
+            ),
+            DIM,
+        ),
         app,
     );
     if app.inbox.is_empty() {
@@ -901,7 +1013,28 @@ fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
             if app.inbox_loading {
                 "Loading GitHub…".into()
             } else {
-                "No open PRs requesting your review.".into()
+                match app.inbox_tab {
+                    InboxTab::ReviewRequests => "No open PRs requesting your review.".into(),
+                    InboxTab::Authored => {
+                        format!("No {} authored PRs.", app.state().label().to_lowercase())
+                    }
+                    InboxTab::Repositories if app.config.review_repositories.is_empty() => {
+                        "Choose repositories first. Shift+F4 opens the whitelist.".into()
+                    }
+                    InboxTab::Repositories
+                        if !app
+                            .config
+                            .review_repositories
+                            .values()
+                            .any(|enabled| *enabled) =>
+                    {
+                        "No repositories enabled. F4 opens filters.".into()
+                    }
+                    InboxTab::Repositories => format!(
+                        "No {} PRs in the enabled repositories.",
+                        app.state().label().to_lowercase()
+                    ),
+                }
             }
         });
         for (i, row) in prose(&message, rect.width as usize)
@@ -1070,6 +1203,81 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
         return;
     };
     let rows = match modal {
+        Modal::Repositories {
+            manage,
+            query,
+            selected,
+            choices,
+        } => {
+            let options = app.repository_choices(*manage, query, choices);
+            let mut rows = vec![
+                bold(
+                    if *manage {
+                        "Choose your repository whitelist"
+                    } else {
+                        "Filter whitelisted repositories"
+                    },
+                    ACCENT,
+                ),
+                text(format!("Search: {query}"), TEXT),
+                text(
+                    "↑↓ select · Space/click toggle · Enter save · Esc cancel",
+                    DIM,
+                ),
+            ];
+            let mut save = bold("[ Save selection ]", ACCENT);
+            save.action = Some(Action::SaveRepositories);
+            rows.push(save);
+            if !manage {
+                let enabled = choices.values().filter(|v| **v).count();
+                let mut all = text(
+                    format!(
+                        "[ All whitelisted · Ctrl+A ]  {enabled}/{} enabled",
+                        choices.len()
+                    ),
+                    TEXT,
+                );
+                all.action = Some(Action::AllRepositories);
+                rows.push(all);
+                let mut edit = text("[ Edit whitelist ]", ACCENT);
+                edit.action = Some(Action::Repositories(true));
+                rows.push(edit);
+            }
+            if *manage && app.repositories_loading {
+                rows.push(text(
+                    "Loading your personal and organization repositories…",
+                    DIM,
+                ));
+            }
+            if *manage && let Some(error) = &app.repositories_error {
+                rows.extend(prose(error, inner.width as usize));
+            }
+            if options.is_empty() {
+                rows.push(text("No matching repositories.", DIM));
+            }
+            let count = (inner.height as usize).saturating_sub(rows.len());
+            let selected = (*selected).min(options.len().saturating_sub(1));
+            let start = selected.saturating_sub(count.saturating_sub(1));
+            for (index, name) in options.iter().enumerate().skip(start).take(count) {
+                let checked = if *manage {
+                    choices.contains_key(name)
+                } else {
+                    choices.get(name).copied().unwrap_or(false)
+                };
+                let mut row = text(
+                    format!(
+                        "{} [{}] {}",
+                        if index == selected { "▸" } else { " " },
+                        if checked { "x" } else { " " },
+                        name
+                    ),
+                    if index == selected { ACCENT } else { TEXT },
+                );
+                row.action = Some(Action::ToggleRepository(name.clone()));
+                rows.push(row);
+            }
+            rows
+        }
         Modal::Help => vec![
             bold("difu · keyboard & mouse", ACCENT),
             text("", DIM),
@@ -1079,7 +1287,14 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
             text("Page Up/Down  Scroll a page · Space scrolls down", TEXT),
             text("Home / End    Jump to start / end", TEXT),
             text("← →           Scroll code horizontally", TEXT),
-            text("1 / 2 / 3     Overview / Guide / Diff", TEXT),
+            text(
+                "1 / 2 / 3     Home: Reviews / Authored / Repositories",
+                TEXT,
+            ),
+            text("              Inside PR: Overview / Guide / Diff", TEXT),
+            text("F3            Cycle Open / Merged / Closed / All", TEXT),
+            text("F4            Filter whitelisted repositories", TEXT),
+            text("Shift+F4      Edit the repository whitelist", TEXT),
             text("F2            Choose model and reasoning", TEXT),
             text("F5            Refresh / load the new PR revision", TEXT),
             text("F6            Generate again / retry", TEXT),
