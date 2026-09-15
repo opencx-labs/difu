@@ -94,6 +94,7 @@ pub enum Action {
     SaveRepositories,
     SelectFile(usize),
     Jump(usize),
+    Chapter(bool),
     Link(String),
     Models,
     Locate,
@@ -995,6 +996,28 @@ impl App {
                 self.scroll = row;
                 self.focus = Focus::Content;
             }
+            Action::Chapter(next) => {
+                if self.home || self.view != View::Guide {
+                    return;
+                }
+                let Some(doc) = &self.document else {
+                    return;
+                };
+                let current = doc
+                    .sections
+                    .iter()
+                    .rposition(|s| s.start <= self.scroll)
+                    .unwrap_or(0);
+                let index = if next {
+                    current.saturating_add(1)
+                } else {
+                    current.saturating_sub(1)
+                };
+                if let Some(section) = doc.sections.get(index) {
+                    self.scroll = section.start;
+                    self.focus = Focus::Content;
+                }
+            }
             Action::Link(url) => {
                 self.spawn(move |tx, cancel| {
                     if let Err(e) = github::open_url(&url, &cancel) {
@@ -1066,7 +1089,7 @@ impl App {
             let max = self
                 .document
                 .as_ref()
-                .map(|d| d.rows.len().saturating_sub(self.viewport))
+                .map(|d| d.max_scroll(self.viewport))
                 .unwrap_or(0);
             self.scroll = self.scroll.saturating_add_signed(delta as isize).min(max);
         }
@@ -1081,6 +1104,12 @@ impl App {
             return;
         }
         match key.code {
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.action(Action::Chapter(false))
+            }
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.action(Action::Chapter(true))
+            }
             KeyCode::Esc => {
                 if self.home {
                     self.quit = true;

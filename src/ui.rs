@@ -38,14 +38,45 @@ pub struct Section {
     pub end: usize,
     pub left: Vec<TextRow>,
 }
+pub struct FileSection {
+    pub start: usize,
+    pub end: usize,
+    pub header: Vec<TextRow>,
+}
 pub struct Document {
     pub epoch: u64,
     pub width: u16,
     pub horizontal: usize,
     pub rows: Vec<Row>,
     pub sections: Vec<Section>,
+    pub files: Vec<FileSection>,
     pub guide_columns: bool,
     pub left_width: u16,
+}
+impl Document {
+    pub fn max_scroll(&self, height: usize) -> usize {
+        self.rows
+            .len()
+            .saturating_sub(height)
+            .max(self.sections.last().map(|s| s.start).unwrap_or(0))
+    }
+}
+
+fn wrapped_text(value: &str, width: usize) -> Vec<String> {
+    textwrap::wrap(&clean(value), width.max(1))
+        .into_iter()
+        .map(|line| line.into_owned())
+        .collect()
+}
+
+fn file_header(file: &DiffFile, width: usize) -> Vec<TextRow> {
+    wrapped_text(
+        &format!("{}   +{} −{}", file.path, file.additions, file.deletions),
+        width,
+    )
+    .into_iter()
+    .map(|line| bold(line, TEXT))
+    .collect()
 }
 
 fn span(text: impl Into<String>, color: Color) -> Span<'static> {
@@ -344,15 +375,7 @@ fn hunk_rows(
 ) -> Vec<TextRow> {
     let mut rows = Vec::new();
     if with_title {
-        rows.push(bold(
-            format!(
-                " {}   +{} −{}",
-                clean(&file.path),
-                file.additions,
-                file.deletions
-            ),
-            TEXT,
-        ));
+        rows.extend(file_header(file, width));
     }
     rows.push(text(format!(" {}", hunk.header), DIM));
     if split {
@@ -386,6 +409,7 @@ fn build(app: &App, width: u16) -> Document {
         horizontal: app.horizontal,
         rows: Vec::new(),
         sections: Vec::new(),
+        files: Vec::new(),
         guide_columns: false,
         left_width: 0,
     };
@@ -554,12 +578,16 @@ fn build(app: &App, width: u16) -> Document {
             // Compact chapters place explanation before all code. File links
             // below it point to actual document rows, calculated after layout.
             let mut links = Vec::new();
+            let mut headers = Vec::new();
             for id in &chapter.hunks {
                 if let Some((file, hunk)) = snapshot.find(id) {
                     let title = last_file != file.path;
                     last_file = file.path.clone();
                     if seen.insert(file.path.clone()) {
                         links.push((file.path.clone(), right.len()));
+                    }
+                    if title {
+                        headers.push((right.len(), file_header(file, code_width)));
                     }
                     right.extend(hunk_rows(
                         file,
@@ -571,16 +599,31 @@ fn build(app: &App, width: u16) -> Document {
                     ));
                 }
             }
+            let links = links
+                .into_iter()
+                .map(|(path, row)| (wrapped_text(&format!("↳ {}", path), prose_width), row))
+                .collect::<Vec<_>>();
+            let link_rows: usize = links.iter().map(|(lines, _)| lines.len()).sum();
             let offset = if wide {
                 start
             } else {
-                start + prose_length + links.len() + 1
+                start + prose_length + link_rows + 1
             };
-            for (path, row) in links {
-                left.push(link(
-                    format!("↳ {}", clean(&path)),
-                    Action::Jump(offset + row),
-                ));
+            for (lines, row) in links {
+                for line in lines {
+                    left.push(link(line, Action::Jump(offset + row)));
+                }
+            }
+            for (index, (row, header)) in headers.iter().enumerate() {
+                doc.files.push(FileSection {
+                    start: offset + row,
+                    end: offset
+                        + headers
+                            .get(index + 1)
+                            .map(|(start, _)| *start)
+                            .unwrap_or(right.len()),
+                    header: header.clone(),
+                });
             }
             left.push(TextRow::default());
             if wide {
@@ -622,6 +665,11 @@ fn build(app: &App, width: u16) -> Document {
                     append(&mut doc.rows, row);
                 }
             }
+            doc.files.push(FileSection {
+                start: 0,
+                end: doc.rows.len(),
+                header: file_header(file, width as usize),
+            });
         }
     }
     doc
@@ -839,9 +887,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let Some(doc) = app.document.take() else {
         return;
     };
-    app.scroll = app
-        .scroll
-        .min(doc.rows.len().saturating_sub(main.height as usize));
+    app.scroll = app.scroll.min(doc.max_scroll(main.height as usize));
     for y in 0..main.height {
         let index = app.scroll + y as usize;
         let Some(row) = doc.rows.get(index) else {
@@ -890,6 +936,34 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 &row.right,
                 app,
             );
+        }
+    }
+    if let Some(file) = doc
+        .files
+        .iter()
+        .find(|file| app.scroll > file.start && app.scroll < file.end)
+        && file.header.len() < main.height as usize
+    {
+        let offset = if doc.guide_columns {
+            doc.left_width + 3
+        } else {
+            0
+        };
+        // Stop at the next file's natural header instead of covering it.
+        let count = file.header.len().min(file.end.saturating_sub(app.scroll));
+        for (index, row) in file.header.iter().take(count).enumerate() {
+            let rect = Rect::new(
+                main.x + offset,
+                main.y + index as u16,
+                main.width.saturating_sub(offset),
+                1,
+            );
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Block::default().style(Style::default().bg(BG).fg(TEXT)),
+                rect,
+            );
+            paint(frame, rect, row, app);
         }
     }
     if doc.rows.len() > main.height as usize && main.height > 0 {
@@ -1136,21 +1210,30 @@ fn draw_files(frame: &mut Frame, app: &mut App, rect: Rect) {
             .take_while(|(a, b)| **a == b.as_str())
             .count();
         for (depth, parent) in parents.iter().enumerate().skip(common) {
-            entries.push((format!("{}{parent}/", "  ".repeat(depth.min(5))), None));
+            entries.extend(
+                wrapped_text(
+                    &format!("{}{parent}/", "  ".repeat(depth.min(5))),
+                    rect.width.saturating_sub(1) as usize,
+                )
+                .into_iter()
+                .map(|line| (line, None)),
+            );
         }
         previous = parents.iter().map(|s| s.to_string()).collect();
+        let label = format!(
+            "{}{} {}",
+            "  ".repeat(parents.len().min(5)),
+            if index == app.file { "▸" } else { " " },
+            parts.last().unwrap_or(&"")
+        );
+        entries.extend(
+            wrapped_text(&label, rect.width.saturating_sub(1) as usize)
+                .into_iter()
+                .map(|line| (line, Some(index))),
+        );
         if index == app.file {
-            selected_row = entries.len();
+            selected_row = entries.len().saturating_sub(1);
         }
-        entries.push((
-            format!(
-                "{}{} {}",
-                "  ".repeat(parents.len().min(5)),
-                if index == app.file { "▸" } else { " " },
-                parts.last().unwrap_or(&"")
-            ),
-            Some(index),
-        ));
     }
     let height = rect.height.saturating_sub(2) as usize;
     let start = selected_row.saturating_sub(height.saturating_sub(1));
@@ -1282,6 +1365,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
             bold("difu · keyboard & mouse", ACCENT),
             text("", DIM),
             text("↑ ↓           Navigate PRs, files, or code", TEXT),
+            text("Alt+↑ / ↓     Previous / next guide chapter", TEXT),
             text("Tab           Switch navigation / content focus", TEXT),
             text("Enter         Open the selected PR", TEXT),
             text("Page Up/Down  Scroll a page · Space scrolls down", TEXT),
@@ -1374,6 +1458,202 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, Result};
+
+    fn guide_app(directory: &std::path::Path) -> App {
+        use crate::{
+            app::Review,
+            codex::{Chapter, Guide},
+            diff::Snapshot,
+            model::{PrKey, PrSummary},
+        };
+        use std::sync::Arc;
+        let key = PrKey {
+            owner: "example".into(),
+            repo: "repo".into(),
+            number: 1,
+        };
+        let files = (0..3)
+            .map(|index| {
+                let path = format!(
+                    "directory/with/a/very/long/path/to/a-distinctive-file-name-{index}.rs"
+                );
+                DiffFile {
+                    path: path.clone(),
+                    old_path: path,
+                    status: "M".into(),
+                    additions: 80,
+                    deletions: 0,
+                    hunks: vec![Hunk {
+                        id: format!("h{index}"),
+                        header: "@@ -0,0 +1,80 @@".into(),
+                        lines: (1..=80)
+                            .map(|line| DiffLine {
+                                kind: LineKind::Add,
+                                old: None,
+                                new: Some(line),
+                                text: format!("line_{line}"),
+                            })
+                            .collect(),
+                    }],
+                }
+            })
+            .collect();
+        let mut app = App::new(
+            crate::storage::Storage {
+                config: directory.join("config.json"),
+                cache: directory.into(),
+            },
+            Default::default(),
+        );
+        app.inbox.push(PrSummary {
+            key: key.clone(),
+            title: "Test".into(),
+            author: "author".into(),
+            updated: String::new(),
+            draft: false,
+        });
+        app.reviews.insert(
+            key.id(),
+            Review {
+                snapshot: Some(Arc::new(Snapshot {
+                    base: "base".into(),
+                    head: "head".into(),
+                    merge_base: "base".into(),
+                    files,
+                })),
+                guide: Some(Arc::new(Guide {
+                    chapters: vec![
+                        Chapter {
+                            title: "First chapter".into(),
+                            explanation: "Changes across two files.".into(),
+                            hunks: vec!["h0".into(), "h1".into()],
+                        },
+                        Chapter {
+                            title: "Second chapter".into(),
+                            explanation: "The final file.".into(),
+                            hunks: vec!["h2".into()],
+                        },
+                    ],
+                })),
+                ..Review::default()
+            },
+        );
+        app.action(Action::SetView(View::Guide));
+        app
+    }
+
+    #[test]
+    fn wrapped_links_and_sticky_headers_follow_each_file_in_both_layouts() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        for width in [80, 180] {
+            let mut app = guide_app(dir.path());
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))?;
+            terminal.draw(|frame| draw(frame, &mut app))?;
+            let doc = app.document.as_ref().context("Missing document")?;
+            let first = doc.files.first().context("Missing file")?;
+            let target = first.start;
+            let destination = doc
+                .rows
+                .get(target)
+                .context("Missing link destination")?
+                .right
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert!(destination.starts_with("directory/with/"));
+            let links = doc
+                .rows
+                .iter()
+                .flat_map(|row| [&row.left, &row.right])
+                .filter(|row| matches!(row.action, Some(Action::Jump(n)) if n == target))
+                .collect::<Vec<_>>();
+            let complete = links
+                .iter()
+                .flat_map(|row| row.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+            assert!(complete.contains("a-distinctive-file-name-0.rs"));
+            if width == 180 {
+                assert!(links.len() > 1);
+            }
+            let starts = doc.files.iter().map(|file| file.start).collect::<Vec<_>>();
+            for (index, start) in starts.iter().enumerate() {
+                app.scroll = start + 10;
+                terminal.draw(|frame| draw(frame, &mut app))?;
+                let doc = app.document.as_ref().context("Missing document")?;
+                let file = doc.files.get(index).context("Missing file")?;
+                let x = app.content_rect.x
+                    + if doc.guide_columns {
+                        doc.left_width + 3
+                    } else {
+                        0
+                    };
+                let y = app.content_rect.y;
+                let header = (0..file.header.len())
+                    .flat_map(|line| {
+                        (x..app.content_rect.right()).map(move |column| (column, y + line as u16))
+                    })
+                    .filter_map(|position| terminal.backend().buffer().cell(position))
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .chars()
+                    .filter(|c| !c.is_whitespace())
+                    .collect::<String>();
+                assert!(header.contains(&format!("a-distinctive-file-name-{index}.rs")));
+            }
+            app.action(Action::SetView(View::Diff));
+            app.scroll = 12;
+            terminal.draw(|frame| draw(frame, &mut app))?;
+            let first_row = (app.content_rect.x..app.content_rect.right())
+                .filter_map(|x| terminal.backend().buffer().cell((x, app.content_rect.y)))
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(first_row.contains("directory/with/a/very"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn alt_arrows_reach_and_align_a_short_final_chapter() -> Result<()> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        for width in [80, 180] {
+            let mut app = guide_app(dir.path());
+            let snapshot = app
+                .reviews
+                .get_mut("example/repo#1")
+                .and_then(|r| r.snapshot.as_mut())
+                .context("Missing snapshot")?;
+            let snapshot = std::sync::Arc::make_mut(snapshot);
+            snapshot
+                .files
+                .last_mut()
+                .and_then(|f| f.hunks.first_mut())
+                .context("Missing hunk")?
+                .lines
+                .truncate(1);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))?;
+            terminal.draw(|frame| draw(frame, &mut app))?;
+            let last = app
+                .document
+                .as_ref()
+                .and_then(|d| d.sections.last())
+                .context("Missing chapter")?
+                .start;
+            app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+            terminal.draw(|frame| draw(frame, &mut app))?;
+            assert_eq!(app.scroll, last);
+            app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+            assert_eq!(app.scroll, last);
+            app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+            assert_eq!(app.scroll, 0);
+        }
+        Ok(())
+    }
     #[test]
     fn unicode_crop_preserves_cell_boundaries() {
         assert_eq!(crop("a界b", 1, 2), "界");
