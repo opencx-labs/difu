@@ -16,6 +16,11 @@ if args[0] == 'search':
     else:
         url = f'https://github.com/example/project/pull/{number}'
     value = [dict(number=number, title=title, url=url, author=dict(login='author'), updatedAt='2026-09-15T00:00:00Z', isDraft=False)]
+elif args[0:2] == ['api', 'graphql']:
+    with (root / 'revision-polls').open('a') as log:
+        log.write('poll\n')
+    assert 'headRefOid baseRefOid' in args[-1]
+    value = dict(data=dict(repository=dict(pullRequest=dict(headRefOid=revs['head'], baseRefOid=revs['base']))))
 elif 'user/repos?' in args[-1]:
     assert '--paginate' in args and '--slurp' in args
     value = [[dict(full_name='example/project')], [dict(full_name='example/second')]]

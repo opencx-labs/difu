@@ -529,7 +529,7 @@ fn build(app: &App, width: u16) -> Document {
             &mut doc.rows,
             text(
                 if review.preparing {
-                    "Fetching the PR revisions and preparing the diff…"
+                    "Preparing PR revisions and the diff…"
                 } else {
                     "Open a PR to load its diff."
                 },
@@ -983,11 +983,33 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 job.activity
             )
         } else if review.preparing {
-            "◌ Preparing PR snapshot…".into()
-        } else if review.newer.is_some() {
-            "● PR updated · F5 to refresh this snapshot".into()
+            let step = review
+                .preparation_progress
+                .as_ref()
+                .map_or(1, |p| p.step)
+                .clamp(1, 5);
+            let completed = usize::from(step.saturating_sub(1)) * 2;
+            let bar = format!("{}{}", "■".repeat(completed), "□".repeat(10 - completed));
+            let activity = review
+                .preparation_progress
+                .as_ref()
+                .map_or("Checking the local clone", |p| p.activity.as_str());
+            let elapsed = review
+                .preparation_started
+                .map_or(0, |t| t.elapsed().as_secs());
+            format!("[{bar}] {step}/5 · {elapsed}s · {}", clean(activity))
         } else if let Some(error) = &review.guide_error {
-            format!("Guide: {} · F6 retry", clean(error).replace('\n', " "))
+            format!(
+                "{}: {} · F6 retry",
+                if review.preparation_failed {
+                    "Snapshot"
+                } else {
+                    "Guide"
+                },
+                clean(error).replace('\n', " ")
+            )
+        } else if review.newer.is_some() {
+            "● Remote PR updated · F5 to sync and refresh".into()
         } else if let Some(model) = &review.guide_model {
             format!("Guide ready · {model}")
         } else {
@@ -1520,6 +1542,8 @@ mod tests {
                     base: "base".into(),
                     head: "head".into(),
                     merge_base: "base".into(),
+                    head_tree: "head tree".into(),
+                    base_tree: "base tree".into(),
                     files,
                 })),
                 guide: Some(Arc::new(Guide {
@@ -1541,6 +1565,50 @@ mod tests {
         );
         app.action(Action::SetView(View::Guide));
         app
+    }
+
+    #[test]
+    fn snapshot_footer_shows_steps_and_live_transfer_details() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        let review = app.reviews.values_mut().next().context("Missing review")?;
+        review.preparing = true;
+        review.preparation_started = Some(std::time::Instant::now());
+        review.preparation_progress = Some(crate::repo::SnapshotProgress {
+            step: 2,
+            activity: "Receiving objects: 50%, 12 MiB | 2 MiB/s".into(),
+        });
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30))?;
+        terminal.draw(|f| draw(f, &mut app))?;
+        let output: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(output.contains("[■■□□□□□□□□] 2/5"));
+        assert!(output.contains("Receiving objects: 50%, 12 MiB | 2 MiB/s"));
+        app.reviews
+            .values_mut()
+            .next()
+            .context("Missing review")?
+            .preparation_progress = Some(crate::repo::SnapshotProgress {
+            step: 5,
+            activity: "Building and validating the diff".into(),
+        });
+        terminal.draw(|f| draw(f, &mut app))?;
+        let output: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(output.contains("[■■■■■■■■□□] 5/5"));
+        assert!(output.contains("Building and validating the diff"));
+        assert!(!output.contains("Receiving objects:"));
+        Ok(())
     }
 
     #[test]

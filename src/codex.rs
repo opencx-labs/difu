@@ -76,13 +76,39 @@ impl Guide {
 }
 
 pub fn cache_key(pr: &PrDetail, snapshot: &Snapshot, model: &ModelChoice) -> Result<String> {
-    // Contents, revision identities, title/body, model, prompt and schema all
-    // participate. Local uncommitted files never enter a review or its key.
+    // Tree identities cover all repository context Codex can read. Commit-only
+    // rewrites can reuse a guide; changed code, hunks, or instructions cannot.
     Ok(storage::hash(serde_json::to_vec(&(
         pr.key.id(),
         &pr.title,
         &pr.body,
-        snapshot,
+        (&snapshot.head_tree, &snapshot.base_tree, &snapshot.files),
+        model,
+        INSTRUCTIONS,
+        schema(),
+    ))?))
+}
+
+/// Preserve access to guides written before content-based cache identities.
+pub fn legacy_cache_key(pr: &PrDetail, snapshot: &Snapshot, model: &ModelChoice) -> Result<String> {
+    #[derive(Serialize)]
+    struct LegacySnapshot<'a> {
+        base: &'a str,
+        head: &'a str,
+        merge_base: &'a str,
+        files: &'a [crate::diff::DiffFile],
+    }
+    let legacy = LegacySnapshot {
+        base: &snapshot.base,
+        head: &snapshot.head,
+        merge_base: &snapshot.merge_base,
+        files: &snapshot.files,
+    };
+    Ok(storage::hash(serde_json::to_vec(&(
+        pr.key.id(),
+        &pr.title,
+        &pr.body,
+        legacy,
         model,
         INSTRUCTIONS,
         schema(),
@@ -448,6 +474,8 @@ mod tests {
             base: "b".into(),
             head: "h".into(),
             merge_base: "m".into(),
+            head_tree: "head tree".into(),
+            base_tree: "base tree".into(),
             files: crate::diff::parse("M\0a\0", "diff --git a/a b/a\n@@ -1 +1 @@\n-old\n+new\n")?,
         })
     }
@@ -519,6 +547,10 @@ mod tests {
         let other_model = cache_key(&pr, &snapshot, &model)?;
         assert_ne!(effort, other_model);
         snapshot.head = "new revision".into();
+        snapshot.base = "new base revision".into();
+        snapshot.merge_base = "new merge base revision".into();
+        assert_eq!(other_model, cache_key(&pr, &snapshot, &model)?);
+        snapshot.head_tree = "changed repository contents".into();
         assert_ne!(other_model, cache_key(&pr, &snapshot, &model)?);
         Ok(())
     }

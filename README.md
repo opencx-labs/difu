@@ -89,8 +89,12 @@ difu 123 # uses the GitHub repository in your current directory
 ```
 
 The first time you open a repository, supply its existing local clone path.
-Difu remembers it. It fetches missing PR commits using your `gh` authentication;
-it never clones repositories automatically. GitHub.com is supported in v1.
+Difu remembers it. It uses local commits first and automatically fetches missing
+PR revisions using your `gh` login. Fetched revisions are recorded under
+`refs/difu/` so later fetches can reuse their history. Your checked-out branch and
+uncommitted files are preserved. Diffs are computed locally from the merge base
+to the PR head (a three-dot diff). Difu does not clone repositories automatically.
+GitHub.com is supported in v1.
 Lists show the most recently updated PRs first. GitHub search returns up to
 1,000 results for Review requests or Authored, and up to 1,000 per enabled
 repository in the Repositories inbox.
@@ -132,9 +136,17 @@ visible; cancel or retry explicitly. Every changed hunk must appear exactly once
 in the guide. Binary files, renames, and permission changes have metadata review
 units. Unknown, duplicate, or missing references reject the guide.
 
-New revisions are announced without replacing the snapshot you are reading.
-Refresh explicitly to load the newer diff and its matching guide. If generation
-is still running, cancel it with F8 before refreshing with F5.
+Difu checks the open PR's head and base commit IDs through GitHub every 30 seconds.
+This metadata check does not fetch Git objects. Remote updates are announced
+without replacing your current diff or guide. **F5** syncs missing revisions and
+refreshes the review; a failed sync keeps your current review usable. If guide
+generation is still running, cancel it with **F8** before refreshing.
+
+Snapshot preparation shows a five-step progress bar: checking the local clone,
+checking/syncing revisions, finding the merge base, reading changed files, and
+building/validating the diff. The footer includes elapsed time and Git's live
+transfer percentage, size, and speed when available. **F8** cancels preparation;
+**F6** retries a failed preparation.
 
 ### Controls
 
@@ -191,9 +203,12 @@ authentication files are rewritten.
 The PR description, diff, and repository context Codex reads are sent through
 your Codex account to generate the guide.
 
-Guides persist locally. A cache key includes the PR identity, base/head/merge-base,
-complete parsed diff, PR title/description, model, reasoning level, prompt, and
-schema. Cached guides are validated again before use. F6 bypasses the cache.
+Guides persist locally. Cache identity includes repository contents at the head
+and merge base, the complete parsed diff, PR identity/title/description, model,
+reasoning level, prompt, and schema. Commit-message-only rewrites can reuse a
+guide; changed code or guide inputs require a matching cache entry or generation.
+Existing guides from older releases are reused when their original inputs match.
+Cached guides are validated again before use. F6 bypasses the guide cache.
 Damaged cache entries produce an error and can be replaced with F6.
 
 Settings and guides use the OS's standard per-user directories:

@@ -129,6 +129,34 @@ pub fn current_repository(cancel: &Cancel) -> Result<String> {
         .context("Run inside a GitHub clone when using only a PR number")
 }
 
+/// Poll only revision identities; download full metadata only when they change.
+pub fn updated_revision(pr: &PrDetail, cancel: &Cancel) -> Result<Option<PrDetail>> {
+    pr.key.validate()?;
+    let query = format!(
+        "query {{ repository(owner:{},name:{}) {{ pullRequest(number:{}) {{ headRefOid baseRefOid }} }} }}",
+        serde_json::to_string(&pr.key.owner)?,
+        serde_json::to_string(&pr.key.repo)?,
+        pr.key.number,
+    );
+    let value = json(&["api", "graphql", "-f", &format!("query={query}")], cancel)?;
+    let revision = value
+        .pointer("/data/repository/pullRequest")
+        .context("Missing PR revision response")?;
+    let head = revision
+        .get("headRefOid")
+        .and_then(Value::as_str)
+        .context("Missing PR head revision")?;
+    let base = revision
+        .get("baseRefOid")
+        .and_then(Value::as_str)
+        .context("Missing PR base revision")?;
+    if head == pr.head && base == pr.base {
+        Ok(None)
+    } else {
+        detail(&pr.key, cancel).map(Some)
+    }
+}
+
 pub fn detail(key: &PrKey, cancel: &Cancel) -> Result<PrDetail> {
     key.validate()?;
     let v = json(

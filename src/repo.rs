@@ -7,6 +7,7 @@ use anyhow::{Context, Result, ensure};
 use std::{
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
 };
 
 fn git(path: &Path) -> Command {
@@ -25,6 +26,9 @@ fn git(path: &Path) -> Command {
             "-c",
             "diff.submodule=short",
         ])
+        // No local review operation may trigger an implicit partial-clone fetch.
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat")
         .env("GIT_LFS_SKIP_SMUDGE", "1");
@@ -90,48 +94,121 @@ fn has_commit(root: &Path, revision: &str, cancel: &Cancel) -> Result<bool> {
     .code
         == 0)
 }
-fn fetch(root: &Path, key: &PrKey, reference: &str, cancel: &Cancel) -> Result<()> {
-    // Use the agreed gh login rather than requiring a second SSH authentication.
-    process::checked(
-        git(root).args([
+#[derive(Clone, Debug)]
+pub struct SnapshotProgress {
+    pub step: u8,
+    pub activity: String,
+}
+pub type Progress = Arc<dyn Fn(SnapshotProgress) + Send + Sync>;
+fn report(progress: &Progress, step: u8, activity: impl Into<String>) {
+    progress(SnapshotProgress {
+        step,
+        activity: activity.into(),
+    });
+}
+
+fn revision_ref(pr: &PrDetail, kind: &str) -> String {
+    format!(
+        "refs/difu/{}/{}/pr/{}/{kind}",
+        pr.key.owner, pr.key.repo, pr.key.number
+    )
+}
+
+fn sync_revisions(root: &Path, pr: &PrDetail, cancel: &Cancel, progress: &Progress) -> Result<()> {
+    let mut missing = Vec::new();
+    for (kind, revision) in [("head", &pr.head), ("base", &pr.base)] {
+        let reference = revision_ref(pr, kind);
+        if has_commit(root, revision, cancel)? {
+            // Advertise existing PR history before negotiating the next fetch,
+            // including objects downloaded by earlier difu releases.
+            read(root, &["update-ref", &reference, revision], cancel)?;
+        } else {
+            missing.push(format!("+{revision}:{reference}"));
+        }
+    }
+    if missing.is_empty() {
+        return Ok(());
+    }
+    report(progress, 2, "Syncing missing PR revisions");
+    let mut command = git(root);
+    command
+        .env("GIT_ALLOW_PROTOCOL", "https")
+        .args([
             "-c",
             "credential.helper=",
             "-c",
             "credential.helper=!gh auth git-credential",
             "fetch",
+            "--atomic",
+            "--progress",
             "--no-tags",
             "--no-recurse-submodules",
             "--no-write-fetch-head",
+            "--no-auto-maintenance",
             "--refmap=",
             "--",
-            &format!("https://github.com/{}.git", key.repository()),
-            reference,
-        ]),
+            &format!("https://github.com/{}.git", pr.key.repository()),
+        ])
+        .args(missing);
+    let progress = progress.clone();
+    let output = process::streaming_with_stderr(
+        &mut command,
+        None,
         cancel,
-    )?;
+        |_| {},
+        move |line| {
+            let line = line.trim().trim_start_matches("remote: ");
+            if [
+                "Enumerating objects:",
+                "Counting objects:",
+                "Compressing objects:",
+                "Receiving objects:",
+                "Resolving deltas:",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+            {
+                report(&progress, 2, line);
+            }
+        },
+    )
+    .context("Automatic PR sync failed")?;
+    let errors = String::from_utf8_lossy(&output.stderr);
+    ensure!(
+        output.code == 0,
+        "Automatic PR sync failed: {}",
+        errors
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("Git exited without an error message")
+    );
+    for revision in [&pr.head, &pr.base] {
+        ensure!(
+            has_commit(root, revision, cancel)?,
+            "The requested PR revision is unavailable after syncing. Refresh PR details and retry."
+        );
+    }
     Ok(())
 }
 
 pub fn snapshot(root: &Path, pr: &PrDetail, cancel: &Cancel) -> Result<Snapshot> {
+    snapshot_with_progress(root, pr, cancel, Arc::new(|_| {}))
+}
+pub fn snapshot_with_progress(
+    root: &Path,
+    pr: &PrDetail,
+    cancel: &Cancel,
+    progress: Progress,
+) -> Result<Snapshot> {
+    pr.key.validate()?;
     sha(&pr.head)?;
     sha(&pr.base)?;
-    if !has_commit(root, &pr.head, cancel)? {
-        fetch(
-            root,
-            &pr.key,
-            &format!("refs/pull/{}/head", pr.key.number),
-            cancel,
-        )?;
-    }
-    if !has_commit(root, &pr.base, cancel)? {
-        fetch(root, &pr.key, &pr.base, cancel)?;
-    }
-    ensure!(
-        has_commit(root, &pr.head, cancel)?,
-        "The PR changed while fetching. Refresh its details and open it again."
-    );
+    report(&progress, 2, "Checking local PR revisions");
+    sync_revisions(root, pr, cancel, &progress)?;
+    report(&progress, 3, "Finding the merge base");
     let merge_base = read(root, &["merge-base", &pr.base, &pr.head], cancel).context(
-        "Cannot find the PR merge base. A shallow clone may need more history; fetch it and retry.",
+        "Cannot find the PR merge base. A shallow clone may need more history; update your clone manually and retry.",
     )?;
     sha(&merge_base)?;
     let common = [
@@ -141,12 +218,14 @@ pub fn snapshot(root: &Path, pr: &PrDetail, cancel: &Cancel) -> Result<Snapshot>
         "--find-renames",
         "--ignore-submodules=none",
     ];
+    report(&progress, 4, "Reading changed files");
     let names = process::checked(
         git(root)
             .args(common)
             .args(["--name-status", "-z", &merge_base, &pr.head, "--"]),
         cancel,
     )?;
+    report(&progress, 5, "Building and validating the diff");
     let patch = process::checked(
         git(root).args(common).args([
             "--no-color",
@@ -169,6 +248,16 @@ pub fn snapshot(root: &Path, pr: &PrDetail, cancel: &Cancel) -> Result<Snapshot>
     Ok(Snapshot {
         base: pr.base.clone(),
         head: pr.head.clone(),
+        head_tree: read(
+            root,
+            &["rev-parse", &format!("{}^{{tree}}", pr.head)],
+            cancel,
+        )?,
+        base_tree: read(
+            root,
+            &["rev-parse", &format!("{merge_base}^{{tree}}")],
+            cancel,
+        )?,
         merge_base,
         files,
     })

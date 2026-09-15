@@ -55,8 +55,14 @@ pub struct Review {
     pub newer: Option<PrDetail>,
     pub loading: bool,
     pub preparing: bool,
+    pub preparation_failed: bool,
+    pub preparation_started: Option<Instant>,
+    pub preparation_progress: Option<repo::SnapshotProgress>,
     pub preparation: Option<Cancel>,
+    pub preparing_detail: Option<Arc<PrDetail>>,
     pub polling: bool,
+    pub revision_polling: bool,
+    pub revision_poll_at: Option<Instant>,
     pub poll_at: Option<Instant>,
     pub snapshot_id: u64,
 }
@@ -67,13 +73,9 @@ pub enum Message {
     Detail(String, Result<PrDetail, String>),
     Timeline(String, Result<Vec<TimelineItem>, String>),
     Checks(String, Result<Vec<Check>, String>),
-    Poll(
-        String,
-        u64,
-        Result<PrDetail, String>,
-        Result<Vec<Check>, String>,
-    ),
+    Poll(String, u64, Result<Option<PrDetail>, String>),
     Snapshot(String, u64, Result<(PathBuf, Snapshot), String>),
+    SnapshotProgress(String, u64, repo::SnapshotProgress),
     Progress(String, u64, String),
     Guide(String, u64, ModelChoice, Result<Guide, String>),
     Models(Result<Vec<ModelInfo>, String>),
@@ -475,18 +477,44 @@ impl App {
         let Some(pr) = self.reviews.get(&id).and_then(|r| r.detail.clone()) else {
             return;
         };
+        self.prepare_revision(path, pr);
+    }
+    fn prepare_revision(&mut self, path: PathBuf, pr: Arc<PrDetail>) {
+        let Some(id) = self.key() else {
+            return;
+        };
         let sequence = self.next_id();
         let Some(review) = self.reviews.get_mut(&id) else {
             return;
         };
         review.preparing = true;
+        review.preparation_started = Some(Instant::now());
+        review.preparation_progress = Some(repo::SnapshotProgress {
+            step: 1,
+            activity: "Checking the local clone".into(),
+        });
+        review.preparation_failed = false;
+        review.preparing_detail = Some(pr.clone());
         review.guide_error = None;
         review.snapshot_id = sequence;
         let job_id = id.clone();
         let cancel = self.spawn(move |tx, cancel| {
             let output = (|| {
                 let root = repo::validate(&path, &pr.key, &cancel)?;
-                let snapshot = repo::snapshot(&root, &pr, &cancel)?;
+                let progress_tx = tx.clone();
+                let progress_id = job_id.clone();
+                let snapshot = repo::snapshot_with_progress(
+                    &root,
+                    &pr,
+                    &cancel,
+                    Arc::new(move |progress| {
+                        let _ = progress_tx.send(Message::SnapshotProgress(
+                            progress_id.clone(),
+                            sequence,
+                            progress,
+                        ));
+                    }),
+                )?;
                 Ok((root, snapshot))
             })();
             let _ = tx.send(Message::Snapshot(job_id, sequence, result(output)));
@@ -522,7 +550,19 @@ impl App {
         if !force {
             let cached = (|| -> Result<Option<Guide>> {
                 let key = codex::cache_key(&pr, &snapshot, &model)?;
-                let guide = self.storage.load_guide(&key)?;
+                let guide = match self.storage.load_guide(&key)? {
+                    Some(guide) => Some(guide),
+                    None => {
+                        let legacy = self
+                            .storage
+                            .load_guide(&codex::legacy_cache_key(&pr, &snapshot, &model)?)?;
+                        if let Some(guide) = &legacy {
+                            guide.validate(&snapshot)?;
+                            self.storage.save_guide(&key, guide)?;
+                        }
+                        legacy
+                    }
+                };
                 if let Some(guide) = &guide {
                     guide.validate(&snapshot)?;
                 }
@@ -631,16 +671,24 @@ impl App {
             self.notice = "Cancel the current generation before refreshing its snapshot".into();
             return;
         }
-        if let Some(newer) = review.newer.take() {
-            review.detail = Some(Arc::new(newer));
-            review.snapshot = None;
-            review.guide = None;
-            self.file = 0;
-            self.scroll = 0;
-            self.open();
+        if review.preparing {
+            return;
+        }
+        if let Some(newer) = review.newer.clone() {
+            let root = review.root.clone().or_else(|| {
+                self.config
+                    .repositories
+                    .get(&newer.key.repository())
+                    .cloned()
+            });
+            if let Some(root) = root {
+                self.prepare_revision(root, Arc::new(newer));
+            } else {
+                self.notice = "Locate this repository's local clone before refreshing".into();
+            }
         } else {
             self.notice =
-                "This snapshot is current. New revisions are checked every 10 seconds.".into();
+                "This snapshot is current. Remote revisions are checked every 30 seconds.".into();
         }
     }
     pub fn load_models(&mut self) {
@@ -715,6 +763,7 @@ impl App {
                 index += 1;
             }
         }
+        self.poll_revisions();
         let Some(id) = self.key() else {
             return;
         };
@@ -735,11 +784,40 @@ impl App {
         let Some(key) = review.detail.as_ref().map(|pr| pr.key.clone()) else {
             return;
         };
+        self.spawn(move |tx, cancel| {
+            let _ = tx.send(Message::Checks(id, result(github::checks(&key, &cancel))));
+        });
+    }
+    fn poll_revisions(&mut self) {
+        if self.home {
+            return;
+        }
+        let Some(id) = self.key() else {
+            return;
+        };
+        let Some(review) = self.reviews.get_mut(&id) else {
+            return;
+        };
+        if review.loading
+            || review.revision_polling
+            || review
+                .revision_poll_at
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(30))
+        {
+            return;
+        }
+        let Some(pr) = review.newer.as_ref().or(review.detail.as_deref()).cloned() else {
+            return;
+        };
+        review.revision_polling = true;
+        review.revision_poll_at = Some(Instant::now());
         let snapshot_id = review.snapshot_id;
         self.spawn(move |tx, cancel| {
-            let detail = result(github::detail(&key, &cancel));
-            let checks = result(github::checks(&key, &cancel));
-            let _ = tx.send(Message::Poll(id, snapshot_id, detail, checks));
+            let _ = tx.send(Message::Poll(
+                id,
+                snapshot_id,
+                result(github::updated_revision(&pr, &cancel)),
+            ));
         });
     }
     fn receive(&mut self, message: Message) {
@@ -774,6 +852,7 @@ impl App {
                 let r = self.reviews.entry(id.clone()).or_default();
                 r.loading = false;
                 r.poll_at = Some(Instant::now());
+                r.revision_poll_at = Some(Instant::now());
                 match output {
                     Ok(pr) => {
                         if let Some(summary) = self.inbox.iter_mut().find(|p| p.key.id() == id) {
@@ -816,6 +895,7 @@ impl App {
             }
             Message::Checks(id, output) => {
                 if let Some(r) = self.reviews.get_mut(&id) {
+                    r.polling = false;
                     match output {
                         Ok(items) => {
                             r.checks = items;
@@ -825,21 +905,14 @@ impl App {
                     }
                 }
             }
-            Message::Poll(id, snapshot_id, detail, checks) => {
+            Message::Poll(id, snapshot_id, detail) => {
                 if let Some(r) = self.reviews.get_mut(&id) {
-                    r.polling = false;
+                    r.revision_polling = false;
                     if r.snapshot_id != snapshot_id {
                         return;
                     }
-                    match checks {
-                        Ok(items) => {
-                            r.checks = items;
-                            r.checks_error = None;
-                        }
-                        Err(e) => r.checks_error = Some(e),
-                    }
                     match detail {
-                        Ok(pr) => {
+                        Ok(Some(pr)) => {
                             if (r.snapshot.is_some() || r.preparing)
                                 && r.detail.as_ref().is_some_and(|old| {
                                     old.head != pr.head
@@ -856,9 +929,19 @@ impl App {
                                 }
                             }
                         }
+                        Ok(None) => {}
                         Err(e) => self.notice = format!("Revision refresh failed: {e}"),
                     }
                 }
+            }
+            Message::SnapshotProgress(id, sequence, progress) => {
+                if let Some(r) = self.reviews.get_mut(&id)
+                    && r.preparing
+                    && r.snapshot_id == sequence
+                {
+                    r.preparation_progress = Some(progress);
+                }
+                return;
             }
             Message::Snapshot(id, sequence, output) => {
                 if let Some(r) = self.reviews.get_mut(&id) {
@@ -869,12 +952,23 @@ impl App {
                     r.preparation = None;
                     match output {
                         Ok((root, snapshot)) => {
-                            if r.detail.as_ref().is_none_or(|detail| {
+                            let candidate = r.preparing_detail.take();
+                            if candidate.as_ref().is_none_or(|detail| {
                                 detail.head != snapshot.head || detail.base != snapshot.base
                             }) {
                                 r.guide_error = Some("PR details changed during preparation. Refresh and retry to load a matching snapshot.".into());
                                 return;
                             }
+                            if r.newer.as_ref().is_some_and(|newer| {
+                                newer.head == snapshot.head && newer.base == snapshot.base
+                            }) {
+                                r.newer = None;
+                            }
+                            r.detail = candidate;
+                            r.guide = None;
+                            r.guide_model = None;
+                            self.file = 0;
+                            self.scroll = 0;
                             if let Some(detail) = &r.detail {
                                 self.config
                                     .repositories
@@ -888,7 +982,8 @@ impl App {
                         }
                         Err(error) => {
                             r.guide_error = Some(error);
-                            r.root = None;
+                            r.preparation_failed = true;
+                            r.preparing_detail = None;
                         }
                     }
                 }
@@ -1046,7 +1141,12 @@ impl App {
             }
             Action::Refresh => self.refresh(),
             Action::Regenerate => {
-                if self.review().is_some_and(|r| r.snapshot.is_some()) {
+                if self
+                    .review()
+                    .is_some_and(|r| r.preparation_failed && r.snapshot.is_some())
+                {
+                    self.refresh();
+                } else if self.review().is_some_and(|r| r.snapshot.is_some()) {
                     self.generate(true);
                 } else {
                     self.open();
@@ -1463,19 +1563,14 @@ mod tests {
                 ..Review::default()
             },
         );
-        app.receive(Message::Poll(id.clone(), 2, Ok(detail("new")), Ok(vec![])));
+        app.receive(Message::Poll(id.clone(), 2, Ok(Some(detail("new")))));
         let review = app.reviews.get(&id).context("Missing review")?;
         assert_eq!(
             review.detail.as_ref().context("Missing detail")?.head,
             "original"
         );
         assert_eq!(review.newer.as_ref().context("Missing update")?.head, "new");
-        app.receive(Message::Poll(
-            id.clone(),
-            1,
-            Ok(detail("obsolete")),
-            Ok(vec![]),
-        ));
+        app.receive(Message::Poll(id.clone(), 1, Ok(Some(detail("obsolete")))));
         let review = app.reviews.get(&id).context("Missing review")?;
         assert_eq!(review.newer.as_ref().context("Missing update")?.head, "new");
         app.receive(Message::Snapshot(

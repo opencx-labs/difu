@@ -91,6 +91,16 @@ pub fn streaming(
     cancel: &Cancel,
     progress: impl Fn(&str) + Send + 'static,
 ) -> Result<Output> {
+    streaming_with_stderr(command, input, cancel, progress, |_| {})
+}
+
+pub fn streaming_with_stderr(
+    command: &mut Command,
+    input: Option<Vec<u8>>,
+    cancel: &Cancel,
+    progress: impl Fn(&str) + Send + 'static,
+    errors: impl Fn(&str) + Send + 'static,
+) -> Result<Output> {
     cancel.check()?;
     let name = command.get_program().to_string_lossy().to_string();
     command
@@ -130,8 +140,33 @@ pub fn streaming(
     let err = thread::Builder::new()
         .name("difu-errors".into())
         .spawn(move || {
-            let mut b = Vec::new();
-            stderr.read_to_end(&mut b).map(|_| b)
+            let mut all = Vec::new();
+            let mut line = Vec::new();
+            let mut chunk = [0; 4096];
+            loop {
+                let count = stderr.read(&mut chunk)?;
+                if count == 0 {
+                    break;
+                }
+                for byte in chunk.iter().take(count) {
+                    all.push(*byte);
+                    if *byte == b'\r' || *byte == b'\n' {
+                        if !line.is_empty() {
+                            errors(&String::from_utf8_lossy(&line));
+                            line.clear();
+                        }
+                    } else {
+                        line.push(*byte);
+                        if line.len() >= 16384 {
+                            line.clear();
+                        }
+                    }
+                }
+            }
+            if !line.is_empty() {
+                errors(&String::from_utf8_lossy(&line));
+            }
+            Ok::<_, std::io::Error>(all)
         })?;
     let writer = if let Some(bytes) = input {
         let mut pipe = group
@@ -221,6 +256,38 @@ mod tests {
                 .is_err()
         );
         assert!(start.elapsed() < Duration::from_secs(5));
+        Ok(())
+    }
+    #[test]
+    fn streams_carriage_return_progress_before_process_exit() -> Result<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            streaming_with_stderr(
+                Command::new("sh").args([
+                    "-c",
+                    "printf 'Receiving objects: 50%%\\r' >&2; sleep 0.2; printf 'done\\n' >&2",
+                ]),
+                None,
+                &Cancel::default(),
+                |_| {},
+                move |line| {
+                    let _ = tx.send(line.to_owned());
+                },
+            )
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2))?,
+            "Receiving objects: 50%"
+        );
+        assert!(!worker.is_finished());
+        let output = worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("Worker failed"))??;
+        assert_eq!(output.code, 0);
+        assert_eq!(
+            String::from_utf8(output.stderr)?,
+            "Receiving objects: 50%\rdone\n"
+        );
         Ok(())
     }
     #[test]
