@@ -2,18 +2,74 @@
 
 *dīfu* is your diff *shīfu*... guides you through the depths of every diff... may you fathom whatever slop you're feasting your eyes on
 
+A read-only terminal app for GitHub pull requests, built in Rust with Ratatui and
+Crossterm. Browse your review inbox, read PR activity, and follow AI-generated
+chapters that explain related changes across files.
 
+## Requirements
 
-## Run
+- **macOS or Linux** with an interactive terminal.
+- **Git** and an existing local clone of any repository whose diff you want to open.
+- **[GitHub CLI](https://cli.github.com/)** (`gh`) for GitHub authentication and PR data.
+- **[Codex CLI](https://github.com/openai/codex)** for guide generation using your
+  existing login. The integration has been tested with Codex CLI 0.154.0.
+- **[Rust 1.88 or newer](https://www.rust-lang.org/tools/install)** when building
+  from source.
 
-Requires macOS or Linux, Git, [GitHub CLI](https://cli.github.com/), and an installed
-[Codex CLI](https://github.com/openai/codex) with `exec` and `app-server` support.
-Log in once with `gh auth login` and `codex login`.
-
-Build with Rust 1.88 or newer:
+Git, `gh`, and `codex` must be available on your `PATH`. If you use Homebrew, install
+these prerequisites with:
 
 ```sh
+brew install git gh
+brew install --cask codex
+```
+
+See the Homebrew listings for [GitHub CLI](https://formulae.brew.sh/formula/gh)
+and [Codex CLI](https://formulae.brew.sh/cask/codex).
+
+## Installation
+
+### Homebrew — planned
+
+**`difu` is not yet available through Homebrew.** The intended installation command
+is:
+
+```sh
+# Planned command — not available yet
+brew install difu
+```
+
+Making this work without adding a tap requires the formula to be accepted into
+Homebrew's official `homebrew/core` repository. Until it is published there, use
+the source installation below.
+
+### Build from source — available now
+
+With Git and Rust 1.88+ installed:
+
+```sh
+git clone https://github.com/opencx-labs/difu.git
+cd difu
 cargo install --path . --locked
+```
+
+Cargo installs the executable into its binary directory, normally `~/.cargo/bin`.
+Make sure that directory is on your `PATH`.
+
+### First-time login
+
+Authenticate GitHub CLI and Codex once, unless you are already logged in:
+
+```sh
+gh auth login
+codex login
+```
+
+Difu reuses those logins; you do not enter an API key into the TUI.
+
+## Quick start
+
+```sh
 difu
 ```
 
@@ -49,7 +105,8 @@ in the guide. Binary files, renames, and permission changes have metadata review
 units. Unknown, duplicate, or missing references reject the guide.
 
 New revisions are announced without replacing the snapshot you are reading.
-Refresh explicitly to load the newer diff and its matching guide.
+Refresh explicitly to load the newer diff and its matching guide. If generation
+is still running, cancel it with F8 before refreshing with F5.
 
 ### Controls
 
@@ -94,10 +151,11 @@ execution-policy rules are ignored for generation. Project instruction loading i
 disabled, and the clone/worktree are marked untrusted for this invocation so their
 Codex configuration is skipped. Configured MCP server names are read and each
 server is explicitly disabled; the read-only guide instructions are supplied as
-developer instructions. See the [Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
-Apps, plugins, hooks, multi-agent
-execution, memories, browser/computer use, web search, and MCP servers are disabled
-for that invocation. No Codex settings or authentication files are rewritten.
+developer instructions. See the
+[Codex configuration reference](https://learn.chatgpt.com/docs/config-file/config-reference).
+Apps, plugins, hooks, multi-agent execution, memories, browser/computer use, web
+search, and MCP servers are disabled for that invocation. No Codex settings or
+authentication files are rewritten.
 The PR description, diff, and repository context Codex reads are sent through
 your Codex account to generate the guide.
 
@@ -150,12 +208,12 @@ reader: it does not submit comments, reviews, approvals, or mark review progress
 
 ## Guide writing research
 
-The writing instructions in [prompts/guide.md](prompts/guide.md) use the approved
-reference recording's three visible Linear Guide chapters and the corresponding
-PR description. The connected Linear API exposed PR metadata and descriptions,
-not generated Guide chapters. This is a limited sample, not a reconstruction of
-Linear's full guide-writing system. The observed style connects logical changes
-in dependency order, using short causal explanations and links across files.
+The writing instructions in [prompts/guide.md](prompts/guide.md) draw on three
+visible Linear Guide chapters from a reference recording and the corresponding
+PR description. The Linear API exposed PR metadata and descriptions but no
+generated Guide chapters, so the research is limited to that sample. The guide
+style connects logical changes in dependency order, using short causal
+explanations and links across files.
 
 ## Development
 
@@ -167,7 +225,8 @@ cargo build --locked --release
 ```
 
 The workflow test uses Python 3 to script GitHub/Codex responses, alongside real
-local Git repositories. Tests do not require GitHub credentials or AI calls.
+local Git repositories. The default test suite requires no GitHub credentials or
+AI calls.
 CI runs the checks on macOS and Linux.
 
 An additional live smoke test is ignored by default. It uses your Codex login and
@@ -176,3 +235,7 @@ one Luna High generation against a tiny synthetic repository:
 ```sh
 cargo test --locked --test codex_smoke -- --ignored --nocapture
 ```
+
+## License
+
+[MIT](LICENSE).
