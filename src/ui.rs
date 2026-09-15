@@ -529,7 +529,7 @@ fn build(app: &App, width: u16) -> Document {
             &mut doc.rows,
             text(
                 if review.preparing {
-                    "Fetching the PR revisions and preparing the diff…"
+                    "Reading local PR revisions and preparing the diff…"
                 } else {
                     "Open a PR to load its diff."
                 },
@@ -983,11 +983,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 job.activity
             )
         } else if review.preparing {
-            "◌ Preparing PR snapshot…".into()
-        } else if review.newer.is_some() {
-            "● PR updated · F5 to refresh this snapshot".into()
+            "◌ Preparing local PR snapshot…".into()
         } else if let Some(error) = &review.guide_error {
-            format!("Guide: {} · F6 retry", clean(error).replace('\n', " "))
+            format!(
+                "{}: {} · F6 retry",
+                if review.preparation_failed {
+                    "Snapshot"
+                } else {
+                    "Guide"
+                },
+                clean(error).replace('\n', " ")
+            )
+        } else if review.newer.is_some() {
+            "● Remote PR updated · F5 to refresh from local commits".into()
         } else if let Some(model) = &review.guide_model {
             format!("Guide ready · {model}")
         } else {
@@ -1520,6 +1528,8 @@ mod tests {
                     base: "base".into(),
                     head: "head".into(),
                     merge_base: "base".into(),
+                    head_tree: "head tree".into(),
+                    base_tree: "base tree".into(),
                     files,
                 })),
                 guide: Some(Arc::new(Guide {

@@ -39,6 +39,8 @@ pub struct Snapshot {
     pub base: String,
     pub head: String,
     pub merge_base: String,
+    pub head_tree: String,
+    pub base_tree: String,
     pub files: Vec<DiffFile>,
 }
 impl Snapshot {

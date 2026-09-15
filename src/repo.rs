@@ -25,6 +25,9 @@ fn git(path: &Path) -> Command {
             "-c",
             "diff.submodule=short",
         ])
+        // No local review operation may trigger an implicit partial-clone fetch.
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "")
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_PAGER", "cat")
         .env("GIT_LFS_SKIP_SMUDGE", "1");
@@ -90,48 +93,19 @@ fn has_commit(root: &Path, revision: &str, cancel: &Cancel) -> Result<bool> {
     .code
         == 0)
 }
-fn fetch(root: &Path, key: &PrKey, reference: &str, cancel: &Cancel) -> Result<()> {
-    // Use the agreed gh login rather than requiring a second SSH authentication.
-    process::checked(
-        git(root).args([
-            "-c",
-            "credential.helper=",
-            "-c",
-            "credential.helper=!gh auth git-credential",
-            "fetch",
-            "--no-tags",
-            "--no-recurse-submodules",
-            "--no-write-fetch-head",
-            "--refmap=",
-            "--",
-            &format!("https://github.com/{}.git", key.repository()),
-            reference,
-        ]),
-        cancel,
-    )?;
-    Ok(())
-}
-
 pub fn snapshot(root: &Path, pr: &PrDetail, cancel: &Cancel) -> Result<Snapshot> {
     sha(&pr.head)?;
     sha(&pr.base)?;
-    if !has_commit(root, &pr.head, cancel)? {
-        fetch(
-            root,
-            &pr.key,
-            &format!("refs/pull/{}/head", pr.key.number),
-            cancel,
-        )?;
-    }
-    if !has_commit(root, &pr.base, cancel)? {
-        fetch(root, &pr.key, &pr.base, cancel)?;
-    }
     ensure!(
         has_commit(root, &pr.head, cancel)?,
-        "The PR changed while fetching. Refresh its details and open it again."
+        "The PR head commit is not available locally. Update your clone and retry; difu does not download commits."
+    );
+    ensure!(
+        has_commit(root, &pr.base, cancel)?,
+        "The PR base commit is not available locally. Update your clone and retry; difu does not download commits."
     );
     let merge_base = read(root, &["merge-base", &pr.base, &pr.head], cancel).context(
-        "Cannot find the PR merge base. A shallow clone may need more history; fetch it and retry.",
+        "Cannot find the PR merge base. A shallow clone may need more history; update your clone manually and retry.",
     )?;
     sha(&merge_base)?;
     let common = [
@@ -169,6 +143,16 @@ pub fn snapshot(root: &Path, pr: &PrDetail, cancel: &Cancel) -> Result<Snapshot>
     Ok(Snapshot {
         base: pr.base.clone(),
         head: pr.head.clone(),
+        head_tree: read(
+            root,
+            &["rev-parse", &format!("{}^{{tree}}", pr.head)],
+            cancel,
+        )?,
+        base_tree: read(
+            root,
+            &["rev-parse", &format!("{merge_base}^{{tree}}")],
+            cancel,
+        )?,
         merge_base,
         files,
     })

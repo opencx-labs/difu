@@ -158,6 +158,60 @@ fn exercise(root: &Path) -> Result<()> {
     );
     app.action(Action::OpenPr);
     wait(&mut app, |a| a.review().is_some_and(|r| r.guide.is_some()))?;
+    // Revision checks are lightweight, spaced by 30 seconds, and pin open code.
+    let revision_file = root.join("revisions.json");
+    let original_revisions = fs::read(&revision_file)?;
+    let original_head = app
+        .review()
+        .and_then(|r| r.snapshot.as_ref())
+        .context("Missing snapshot")?
+        .head
+        .clone();
+    let review = app
+        .reviews
+        .get_mut("example/project#1")
+        .context("Missing review")?;
+    review.revision_poll_at = Instant::now().checked_sub(Duration::from_secs(29));
+    app.tick();
+    assert!(!root.join("revision-polls").exists());
+    let review = app
+        .reviews
+        .get_mut("example/project#1")
+        .context("Missing review")?;
+    review.revision_poll_at = Instant::now().checked_sub(Duration::from_secs(31));
+    app.tick();
+    wait(&mut app, |a| {
+        a.review().is_some_and(|r| !r.revision_polling)
+    })?;
+    assert_eq!(fs::read_to_string(root.join("revision-polls"))?, "poll\n");
+    assert!(app.review().is_some_and(|r| r.newer.is_none()));
+    app.tick();
+    assert_eq!(fs::read_to_string(root.join("revision-polls"))?, "poll\n");
+    let mut changed: serde_json::Value = serde_json::from_slice(&original_revisions)?;
+    *changed.get_mut("head").context("Missing fixture head")? =
+        serde_json::json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    fs::write(&revision_file, serde_json::to_vec(&changed)?)?;
+    app.reviews
+        .get_mut("example/project#1")
+        .context("Missing review")?
+        .revision_poll_at = Instant::now().checked_sub(Duration::from_secs(31));
+    app.tick();
+    wait(&mut app, |a| {
+        a.review().is_some_and(|r| !r.revision_polling)
+    })?;
+    assert!(app.review().is_some_and(|r| r.newer.is_some()
+        && r.guide.is_some()
+        && r.snapshot.as_ref().is_some_and(|s| s.head == original_head)));
+    app.action(Action::Refresh);
+    wait(&mut app, |a| a.review().is_some_and(|r| !r.preparing))?;
+    assert!(app.review().is_some_and(|r| r.preparation_failed
+        && r.guide.is_some()
+        && r.snapshot.as_ref().is_some_and(|s| s.head == original_head)));
+    assert!(render(&mut app, 180)?.contains("not available locally"));
+    app.action(Action::Regenerate);
+    wait(&mut app, |a| a.review().is_some_and(|r| !r.preparing))?;
+    assert_eq!(fs::read_to_string(root.join("turns"))?, "turn\n");
+    fs::write(&revision_file, original_revisions)?;
     let wide = render(&mut app, 180)?;
     assert!(!app.home);
     assert_eq!(app.view, View::Guide);
@@ -278,8 +332,21 @@ fn exercise(root: &Path) -> Result<()> {
     assert!(searches.contains("--merged=false"));
     assert!(searches.contains("--merged\""));
     app.shutdown();
-    // A new session must reuse a valid disk cache without another Codex turn.
-    let mut reopened = App::new(storage, config);
+    // Old releases' cache entries migrate without another Codex turn.
+    let review = app
+        .reviews
+        .get("example/project#1")
+        .context("Missing cached review")?;
+    let pr = review.detail.as_ref().context("Missing PR")?;
+    let snapshot = review.snapshot.as_ref().context("Missing snapshot")?;
+    let guide = review.guide.as_ref().context("Missing guide")?;
+    let cache_key = difu::codex::cache_key(pr, snapshot, &config.model)?;
+    storage.save_guide(
+        &difu::codex::legacy_cache_key(pr, snapshot, &config.model)?,
+        guide,
+    )?;
+    fs::remove_file(storage.cache.join(format!("{cache_key}.json")))?;
+    let mut reopened = App::new(storage.clone(), config.clone());
     reopened.start(Some(PrKey::from_url(
         "https://github.com/example/project/pull/1",
     )?));
@@ -288,5 +355,25 @@ fn exercise(root: &Path) -> Result<()> {
     })?;
     assert_eq!(fs::read_to_string(root.join("turns"))?, "turn\n");
     reopened.shutdown();
+    assert!(storage.load_guide(&cache_key)?.is_some());
+    // Rewriting only the commit message preserves code and reuses the guide.
+    git(
+        &root.join("clone"),
+        &["commit", "--amend", "-m", "same code, new message"],
+    )?;
+    let rewritten = git(&root.join("clone"), &["rev-parse", "HEAD"])?;
+    let mut revisions: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("revisions.json"))?)?;
+    *revisions.get_mut("head").context("Missing head")? = serde_json::json!(rewritten);
+    fs::write(root.join("revisions.json"), serde_json::to_vec(&revisions)?)?;
+    let mut rewritten_app = App::new(storage, config);
+    rewritten_app.start(Some(PrKey::from_url(
+        "https://github.com/example/project/pull/1",
+    )?));
+    wait(&mut rewritten_app, |a| {
+        a.review().is_some_and(|r| r.guide.is_some())
+    })?;
+    assert_eq!(fs::read_to_string(root.join("turns"))?, "turn\n");
+    rewritten_app.shutdown();
     Ok(())
 }
