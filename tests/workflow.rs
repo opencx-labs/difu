@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use difu::{
     app::{Action, App, View},
-    model::PrKey,
+    model::{InboxTab, PrKey, PrState},
     process::{self, Cancel},
     storage::{Config, Storage},
 };
@@ -149,6 +149,9 @@ fn exercise(root: &Path) -> Result<()> {
     assert!(overview.contains("Describe the behavior"));
     assert!(overview.contains("ACTIVITY"));
     assert!(overview.contains("CHECKS"));
+    assert!(overview.contains("1 Review requests"));
+    assert!(overview.contains("2 Authored"));
+    assert!(!overview.contains("2 Guide"));
     assert!(
         app.review()
             .is_some_and(|r| r.checks.first().is_some_and(|c| c.state == "pending"))
@@ -156,6 +159,10 @@ fn exercise(root: &Path) -> Result<()> {
     app.action(Action::OpenPr);
     wait(&mut app, |a| a.review().is_some_and(|r| r.guide.is_some()))?;
     let wide = render(&mut app, 180)?;
+    assert!(!app.home);
+    assert_eq!(app.view, View::Guide);
+    assert!(wide.contains("1 Overview"));
+    assert!(wide.contains("2 Guide"));
     assert!(wide.contains("Use the new behavior"));
     assert!(app.document.as_ref().is_some_and(|d| d.guide_columns));
     render(&mut app, 80)?;
@@ -169,6 +176,107 @@ fn exercise(root: &Path) -> Result<()> {
     wait(&mut app, |a| !a.models_loading)?;
     assert_eq!(app.model_options("luna").len(), 1);
     assert_eq!(app.model_options("sol").len(), 2);
+    app.modal = None;
+    app.action(Action::SetView(View::Overview));
+    assert!(!app.home);
+    assert!(!render(&mut app, 160)?.contains("REVIEW REQUESTS"));
+    app.key_event(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert!(app.home);
+    assert!(!app.quit);
+    wait(&mut app, |a| !a.inbox_loading)?;
+
+    render(&mut app, 160)?;
+    let authored_tab = app
+        .hits
+        .iter()
+        .find_map(|(rect, action)| {
+            matches!(action, Action::SetInbox(InboxTab::Authored)).then_some(*rect)
+        })
+        .context("Missing clickable Authored tab")?;
+    app.mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: authored_tab.x,
+        row: authored_tab.y,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    });
+    wait(&mut app, |a| !a.inbox_loading)?;
+    assert_eq!(app.inbox.first().context("No authored PR")?.key.number, 2);
+    assert_eq!(app.state(), PrState::Open);
+    for state in [PrState::Merged, PrState::Closed, PrState::All] {
+        app.action(Action::SetState(state));
+        wait(&mut app, |a| !a.inbox_loading)?;
+        assert!(app.inbox_error.is_none());
+    }
+    app.action(Action::SetInbox(InboxTab::Repositories));
+    wait(&mut app, |a| !a.inbox_loading && !a.repositories_loading)?;
+    assert!(app.inbox.is_empty());
+    assert_eq!(app.repository_options.len(), 2);
+    assert!(render(&mut app, 160)?.contains("Choose your repository whitelist"));
+    app.paste("second".into());
+    let filtered = render(&mut app, 160)?;
+    assert!(filtered.contains("example/second"));
+    assert!(!filtered.contains("example/project"));
+    for _ in 0..6 {
+        app.key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Backspace,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+    app.action(Action::ToggleRepository("example/project".into()));
+    app.action(Action::ToggleRepository("example/second".into()));
+    app.action(Action::SaveRepositories);
+    wait(&mut app, |a| !a.inbox_loading)?;
+    assert_eq!(app.inbox.len(), 2);
+    app.action(Action::Repositories(false));
+    app.action(Action::ToggleRepository("example/project".into()));
+    app.action(Action::SaveRepositories);
+    wait(&mut app, |a| !a.inbox_loading)?;
+    assert_eq!(app.inbox.len(), 1);
+    assert_eq!(
+        app.inbox
+            .first()
+            .context("No repository PR")?
+            .key
+            .repository(),
+        "example/second"
+    );
+    assert_eq!(
+        storage
+            .load_config()?
+            .review_repositories
+            .get("example/project"),
+        Some(&false)
+    );
+    assert_eq!(
+        storage
+            .load_config()?
+            .review_repositories
+            .get("example/second"),
+        Some(&true)
+    );
+    app.action(Action::Repositories(false));
+    app.action(Action::AllRepositories);
+    // Cancelling must preserve the saved active filters.
+    app.key_event(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Esc,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+    assert_eq!(
+        app.config.review_repositories.get("example/project"),
+        Some(&false)
+    );
+    app.action(Action::Repositories(false));
+    app.action(Action::ToggleRepository("example/second".into()));
+    app.action(Action::SaveRepositories);
+    wait(&mut app, |a| !a.inbox_loading)?;
+    assert!(app.inbox.is_empty());
+    let searches = fs::read_to_string(root.join("searches.jsonl"))?;
+    assert!(searches.contains("--author=@me"));
+    assert!(searches.contains("--merged=false"));
+    assert!(searches.contains("--merged\""));
     app.shutdown();
     // A new session must reuse a valid disk cache without another Codex turn.
     let mut reopened = App::new(storage, config);

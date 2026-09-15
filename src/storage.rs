@@ -13,6 +13,9 @@ use std::{
 pub struct Config {
     #[serde(default)]
     pub repositories: BTreeMap<String, PathBuf>,
+    /// Explicit whitelist for the repository inbox; values are active filters.
+    #[serde(default)]
+    pub review_repositories: BTreeMap<String, bool>,
     #[serde(default)]
     pub model: ModelChoice,
     #[serde(default)]
@@ -90,10 +93,17 @@ mod tests {
         };
         let config = Config {
             unified: true,
+            review_repositories: BTreeMap::from([("owner/repo".into(), false)]),
             ..Config::default()
         };
         storage.save_config(&config)?;
         assert!(storage.load_config()?.unified);
+        assert_eq!(
+            storage.load_config()?.review_repositories.get("owner/repo"),
+            Some(&false)
+        );
+        let old: Config = serde_json::from_str(r#"{"repositories":{},"unified":true}"#)?;
+        assert!(old.review_repositories.is_empty());
         assert_eq!(
             fs::metadata(&storage.config)?.permissions().mode() & 0o777,
             0o600
