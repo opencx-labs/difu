@@ -1,0 +1,134 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrKey {
+    pub owner: String,
+    pub repo: String,
+    pub number: u64,
+}
+
+impl PrKey {
+    pub fn repository(&self) -> String {
+        format!("{}/{}", self.owner, self.repo)
+    }
+    pub fn id(&self) -> String {
+        format!("{}#{}", self.repository(), self.number)
+    }
+    pub fn url(&self) -> String {
+        format!(
+            "https://github.com/{}/{}/pull/{}",
+            self.owner, self.repo, self.number
+        )
+    }
+    pub fn from_url(value: &str) -> anyhow::Result<Self> {
+        let url = url::Url::parse(value)?;
+        anyhow::ensure!(
+            url.scheme() == "https" && url.host_str() == Some("github.com"),
+            "Use a GitHub PR URL: https://github.com/owner/repo/pull/123"
+        );
+        let parts: Vec<_> = url.path_segments().into_iter().flatten().collect();
+        let [owner, repo, "pull", number, ..] = parts.as_slice() else {
+            anyhow::bail!("Expected a GitHub pull request URL");
+        };
+        let key = Self {
+            owner: (*owner).into(),
+            repo: (*repo).into(),
+            number: number.parse()?,
+        };
+        key.validate()?;
+        Ok(key)
+    }
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for value in [&self.owner, &self.repo] {
+            anyhow::ensure!(
+                !value.is_empty()
+                    && value != "."
+                    && value != ".."
+                    && value
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b)),
+                "Invalid GitHub repository name"
+            );
+        }
+        anyhow::ensure!(self.number > 0, "PR number must be positive");
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PrSummary {
+    pub key: PrKey,
+    pub title: String,
+    pub author: String,
+    pub updated: String,
+    pub draft: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PrDetail {
+    pub key: PrKey,
+    pub title: String,
+    pub body: String,
+    pub author: String,
+    pub head: String,
+    pub base: String,
+    pub head_branch: String,
+    pub base_branch: String,
+    pub state: String,
+    pub additions: u64,
+    pub deletions: u64,
+    pub changed_files: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct TimelineItem {
+    pub date: String,
+    pub author: String,
+    pub kind: String,
+    pub body: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Check {
+    pub name: String,
+    pub state: String,
+    pub started: String,
+    pub completed: String,
+    pub url: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelChoice {
+    pub model: String,
+    pub effort: String,
+}
+impl Default for ModelChoice {
+    fn default() -> Self {
+        Self {
+            model: "gpt-5.6-luna".into(),
+            effort: "high".into(),
+        }
+    }
+}
+impl std::fmt::Display for ModelChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} · {}", self.model, self.effort)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ModelInfo {
+    pub id: String,
+    pub name: String,
+    pub efforts: Vec<String>,
+}
+
+/// GitHub and model output are untrusted terminal text. Retain text and newlines,
+/// never terminal escape sequences or other control characters.
+pub fn clean(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
+        .collect()
+}
