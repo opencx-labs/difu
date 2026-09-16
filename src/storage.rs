@@ -89,7 +89,7 @@ pub fn hash(bytes: impl AsRef<[u8]>) -> String {
     format!("{:x}", Sha256::digest(bytes.as_ref()))
 }
 
-fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
+pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
     let mut temp =
         tempfile::NamedTempFile::new_in(path.parent().context("Missing parent directory")?)?;
     temp.write_all(&serde_json::to_vec_pretty(value)?)?;

@@ -134,6 +134,7 @@ fn scripted_workflow() -> Result<()> {
 }
 
 fn exercise(root: &Path) -> Result<()> {
+    exercise_writes(root)?;
     let storage = Storage {
         config: root.join("config.json"),
         cache: root.to_owned(),
@@ -510,5 +511,136 @@ fn exercise(root: &Path) -> Result<()> {
         fetches_before + 1
     );
     already_local.shutdown();
+    Ok(())
+}
+
+fn exercise_writes(root: &Path) -> Result<()> {
+    use difu::review::{self, Anchor, Operation, Side};
+    let cancel = Cancel::default();
+    let key = PrKey {
+        owner: "example".into(),
+        repo: "project".into(),
+        number: 1,
+    };
+    let revisions: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.join("revisions.json"))?)?;
+    let head = revisions
+        .get("head")
+        .and_then(serde_json::Value::as_str)
+        .context("Missing head")?;
+    let anchor = Anchor {
+        path: "main.rs".into(),
+        side: Side::Right,
+        start: 1,
+        end: 3,
+    };
+    let pending = Operation::Comment {
+        anchor: anchor.clone(),
+        body: "Please explain @alice 🦀".into(),
+        pending: true,
+    };
+    assert!(review::execute(&key, "outdated", &pending, &cancel).is_err());
+    assert!(!root.join("writes.jsonl").exists());
+    review::execute(&key, head, &pending, &cancel)?;
+    assert!(review::state(&key, &cancel)?.pending.is_some());
+    review::execute(&key, head, &pending, &cancel)?;
+    let writes = fs::read_to_string(root.join("writes.jsonl"))?;
+    assert_eq!(writes.matches("AddPullRequestReviewInput").count(), 1);
+    assert_eq!(writes.matches("AddPullRequestReviewThreadInput").count(), 1);
+    for line in writes.lines() {
+        let data: serde_json::Value = serde_json::from_str(line)?;
+        let input = data.pointer("/variables/input").context("Missing input")?;
+        let thread = input.pointer("/threads/0").unwrap_or(input);
+        assert_eq!(
+            thread.get("startLine").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            thread.get("line").and_then(serde_json::Value::as_u64),
+            Some(3)
+        );
+        assert_eq!(
+            thread.get("side").and_then(serde_json::Value::as_str),
+            Some("RIGHT")
+        );
+    }
+    review::execute(
+        &key,
+        head,
+        &Operation::Review {
+            event: "REQUEST_CHANGES".into(),
+            body: "Needs changes".into(),
+        },
+        &cancel,
+    )?;
+    assert!(review::state(&key, &cancel)?.pending.is_none());
+    let old = Anchor {
+        side: Side::Left,
+        ..anchor
+    };
+    review::execute(
+        &key,
+        head,
+        &Operation::Comment {
+            anchor: old,
+            body: "Old side".into(),
+            pending: false,
+        },
+        &cancel,
+    )?;
+    review::execute(
+        &key,
+        head,
+        &Operation::Viewed {
+            path: "main.rs".into(),
+            viewed: true,
+        },
+        &cancel,
+    )?;
+    assert!(review::state(&key, &cancel)?.viewed.contains("main.rs"));
+    review::execute(
+        &key,
+        head,
+        &Operation::Viewed {
+            path: "main.rs".into(),
+            viewed: false,
+        },
+        &cancel,
+    )?;
+    assert!(review::state(&key, &cancel)?.viewed.is_empty());
+    for squash in [false, true] {
+        for admin in [false, true] {
+            review::execute(&key, head, &Operation::Merge { squash, admin }, &cancel)?;
+        }
+    }
+    review::execute(
+        &key,
+        head,
+        &Operation::Close {
+            body: "Closing explanation".into(),
+        },
+        &cancel,
+    )?;
+    let writes = fs::read_to_string(root.join("writes.jsonl"))?;
+    assert!(writes.contains("start_line"));
+    assert!(writes.contains("LEFT"));
+    assert!(writes.contains("SubmitPullRequestReviewInput"));
+    assert_eq!(writes.matches("match-head-commit").count(), 4);
+    assert!(writes.contains("Closing explanation"));
+    fs::write(root.join("fail-write"), "")?;
+    assert!(review::execute(&key, head, &pending, &cancel).is_err());
+    assert_eq!(writes, fs::read_to_string(root.join("writes.jsonl"))?);
+    fs::remove_file(root.join("fail-write"))?;
+    let mentions = review::mentions(&key, &cancel)?;
+    assert_eq!(mentions.users, vec!["alice", "author", "reviewer"]);
+    let storage = Storage {
+        config: root.join("config.json"),
+        cache: root.into(),
+    };
+    review::save_mentions(&storage, &key, &mentions)?;
+    assert_eq!(
+        review::cached_mentions(&storage, &key)?.users,
+        mentions.users
+    );
     Ok(())
 }

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
+    cursor::SetCursorStyle,
     event::{
         self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
         Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
@@ -17,7 +18,7 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
-    about = "Your diff shifu · a terminal inbox and guided PR reader"
+    about = "Your diff shifu · a terminal inbox and guided PR reviewer"
 )]
 struct Args {
     /// Optional GitHub PR URL or number (numbers use the current repository).
@@ -69,6 +70,7 @@ fn main() -> Result<()> {
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(
             io::stdout(),
+            SetCursorStyle::DefaultUserShape,
             PopKeyboardEnhancementFlags,
             DisableMouseCapture,
             DisableBracketedPaste
@@ -80,6 +82,7 @@ fn main() -> Result<()> {
         execute!(
             io::stdout(),
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            SetCursorStyle::BlinkingBar,
             EnableMouseCapture,
             EnableBracketedPaste
         )?;
@@ -101,6 +104,7 @@ fn main() -> Result<()> {
     })();
     let _ = execute!(
         io::stdout(),
+        SetCursorStyle::DefaultUserShape,
         PopKeyboardEnhancementFlags,
         DisableMouseCapture,
         DisableBracketedPaste

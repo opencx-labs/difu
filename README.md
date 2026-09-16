@@ -2,9 +2,10 @@
 
 *dīfu* is your diff *shīfu*... guides you through the depths of every diff... may you fathom whatever slop you're feasting your eyes on
 
-A read-only terminal app for GitHub pull requests, built in Rust with Ratatui and
+A terminal review app for GitHub pull requests, built in Rust with Ratatui and
 Crossterm. Browse your review inbox, read PR activity, and follow AI-generated
-chapters that explain related changes across files.
+chapters that explain related changes across files. Write comments and reviews,
+track chapter completion, and merge or close PRs without leaving the terminal.
 
 ## Requirements
 
@@ -88,7 +89,7 @@ Select a PR to preview its description, chronological activity, inline review
 comments, and checks. **Enter** drills into that PR and selects **Guide**, starting
 or retrieving its guide. Inside the PR, the tabs are **Overview / Guide / Diff**;
 **Esc** returns home. Guide and Diff start with chapters or files focused; the
-footer names the focused pane, and **Tab** switches focus. You can also launch directly:
+border highlights the focused pane, the footer names it, and **Tab** switches focus. You can also launch directly:
 
 ```sh
 difu https://github.com/owner/repo/pull/123
@@ -143,7 +144,8 @@ expansion; read failures remain visible with a retry option.
 
 File headers stay visible while scrolling their diffs. Long paths wrap in file
 headers, chapter links, and the file tree. **Alt+Up / Alt+Down** jumps to the
-previous or next guide chapter.
+previous or next guide chapter. With the chapter pane focused, plain **Up / Down**
+moves between its file links and scrolls the corresponding diff into view.
 
 Guide generation has no automatic timeout. Its elapsed time and activity remain
 visible; cancel or retry explicitly. Every changed hunk must appear at least once
@@ -164,6 +166,53 @@ building/validating the diff. The footer includes elapsed time and Git's live
 transfer percentage, size, and speed when available. **F8** cancels preparation;
 **F6** retries a failed preparation.
 
+### Comments, reviews, and PR actions
+
+Press **/** inside a PR for its action wizard. At home, **/** offers **PR controls**
+for the selected PR and **Memory management** for temporary worktrees.
+
+PR controls support comment/approve/request-changes reviews, merge, squash merge,
+either merge method with the admin flag, and closing with an optional comment.
+A final confirmation shows the PR, action, and pinned revision. Difu checks the
+remote head before writing; if it changed, refresh the PR and confirm again.
+Merge requests also pass GitHub's atomic expected-head guard. GitHub permissions,
+branch protection, and merge-queue rules still apply; admin is used only when
+explicitly selected. Failed or uncertain writes are never automatically retried.
+Closing with a comment performs two operations; a comment failure after closing
+is reported explicitly.
+
+With the diff focused, **>** marks the current line. **Up / Down** moves one row;
+**Command+Up / Down** moves ten. **Left / Right** chooses old/new code, and
+**Alt+Left / Right** scrolls horizontally. **Shift+Up / Down** selects a line range
+within one file and side. **Enter** opens the comment editor: publish a standalone
+comment or add it to your GitHub pending review. Existing pending reviews are
+reused; pending comments stay private until the review is submitted.
+GitHub validates comment locations, including expanded context, and reports any
+unsupported range without posting a different kind of comment.
+
+Text inputs show a blinking cursor. Comments and review messages support multiline
+editing and paste. **Tab** moves between the message, review type, and Next button;
+**Ctrl+Enter** goes to confirmation. **Esc** goes back. Unsubmitted text is retained
+in the running session when closing a dialog or refreshing the PR; comments already
+added to a pending review are stored by GitHub.
+
+Type **@** for mention suggestions from visible organization members and PR
+participants. **Up / Down** chooses a suggestion and **Tab** inserts it. Suggestions
+are cached locally for 24 hours; expired data remains available during background
+refresh. **F5** in the editor explicitly refreshes suggestions.
+
+### Chapter completion and GitHub Viewed
+
+These are separate:
+
+- **Guide:** Enter on a diff's file heading toggles completion and collapse for
+  that file **in that chapter only**. Other chapters and GitHub are unchanged.
+  Chapter counters and the overall counter count chapter-file sections. Progress
+  is restored for the exact same guide and diff; changed content starts fresh.
+- **Diff:** Enter on a file heading toggles GitHub's **Viewed** state and collapses
+  or expands the file. This does not complete any guide chapter. A separate total
+  counts files Viewed on GitHub.
+
 ### Controls
 
 Buttons, tabs, files, PRs, and links are clickable; the mouse wheel scrolls the
@@ -172,13 +221,16 @@ bindings.
 
 | Key | Action |
 | --- | --- |
-| Up / Down | Select a PR/file/chapter or scroll content |
-| Command+Up / Command+Down | Focus content and scroll ten lines |
+| Up / Down | Select a PR or chapter file; move the focused code line |
+| Command+Up / Command+Down | Focus content and move ten lines |
 | Tab / Shift+Tab | Switch navigation/content focus |
-| Enter | Open selected PR |
+| Enter | Open PR; comment on a code line; toggle a file heading |
+| / | PR actions; home also offers worktree management |
+| Shift+Up / Shift+Down | Select code lines within one file and side |
 | Page Up / Page Down / Space | Scroll a page |
 | Home / End | Start / end |
-| Left / Right | Scroll code horizontally |
+| Left / Right | Select old/new diff side |
+| Alt+Left / Alt+Right | Scroll code horizontally |
 | Alt+Up / Alt+Down | Previous / next guide chapter |
 | 1 / 2 / 3 | Home: Review requests / Authored / Repositories; inside a PR: Overview / Guide / Diff |
 | F1 | Help |
@@ -259,7 +311,9 @@ Settings remember clone paths, model/effort, diff preference, the repository
 whitelist, and which whitelisted repositories are enabled. Writes are atomic
 and files are created with owner-only permissions. Guide cache files contain PR
 explanations and hunk references. PR-list cache files contain PR titles, authors,
-opened dates, and counts. Remove the cache directory to clear cached data.
+opened dates, and counts. Mention caches contain GitHub logins; progress caches
+contain completed chapter-file sections. Remove the cache directory to clear
+cached data. GitHub pending reviews and Viewed state are unaffected.
 
 ## Worktrees and safety
 
@@ -279,7 +333,12 @@ Owned subprocess groups are terminated on cancellation. Worktrees are removed on
 completion, failure, normal exit, Ctrl+C, SIGTERM, and SIGHUP. Cleanup does not use
 `--force`: if a worktree unexpectedly contains changes, difu reports and preserves
 its path. An uncatchable kill or power loss can leave a temporary worktree; inspect
-`git worktree list` and remove that specific worktree manually after inspection.
+the home **/ → Memory management** dialog. It lists remaining worktrees and offers
+individual deletion or **Delete all stale**. Only difu-owned, inactive, clean,
+unlocked worktrees can be deleted. Process leases protect active trees across
+difu instances. Modified, ignored/untracked, Git-locked, and unverified legacy
+trees remain protected; the dialog explains why. Ownership and eligibility are
+checked again immediately before deletion; removal never uses `--force`.
 
 The first-party Rust code forbids `unsafe`. Clippy denies `.unwrap()`, `.expect()`,
 explicit panics, unchecked indexing/slicing, `todo!`, and `unimplemented!`, including
@@ -289,8 +348,8 @@ Coverage validation checks references and omissions; reviewers still assess the
 explanation against the code.
 
 Shallow history with no merge base and non-UTF-8 diffs produce explicit errors;
-difu does not silently substitute an incomplete or lossy snapshot. The tool is a
-reader: it does not submit comments, reviews, approvals, or mark review progress.
+difu does not silently substitute an incomplete or lossy snapshot. GitHub write
+actions occur only through the explicit controls described above.
 
 ## Guide writing research
 

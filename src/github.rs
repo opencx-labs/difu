@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::process::Command;
 
-fn command() -> Command {
+pub(crate) fn command() -> Command {
     let mut cmd = Command::new("gh");
     cmd.env("GH_PROMPT_DISABLED", "1")
         .env("GH_PAGER", "cat")

@@ -13,14 +13,14 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-const BG: Color = Color::Rgb(12, 14, 18);
-const PANEL: Color = Color::Rgb(18, 21, 27);
-const TEXT: Color = Color::Rgb(220, 225, 232);
-const DIM: Color = Color::Rgb(130, 140, 156);
-const BORDER: Color = Color::Rgb(42, 48, 61);
-const ACCENT: Color = Color::Rgb(183, 161, 255);
-const GREEN: Color = Color::Rgb(114, 216, 163);
-const RED: Color = Color::Rgb(247, 137, 145);
+pub(crate) const BG: Color = Color::Rgb(12, 14, 18);
+pub(crate) const PANEL: Color = Color::Rgb(18, 21, 27);
+pub(crate) const TEXT: Color = Color::Rgb(220, 225, 232);
+pub(crate) const DIM: Color = Color::Rgb(130, 140, 156);
+pub(crate) const BORDER: Color = Color::Rgb(42, 48, 61);
+pub(crate) const ACCENT: Color = Color::Rgb(183, 161, 255);
+pub(crate) const GREEN: Color = Color::Rgb(114, 216, 163);
+pub(crate) const RED: Color = Color::Rgb(247, 137, 145);
 const ADD_BG: Color = Color::Rgb(18, 43, 32);
 const REMOVE_BG: Color = Color::Rgb(49, 25, 31);
 
@@ -28,6 +28,7 @@ const REMOVE_BG: Color = Color::Rgb(49, 25, 31);
 pub struct TextRow {
     pub spans: Vec<Span<'static>>,
     pub action: Option<Action>,
+    pub target: Option<crate::workflow::Target>,
 }
 #[derive(Clone, Default)]
 pub struct Row {
@@ -44,7 +45,13 @@ pub struct FileSection {
     pub end: usize,
     pub header: Vec<TextRow>,
 }
+pub struct NavItem {
+    pub chapter: usize,
+    pub path: String,
+    pub row: usize,
+}
 pub struct Document {
+    pub navigation: Vec<NavItem>,
     pub epoch: u64,
     pub width: u16,
     pub horizontal: usize,
@@ -76,29 +83,38 @@ fn file_header(file: &DiffFile, width: usize) -> Vec<TextRow> {
         width,
     )
     .into_iter()
-    .map(|line| bold(line, TEXT))
+    .map(|line| {
+        let mut row = bold(line, TEXT);
+        row.target = Some(crate::workflow::Target::Header {
+            path: file.path.clone(),
+            chapter: None,
+        });
+        row
+    })
     .collect()
 }
 
 fn span(text: impl Into<String>, color: Color) -> Span<'static> {
     Span::styled(text.into(), Style::default().fg(color))
 }
-fn text(value: impl Into<String>, color: Color) -> TextRow {
+pub(crate) fn text(value: impl Into<String>, color: Color) -> TextRow {
     TextRow {
         spans: vec![span(value, color)],
         action: None,
+        target: None,
     }
 }
-fn bold(value: impl Into<String>, color: Color) -> TextRow {
+pub(crate) fn bold(value: impl Into<String>, color: Color) -> TextRow {
     TextRow {
         spans: vec![Span::styled(
             value.into(),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         )],
         action: None,
+        target: None,
     }
 }
-fn link(value: impl Into<String>, action: Action) -> TextRow {
+pub(crate) fn link(value: impl Into<String>, action: Action) -> TextRow {
     TextRow {
         spans: vec![Span::styled(
             value.into(),
@@ -107,6 +123,7 @@ fn link(value: impl Into<String>, action: Action) -> TextRow {
                 .add_modifier(Modifier::UNDERLINED),
         )],
         action: Some(action),
+        target: None,
     }
 }
 fn append(rows: &mut Vec<Row>, right: TextRow) {
@@ -161,7 +178,7 @@ fn inline(source: &str) -> Vec<Span<'static>> {
     }
     spans
 }
-fn prose(source: &str, width: usize) -> Vec<TextRow> {
+pub(crate) fn prose(source: &str, width: usize) -> Vec<TextRow> {
     let mut rows = Vec::new();
     let source = clean(source);
     let mut fence = false;
@@ -190,6 +207,7 @@ fn prose(source: &str, width: usize) -> Vec<TextRow> {
                 TextRow {
                     spans: inline(&wrapped),
                     action: None,
+                    target: None,
                 }
             });
         }
@@ -222,7 +240,7 @@ fn prose(source: &str, width: usize) -> Vec<TextRow> {
 
 /// Crop by terminal cells, never UTF-8 bytes. A clipped wide glyph becomes a
 /// space so the next character stays in the correct column.
-fn crop(value: &str, offset: usize, width: usize) -> String {
+pub(crate) fn crop(value: &str, offset: usize, width: usize) -> String {
     let mut output = String::new();
     let mut position = 0;
     let mut written = 0;
@@ -366,7 +384,13 @@ fn code(line: Option<&DiffLine>, old: bool, width: usize, horizontal: usize) -> 
     spans
 }
 
-fn code_rows(lines: &[DiffLine], width: usize, split: bool, horizontal: usize) -> Vec<TextRow> {
+fn code_rows(
+    path: &str,
+    lines: &[DiffLine],
+    width: usize,
+    split: bool,
+    horizontal: usize,
+) -> Vec<TextRow> {
     let mut rows = Vec::new();
     if split {
         let left = width.saturating_sub(1) / 2;
@@ -383,6 +407,11 @@ fn code_rows(lines: &[DiffLine], width: usize, split: bool, horizontal: usize) -
             rows.push(TextRow {
                 spans,
                 action: None,
+                target: Some(crate::workflow::Target::Code {
+                    path: path.into(),
+                    old: old.and_then(|l| l.old),
+                    new: new.and_then(|l| l.new),
+                }),
             });
         }
     } else {
@@ -390,6 +419,11 @@ fn code_rows(lines: &[DiffLine], width: usize, split: bool, horizontal: usize) -
             rows.push(TextRow {
                 spans: code(Some(line), line.kind == LineKind::Remove, width, horizontal),
                 action: None,
+                target: Some(crate::workflow::Target::Code {
+                    path: path.into(),
+                    old: line.old,
+                    new: line.new,
+                }),
             });
         }
     }
@@ -493,10 +527,10 @@ fn hunk_rows(
                     None => rows.push(text("── Context ──", DIM)),
                 }
             }
-            rows.extend(code_rows(part.lines, width, split, horizontal));
+            rows.extend(code_rows(&file.path, part.lines, width, split, horizontal));
         }
     } else {
-        rows.extend(code_rows(&hunk.lines, width, split, horizontal));
+        rows.extend(code_rows(&file.path, &hunk.lines, width, split, horizontal));
     }
     if let Some(button) = expansion_button(review, file, hunk, Direction::Below) {
         rows.push(button);
@@ -507,6 +541,7 @@ fn hunk_rows(
 
 fn build(app: &App, width: u16) -> Document {
     let mut doc = Document {
+        navigation: Vec::new(),
         epoch: app.epoch,
         width,
         horizontal: app.horizontal,
@@ -653,6 +688,7 @@ fn build(app: &App, width: u16) -> Document {
         doc.guide_columns = wide;
         doc.left_width = if wide { (width / 4).clamp(30, 44) } else { 0 };
         let code_width = width.saturating_sub(if wide { doc.left_width + 3 } else { 0 }) as usize;
+        let code_width = code_width.saturating_sub(2);
         let split = wide && !app.config.unified;
         for (chapter_index, chapter) in guide.chapters.iter().enumerate() {
             let start = doc.rows.len();
@@ -674,6 +710,25 @@ fn build(app: &App, width: u16) -> Document {
             left.push(TextRow::default());
             left.extend(prose(&chapter.explanation, prose_width));
             left.push(TextRow::default());
+            let chapter_files = chapter
+                .hunks
+                .iter()
+                .filter_map(|id| snapshot.find(id).map(|(f, _)| f.path.clone()))
+                .collect::<std::collections::BTreeSet<_>>();
+            let completed = chapter_files
+                .iter()
+                .filter(|path| {
+                    review
+                        .interaction
+                        .progress
+                        .completed
+                        .contains(&(chapter_index, (*path).clone()))
+                })
+                .count();
+            left.push(text(
+                format!("{completed}/{} sections completed", chapter_files.len()),
+                DIM,
+            ));
             let mut right = Vec::new();
             let mut last_file = String::new();
             let mut seen = std::collections::HashSet::new();
@@ -692,6 +747,19 @@ fn build(app: &App, width: u16) -> Document {
                     if title {
                         headers.push((right.len(), file_header(file, code_width)));
                     }
+                    let collapsed = review
+                        .interaction
+                        .progress
+                        .completed
+                        .contains(&(chapter_index, file.path.clone()));
+                    if collapsed {
+                        if title {
+                            right.extend(file_header(file, code_width));
+                            right
+                                .push(text("✓ Chapter section completed · Enter to reopen", GREEN));
+                        }
+                        continue;
+                    }
                     right.extend(hunk_rows(
                         file,
                         hunk,
@@ -703,19 +771,62 @@ fn build(app: &App, width: u16) -> Document {
                     ));
                 }
             }
+            for row in &mut right {
+                if let Some(crate::workflow::Target::Header { chapter, .. }) = &mut row.target {
+                    *chapter = Some(chapter_index);
+                }
+            }
+            for (_, header) in &mut headers {
+                for row in header {
+                    if let Some(crate::workflow::Target::Header { chapter, .. }) = &mut row.target {
+                        *chapter = Some(chapter_index);
+                    }
+                }
+            }
             let links = links
                 .into_iter()
-                .map(|(path, row)| (wrapped_text(&format!("↳ {}", path), prose_width), row))
+                .map(|(path, row)| {
+                    (
+                        path.clone(),
+                        wrapped_text(
+                            &format!(
+                                "{} {}",
+                                if review
+                                    .interaction
+                                    .progress
+                                    .completed
+                                    .contains(&(chapter_index, path.clone()))
+                                {
+                                    "✓"
+                                } else {
+                                    "↳"
+                                },
+                                path
+                            ),
+                            prose_width,
+                        ),
+                        row,
+                    )
+                })
                 .collect::<Vec<_>>();
-            let link_rows: usize = links.iter().map(|(lines, _)| lines.len()).sum();
+            let link_rows: usize = links.iter().map(|(_, lines, _)| lines.len()).sum();
             let offset = if wide {
                 start
             } else {
                 start + prose_length + link_rows + 1
             };
-            for (lines, row) in links {
+            for (path, lines, row) in links {
+                let index = doc.navigation.len();
+                doc.navigation.push(NavItem {
+                    chapter: chapter_index,
+                    path,
+                    row: offset + row,
+                });
                 for line in lines {
-                    left.push(link(line, Action::Jump(offset + row)));
+                    left.push(link(
+                        line,
+                        Action::Workflow(crate::workflow::WAction::Nav(index)),
+                    ));
                 }
             }
             for (index, (row, header)) in headers.iter().enumerate() {
@@ -757,11 +868,22 @@ fn build(app: &App, width: u16) -> Document {
         }
     } else {
         if let Some(file) = snapshot.files.get(app.file) {
-            for (i, hunk) in file.hunks.iter().enumerate() {
+            let collapsed = review.interaction.github.viewed.contains(&file.path)
+                && review.interaction.github.head == snapshot.head;
+            if collapsed {
+                for row in file_header(file, width.saturating_sub(2) as usize) {
+                    append(&mut doc.rows, row);
+                }
+                append(
+                    &mut doc.rows,
+                    text("✓ Viewed on GitHub · Enter to reopen", GREEN),
+                );
+            }
+            for (i, hunk) in file.hunks.iter().enumerate().filter(|_| !collapsed) {
                 for row in hunk_rows(
                     file,
                     hunk,
-                    width as usize,
+                    width.saturating_sub(2) as usize,
                     width >= 80 && !app.config.unified,
                     app.horizontal,
                     i == 0,
@@ -773,22 +895,117 @@ fn build(app: &App, width: u16) -> Document {
             doc.files.push(FileSection {
                 start: 0,
                 end: doc.rows.len(),
-                header: file_header(file, width as usize),
+                header: file_header(file, width.saturating_sub(2) as usize),
             });
         }
     }
     doc
 }
 
-fn paint(frame: &mut Frame, rect: Rect, row: &TextRow, app: &mut App) {
+pub(crate) fn paint(frame: &mut Frame, rect: Rect, row: &TextRow, app: &mut App) {
     if rect.width == 0 || rect.height == 0 {
         return;
     }
-    frame.render_widget(Paragraph::new(Line::from(row.spans.clone())), rect);
+    let mut spans = row.spans.clone();
+    if matches!(&row.action,Some(Action::Workflow(crate::workflow::WAction::Nav(i))) if *i==app.workflow.nav)
+    {
+        for span in &mut spans {
+            span.style = span.style.bg(PANEL).add_modifier(Modifier::BOLD);
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), rect);
     if let Some(action) = &row.action {
         app.hits.push((rect, action.clone()));
     }
 }
+fn paint_diff(
+    frame: &mut Frame,
+    rect: Rect,
+    row: &TextRow,
+    index: usize,
+    doc: &Document,
+    app: &mut App,
+) {
+    if app.view == View::Overview {
+        paint(frame, rect, row, app);
+        return;
+    }
+    let code = Rect::new(rect.x + 2, rect.y, rect.width.saturating_sub(2), 1);
+    paint(frame, code, row, app);
+    let split =
+        !app.config.unified && (doc.guide_columns || (app.view == View::Diff && doc.width >= 80));
+    if row.target.is_some() {
+        let left = if split { code.width / 2 } else { code.width };
+        let side = if !split
+            && matches!(
+                &row.target,
+                Some(crate::workflow::Target::Code { new: None, .. })
+            ) {
+            crate::review::Side::Left
+        } else {
+            crate::review::Side::Right
+        };
+        app.hits.push((
+            Rect::new(code.x, code.y, left, 1),
+            Action::Workflow(crate::workflow::WAction::Cursor(
+                index,
+                if split {
+                    crate::review::Side::Left
+                } else {
+                    side
+                },
+            )),
+        ));
+        if split {
+            app.hits.push((
+                Rect::new(code.x + left, code.y, code.width.saturating_sub(left), 1),
+                Action::Workflow(crate::workflow::WAction::Cursor(
+                    index,
+                    crate::review::Side::Right,
+                )),
+            ));
+        }
+    }
+    let cursor = app.workflow.cursor.unwrap_or(app.scroll);
+    let focused = app.focus == Focus::Content && cursor == index;
+    let selected = app.workflow.selection.as_ref().is_some_and(|start| {
+        let end = doc
+            .rows
+            .get(cursor)
+            .and_then(|r| r.right.target.as_ref())
+            .and_then(|t| t.line(app.workflow.side));
+        let line = row.target.as_ref().and_then(|t| t.line(app.workflow.side));
+        end.zip(line).is_some_and(|(end, line)| {
+            start.path == line.path
+                && end.path == line.path
+                && (start.start.min(end.end)..=start.start.max(end.end)).contains(&line.start)
+        })
+    });
+    if focused || selected {
+        let offset = if split && app.workflow.side == crate::review::Side::Right {
+            code.width / 2 + 1
+        } else {
+            0
+        };
+        let width = if split { code.width / 2 } else { code.width };
+        for x in code.x + offset..(code.x + offset + width).min(code.right()) {
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, code.y)) {
+                cell.set_bg(if selected {
+                    Color::Rgb(55, 48, 78)
+                } else {
+                    PANEL
+                });
+            }
+        }
+    }
+    if focused {
+        frame.render_widget(
+            Paragraph::new(">").style(Style::default().fg(ACCENT)),
+            Rect::new(rect.x, rect.y, 1, 1),
+        );
+    }
+}
+
 fn button(
     frame: &mut Frame,
     app: &mut App,
@@ -962,6 +1179,30 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         content
     };
+    let outer_main = main;
+    let main = Rect::new(
+        main.x + 1,
+        main.y + 1,
+        main.width.saturating_sub(2),
+        main.height.saturating_sub(2),
+    );
+    if !has_guide || main.width < 132 {
+        frame.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(if app.view == View::Overview {
+                    " PR preview "
+                } else {
+                    " Diff "
+                })
+                .border_style(Style::default().fg(if app.focus == Focus::Content {
+                    ACCENT
+                } else {
+                    BORDER
+                })),
+            outer_main,
+        );
+    }
     app.content_rect = main;
     app.viewport = main.height as usize;
     app.hits.push((main, Action::Focus(Focus::Content)));
@@ -969,15 +1210,21 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let nav = Rect::new(content.x, content.y, nav_width, content.height);
         frame.render_widget(
             Block::default()
-                .borders(Borders::RIGHT)
+                .borders(Borders::ALL)
                 .border_style(Style::default().fg(if app.focus == Focus::Navigation {
                     ACCENT
                 } else {
                     BORDER
                 })),
-            Rect::new(nav.x, nav.y, nav.width + 1, nav.height),
+            Rect::new(nav.x, nav.y, nav.width, nav.height),
         );
         app.hits.push((nav, Action::Focus(Focus::Navigation)));
+        let nav = Rect::new(
+            nav.x + 1,
+            nav.y + 1,
+            nav.width.saturating_sub(2),
+            nav.height.saturating_sub(2),
+        );
         if app.home {
             draw_inbox(frame, app, nav);
         } else {
@@ -993,6 +1240,35 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     };
     if doc.guide_columns {
+        for (rect, label, focus) in [
+            (
+                Rect::new(main.x - 1, main.y - 1, doc.left_width + 2, main.height + 2),
+                " Chapter ",
+                Focus::Navigation,
+            ),
+            (
+                Rect::new(
+                    main.x + doc.left_width + 2,
+                    main.y - 1,
+                    main.width.saturating_sub(doc.left_width + 1),
+                    main.height + 2,
+                ),
+                " Diff ",
+                Focus::Content,
+            ),
+        ] {
+            frame.render_widget(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(label)
+                    .border_style(Style::default().fg(if app.focus == focus {
+                        ACCENT
+                    } else {
+                        BORDER
+                    })),
+                rect,
+            );
+        }
         app.hits.push((
             Rect::new(main.x, main.y, doc.left_width, main.height),
             Action::Focus(Focus::Navigation),
@@ -1002,6 +1278,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         && let Some(section) = doc.sections.get(index)
     {
         app.scroll = section.start;
+        app.workflow.cursor = Some(section.start);
+        app.workflow.selection = None;
+        app.workflow.nav = doc
+            .navigation
+            .iter()
+            .position(|item| item.chapter == index)
+            .unwrap_or(0);
     }
     app.scroll = app.scroll.min(doc.max_scroll(main.height as usize));
     for y in 0..main.height {
@@ -1034,7 +1317,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 left,
                 app,
             );
-            paint(
+            paint_diff(
                 frame,
                 Rect::new(
                     main.x + doc.left_width + 3,
@@ -1043,13 +1326,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     1,
                 ),
                 &row.right,
+                index,
+                &doc,
                 app,
             );
         } else {
-            paint(
+            paint_diff(
                 frame,
                 Rect::new(main.x, main.y + y, main.width, 1),
                 &row.right,
+                index,
+                &doc,
                 app,
             );
         }
@@ -1079,7 +1366,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 Block::default().style(Style::default().bg(BG).fg(TEXT)),
                 rect,
             );
-            paint(frame, rect, row, app);
+            paint_diff(frame, rect, row, file.start + index, &doc, app);
         }
     }
     if doc.rows.len() > main.height as usize && main.height > 0 {
@@ -1091,7 +1378,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
     app.document = Some(doc);
-    let status = if app.home && app.inbox_loading && !app.inbox.is_empty() {
+    let mut status = if app.home && app.inbox_loading && !app.inbox.is_empty() {
         "Showing cached PRs · Refreshing…".into()
     } else if app.home && app.inbox_error.is_some() && !app.inbox.is_empty() {
         "Showing cached PRs · Refresh failed · F5 retry".into()
@@ -1140,6 +1427,40 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         app.notice.clone()
     };
+    if !app.home
+        && let Some(review) = app.review()
+    {
+        if app.view == View::Guide
+            && let (Some(guide), Some(snapshot)) = (&review.guide, &review.snapshot)
+        {
+            let total: usize = guide
+                .chapters
+                .iter()
+                .map(|c| {
+                    c.hunks
+                        .iter()
+                        .filter_map(|id| snapshot.find(id).map(|(f, _)| f.path.as_str()))
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .len()
+                })
+                .sum();
+            status = format!(
+                "{} · {}/{} chapter sections complete",
+                status,
+                review.interaction.progress.completed.len(),
+                total
+            );
+        } else if app.view == View::Diff
+            && let Some(snapshot) = &review.snapshot
+        {
+            status = format!(
+                "{} · {}/{} files Viewed on GitHub",
+                status,
+                review.interaction.github.viewed.len(),
+                snapshot.files.len()
+            );
+        }
+    }
     frame.render_widget(
         Paragraph::new(crop(&status, 0, area.width.saturating_sub(4) as usize)).style(
             Style::default().fg(if app.review().is_some_and(|r| r.guide_error.is_some()) {
@@ -1153,6 +1474,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let mut footer_x = 2;
     let footer = if app.home {
         vec![
+            (
+                "/ Actions",
+                Action::Workflow(crate::workflow::WAction::Open),
+            ),
             ("F1 Help", Action::Help),
             (
                 "F3 State",
@@ -1170,6 +1495,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ]
     } else {
         vec![
+            (
+                "/ Actions",
+                Action::Workflow(crate::workflow::WAction::Open),
+            ),
             ("Alt+↑/↓ Chapters", Action::Chapter(true)),
             ("Cmd+↑/↓ 10 lines", Action::FastScroll(10)),
             ("F1 Help", Action::Help),
@@ -1497,6 +1826,10 @@ fn draw_files(frame: &mut Frame, app: &mut App, rect: Rect) {
 }
 
 fn draw_modal(frame: &mut Frame, app: &mut App) {
+    if matches!(app.modal, Some(Modal::Workflow(_))) {
+        crate::workflow_ui::draw(frame, app);
+        return;
+    }
     let area = frame.area();
     let width = area.width.saturating_sub(4).min(88);
     let height = area.height.saturating_sub(4).min(26);
@@ -1524,13 +1857,19 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
     let Some(modal) = &app.modal else {
         return;
     };
+    let mut input_cursor = None;
     let rows = match modal {
+        Modal::Workflow(_) => Vec::new(),
         Modal::Repositories {
             manage,
             query,
             selected,
             choices,
         } => {
+            input_cursor = Some((
+                inner.x + 7 + (query.width().min(inner.width.saturating_sub(9) as usize) as u16),
+                inner.y + 1,
+            ));
             let options = app.repository_choices(*manage, query, choices);
             let mut rows = vec![
                 bold(
@@ -1541,7 +1880,19 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
                     },
                     ACCENT,
                 ),
-                text(format!("Search: {query}"), TEXT),
+                text(
+                    format!(
+                        "Search: {}",
+                        crop(
+                            query,
+                            query
+                                .width()
+                                .saturating_sub(inner.width.saturating_sub(9) as usize),
+                            inner.width.saturating_sub(9) as usize
+                        )
+                    ),
+                    TEXT,
+                ),
                 text(
                     "↑↓ select · Space/click toggle · Enter save · Esc cancel",
                     DIM,
@@ -1607,10 +1958,11 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
             text("Alt+↑ / ↓     Previous / next guide chapter", TEXT),
             text("Tab           Switch navigation / content focus", TEXT),
             text("Cmd+Up/Down   Scroll content by ten lines", TEXT),
-            text("Enter         Open the selected PR", TEXT),
+            text("Enter         Open PR / comment / toggle completion", TEXT),
+            text("/             PR actions / worktree management", TEXT),
             text("Page Up/Down  Scroll a page · Space scrolls down", TEXT),
             text("Home / End    Jump to start / end", TEXT),
-            text("← →           Scroll code horizontally", TEXT),
+            text("← → side · Alt+← → horizontal · Shift+↑↓ select", TEXT),
             text(
                 "1 / 2 / 3     Home: Reviews / Authored / Repositories",
                 TEXT,
@@ -1634,6 +1986,10 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
             let mut rows = vec![bold("Locate your repository", ACCENT), text("", DIM)];
             rows.extend(prose(&format!("Choose the existing local clone for {key}. Difu remembers it for future reviews."),inner.width as usize));
             rows.push(text("", DIM));
+            input_cursor = Some((
+                inner.x + 2 + (value.width().min(inner.width.saturating_sub(4) as usize) as u16),
+                inner.y + rows.len() as u16,
+            ));
             rows.push(bold(
                 crop(
                     &format!("> {value}"),
@@ -1654,11 +2010,27 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
         Modal::Models {
             selected, query, ..
         } => {
+            input_cursor = Some((
+                inner.x + 8 + (query.width().min(inner.width.saturating_sub(9) as usize) as u16),
+                inner.y + 1,
+            ));
             let options = app.model_options(query);
             let selected = *selected;
             let mut rows = vec![
                 bold("Model & reasoning", ACCENT),
-                text(format!("Filter: {query}"), DIM),
+                text(
+                    format!(
+                        "Filter: {}",
+                        crop(
+                            query,
+                            query
+                                .width()
+                                .saturating_sub(inner.width.saturating_sub(9) as usize),
+                            inner.width.saturating_sub(9) as usize
+                        )
+                    ),
+                    DIM,
+                ),
                 text("↑↓ select · Enter apply · Esc close", DIM),
                 text("", DIM),
             ];
@@ -1685,6 +2057,12 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
             rows
         }
     };
+    if let Some((x, y)) = input_cursor
+        && x < inner.right()
+        && y < inner.bottom()
+    {
+        frame.set_cursor_position((x, y));
+    }
     for (i, row) in rows.iter().take(inner.height as usize).enumerate() {
         paint(
             frame,
@@ -1860,19 +2238,19 @@ mod tests {
         assert!(output.contains("Alt+↑/↓ Chapters"));
         assert!(output.contains("Cmd+↑/↓ 10 lines"));
         assert!(output.contains("Focus: Chapters"));
-        let last = app
+        let next_file = app
             .document
             .as_ref()
-            .and_then(|d| d.sections.last())
-            .context("Missing chapter")?
-            .start;
+            .and_then(|d| d.navigation.get(1))
+            .context("Missing next file")?
+            .row;
         app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(app.scroll, last);
+        assert_eq!(app.scroll, next_file);
         assert_eq!(app.focus, Focus::Navigation);
         app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(app.scroll, 0);
         app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER));
-        assert_eq!(app.scroll, 10);
+        assert_eq!(app.workflow.cursor, Some(10));
         assert_eq!(app.focus, Focus::Content);
         app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
         assert_eq!(app.scroll, 0);
@@ -1884,7 +2262,7 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app))?;
         app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER));
         assert_eq!(app.file, 1);
-        assert_eq!(app.scroll, 10);
+        assert_eq!(app.workflow.cursor, Some(10));
         app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
         app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
         assert_eq!(app.scroll, 0);
@@ -1981,7 +2359,7 @@ mod tests {
             }
             app.key_event(crossterm::event::KeyEvent::new(
                 crossterm::event::KeyCode::Down,
-                crossterm::event::KeyModifiers::NONE,
+                crossterm::event::KeyModifiers::ALT,
             ));
             assert_eq!(app.scroll, second);
             terminal.draw(|frame| draw(frame, &mut app))?;
@@ -2022,7 +2400,12 @@ mod tests {
                 .rows
                 .iter()
                 .flat_map(|row| [&row.left, &row.right])
-                .filter(|row| matches!(row.action, Some(Action::Jump(n)) if n == target))
+                .filter(|row| {
+                    matches!(
+                        row.action,
+                        Some(Action::Workflow(crate::workflow::WAction::Nav(0)))
+                    )
+                })
                 .collect::<Vec<_>>();
             let complete = links
                 .iter()
@@ -2130,6 +2513,199 @@ mod tests {
             let backend = ratatui::backend::TestBackend::new(w, h);
             let mut terminal = ratatui::Terminal::new(backend)?;
             terminal.draw(|f| draw(f, &mut app))?;
+        }
+        Ok(())
+    }
+    #[test]
+    fn chapter_completion_is_local_per_section_and_persists_for_exact_content() -> Result<()> {
+        use crate::workflow::Target;
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        let r = app
+            .reviews
+            .get_mut("example/repo#1")
+            .context("Missing review")?;
+        std::sync::Arc::make_mut(r.guide.as_mut().context("Missing guide")?)
+            .chapters
+            .get_mut(1)
+            .context("Missing chapter")?
+            .hunks
+            .push("h0".into());
+        app.sync_progress("example/repo#1");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 36))?;
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        let first = app
+            .document
+            .as_ref()
+            .context("Missing document")?
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    &r.right.target,
+                    Some(Target::Header {
+                        chapter: Some(0),
+                        ..
+                    })
+                )
+            })
+            .context("Missing first header")?;
+        app.workflow.cursor = Some(first);
+        app.focus = Focus::Content;
+        app.enter_diff();
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        let r = app.review().context("Missing review")?;
+        assert_eq!(r.interaction.progress.completed.len(), 1);
+        assert!(r.interaction.github.viewed.is_empty());
+        let doc = app.document.as_ref().context("Missing doc")?;
+        let second = doc.sections.get(1).context("Missing chapter")?;
+        assert!(doc.rows.iter().skip(second.start).take(second.end-second.start).any(|r|matches!(&r.right.target,Some(Target::Code{path,..})if path.ends_with("file-name-0.rs"))));
+        let saved = app
+            .review()
+            .context("Missing review")?
+            .interaction
+            .progress_key
+            .clone();
+        app.reviews
+            .get_mut("example/repo#1")
+            .context("Missing review")?
+            .interaction = Default::default();
+        app.sync_progress("example/repo#1");
+        assert_eq!(
+            app.review()
+                .context("Missing review")?
+                .interaction
+                .progress
+                .completed
+                .len(),
+            1
+        );
+        let r = app
+            .reviews
+            .get_mut("example/repo#1")
+            .context("Missing review")?;
+        std::sync::Arc::make_mut(r.guide.as_mut().context("Missing guide")?)
+            .chapters
+            .get_mut(0)
+            .context("Missing chapter")?
+            .explanation
+            .push_str(" Updated.");
+        app.sync_progress("example/repo#1");
+        let r = app.review().context("Missing review")?;
+        assert_ne!(r.interaction.progress_key, saved);
+        assert!(r.interaction.progress.completed.is_empty());
+        Ok(())
+    }
+    #[test]
+    fn line_focus_and_selection_keep_correct_side_and_file() -> Result<()> {
+        use crate::{review::Side, workflow::Target};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 30))?;
+        terminal.draw(|f| draw(f, &mut app))?;
+        let first = app
+            .document
+            .as_ref()
+            .context("Missing doc")?
+            .rows
+            .iter()
+            .position(|r| matches!(r.right.target, Some(Target::Code { new: Some(1), .. })))
+            .context("Missing line")?;
+        app.focus = Focus::Content;
+        app.workflow.cursor = Some(first);
+        app.workflow.side = Side::Right;
+        app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(app.workflow.cursor, Some(first + 1));
+        assert_eq!(app.workflow.selection.as_ref().map(|a| a.start), Some(1));
+        app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER));
+        assert_eq!(app.workflow.cursor, Some(first + 11));
+        assert!(app.workflow.selection.is_none());
+        terminal.draw(|f| draw(f, &mut app))?;
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|c| c.symbol() == ">" && c.fg == ACCENT)
+        );
+        app.key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.workflow.side, Side::Left);
+        assert_eq!(app.horizontal, 0);
+        app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(app.horizontal, 4);
+        let current = app.workflow.cursor;
+        app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(app.workflow.cursor, current);
+        Ok(())
+    }
+    #[test]
+    fn all_text_inputs_position_a_cursor_and_wizard_keeps_drafts() -> Result<()> {
+        use crate::{
+            editor::Editor,
+            workflow::{Compose, Kind, WAction, Wizard},
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        let key = app.inbox.first().context("Missing PR")?.key.clone();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 36))?;
+        let draft = Compose {
+            key,
+            head: "head".into(),
+            kind: Kind::Review,
+            editor: Editor::default(),
+            choice: 0,
+            focus: 0,
+            mention: 0,
+        };
+        let draft_id = draft.id();
+        app.wizard(Wizard::Compose(draft));
+        app.paste("A unicode review 🦀\nsecond line".into());
+        terminal.draw(|f| draw(f, &mut app))?;
+        let position = terminal.get_cursor_position()?;
+        assert!(position.x > 0 && position.y > 4);
+        app.workflow_action(WAction::Next);
+        assert!(
+            matches!(&app.modal,Some(Modal::Workflow(m))if matches!(m.as_ref(),Wizard::Confirm{..}))
+        );
+        app.workflow_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            matches!(&app.modal,Some(Modal::Workflow(m))if matches!(m.as_ref(),Wizard::Compose(_)))
+        );
+        app.workflow_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.workflow
+                .drafts
+                .get(&draft_id)
+                .context("Missing saved draft")?
+                .editor
+                .text(),
+            "A unicode review 🦀\nsecond line"
+        );
+        for modal in [
+            Modal::Clone {
+                value: "/tmp/clone".into(),
+                key: "example/repo".into(),
+            },
+            Modal::Models {
+                selected: 0,
+                effort: 0,
+                query: "luna".into(),
+            },
+            Modal::Repositories {
+                manage: true,
+                query: "example".into(),
+                selected: 0,
+                choices: Default::default(),
+            },
+        ] {
+            app.modal = Some(modal);
+            terminal.draw(|f| draw(f, &mut app))?;
+            let cursor = terminal.get_cursor_position()?;
+            assert!(cursor.x > 0 && cursor.y > 3);
         }
         Ok(())
     }
