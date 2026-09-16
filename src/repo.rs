@@ -10,7 +10,7 @@ use std::{
     sync::Arc,
 };
 
-fn git(path: &Path) -> Command {
+pub(crate) fn git(path: &Path) -> Command {
     let mut cmd = Command::new("git");
     cmd.arg("-C")
         .arg(path)
@@ -327,7 +327,7 @@ pub fn snapshot_with_progress(
 }
 
 // Disable checkout filters for both materialization and cleanliness checks.
-fn checkout_git(root: &Path, cancel: &Cancel) -> Result<Command> {
+pub(crate) fn checkout_git(root: &Path, cancel: &Cancel) -> Result<Command> {
     let mut command = git(root);
     // Avoid executing checkout filters (including LFS downloads) during a
     // read-only review. Read their names only; never expose their commands.
@@ -358,13 +358,16 @@ pub struct Worktree {
     root: PathBuf,
     pub path: PathBuf,
     directory: Option<tempfile::TempDir>,
+    _lease: crate::worktrees::Lease,
 }
 impl Worktree {
     pub fn create(root: &Path, revision: &str, cancel: &Cancel) -> Result<Self> {
         sha(revision)?;
         let directory = tempfile::Builder::new().prefix("difu-review-").tempdir()?;
         let path = directory.path().join("source");
+        let lease = crate::worktrees::register(directory.path(), root, &path)?;
         let mut tree = Self {
+            _lease: lease,
             root: root.to_owned(),
             path,
             directory: Some(directory),
@@ -596,7 +599,10 @@ mod tests {
                 .arg(&tree.path),
             &Cancel::default(),
         )?;
-        std::fs::remove_dir(tree.path.parent().context("Missing temporary parent")?)?;
+        let parent = tree.path.parent().context("Missing temporary parent")?;
+        std::fs::remove_file(parent.join("difu-owner.json"))?;
+        std::fs::remove_file(parent.join("difu.lock"))?;
+        std::fs::remove_dir(parent)?;
         Ok(())
     }
     #[test]

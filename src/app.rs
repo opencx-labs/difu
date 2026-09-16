@@ -41,6 +41,7 @@ pub struct Generation {
 }
 #[derive(Default)]
 pub struct Review {
+    pub interaction: crate::workflow::PrState,
     pub detail: Option<Arc<PrDetail>>,
     pub timeline: Vec<TimelineItem>,
     pub checks: Vec<Check>,
@@ -71,6 +72,7 @@ pub struct Review {
 }
 
 pub enum Message {
+    Workflow(crate::workflow::Event),
     Inbox(u64, Result<Vec<PrSummary>, String>),
     InboxStats(u64, Vec<(String, Option<PrStats>)>),
     Repositories(Result<Vec<String>, String>),
@@ -89,6 +91,7 @@ pub enum Message {
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    Workflow(crate::workflow::WAction),
     SelectPr(usize),
     OpenPr,
     SetView(View),
@@ -120,6 +123,7 @@ pub enum Action {
 }
 
 pub enum Modal {
+    Workflow(Box<crate::workflow::Wizard>),
     Clone {
         value: String,
         key: String,
@@ -139,6 +143,7 @@ pub enum Modal {
 }
 
 pub struct App {
+    pub workflow: crate::workflow::State,
     pub storage: Storage,
     pub config: Config,
     pub inbox: Vec<PrSummary>,
@@ -207,6 +212,7 @@ impl App {
             selected: 0,
             inbox_loading: false,
             inbox_error: None,
+            workflow: Default::default(),
             home: true,
             inbox_tab: InboxTab::ReviewRequests,
             authored_state: PrState::Open,
@@ -262,7 +268,10 @@ impl App {
             self.load_inbox();
         }
     }
-    fn spawn(&mut self, work: impl FnOnce(Sender<Message>, Cancel) + Send + 'static) -> Cancel {
+    pub(crate) fn spawn(
+        &mut self,
+        work: impl FnOnce(Sender<Message>, Cancel) + Send + 'static,
+    ) -> Cancel {
         let sender = self.sender.clone();
         let cancel = Cancel::default();
         let token = cancel.clone();
@@ -486,6 +495,11 @@ impl App {
             self.file = 0;
             self.horizontal = 0;
         }
+        if index != self.selected {
+            self.workflow.cursor = None;
+            self.workflow.selection = None;
+            self.workflow.nav = 0;
+        }
         self.selected = index;
         self.invalidate();
         let Some(key) = self.inbox.get(index).map(|pr| pr.key.clone()) else {
@@ -532,6 +546,9 @@ impl App {
             .root
             .clone()
             .or_else(|| self.config.repositories.get(&pr.key.repository()).cloned());
+        self.workflow.cursor = None;
+        self.workflow.selection = None;
+        self.workflow.nav = 0;
         self.opened = Some(id.clone());
         self.home = false;
         self.view = View::Guide;
@@ -708,6 +725,7 @@ impl App {
                     r.guide = Some(Arc::new(guide));
                     r.guide_model = Some(model);
                     r.guide_error = None;
+                    self.sync_progress(id);
                     self.notice = "Loaded cached guide".into();
                     self.invalidate();
                     return;
@@ -772,6 +790,14 @@ impl App {
         }
     }
     pub fn refresh(&mut self) {
+        if !self.home && self.view == View::Diff {
+            if let Some(id) = self.key()
+                && let Some(r) = self.reviews.get_mut(&id)
+            {
+                r.interaction.github_loaded = false;
+            }
+            self.load_viewed();
+        }
         let Some(id) = self.key() else {
             self.load_inbox();
             return;
@@ -954,6 +980,10 @@ impl App {
     }
     fn receive(&mut self, message: Message) {
         match message {
+            Message::Workflow(event) => {
+                self.workflow_receive(event);
+                return;
+            }
             Message::Inbox(id, output) => {
                 if id != self.inbox_id {
                     return;
@@ -1126,6 +1156,10 @@ impl App {
                             }
                             r.root = Some(root);
                             r.snapshot = Some(Arc::new(snapshot));
+                            r.interaction = Default::default();
+                            self.workflow.cursor = None;
+                            self.workflow.selection = None;
+                            self.workflow.nav = 0;
                             r.context.clear();
                             r.expanded.clear();
                             r.guide_error = None;
@@ -1214,13 +1248,20 @@ impl App {
                 }
             }
         }
+        if let Some(id) = self.key() {
+            self.sync_progress(&id);
+        }
         self.invalidate();
     }
     pub fn action(&mut self, action: Action) {
         match action {
+            Action::Workflow(action) => self.workflow_action(action),
             Action::SelectPr(index) => self.select(index),
             Action::OpenPr => self.open(),
             Action::SetView(view) => {
+                self.workflow.cursor = None;
+                self.workflow.selection = None;
+                self.workflow.nav = 0;
                 self.chapter_target = None;
                 let Some(id) = self.key() else {
                     return;
@@ -1238,6 +1279,9 @@ impl App {
                 } else {
                     Focus::Navigation
                 };
+                if view == View::Diff {
+                    self.load_viewed();
+                }
                 self.invalidate();
             }
             Action::Back => {
@@ -1271,12 +1315,16 @@ impl App {
             }
             Action::SaveRepositories => self.save_repositories(),
             Action::SelectFile(file) => {
+                self.workflow.cursor = None;
+                self.workflow.selection = None;
                 self.focus = Focus::Navigation;
                 self.file = file;
                 self.scroll = 0;
                 self.invalidate();
             }
             Action::Jump(row) => {
+                self.workflow.cursor = Some(row);
+                self.workflow.selection = None;
                 self.scroll = row;
                 self.focus = Focus::Content;
             }
@@ -1311,6 +1359,13 @@ impl App {
                 };
                 if let Some(section) = doc.sections.get(index) {
                     self.scroll = section.start;
+                    self.workflow.cursor = Some(section.start);
+                    self.workflow.selection = None;
+                    self.workflow.nav = doc
+                        .navigation
+                        .iter()
+                        .position(|item| item.chapter == index)
+                        .unwrap_or(0);
                     self.focus = Focus::Content;
                 }
             }
@@ -1384,6 +1439,8 @@ impl App {
                 .and_then(|r| r.snapshot.as_ref())
                 .map(|s| s.files.len())
                 .unwrap_or(0);
+            self.workflow.cursor = None;
+            self.workflow.selection = None;
             self.file = self
                 .file
                 .saturating_add_signed(delta as isize)
@@ -1391,19 +1448,15 @@ impl App {
             self.scroll = 0;
             self.invalidate();
         } else if self.focus == Focus::Navigation && self.view == View::Guide {
-            if let Some(doc) = &self.document {
-                let current = doc
-                    .sections
-                    .iter()
-                    .rposition(|s| s.start <= self.scroll)
-                    .unwrap_or(0);
-                let index = current
-                    .saturating_add_signed(delta as isize)
-                    .min(doc.sections.len().saturating_sub(1));
-                if let Some(section) = doc.sections.get(index) {
-                    self.scroll = section.start;
-                }
-            }
+            let count = self.document.as_ref().map_or(0, |d| d.navigation.len());
+            let index = self
+                .workflow
+                .nav
+                .saturating_add_signed(delta as isize)
+                .min(count.saturating_sub(1));
+            self.workflow_action(crate::workflow::WAction::Nav(index));
+        } else if !self.home && self.view != View::Overview {
+            self.move_diff(delta, false);
         } else {
             let max = self
                 .document
@@ -1418,11 +1471,37 @@ impl App {
             self.quit = true;
             return;
         }
+        if matches!(self.modal, Some(Modal::Workflow(_))) {
+            self.workflow_key(key);
+            return;
+        }
         if self.modal.is_some() {
             self.modal_key(key);
             return;
         }
         match key.code {
+            KeyCode::Char('/') => self.workflow_action(crate::workflow::WAction::Open),
+            KeyCode::Up | KeyCode::Down
+                if key.modifiers.contains(KeyModifiers::SHIFT)
+                    && self.focus == Focus::Content
+                    && !self.home
+                    && self.view != View::Overview =>
+            {
+                self.move_diff(if key.code == KeyCode::Up { -1 } else { 1 }, true);
+            }
+            KeyCode::Left | KeyCode::Right
+                if self.focus == Focus::Content
+                    && !self.home
+                    && self.view != View::Overview
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.workflow.side = if key.code == KeyCode::Left {
+                    crate::review::Side::Left
+                } else {
+                    crate::review::Side::Right
+                };
+                self.workflow.selection = None;
+            }
             KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
                 self.action(Action::Chapter(false))
             }
@@ -1445,8 +1524,8 @@ impl App {
             KeyCode::Enter => {
                 if self.home {
                     self.open();
-                } else {
-                    self.focus = Focus::Content;
+                } else if self.view != View::Overview {
+                    self.enter_diff();
                 }
             }
             KeyCode::Up => self.move_scroll(-1),
@@ -1454,6 +1533,8 @@ impl App {
             KeyCode::PageUp => self.move_scroll(-(self.viewport as i32)),
             KeyCode::PageDown | KeyCode::Char(' ') => self.move_scroll(self.viewport as i32),
             KeyCode::Home => {
+                self.workflow.cursor = Some(0);
+                self.workflow.selection = None;
                 self.scroll = 0;
                 if self.focus == Focus::Navigation && self.home {
                     self.select(0);
@@ -1525,6 +1606,7 @@ impl App {
             return;
         };
         match modal {
+            Modal::Workflow(modal) => self.modal = Some(Modal::Workflow(modal)),
             Modal::Repositories {
                 manage,
                 mut query,
@@ -1695,6 +1777,13 @@ impl App {
     }
     pub fn paste(&mut self, text: String) {
         match &mut self.modal {
+            Some(Modal::Workflow(modal)) => {
+                if let crate::workflow::Wizard::Compose(draft) = modal.as_mut()
+                    && draft.focus == 0
+                {
+                    draft.editor.insert(&text);
+                }
+            }
             Some(Modal::Clone { value, .. }) => value.push_str(text.trim()),
             Some(Modal::Repositories {
                 query, selected, ..
