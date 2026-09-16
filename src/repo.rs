@@ -114,7 +114,15 @@ fn revision_ref(pr: &PrDetail, kind: &str) -> String {
     )
 }
 
-fn sync_revisions(root: &Path, pr: &PrDetail, cancel: &Cancel, progress: &Progress) -> Result<()> {
+pub(crate) fn sync_revisions(
+    root: &Path,
+    pr: &PrDetail,
+    cancel: &Cancel,
+    progress: &Progress,
+) -> Result<()> {
+    pr.key.validate()?;
+    sha(&pr.head)?;
+    sha(&pr.base)?;
     let mut missing = Vec::new();
     for (kind, revision) in [("head", &pr.head), ("base", &pr.base)] {
         let reference = revision_ref(pr, kind);
@@ -355,18 +363,50 @@ pub(crate) fn checkout_git(root: &Path, cancel: &Cancel) -> Result<Command> {
 }
 
 pub struct Worktree {
+    disposable: bool,
     root: PathBuf,
     pub path: PathBuf,
     directory: Option<tempfile::TempDir>,
     _lease: crate::worktrees::Lease,
 }
 impl Worktree {
+    /// Only the explicitly disposable conflict-resolution attempt uses this.
+    /// Guide worktrees keep their conservative cleanup policy.
+    pub(crate) fn discard(&mut self) -> Result<()> {
+        if self.directory.is_none() {
+            return Ok(());
+        }
+        if self.path.exists() {
+            process::checked(
+                checkout_git(&self.root, &Cancel::default())?
+                    .args(["worktree", "remove", "--force"])
+                    .arg(&self.path),
+                &Cancel::default(),
+            )?;
+        }
+        if let Some(directory) = self.directory.take() {
+            directory.close()?;
+        }
+        Ok(())
+    }
     pub fn create(root: &Path, revision: &str, cancel: &Cancel) -> Result<Self> {
+        Self::create_inner(root, revision, cancel, false)
+    }
+    pub(crate) fn create_disposable(root: &Path, revision: &str, cancel: &Cancel) -> Result<Self> {
+        Self::create_inner(root, revision, cancel, true)
+    }
+    fn create_inner(
+        root: &Path,
+        revision: &str,
+        cancel: &Cancel,
+        disposable: bool,
+    ) -> Result<Self> {
         sha(revision)?;
         let directory = tempfile::Builder::new().prefix("difu-review-").tempdir()?;
         let path = directory.path().join("source");
         let lease = crate::worktrees::register(directory.path(), root, &path)?;
         let mut tree = Self {
+            disposable,
             _lease: lease,
             root: root.to_owned(),
             path,
@@ -401,6 +441,9 @@ impl Worktree {
         Ok(tree)
     }
     pub fn cleanup(&mut self) -> Result<()> {
+        if self.disposable {
+            return self.discard();
+        }
         let Some(directory) = self.directory.take() else {
             return Ok(());
         };

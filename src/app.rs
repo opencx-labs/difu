@@ -86,6 +86,9 @@ pub struct Review {
     pub detail: Option<Arc<PrDetail>>,
     pub timeline: Vec<TimelineItem>,
     pub checks: Vec<Check>,
+    pub check_report: Option<CheckReport>,
+    pub failures: HashMap<String, crate::ci::Failures>,
+    pub failures_loading: std::collections::HashSet<String>,
     pub detail_error: Option<String>,
     pub timeline_error: Option<String>,
     pub checks_error: Option<String>,
@@ -112,7 +115,35 @@ pub struct Review {
     pub snapshot_id: u64,
 }
 
+impl Review {
+    /// Lifecycle metadata remains live even when the reviewed code is pinned.
+    fn update_state(&mut self, state: &str) {
+        let state = match state {
+            "OPEN" | "open" => "open",
+            "CLOSED" | "closed" => "closed",
+            "MERGED" | "merged" => "merged",
+            _ => return,
+        };
+        // A delayed response cannot reopen a merged PR; GitHub never does that.
+        let state = if self.detail.as_ref().is_some_and(|pr| pr.state == "merged") {
+            "merged"
+        } else {
+            state
+        };
+        for detail in [&mut self.detail, &mut self.preparing_detail]
+            .into_iter()
+            .flatten()
+        {
+            Arc::make_mut(detail).state = state.into();
+        }
+        if let Some(newer) = &mut self.newer {
+            newer.state = state.into();
+        }
+    }
+}
+
 pub enum Message {
+    Failures(String, String, crate::ci::Failures),
     Definition(u64, Result<Arc<crate::navigation::Definition>, String>),
     Workflow(crate::workflow::Event),
     Inbox(u64, Result<Vec<PrSummary>, String>),
@@ -120,7 +151,7 @@ pub enum Message {
     Repositories(Result<Vec<String>, String>),
     Detail(String, Result<PrDetail, String>),
     Timeline(String, Result<Vec<TimelineItem>, String>),
-    Checks(String, Result<Vec<Check>, String>),
+    Checks(String, Result<CheckReport, String>),
     Poll(String, u64, Result<Option<PrDetail>, String>),
     Snapshot(String, u64, Result<(PathBuf, Snapshot), String>),
     SnapshotProgress(String, u64, repo::SnapshotProgress),
@@ -216,6 +247,7 @@ pub struct App {
     pub file: usize,
     pub modal: Option<Modal>,
     pub models: Vec<ModelInfo>,
+    pub model_purpose: ModelPurpose,
     pub models_loading: bool,
     pub models_error: Option<String>,
     pub notice: Notice,
@@ -279,6 +311,7 @@ impl App {
             file: 0,
             modal: None,
             models: Vec::new(),
+            model_purpose: ModelPurpose::Guide,
             models_loading: false,
             models_error: None,
             notice: Notice::default(),
@@ -855,6 +888,12 @@ impl App {
             return;
         };
         if self.view == View::Overview {
+            if let Some(review) = self.reviews.get_mut(&id) {
+                review
+                    .failures
+                    .retain(|_, failures| !failures.tests.is_empty());
+                review.poll_at = None;
+            }
             if let Some(key) = self
                 .review()
                 .and_then(|r| r.detail.as_ref())
@@ -905,6 +944,10 @@ impl App {
         }
     }
     pub fn load_models(&mut self) {
+        self.load_models_for(ModelPurpose::Guide);
+    }
+    pub fn load_models_for(&mut self, purpose: ModelPurpose) {
+        self.model_purpose = purpose;
         self.modal = Some(Modal::Models {
             selected: 0,
             effort: 0,
@@ -920,7 +963,8 @@ impl App {
         });
     }
     pub fn model_options(&self, query: &str) -> Vec<ModelChoice> {
-        let mut choices = vec![ModelChoice::default()];
+        let recommended = self.model_purpose.recommended();
+        let mut choices = vec![recommended.clone()];
         for model in &self.models {
             for effort in &model.efforts {
                 let choice = ModelChoice {
@@ -936,9 +980,9 @@ impl App {
         if !self
             .models
             .iter()
-            .any(|m| m.id == "gpt-5.6-luna" && m.efforts.iter().any(|e| e == "high"))
+            .any(|m| m.id == recommended.model && m.efforts.contains(&recommended.effort))
         {
-            choices.retain(|c| *c != ModelChoice::default());
+            choices.retain(|c| *c != recommended);
         }
         let query = query.to_lowercase();
         choices
@@ -951,10 +995,18 @@ impl App {
             .collect()
     }
     fn apply_model(&mut self, choice: ModelChoice) {
-        self.config.model = choice;
-        self.save_config();
+        let mut config = self.config.clone();
+        match self.model_purpose {
+            ModelPurpose::Guide => config.model = choice,
+            ModelPurpose::Conflicts => config.conflict_model = choice,
+        }
+        if let Err(error) = self.storage.save_config(&config) {
+            self.notice = Notice::error(format!("Could not save model: {error:#}"));
+            return;
+        }
+        self.config = config;
         self.modal = None;
-        self.notice = Notice::success("Model saved. Open a PR or choose Regenerate to use it.");
+        self.notice = Notice::success(format!("{} saved", self.model_purpose.label()));
         self.invalidate();
     }
     pub fn tick(&mut self) {
@@ -1093,7 +1145,11 @@ impl App {
                 r.poll_at = Some(Instant::now());
                 r.revision_poll_at = Some(Instant::now());
                 match output {
-                    Ok(pr) => {
+                    Ok(mut pr) => {
+                        r.update_state(&pr.state);
+                        if r.detail.as_ref().is_some_and(|old| old.state == "merged") {
+                            pr.state = "merged".into();
+                        }
                         if let Some(summary) = self.inbox.iter_mut().find(|p| p.key.id() == id) {
                             summary.title = pr.title.clone();
                             summary.author = pr.author.clone();
@@ -1138,16 +1194,44 @@ impl App {
                     }
                 }
             }
+            Message::Failures(id, url, failures) => {
+                if let Some(r) = self.reviews.get_mut(&id) {
+                    r.failures_loading.remove(&url);
+                    r.failures.insert(url, failures);
+                }
+            }
             Message::Checks(id, output) => {
+                let mut failed = Vec::new();
                 if let Some(r) = self.reviews.get_mut(&id) {
                     r.polling = false;
                     match output {
                         Ok(items) => {
-                            r.checks = items;
-                            r.checks_error = None;
+                            r.update_state(&items.state);
+                            for check in items.checks.iter().filter(|c| c.state == "fail") {
+                                if let Some(pr) = &r.detail
+                                    && !r.failures.contains_key(&check.url)
+                                    && r.failures_loading.insert(check.url.clone())
+                                {
+                                    failed.push((pr.key.clone(), check.clone()));
+                                }
+                            }
+                            r.checks = items.checks.clone();
+                            r.checks_error = items.rules_error.clone();
+                            r.check_report = Some(items);
                         }
                         Err(e) => r.checks_error = Some(e),
                     }
+                }
+                if !failed.is_empty() {
+                    self.spawn(move |tx, cancel| {
+                        for (key, check) in failed {
+                            if cancel.cancelled() {
+                                break;
+                            }
+                            let result = crate::ci::load(&key, &check, &cancel);
+                            let _ = tx.send(Message::Failures(id.clone(), check.url, result));
+                        }
+                    });
                 }
             }
             Message::Poll(id, snapshot_id, detail) => {
@@ -1157,7 +1241,11 @@ impl App {
                         return;
                     }
                     match detail {
-                        Ok(Some(pr)) => {
+                        Ok(Some(mut pr)) => {
+                            r.update_state(&pr.state);
+                            if r.detail.as_ref().is_some_and(|old| old.state == "merged") {
+                                pr.state = "merged".into();
+                            }
                             if (r.snapshot.is_some() || r.preparing)
                                 && r.detail.as_ref().is_some_and(|old| {
                                     old.head != pr.head
@@ -1607,6 +1695,13 @@ impl App {
             self.modal_key(key);
             return;
         }
+        let plain = !key.modifiers.intersects(
+            KeyModifiers::CONTROL
+                | KeyModifiers::ALT
+                | KeyModifiers::SUPER
+                | KeyModifiers::HYPER
+                | KeyModifiers::META,
+        );
         match key.code {
             KeyCode::Char('/') => self.workflow_action(crate::workflow::WAction::Open),
             KeyCode::Up | KeyCode::Down
@@ -1696,9 +1791,11 @@ impl App {
             } else {
                 Action::SetView(View::Diff)
             }),
-            KeyCode::F(1) => self.action(Action::Help),
-            KeyCode::F(2) => self.load_models(),
-            KeyCode::F(3) if self.home && self.inbox_tab != InboxTab::ReviewRequests => {
+            KeyCode::Char('?') if plain => self.action(Action::Help),
+            KeyCode::Char('m') if plain => self.load_models(),
+            KeyCode::Char('s')
+                if plain && self.home && self.inbox_tab != InboxTab::ReviewRequests =>
+            {
                 let state = match self.state() {
                     PrState::Open => PrState::Merged,
                     PrState::Merged => PrState::Closed,
@@ -1707,13 +1804,17 @@ impl App {
                 };
                 self.action(Action::SetState(state));
             }
-            KeyCode::F(4) if self.home && self.inbox_tab == InboxTab::Repositories => {
-                self.choose_repositories(key.modifiers.contains(KeyModifiers::SHIFT));
+            KeyCode::Char('f' | 'F')
+                if plain && self.home && self.inbox_tab == InboxTab::Repositories =>
+            {
+                self.choose_repositories(
+                    key.code == KeyCode::Char('F') || key.modifiers.contains(KeyModifiers::SHIFT),
+                );
             }
-            KeyCode::F(5) => self.refresh(),
-            KeyCode::F(6) => self.action(Action::Regenerate),
-            KeyCode::F(7) => self.action(Action::Locate),
-            KeyCode::F(8) => self.cancel(),
+            KeyCode::Char('r') if plain => self.refresh(),
+            KeyCode::Char('g') if plain => self.action(Action::Regenerate),
+            KeyCode::Char('l') if plain => self.action(Action::Locate),
+            KeyCode::Char('x') if plain => self.cancel(),
             KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.action(Action::ToggleLayout);
             }
@@ -2291,6 +2392,92 @@ mod tests {
             changed_files: 1,
         }
     }
+    #[test]
+    fn live_pr_state_updates_without_replacing_pinned_code_or_guide() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = App::new(
+            Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().into(),
+            },
+            Config::default(),
+        );
+        let pr = detail("pinned");
+        let id = pr.key.id();
+        let snapshot = Arc::new(Snapshot {
+            base: "base".into(),
+            head: "pinned".into(),
+            merge_base: "base".into(),
+            head_tree: "tree".into(),
+            base_tree: "base tree".into(),
+            files: Vec::new(),
+        });
+        let guide = Arc::new(Guide {
+            chapters: Vec::new(),
+        });
+        app.reviews.insert(
+            id.clone(),
+            Review {
+                detail: Some(Arc::new(pr.clone())),
+                snapshot: Some(snapshot.clone()),
+                guide: Some(guide.clone()),
+                ..Review::default()
+            },
+        );
+        for state in ["CLOSED", "OPEN", "MERGED"] {
+            app.receive(Message::Checks(
+                id.clone(),
+                Ok(CheckReport {
+                    state: state.into(),
+                    head: "new".into(),
+                    base: "new base".into(),
+                    ..CheckReport::default()
+                }),
+            ));
+            let review = app.reviews.get(&id).context("Missing review")?;
+            let pinned = review.detail.as_ref().context("Missing detail")?;
+            assert_eq!(pinned.state, state.to_lowercase());
+            assert_eq!(pinned.head, "pinned");
+            assert!(Arc::ptr_eq(
+                review.snapshot.as_ref().context("Missing snapshot")?,
+                &snapshot
+            ));
+            assert!(Arc::ptr_eq(
+                review.guide.as_ref().context("Missing guide")?,
+                &guide
+            ));
+        }
+        // A queued response from before merging cannot resurrect the Open badge.
+        app.receive(Message::Detail(id.clone(), Ok(pr)));
+        assert_eq!(
+            app.reviews
+                .get(&id)
+                .and_then(|r| r.detail.as_ref())
+                .map(|p| p.state.as_str()),
+            Some("merged")
+        );
+        // Full-detail refreshes must also update a pinned review's lifecycle state.
+        app.reviews.get_mut(&id).context("Missing review")?.detail =
+            Some(Arc::new(detail("pinned")));
+        let mut merged = detail("new");
+        merged.state = "merged".into();
+        app.receive(Message::Detail(id.clone(), Ok(merged)));
+        let review = app.reviews.get(&id).context("Missing review")?;
+        assert_eq!(
+            review.detail.as_ref().context("Missing detail")?.state,
+            "merged"
+        );
+        assert_eq!(
+            review.detail.as_ref().context("Missing detail")?.head,
+            "pinned"
+        );
+        assert_eq!(
+            review.newer.as_ref().context("Missing new revision")?.head,
+            "new"
+        );
+        Ok(())
+    }
+
     #[test]
     fn polling_pins_inflight_snapshot_and_ignores_stale_results() -> Result<()> {
         let dir = tempfile::tempdir()?;

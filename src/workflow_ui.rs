@@ -43,13 +43,32 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     let mut rows = Vec::new();
     match &wizard {
+        Wizard::Resolve { key, head, model } => {
+            rows.push(ui::bold("Resolve conflicts and push", ACCENT));
+            rows.extend(ui::prose(&format!("{}\nRevision: {head}\nModel: {model}\n\nCodex edits only conflicted text files in an isolated worktree. Difu validates, commits and pushes to the PR branch without force. Project checks run in CI.\n\nFailures discard the isolated attempt and report the error; no automatic retry.", key.id()), inner.width as usize));
+            rows.push(ui::text("", DIM));
+            rows.push(action("[ Resolve and push · Enter ]", WAction::Resolve));
+            rows.push(action("[ Back · Esc ]", WAction::Back));
+        }
+        Wizard::Resolving { activity } => {
+            rows.push(ui::bold("Resolving PR conflicts", ACCENT));
+            rows.extend(ui::prose(activity, inner.width as usize));
+            rows.push(ui::text("", DIM));
+            rows.push(action("[ Cancel · x / Esc ]", WAction::CancelResolution));
+        }
+
         Wizard::Home(selected) => {
             rows.push(ui::bold("Actions", ACCENT));
             rows.push(ui::text("↑↓ select · Enter open · Esc close", DIM));
             rows.push(ui::text("", DIM));
-            for (i, label) in ["PR controls", "Memory management · worktrees"]
-                .iter()
-                .enumerate()
+            for (i, label) in [
+                "PR controls",
+                "Memory management · worktrees",
+                "Default guide model",
+                "Default conflict resolve model",
+            ]
+            .iter()
+            .enumerate()
             {
                 rows.push(action(
                     format!("{} {label}", if i == *selected { ">" } else { " " }),
@@ -68,6 +87,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 "Merge with admin override",
                 "Squash merge with admin override",
                 "Close PR (optional comment)",
+                "Resolve conflicts",
             ]
             .iter()
             .enumerate()
@@ -114,7 +134,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 ));
             }
             rows.push(ui::text(
-                "Tab focus/complete @mention · Ctrl+Enter next · F5 mentions · Esc back",
+                "Tab focus/complete @mention · Ctrl+Enter next · Ctrl+R mentions · Esc back",
                 DIM,
             ));
             let top = rows.len() as u16;
@@ -197,7 +217,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     if app.workflow.mentions_loading.contains(&draft.key.id()) {
                         "Refreshing mention suggestions…"
                     } else {
-                        "[ Refresh @mention suggestions · F5 ]"
+                        "[ Refresh @mention suggestions · Ctrl+R ]"
                     },
                     WAction::RefreshMentions,
                 ));
@@ -260,7 +280,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ));
             rows.push(action("[ Delete selected · Enter ]", WAction::DeleteOne));
             rows.push(action("[ Delete all stale · A ]", WAction::DeleteStale));
-            rows.push(action("[ Refresh · F5 ]", WAction::Trees));
+            rows.push(action("[ Refresh · r ]", WAction::Trees));
             if *loading {
                 rows.push(ui::text("Inspecting worktrees…", DIM));
             }
@@ -321,10 +341,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
     if app.workflow.busy {
-        app.hits.clear();
+        app.hits
+            .retain(|(_, action)| matches!(action, Action::Workflow(WAction::CancelResolution)));
         frame.render_widget(
-            Paragraph::new("Working… waiting for confirmation")
-                .style(Style::default().fg(ACCENT).bg(BG)),
+            Paragraph::new(if app.workflow.conflict_cancel.is_some() {
+                "Working… x / Esc cancels the isolated attempt"
+            } else {
+                "Working… waiting for confirmation"
+            })
+            .style(Style::default().fg(ACCENT).bg(BG)),
             Rect::new(inner.x, rect.bottom().saturating_sub(2), inner.width, 1),
         );
     }

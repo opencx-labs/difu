@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use difu::{
     app::{Action, App, View},
     model::{InboxTab, PrKey, PrState},
@@ -134,6 +135,8 @@ fn scripted_workflow() -> Result<()> {
 }
 
 fn exercise(root: &Path) -> Result<()> {
+    exercise_checks(root)?;
+    exercise_mention_shortcut(root)?;
     exercise_writes(root)?;
     let storage = Storage {
         config: root.join("config.json"),
@@ -246,13 +249,13 @@ fn exercise(root: &Path) -> Result<()> {
     assert!(app.review().is_some_and(|r| r.newer.is_some()
         && r.guide.is_some()
         && r.snapshot.as_ref().is_some_and(|s| s.head == original_head)));
-    app.action(Action::Refresh);
+    app.key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
     wait(&mut app, |a| a.review().is_some_and(|r| !r.preparing))?;
     assert!(app.review().is_some_and(|r| r.preparation_failed
         && r.guide.is_some()
         && r.snapshot.as_ref().is_some_and(|s| s.head == original_head)));
     assert!(render(&mut app, 180)?.contains("Automatic PR sync failed"));
-    app.action(Action::Regenerate);
+    app.key_event(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
     wait(&mut app, |a| a.review().is_some_and(|r| !r.preparing))?;
     assert_eq!(fs::read_to_string(root.join("turns"))?, "turn\n");
     fs::write(&revision_file, original_revisions)?;
@@ -270,7 +273,7 @@ fn exercise(root: &Path) -> Result<()> {
     assert!(app.document.as_ref().is_some_and(|d| d.guide_columns));
     app.action(Action::SetView(View::Diff));
     assert!(render(&mut app, 140)?.contains("main.rs"));
-    app.action(Action::Models);
+    app.key_event(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
     wait(&mut app, |a| !a.models_loading)?;
     assert_eq!(app.model_options("luna").len(), 1);
     assert_eq!(app.model_options("sol").len(), 2);
@@ -304,7 +307,8 @@ fn exercise(root: &Path) -> Result<()> {
     assert_eq!(app.inbox.first().context("No authored PR")?.key.number, 2);
     assert_eq!(app.state(), PrState::Open);
     for state in [PrState::Merged, PrState::Closed, PrState::All] {
-        app.action(Action::SetState(state));
+        app.key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!(app.state(), state);
         wait(&mut app, |a| !a.inbox_loading)?;
         assert!(app.inbox_error.is_none());
     }
@@ -328,7 +332,7 @@ fn exercise(root: &Path) -> Result<()> {
     app.action(Action::SaveRepositories);
     wait(&mut app, |a| !a.inbox_loading)?;
     assert_eq!(app.inbox.len(), 2);
-    app.action(Action::Repositories(false));
+    app.key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
     app.action(Action::ToggleRepository("example/project".into()));
     app.action(Action::SaveRepositories);
     wait(&mut app, |a| !a.inbox_loading)?;
@@ -355,7 +359,7 @@ fn exercise(root: &Path) -> Result<()> {
             .get("example/second"),
         Some(&true)
     );
-    app.action(Action::Repositories(false));
+    app.key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
     app.action(Action::AllRepositories);
     // Cancelling must preserve the saved active filters.
     app.key_event(crossterm::event::KeyEvent::new(
@@ -366,7 +370,7 @@ fn exercise(root: &Path) -> Result<()> {
         app.config.review_repositories.get("example/project"),
         Some(&false)
     );
-    app.action(Action::Repositories(false));
+    app.key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
     app.action(Action::ToggleRepository("example/second".into()));
     app.action(Action::SaveRepositories);
     wait(&mut app, |a| !a.inbox_loading)?;
@@ -668,6 +672,93 @@ fn exercise_writes(root: &Path) -> Result<()> {
     assert_eq!(
         review::cached_mentions(&storage, &key)?.users,
         mentions.users
+    );
+    Ok(())
+}
+
+fn exercise_checks(root: &Path) -> Result<()> {
+    let key = PrKey {
+        owner: "example".into(),
+        repo: "project".into(),
+        number: 1,
+    };
+    let cancel = Cancel::default();
+    fs::write(root.join("status-case"), "conflict")?;
+    let report = difu::github::checks(&key, &cancel)?;
+    assert_eq!(report.mergeable, "CONFLICTING");
+    assert_eq!(report.checks.len(), 2);
+    assert!(report.checks.iter().all(|c| c.state == "expected"));
+    fs::write(root.join("status-case"), "unknown")?;
+    let report = difu::github::checks(&key, &cancel)?;
+    assert_eq!(report.mergeable, "UNKNOWN");
+    assert!(report.checks.is_empty());
+    fs::write(root.join("status-case"), "failure")?;
+    let report = difu::github::checks(&key, &cancel)?;
+    let check = report.checks.first().context("Missing failed check")?;
+    assert_eq!(check.state, "fail");
+    let failures = difu::ci::load(&key, check, &cancel);
+    assert!(
+        failures
+            .tests
+            .first()
+            .is_some_and(|t| t.name.contains("sends reply"))
+    );
+    fs::write(root.join("status-case"), "rules-denied")?;
+    let report = difu::github::checks(&key, &cancel)?;
+    assert!(report.rules_error.is_some());
+    assert_eq!(
+        report.checks.first().map(|c| c.state.as_str()),
+        Some("fail")
+    );
+    fs::remove_file(root.join("status-case"))?;
+    Ok(())
+}
+
+fn exercise_mention_shortcut(root: &Path) -> Result<()> {
+    use difu::{
+        editor::Editor,
+        review::Mentions,
+        workflow::{Compose, Kind, Wizard},
+    };
+    let storage = Storage {
+        config: root.join("mention-shortcut-config.json"),
+        cache: root.into(),
+    };
+    let mut app = App::new(storage, Config::default());
+    let key = PrKey {
+        owner: "example".into(),
+        repo: "project".into(),
+        number: 1,
+    };
+    app.workflow.mentions.insert(
+        key.id(),
+        Mentions {
+            users: vec!["cached-user".into()],
+            fetched: chrono::Utc::now().timestamp(),
+        },
+    );
+    app.wizard(Wizard::Compose(Compose {
+        key: key.clone(),
+        head: "head".into(),
+        kind: Kind::Review,
+        editor: Editor::default(),
+        choice: 0,
+        focus: 0,
+        mention: 0,
+    }));
+    app.key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+    assert!(app.workflow.mentions_loading.is_empty());
+    app.key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    assert!(app.workflow.mentions_loading.contains(&key.id()));
+    wait(&mut app, |a| a.workflow.mentions_loading.is_empty())?;
+    assert!(
+        app.workflow
+            .mentions
+            .get(&key.id())
+            .is_some_and(|m| m.users.iter().any(|u| u == "alice"))
+    );
+    assert!(
+        matches!(&app.modal,Some(difu::app::Modal::Workflow(w)) if matches!(w.as_ref(),Wizard::Compose(draft) if draft.editor.text()=="r"))
     );
     Ok(())
 }

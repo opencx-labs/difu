@@ -238,6 +238,38 @@ pub(crate) fn rows(review: &Review, width: u16) -> Vec<TextRow> {
         }
     }
     rows.push(TextRow::default());
+    if let Some(status) = &review.check_report
+        && status.state == "OPEN"
+        && pr.state == "open"
+    {
+        let (title, color, explanation) = match status.mergeable.as_str() {
+            "CONFLICTING" => (
+                "MERGE CONFLICTS",
+                RED,
+                "This branch has conflicts that must be resolved. Checks may be waiting for conflict resolution. Open / → PR controls → Resolve conflicts.",
+            ),
+            "MERGEABLE" => (
+                "MERGE STATUS",
+                GREEN,
+                "No merge conflicts reported by GitHub.",
+            ),
+            _ => (
+                "MERGE STATUS",
+                DIM,
+                "GitHub is calculating whether this branch has conflicts…",
+            ),
+        };
+        let mut body = prose(explanation, inner);
+        if review
+            .detail
+            .as_ref()
+            .is_some_and(|pr| pr.head != status.head || pr.base != status.base)
+        {
+            body.extend(prose("This is the latest GitHub status; your review snapshot is older. Refresh to load the new revision.", inner));
+        }
+        rows.extend(card(width, vec![bold(title, color)], body));
+        rows.push(TextRow::default());
+    }
     let mut checks = Vec::new();
     if let Some(error) = &review.checks_error {
         checks.extend(prose(error, inner));
@@ -249,7 +281,7 @@ pub(crate) fn rows(review: &Review, width: u16) -> Vec<TextRow> {
         let (symbol, color) = match check.state.as_str() {
             "pass" => ("✓", GREEN),
             "fail" => ("×", RED),
-            "pending" => ("◌", ACCENT),
+            "pending" | "expected" => ("◌", ACCENT),
             _ => ("−", DIM),
         };
         let duration = chrono::DateTime::parse_from_rfc3339(&check.started)
@@ -281,6 +313,124 @@ pub(crate) fn rows(review: &Review, width: u16) -> Vec<TextRow> {
         )],
         checks,
     ));
+    let failed = review
+        .checks
+        .iter()
+        .filter(|c| c.state == "fail")
+        .collect::<Vec<_>>();
+    if !failed.is_empty() {
+        rows.push(TextRow::default());
+        let mut body = Vec::new();
+        for check in failed {
+            body.push(bold(clean(&check.name), RED));
+            if let Some(failures) = review.failures.get(&check.url) {
+                for test in &failures.tests {
+                    body.extend(prose(&format!("× {}", clean(&test.name)), inner));
+                    for line in &test.excerpt {
+                        body.extend(prose(&format!("  {}", clean(line)), inner));
+                    }
+                    body.push(TextRow::default());
+                }
+                if let Some(explanation) = &failures.explanation {
+                    body.extend(prose(explanation, inner));
+                }
+            } else {
+                body.push(text("Loading failed test details…", DIM));
+            }
+            if !check.url.is_empty() {
+                body.push(link(
+                    "↗ Open failed check / full log",
+                    Action::Link(check.url.clone()),
+                ));
+            }
+            body.push(TextRow::default());
+        }
+        rows.extend(card(width, vec![bold("FAILED TESTS", RED)], body));
+    }
     rows.push(TextRow::default());
     rows
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+    use crate::model::{Check, CheckReport, PrDetail, PrKey};
+    use std::sync::Arc;
+    #[test]
+    fn conflicts_and_empty_checks_are_not_parsing_errors_and_failures_follow_checks() {
+        let mut review = Review {
+            detail: Some(Arc::new(PrDetail {
+                key: PrKey {
+                    owner: "example".into(),
+                    repo: "repo".into(),
+                    number: 1,
+                },
+                title: "PR".into(),
+                body: String::new(),
+                author: "author".into(),
+                head: "head".into(),
+                base: "base".into(),
+                head_branch: "feature".into(),
+                base_branch: "main".into(),
+                state: "open".into(),
+                additions: 1,
+                deletions: 1,
+                changed_files: 1,
+            })),
+            check_report: Some(CheckReport {
+                state: "OPEN".into(),
+                mergeable: "CONFLICTING".into(),
+                head: "head".into(),
+                base: "base".into(),
+                ..CheckReport::default()
+            }),
+            checks: vec![Check {
+                name: "lint".into(),
+                state: "expected".into(),
+                ..Check::default()
+            }],
+            ..Review::default()
+        };
+        let output = |r: &Review| {
+            rows(r, 110)
+                .iter()
+                .map(|r| {
+                    r.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let text = output(&review);
+        assert!(text.contains("MERGE CONFLICTS"));
+        assert!(text.contains("lint · expected"));
+        assert!(!text.contains("EOF"));
+        review.check_report = Some(CheckReport {
+            state: "OPEN".into(),
+            mergeable: "UNKNOWN".into(),
+            ..CheckReport::default()
+        });
+        assert!(output(&review).contains("calculating"));
+        assert!(!output(&review).contains("MERGE CONFLICTS"));
+        review.checks = vec![Check {
+            name: "unit tests".into(),
+            state: "fail".into(),
+            url: "https://github.com/example/repo/actions/runs/1/job/2".into(),
+            ..Check::default()
+        }];
+        review.failures.insert(
+            "https://github.com/example/repo/actions/runs/1/job/2".into(),
+            crate::ci::parse("test mail::reply ... FAILED\nassertion failed"),
+        );
+        let text = output(&review);
+        assert!(
+            text.find("CHECKS")
+                .zip(text.find("FAILED TESTS"))
+                .is_some_and(|(a, b)| a < b)
+        );
+        assert!(text.contains("mail::reply"));
+        assert!(text.contains("assertion failed"));
+    }
 }

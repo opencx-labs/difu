@@ -14,7 +14,7 @@ pub(crate) fn command() -> Command {
     cmd
 }
 
-fn json(args: &[&str], cancel: &Cancel) -> Result<Value> {
+pub(crate) fn json(args: &[&str], cancel: &Cancel) -> Result<Value> {
     let output = process::run(command().args(args), None, cancel)?;
     if output.code != 0 {
         bail!("GitHub: {}", String::from_utf8_lossy(&output.stderr).trim());
@@ -193,10 +193,14 @@ pub fn detail(key: &PrKey, cancel: &Cancel) -> Result<PrDetail> {
         ],
         cancel,
     )?;
+    parse_detail(key, &v)
+}
+
+pub(crate) fn parse_detail(key: &PrKey, v: &Value) -> Result<PrDetail> {
     Ok(PrDetail {
         key: key.clone(),
-        title: text(&v, "title"),
-        body: text(&v, "body"),
+        title: text(v, "title"),
+        body: text(v, "body"),
         author: text(v.get("user").unwrap_or(&Value::Null), "login"),
         head: text(v.get("head").unwrap_or(&Value::Null), "sha"),
         base: text(v.get("base").unwrap_or(&Value::Null), "sha"),
@@ -205,7 +209,7 @@ pub fn detail(key: &PrKey, cancel: &Cancel) -> Result<PrDetail> {
         state: if v.get("merged").unwrap_or(&Value::Null).as_bool() == Some(true) {
             "merged".into()
         } else {
-            text(&v, "state")
+            text(v, "state")
         },
         additions: v
             .get("additions")
@@ -350,38 +354,215 @@ pub fn timeline(key: &PrKey, cancel: &Cancel) -> Result<Vec<TimelineItem>> {
     Ok(items)
 }
 
-pub fn checks(key: &PrKey, cancel: &Cancel) -> Result<Vec<Check>> {
-    let output = process::run(
-        command().args([
-            "pr",
-            "checks",
-            &key.url(),
-            "--json=name,state,bucket,startedAt,completedAt,link",
-        ]),
-        None,
-        cancel,
-    )?;
-    // gh uses nonzero statuses for valid failed/pending checks.
-    let value: Value = serde_json::from_slice(&output.stdout).with_context(|| {
-        format!(
-            "Could not load checks: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+const CHECK_QUERY: &str = "query($owner:String!,$repo:String!,$number:Int!,$cursor:String){repository(owner:$owner,name:$repo){pullRequest(number:$number){mergeable mergeStateStatus headRefOid baseRefOid state baseRef{name branchProtectionRule{requiredStatusCheckContexts}} commits(last:1){nodes{commit{statusCheckRollup{contexts(first:100,after:$cursor){nodes{__typename ... on CheckRun{name status conclusion startedAt completedAt detailsUrl checkSuite{app{databaseId}}} ... on StatusContext{context state targetUrl createdAt}} pageInfo{hasNextPage endCursor}}}}}}}}}";
+
+fn required_checks(value: &Value) -> Result<Vec<(String, Option<u64>)>> {
+    let mut checks = std::collections::BTreeSet::new();
+    for page in value.as_array().context("Invalid branch rules pages")? {
+        for rule in page.as_array().context("Invalid branch rules")? {
+            if text(rule, "type") == "required_status_checks" {
+                for check in rule
+                    .pointer("/parameters/required_status_checks")
+                    .and_then(Value::as_array)
+                    .context("Missing required check contexts")?
+                {
+                    let name = check
+                        .get("context")
+                        .and_then(Value::as_str)
+                        .context("Missing required check name")?;
+                    checks.insert((
+                        name.to_owned(),
+                        check.get("integration_id").and_then(Value::as_u64),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(checks.into_iter().collect())
+}
+
+fn parse_check(v: &Value) -> Result<(Check, Option<u64>)> {
+    let (name, status, started, completed, url, app) = match text(v, "__typename").as_str() {
+        "CheckRun" => (
+            text(v, "name"),
+            if text(v, "status") == "COMPLETED" {
+                text(v, "conclusion")
+            } else {
+                "PENDING".into()
+            },
+            text(v, "startedAt"),
+            text(v, "completedAt"),
+            text(v, "detailsUrl"),
+            v.pointer("/checkSuite/app/databaseId")
+                .and_then(Value::as_u64),
+        ),
+        "StatusContext" => (
+            text(v, "context"),
+            text(v, "state"),
+            text(v, "createdAt"),
+            String::new(),
+            text(v, "targetUrl"),
+            None,
+        ),
+        _ => bail!("Unknown GitHub check type"),
+    };
+    let state = match status.as_str() {
+        "SUCCESS" => "pass",
+        "FAILURE" | "ERROR" | "TIMED_OUT" | "ACTION_REQUIRED" | "STARTUP_FAILURE" => "fail",
+        "CANCELLED" => "cancelled",
+        "SKIPPED" | "NEUTRAL" => "skipping",
+        _ => "pending",
+    };
+    Ok((
+        Check {
+            name,
+            state: state.into(),
+            started,
+            completed,
+            url,
+        },
+        app,
+    ))
+}
+
+pub fn checks(key: &PrKey, cancel: &Cancel) -> Result<CheckReport> {
+    key.validate()?;
+    let mut report = CheckReport::default();
+    let mut cursor: Option<String> = None;
+    let mut actual = Vec::new();
+    let mut required = std::collections::BTreeSet::new();
+    let mut base_branch = String::new();
+    loop {
+        let mut args = vec![
+            "api".to_owned(),
+            "graphql".into(),
+            "-f".into(),
+            format!("query={CHECK_QUERY}"),
+            "-f".into(),
+            format!("owner={}", key.owner),
+            "-f".into(),
+            format!("repo={}", key.repo),
+            "-F".into(),
+            format!("number={}", key.number),
+        ];
+        if let Some(cursor) = &cursor {
+            args.extend(["-f".into(), format!("cursor={cursor}")]);
+        }
+        let value = json(&args.iter().map(String::as_str).collect::<Vec<_>>(), cancel)?;
+        ensure_no_graphql_errors(&value)?;
+        let pr = value
+            .pointer("/data/repository/pullRequest")
+            .filter(|v| !v.is_null())
+            .context("Missing PR check status")?;
+        let head = text(pr, "headRefOid");
+        let base = text(pr, "baseRefOid");
+        anyhow::ensure!(
+            report.head.is_empty() || (report.head == head && report.base == base),
+            "PR revisions changed while reading checks; refresh again"
+        );
+        report.head = head;
+        report.base = base;
+        report.state = text(pr, "state");
+        report.mergeable = text(pr, "mergeable");
+        report.merge_state = text(pr, "mergeStateStatus");
+        if let Some(name) = pr.pointer("/baseRef/name").and_then(Value::as_str) {
+            base_branch = name.into();
+        }
+        if let Some(contexts) = pr
+            .pointer("/baseRef/branchProtectionRule/requiredStatusCheckContexts")
+            .and_then(Value::as_array)
+        {
+            for context in contexts {
+                if let Some(name) = context.as_str() {
+                    required.insert((name.to_owned(), None));
+                }
+            }
+        }
+        let contexts = pr.pointer("/commits/nodes/0/commit/statusCheckRollup/contexts");
+        if let Some(contexts) = contexts.filter(|v| !v.is_null()) {
+            for v in contexts
+                .get("nodes")
+                .and_then(Value::as_array)
+                .context("Missing check contexts")?
+            {
+                actual.push(parse_check(v)?);
+            }
+            if contexts
+                .pointer("/pageInfo/hasNextPage")
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                let next = contexts
+                    .pointer("/pageInfo/endCursor")
+                    .and_then(Value::as_str)
+                    .context("Missing check cursor")?;
+                anyhow::ensure!(
+                    cursor.as_deref() != Some(next),
+                    "Repeated GitHub check cursor"
+                );
+                cursor = Some(next.into());
+                continue;
+            }
+        }
+        break;
+    }
+    if !base_branch.is_empty() && report.state == "OPEN" {
+        let mut url = url::Url::parse("https://api.github.com/repos/")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Invalid rules URL"))?
+            .pop_if_empty()
+            .extend([
+                key.owner.as_str(),
+                key.repo.as_str(),
+                "rules",
+                "branches",
+                &base_branch,
+            ]);
+        match json(
+            &[
+                "api",
+                "--paginate",
+                "--slurp",
+                url.path().trim_start_matches('/'),
+            ],
+            cancel,
         )
-    })?;
-    value
-        .as_array()
-        .context("Invalid check response")?
-        .iter()
-        .map(|v| {
-            Ok(Check {
-                name: text(v, "name"),
-                state: text(v, "bucket"),
-                started: text(v, "startedAt"),
-                completed: text(v, "completedAt"),
-                url: text(v, "link"),
-            })
-        })
-        .collect()
+        .and_then(|v| required_checks(&v))
+        {
+            Ok(checks) => required.extend(checks),
+            Err(error) => {
+                report.rules_error = Some(format!("Could not load required checks: {error:#}"))
+            }
+        }
+    }
+    for (name, app) in required {
+        if !actual
+            .iter()
+            .any(|(check, id)| check.name == name && (app.is_none() || app == *id))
+        {
+            report.checks.push(Check {
+                name,
+                state: "expected".into(),
+                ..Check::default()
+            });
+        }
+    }
+    report
+        .checks
+        .dedup_by(|a, b| a.name == b.name && a.state == b.state);
+    report
+        .checks
+        .extend(actual.into_iter().map(|(check, _)| check));
+    Ok(report)
+}
+
+fn ensure_no_graphql_errors(value: &Value) -> Result<()> {
+    anyhow::ensure!(
+        value.get("errors").is_none(),
+        "GitHub: {}",
+        value.get("errors").unwrap_or(&Value::Null)
+    );
+    Ok(())
 }
 
 pub fn open_url(url: &str, cancel: &Cancel) -> Result<()> {
@@ -421,6 +602,29 @@ pub fn open_url(url: &str, cancel: &Cancel) -> Result<()> {
 #[cfg(test)]
 mod inbox_tests {
     use super::*;
+
+    #[test]
+    fn empty_rollups_required_rules_and_failed_checks_are_distinct() -> Result<()> {
+        let rules = serde_json::json!([[{"type":"required_status_checks", "parameters":{"required_status_checks":[{"context":"lint"},{"context":"lint"},{"context":"tests","integration_id":15368}]}}]]);
+        assert_eq!(
+            required_checks(&rules)?,
+            vec![("lint".into(), None), ("tests".into(), Some(15368))]
+        );
+        let (run, app) = parse_check(
+            &serde_json::json!({"__typename":"CheckRun","name":"tests","status":"COMPLETED","conclusion":"FAILURE","checkSuite":{"app":{"databaseId":15368}}}),
+        )?;
+        assert_eq!(run.state, "fail");
+        assert_eq!(app, Some(15368));
+        let (context, _) = parse_check(
+            &serde_json::json!({"__typename":"StatusContext","context":"deploy","state":"PENDING"}),
+        )?;
+        assert_eq!(context.state, "pending");
+        assert!(
+            ensure_no_graphql_errors(&serde_json::json!({"errors":[{"message":"denied"}]}))
+                .is_err()
+        );
+        Ok(())
+    }
 
     #[test]
     fn empty_repository_selection_never_queries_github() -> Result<()> {

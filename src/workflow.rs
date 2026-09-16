@@ -2,7 +2,7 @@
 use crate::{
     app::{App, Focus, Message, Modal, Notice},
     editor::Editor,
-    model::PrKey,
+    model::{ModelChoice, ModelPurpose, PrKey},
     review::{self, Anchor, Operation, Side},
     storage, worktrees,
 };
@@ -54,6 +54,7 @@ pub struct State {
     pub mentions: HashMap<String, review::Mentions>,
     pub mentions_loading: BTreeSet<String>,
     pub busy: bool,
+    pub conflict_cancel: Option<crate::process::Cancel>,
 }
 #[derive(Default)]
 pub struct PrState {
@@ -121,6 +122,14 @@ impl Compose {
 }
 #[derive(Clone, Debug)]
 pub enum Wizard {
+    Resolve {
+        key: PrKey,
+        head: String,
+        model: ModelChoice,
+    },
+    Resolving {
+        activity: String,
+    },
     Home(usize),
     Controls {
         key: PrKey,
@@ -148,6 +157,8 @@ pub enum Wizard {
 }
 #[derive(Clone, Debug)]
 pub enum WAction {
+    Resolve,
+    CancelResolution,
     Open,
     Controls,
     Choose(usize),
@@ -166,6 +177,8 @@ pub enum WAction {
     FocusChoice,
 }
 pub enum Event {
+    ResolutionProgress(String),
+    Resolved(PrKey, Result<String, String>),
     Written(PrKey, Operation, Result<String, String>),
     Viewed(PrKey, String, Result<review::State, String>),
     Mentions(PrKey, Result<review::Mentions, String>),
@@ -181,10 +194,51 @@ impl App {
         self.modal = Some(Modal::Workflow(Box::new(wizard)));
     }
     pub fn workflow_action(&mut self, action: WAction) {
-        if self.workflow.busy {
+        if self.workflow.busy && !matches!(action, WAction::CancelResolution) {
             return;
         }
         match action {
+            WAction::CancelResolution => {
+                if let Some(cancel) = &self.workflow.conflict_cancel {
+                    cancel.cancel();
+                }
+            }
+            WAction::Resolve => {
+                let Some(Modal::Workflow(modal)) = &self.modal else {
+                    return;
+                };
+                let Wizard::Resolve { key, head, model } = modal.as_ref() else {
+                    return;
+                };
+                let (key, head, model) = (key.clone(), head.clone(), model.clone());
+                let root = self
+                    .reviews
+                    .get(&key.id())
+                    .and_then(|r| r.root.clone())
+                    .or_else(|| self.config.repositories.get(&key.repository()).cloned())
+                    .or_else(|| std::env::current_dir().ok());
+                let Some(root) = root else {
+                    self.notice =
+                        Notice::error("Locate the PR's local clone before resolving conflicts");
+                    return;
+                };
+                self.workflow.busy = true;
+                self.wizard(Wizard::Resolving {
+                    activity: "Preparing conflict resolution…".into(),
+                });
+                let cancel = self.spawn(move |tx, cancel| {
+                    let progress_tx = tx.clone();
+                    let progress = std::sync::Arc::new(move |activity| {
+                        let _ = progress_tx
+                            .send(Message::Workflow(Event::ResolutionProgress(activity)));
+                    });
+                    let output = result(crate::conflicts::resolve(
+                        &root, &key, &head, &model, &cancel, progress,
+                    ));
+                    let _ = tx.send(Message::Workflow(Event::Resolved(key, output)));
+                });
+                self.workflow.conflict_cancel = Some(cancel);
+            }
             WAction::Open => {
                 if self.home {
                     self.wizard(Wizard::Home(0));
@@ -209,13 +263,13 @@ impl App {
                     return;
                 };
                 match *modal {
-                    Wizard::Home(_) => {
-                        if index == 0 {
-                            self.workflow_action(WAction::Controls);
-                        } else {
-                            self.workflow_action(WAction::Trees);
-                        }
-                    }
+                    Wizard::Home(_) => match index {
+                        0 => self.workflow_action(WAction::Controls),
+                        1 => self.workflow_action(WAction::Trees),
+                        2 => self.load_models_for(ModelPurpose::Guide),
+                        3 => self.load_models_for(ModelPurpose::Conflicts),
+                        _ => {}
+                    },
                     Wizard::Controls { key, head, .. } => match index {
                         0 => self.compose(key, head, Kind::Review),
                         1..=4 => self.wizard(Wizard::Confirm {
@@ -227,7 +281,13 @@ impl App {
                             },
                             draft: None,
                         }),
-                        _ => self.compose(key, head, Kind::Close),
+                        5 => self.compose(key, head, Kind::Close),
+                        6 => self.wizard(Wizard::Resolve {
+                            key,
+                            head,
+                            model: self.config.conflict_model.clone(),
+                        }),
+                        _ => {}
                     },
                     Wizard::Compose(mut draft) => {
                         draft.choice = index.min(draft.choices().len().saturating_sub(1));
@@ -371,7 +431,7 @@ impl App {
     }
     pub fn close_wizard(&mut self) {
         if self.workflow.busy {
-            self.notice = Notice::info("Waiting for GitHub to confirm the operation…");
+            self.notice = Notice::info("Waiting for the active operation to finish…");
             return;
         }
         if let Some(Modal::Workflow(modal)) = self.modal.take() {
@@ -478,6 +538,33 @@ impl App {
     }
     pub fn workflow_receive(&mut self, event: Event) {
         match event {
+            Event::ResolutionProgress(activity) => {
+                if let Some(Modal::Workflow(modal)) = &mut self.modal
+                    && let Wizard::Resolving { activity: current } = modal.as_mut()
+                {
+                    *current = activity;
+                }
+            }
+            Event::Resolved(key, output) => {
+                self.workflow.busy = false;
+                self.workflow.conflict_cancel = None;
+                let notice = match output {
+                    Ok(message) => Notice::success(message),
+                    Err(error) => Notice::error(error),
+                };
+                self.notice = notice.clone();
+                self.wizard(Wizard::Result { notice });
+                self.spawn(move |tx, cancel| {
+                    let _ = tx.send(Message::Detail(
+                        key.id(),
+                        result(crate::github::detail(&key, &cancel)),
+                    ));
+                    let _ = tx.send(Message::Checks(
+                        key.id(),
+                        result(crate::github::checks(&key, &cancel)),
+                    ));
+                });
+            }
             Event::Mentions(key, output) => {
                 self.workflow.mentions_loading.remove(&key.id());
                 match output {
@@ -590,6 +677,12 @@ impl App {
     }
     pub fn workflow_key(&mut self, key: KeyEvent) {
         if self.workflow.busy {
+            if (key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('x') && key.modifiers.is_empty()))
+                && self.workflow.conflict_cancel.is_some()
+            {
+                self.workflow_action(WAction::CancelResolution);
+            }
             return;
         }
         if key.code == KeyCode::Esc {
@@ -602,11 +695,17 @@ impl App {
         let mut wizard = *modal;
         let mut action = None;
         match &mut wizard {
+            Wizard::Resolve { .. } => {
+                if key.code == KeyCode::Enter {
+                    action = Some(WAction::Resolve);
+                }
+            }
+            Wizard::Resolving { .. } => {}
             Wizard::Home(_) | Wizard::Controls { .. } => {
                 let count = if self.home && matches!(wizard, Wizard::Home(_)) {
-                    2
+                    4
                 } else {
-                    6
+                    7
                 };
                 // Restore below; choosing a menu entry goes through the same mouse action path.
                 let selected = match &mut wizard {
@@ -622,7 +721,7 @@ impl App {
             }
             Wizard::Compose(draft) => {
                 let options = self.mention_options(draft);
-                if key.code == KeyCode::F(5) {
+                if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::CONTROL {
                     action = Some(WAction::RefreshMentions);
                 } else if key.code == KeyCode::Enter
                     && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -681,7 +780,7 @@ impl App {
                 KeyCode::Down => *selected = (*selected + 1).min(entries.len().saturating_sub(1)),
                 KeyCode::Delete | KeyCode::Enter => action = Some(WAction::DeleteOne),
                 KeyCode::Char('a') => action = Some(WAction::DeleteStale),
-                KeyCode::F(5) => action = Some(WAction::Trees),
+                KeyCode::Char('r') if key.modifiers.is_empty() => action = Some(WAction::Trees),
                 _ => {}
             },
             Wizard::Delete { .. } => {
@@ -893,10 +992,12 @@ impl App {
             .iter()
             .find(|f| target > f.start && target < f.end)
             .map_or(0, |f| f.header.len());
-        if target < self.scroll + sticky {
-            self.scroll = target.saturating_sub(sticky);
-        } else if target >= self.scroll + self.viewport.saturating_sub(2) {
-            self.scroll = target.saturating_sub(self.viewport.saturating_sub(3));
-        }
+        let height = self.viewport.max(1);
+        // Track the cursor around the middle immediately, instead of waiting for
+        // it to reach a viewport edge. Keep wrapped sticky headings above it.
+        let offset = (height / 2).max(sticky.min(height.saturating_sub(1)));
+        self.scroll = target
+            .saturating_sub(offset)
+            .min(doc.rows.len().saturating_sub(height));
     }
 }
