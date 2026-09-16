@@ -1,6 +1,6 @@
 //! Interactive review state and explicit, asynchronous wizard actions.
 use crate::{
-    app::{App, Focus, Message, Modal},
+    app::{App, Focus, Message, Modal, Notice},
     editor::Editor,
     model::PrKey,
     review::{self, Anchor, Operation, Side},
@@ -135,7 +135,7 @@ pub enum Wizard {
         draft: Option<Compose>,
     },
     Result {
-        message: String,
+        notice: Notice,
     },
     Trees {
         entries: Vec<worktrees::Entry>,
@@ -201,7 +201,7 @@ impl App {
                     });
                     self.load_viewed();
                 } else {
-                    self.notice = "Wait for PR details before opening its controls".into();
+                    self.notice = Notice::info("Wait for PR details before opening its controls");
                 }
             }
             WAction::Choose(index) => {
@@ -346,7 +346,7 @@ impl App {
                     if !paths.is_empty() {
                         self.wizard(Wizard::Delete { directories: paths });
                     } else {
-                        self.notice = "No eligible inactive worktrees selected".into();
+                        self.notice = Notice::info("No eligible inactive worktrees selected");
                     }
                 }
             }
@@ -371,7 +371,7 @@ impl App {
     }
     pub fn close_wizard(&mut self) {
         if self.workflow.busy {
-            self.notice = "Waiting for GitHub to confirm the operation…".into();
+            self.notice = Notice::info("Waiting for GitHub to confirm the operation…");
             return;
         }
         if let Some(Modal::Workflow(modal)) = self.modal.take() {
@@ -430,7 +430,9 @@ impl App {
                 Ok(cached) => {
                     self.workflow.mentions.insert(id.clone(), cached);
                 }
-                Err(e) => self.notice = format!("Could not read mention cache: {e:#}"),
+                Err(e) => {
+                    self.notice = Notice::error(format!("Could not read mention cache: {e:#}"))
+                }
             }
         }
         if !force
@@ -482,7 +484,7 @@ impl App {
                     Ok(m) => {
                         self.workflow.mentions.insert(key.id(), m);
                     }
-                    Err(e) => self.notice = format!("Mentions refresh failed: {e}"),
+                    Err(e) => self.notice = Notice::error(format!("Mentions refresh failed: {e}")),
                 }
             }
             Event::Viewed(key, head, output) => {
@@ -498,9 +500,9 @@ impl App {
                         }
                         Ok(_) => {
                             self.notice =
-                                "PR changed while loading Viewed state; refresh it".into();
+                                Notice::info("PR changed while loading Viewed state; refresh it");
                         }
-                        Err(e) => self.notice = e,
+                        Err(e) => self.notice = Notice::error(e),
                     }
                 }
             }
@@ -527,10 +529,10 @@ impl App {
                         }
                         if !matches!(operation, Operation::Viewed { .. }) {
                             self.wizard(Wizard::Result {
-                                message: message.clone(),
+                                notice: Notice::success(message.clone()),
                             });
                         }
-                        self.notice = message;
+                        self.notice = Notice::success(message);
                         let id = key.id();
                         self.spawn(move |tx, cancel| {
                             let _ = tx.send(Message::Detail(
@@ -553,9 +555,9 @@ impl App {
                                 other => self.wizard(other),
                             }
                         }
-                        self.notice = format!(
+                        self.notice = Notice::error(format!(
                             "{error} · Check GitHub before retrying if the result is uncertain."
-                        );
+                        ));
                     }
                 }
             }
@@ -570,13 +572,17 @@ impl App {
                         });
                     }
                 }
-                Err(error) => self.wizard(Wizard::Result { message: error }),
+                Err(error) => self.wizard(Wizard::Result {
+                    notice: Notice::error(error),
+                }),
             },
             Event::Deleted(output) => {
                 self.workflow.busy = false;
                 match output {
                     Ok(()) => self.workflow_action(WAction::Trees),
-                    Err(error) => self.wizard(Wizard::Result { message: error }),
+                    Err(error) => self.wizard(Wizard::Result {
+                        notice: Notice::error(error),
+                    }),
                 }
             }
         }
@@ -711,13 +717,17 @@ impl App {
                         {
                             Ok(progress) => r.interaction.progress = progress,
                             Err(e) => {
-                                self.notice = format!("Could not restore chapter progress: {e:#}")
+                                self.notice = Notice::error(format!(
+                                    "Could not restore chapter progress: {e:#}"
+                                ))
                             }
                         }
                     }
                 }
             }
-            Err(e) => self.notice = format!("Could not identify chapter progress: {e}"),
+            Err(e) => {
+                self.notice = Notice::error(format!("Could not identify chapter progress: {e}"))
+            }
         }
     }
     pub fn enter_diff(&mut self) {
@@ -755,7 +765,8 @@ impl App {
                             .join(format!("progress-{}.json", r.interaction.progress_key)),
                         &r.interaction.progress,
                     ) {
-                        self.notice = format!("Could not save chapter progress: {e:#}");
+                        self.notice =
+                            Notice::error(format!("Could not save chapter progress: {e:#}"));
                     }
                 }
                 self.invalidate();
@@ -773,7 +784,7 @@ impl App {
                 if !r.interaction.github_loaded {
                     self.load_viewed();
                     self.notice =
-                        "Loading GitHub Viewed state; press Enter again when ready".into();
+                        Notice::info("Loading GitHub Viewed state; press Enter again when ready");
                     return;
                 }
                 let operation = Operation::Viewed {
@@ -792,7 +803,7 @@ impl App {
             }
             Some(target) => {
                 let Some(mut anchor) = target.line(self.workflow.side) else {
-                    self.notice = "Choose a side with a code line using Left/Right".into();
+                    self.notice = Notice::info("Choose a side with a code line using Left/Right");
                     return;
                 };
                 if let Some(start) = &self.workflow.selection

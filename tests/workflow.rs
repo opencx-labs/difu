@@ -158,10 +158,37 @@ fn exercise(root: &Path) -> Result<()> {
     assert!(overview.contains("ACTIVITY"));
     assert!(overview.contains("2026-09-10"));
     assert!(overview.contains("1 file"));
-    assert!(overview.contains("CHECKS"));
+
     assert!(overview.contains("1 Review requests"));
     assert!(overview.contains("2 Authored"));
     assert!(!overview.contains("2 Guide"));
+    // Card layout reflows the activity into a taller, bounded column. Checks
+    // and their click targets must remain reachable after scrolling and resize.
+    for width in [80, 240] {
+        render(&mut app, width)?;
+        if width == 240 {
+            assert_eq!(app.content_rect.width, 110);
+        }
+        let doc = app.document.as_ref().context("Missing overview")?;
+        assert!(doc.rows.iter().all(|row| {
+            row.right
+                .spans
+                .iter()
+                .map(ratatui::text::Span::width)
+                .sum::<usize>()
+                <= usize::from(doc.width)
+        }));
+        app.scroll = doc.max_scroll(app.viewport);
+        assert!(render(&mut app, width)?.contains("CHECKS"));
+        let (rect, _) = app
+            .hits
+            .iter()
+            .find(|(_, action)| matches!(action,Action::Link(url) if url.ends_with("/checks")))
+            .context("Missing check link")?;
+        assert!(rect.x >= app.content_rect.x && rect.right() <= app.content_rect.right());
+        assert!(rect.y >= app.content_rect.y && rect.bottom() <= app.content_rect.bottom());
+        app.scroll = 0;
+    }
     assert!(
         app.review()
             .is_some_and(|r| r.checks.first().is_some_and(|c| c.state == "pending"))

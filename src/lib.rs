@@ -5,6 +5,8 @@ pub mod diff;
 pub mod editor;
 pub mod github;
 pub mod model;
+pub mod navigation;
+mod overview;
 pub mod process;
 pub mod repo;
 pub mod review;

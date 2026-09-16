@@ -29,6 +29,13 @@ pub struct TextRow {
     pub spans: Vec<Span<'static>>,
     pub action: Option<Action>,
     pub target: Option<crate::workflow::Target>,
+    pub code_links: Vec<CodeLink>,
+}
+#[derive(Clone)]
+pub struct CodeLink {
+    pub column: usize,
+    pub width: usize,
+    pub action: Action,
 }
 #[derive(Clone, Default)]
 pub struct Row {
@@ -102,6 +109,7 @@ pub(crate) fn text(value: impl Into<String>, color: Color) -> TextRow {
         spans: vec![span(value, color)],
         action: None,
         target: None,
+        code_links: Vec::new(),
     }
 }
 pub(crate) fn bold(value: impl Into<String>, color: Color) -> TextRow {
@@ -112,6 +120,7 @@ pub(crate) fn bold(value: impl Into<String>, color: Color) -> TextRow {
         )],
         action: None,
         target: None,
+        code_links: Vec::new(),
     }
 }
 pub(crate) fn link(value: impl Into<String>, action: Action) -> TextRow {
@@ -124,6 +133,7 @@ pub(crate) fn link(value: impl Into<String>, action: Action) -> TextRow {
         )],
         action: Some(action),
         target: None,
+        code_links: Vec::new(),
     }
 }
 fn append(rows: &mut Vec<Row>, right: TextRow) {
@@ -208,6 +218,7 @@ pub(crate) fn prose(source: &str, width: usize) -> Vec<TextRow> {
                     spans: inline(&wrapped),
                     action: None,
                     target: None,
+                    code_links: Vec::new(),
                 }
             });
         }
@@ -384,6 +395,128 @@ fn code(line: Option<&DiffLine>, old: bool, width: usize, horizontal: usize) -> 
     spans
 }
 
+fn code_links(
+    path: &str,
+    line: Option<&DiffLine>,
+    old: bool,
+    width: usize,
+    horizontal: usize,
+    offset: usize,
+) -> Vec<CodeLink> {
+    if !crate::navigation::supported(path) {
+        return Vec::new();
+    }
+    let Some(line) = line else {
+        return Vec::new();
+    };
+    let Some(number) = (if old { line.old } else { line.new }) else {
+        return Vec::new();
+    };
+    let prefix = format!("{number:>5}   ").width();
+    let available = width.saturating_sub(prefix);
+    let mut links = Vec::new();
+    let mut chars = line.text.char_indices().peekable();
+    let mut cells: usize = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    while let Some((byte, ch)) = chars.next() {
+        let cell_width = |c: char| {
+            if c == '\t' {
+                4
+            } else if c.is_control() {
+                0
+            } else {
+                c.width().unwrap_or(0)
+            }
+        };
+        if let Some(end) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == end {
+                quote = None;
+            }
+            cells += cell_width(ch);
+            continue;
+        }
+        if matches!(ch, '\'' | '"' | '`') {
+            quote = Some(ch);
+            cells += cell_width(ch);
+            continue;
+        }
+        if ch == '/'
+            && chars
+                .peek()
+                .is_some_and(|(_, next)| matches!(next, '/' | '*'))
+        {
+            break;
+        }
+        if ch.is_alphabetic() || matches!(ch, '_' | '$') {
+            let start = cells;
+            cells += cell_width(ch);
+            let mut end = byte + ch.len_utf8();
+            while chars.peek().is_some_and(|(_, c)| {
+                c.is_alphanumeric() || matches!(c, '_' | '$') || c.width() == Some(0)
+            }) {
+                if let Some((index, next)) = chars.next() {
+                    cells += cell_width(next);
+                    end = index + next.len_utf8();
+                }
+            }
+            let name = line.text.get(byte..end).unwrap_or_default();
+            if [
+                "function",
+                "const",
+                "let",
+                "var",
+                "return",
+                "import",
+                "export",
+                "from",
+                "as",
+                "async",
+                "await",
+                "if",
+                "else",
+                "for",
+                "while",
+                "switch",
+                "catch",
+                "new",
+                "class",
+                "type",
+                "interface",
+                "true",
+                "false",
+                "null",
+                "throw",
+            ]
+            .contains(&name)
+            {
+                continue;
+            }
+            let visible_start = start.max(horizontal);
+            let visible_end = cells.min(horizontal.saturating_add(available));
+            if visible_end > visible_start {
+                links.push(CodeLink {
+                    column: offset + prefix + visible_start.saturating_sub(horizontal),
+                    width: visible_end - visible_start,
+                    action: Action::Definition {
+                        path: path.into(),
+                        line: number,
+                        column: byte,
+                        old,
+                    },
+                });
+            }
+        } else {
+            cells += cell_width(ch);
+        }
+    }
+    links
+}
+
 fn code_rows(
     path: &str,
     lines: &[DiffLine],
@@ -404,8 +537,11 @@ fn code_rows(
             let mut spans = code(old, true, left, horizontal);
             spans.push(span("│", BORDER));
             spans.extend(code(new, false, right, horizontal));
+            let mut links = code_links(path, old, true, left, horizontal, 0);
+            links.extend(code_links(path, new, false, right, horizontal, left + 1));
             rows.push(TextRow {
                 spans,
+                code_links: links,
                 action: None,
                 target: Some(crate::workflow::Target::Code {
                     path: path.into(),
@@ -418,6 +554,14 @@ fn code_rows(
         for line in lines {
             rows.push(TextRow {
                 spans: code(Some(line), line.kind == LineKind::Remove, width, horizontal),
+                code_links: code_links(
+                    path,
+                    Some(line),
+                    line.kind == LineKind::Remove,
+                    width,
+                    horizontal,
+                    0,
+                ),
                 action: None,
                 target: Some(crate::workflow::Target::Code {
                     path: path.into(),
@@ -555,109 +699,7 @@ fn build(app: &App, width: u16) -> Document {
         return doc;
     };
     if app.view == View::Overview {
-        let Some(pr) = review.detail.as_ref() else {
-            append(
-                &mut doc.rows,
-                text(
-                    review
-                        .detail_error
-                        .as_deref()
-                        .unwrap_or("Loading PR details…"),
-                    DIM,
-                ),
-            );
-            return doc;
-        };
-        let width = width.saturating_sub(4) as usize;
-        for row in prose(&pr.title, width) {
-            append(&mut doc.rows, row);
-        }
-        append(
-            &mut doc.rows,
-            text(
-                format!(
-                    "{} · {} · {} ← {}",
-                    pr.key.id(),
-                    pr.author,
-                    pr.base_branch,
-                    pr.head_branch
-                ),
-                DIM,
-            ),
-        );
-        append(
-            &mut doc.rows,
-            text(
-                format!(
-                    "{} files changed   +{} −{}   {}",
-                    pr.changed_files, pr.additions, pr.deletions, pr.state
-                ),
-                GREEN,
-            ),
-        );
-        append(&mut doc.rows, TextRow::default());
-        for row in prose(&pr.body, width) {
-            append(&mut doc.rows, row);
-        }
-        append(&mut doc.rows, TextRow::default());
-        append(&mut doc.rows, bold("ACTIVITY", ACCENT));
-        append(&mut doc.rows, TextRow::default());
-        if let Some(error) = &review.timeline_error {
-            for row in prose(error, width) {
-                append(&mut doc.rows, row);
-            }
-        }
-        for item in &review.timeline {
-            append(
-                &mut doc.rows,
-                bold(
-                    format!("{} · {}", clean(&item.author), clean(&item.kind)),
-                    TEXT,
-                ),
-            );
-            append(&mut doc.rows, text(&item.date, DIM));
-            for row in prose(&item.body, width) {
-                append(&mut doc.rows, row);
-            }
-            if !item.url.is_empty() {
-                append(
-                    &mut doc.rows,
-                    link("↗ View on GitHub", Action::Link(item.url.clone())),
-                );
-            }
-            append(&mut doc.rows, text("─".repeat(width.min(70)), BORDER));
-            append(&mut doc.rows, TextRow::default());
-        }
-        append(&mut doc.rows, bold("CHECKS · live every 10s", ACCENT));
-        if let Some(error) = &review.checks_error {
-            for row in prose(error, width) {
-                append(&mut doc.rows, row);
-            }
-        }
-        if review.checks.is_empty() && review.checks_error.is_none() {
-            append(&mut doc.rows, text("No checks reported", DIM));
-        }
-        for check in &review.checks {
-            let color = match check.state.as_str() {
-                "pass" => GREEN,
-                "fail" => RED,
-                _ => DIM,
-            };
-            let duration = chrono::DateTime::parse_from_rfc3339(&check.started)
-                .ok()
-                .map(|start| {
-                    let end = chrono::DateTime::parse_from_rfc3339(&check.completed)
-                        .unwrap_or_else(|_| chrono::Utc::now().fixed_offset());
-                    format!("{}s", (end - start).num_seconds().max(0))
-                })
-                .unwrap_or_default();
-            let mut row = text(
-                format!("{}  {}  {}", check.state, clean(&check.name), duration),
-                color,
-            );
-            if !check.url.is_empty() {
-                row.action = Some(Action::Link(check.url.clone()));
-            }
+        for row in crate::overview::rows(review, width) {
             append(&mut doc.rows, row);
         }
         return doc;
@@ -966,6 +1008,18 @@ fn paint_diff(
             ));
         }
     }
+    // Symbol regions take precedence over the row's selection regions. The
+    // resolver checks the exact AST binding before presenting any definition.
+    for link in &row.code_links {
+        if let (Ok(column), Ok(width)) = (u16::try_from(link.column), u16::try_from(link.width))
+            && column < code.width
+        {
+            app.hits.push((
+                Rect::new(code.x + column, code.y, width.min(code.width - column), 1),
+                link.action.clone(),
+            ));
+        }
+    }
     let cursor = app.workflow.cursor.unwrap_or(app.scroll);
     let focused = app.focus == Focus::Content && cursor == index;
     let selected = app.workflow.selection.as_ref().is_some_and(|start| {
@@ -1203,6 +1257,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             outer_main,
         );
     }
+    // Center the overview column inside the available pane, including the home preview.
+    app.hits.push((outer_main, Action::Focus(Focus::Content)));
+    let main = if app.view == View::Overview {
+        crate::overview::column(main)
+    } else {
+        main
+    };
     app.content_rect = main;
     app.viewport = main.height as usize;
     app.hits.push((main, Action::Focus(Focus::Content)));
@@ -1425,7 +1486,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else if app.inbox_loading {
         format!("Loading {}…", app.inbox_tab.label().to_lowercase())
     } else {
-        app.notice.clone()
+        String::new()
     };
     if !app.home
         && let Some(review) = app.review()
@@ -1537,10 +1598,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         _ => "Diff",
     };
     let mut focus_line = vec![span(format!("Focus: {focused} · Tab to switch"), ACCENT)];
-    if !app.notice.is_empty() {
+    let notice_in_modal = matches!(
+        &app.modal,
+        Some(Modal::Workflow(wizard))
+            if matches!(wizard.as_ref(), crate::workflow::Wizard::Result { notice }
+                if notice.message == app.notice.message && notice.kind == app.notice.kind)
+    );
+    if !app.notice.message.is_empty() && !notice_in_modal {
         focus_line.push(span(
-            format!(" · {}", clean(&app.notice).replace('\n', " ")),
-            DIM,
+            format!(" · {}", clean(&app.notice.message).replace('\n', " ")),
+            notice_color(app.notice.kind),
         ));
     }
     frame.render_widget(
@@ -1549,6 +1616,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     if app.modal.is_some() {
         draw_modal(frame, app);
+    }
+}
+
+pub(crate) fn notice_color(kind: crate::app::NoticeKind) -> Color {
+    match kind {
+        crate::app::NoticeKind::Info => DIM,
+        crate::app::NoticeKind::Success => GREEN,
+        crate::app::NoticeKind::Error => RED,
     }
 }
 
@@ -1825,7 +1900,120 @@ fn draw_files(frame: &mut Frame, app: &mut App, rect: Rect) {
     }
 }
 
+fn draw_definition(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    let width = area.width.saturating_sub(4).min(120);
+    let height = area.height.saturating_sub(4).min(40);
+    let rect = Rect::new(
+        (area.width - width) / 2,
+        (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .title(" Function definition ")
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(PANEL).fg(TEXT));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    app.hits.clear();
+    let Some(Modal::Definition(viewer)) = &mut app.modal else {
+        return;
+    };
+    let definition = viewer.output.as_ref().and_then(|r| r.as_ref().ok());
+    let path = definition.map_or(viewer.request.path.as_str(), |d| d.path.as_str());
+    let line = definition.map_or(viewer.request.line, |d| d.line as u64);
+    let short_revision: String = viewer.request.revision.chars().take(8).collect();
+    let header = wrapped_text(
+        &format!("{path}:{line} · {short_revision}"),
+        inner.width as usize,
+    );
+    let header_height = header.len().min(inner.height.saturating_sub(3) as usize);
+    for (i, row) in header.iter().take(header_height).enumerate() {
+        frame.render_widget(
+            Paragraph::new(row.as_str()).style(Style::default().fg(ACCENT)),
+            Rect::new(inner.x, inner.y + i as u16, inner.width, 1),
+        );
+    }
+    let body = Rect::new(
+        inner.x,
+        inner.y + header_height as u16 + 1,
+        inner.width,
+        inner.height.saturating_sub(header_height as u16 + 2),
+    );
+    viewer.viewport = body.height as usize;
+    match &viewer.output {
+        None => frame.render_widget(
+            Paragraph::new("Resolving definition from the pinned local revision…")
+                .style(Style::default().fg(DIM)),
+            body,
+        ),
+        Some(Err(error)) => {
+            let rows = wrapped_text(
+                &format!("Definition unavailable\n\n{error}"),
+                body.width as usize,
+            );
+            for (i, row) in rows.iter().take(body.height as usize).enumerate() {
+                frame.render_widget(
+                    Paragraph::new(row.as_str()).style(Style::default().fg(DIM)),
+                    Rect::new(body.x, body.y + i as u16, body.width, 1),
+                );
+            }
+        }
+        Some(Ok(definition)) => {
+            viewer.scroll = viewer.scroll.min(
+                definition
+                    .source
+                    .lines()
+                    .count()
+                    .saturating_sub(viewer.viewport),
+            );
+            for (i, (offset, value)) in definition
+                .source
+                .lines()
+                .enumerate()
+                .skip(viewer.scroll)
+                .take(body.height as usize)
+                .enumerate()
+            {
+                let line = DiffLine {
+                    kind: LineKind::Context,
+                    old: None,
+                    new: Some(definition.line.saturating_add(offset) as u64),
+                    text: value.into(),
+                };
+                frame.render_widget(
+                    Paragraph::new(Line::from(code(
+                        Some(&line),
+                        false,
+                        body.width as usize,
+                        viewer.horizontal,
+                    ))),
+                    Rect::new(body.x, body.y + i as u16, body.width, 1),
+                );
+            }
+        }
+    }
+    if inner.height > 0 {
+        let footer = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
+        frame.render_widget(
+            Paragraph::new("Esc Close   ↑/↓ Scroll   ←/→ Pan   PgUp/PgDn Page")
+                .style(Style::default().fg(ACCENT)),
+            footer,
+        );
+        app.hits.push((
+            Rect::new(footer.x, footer.y, footer.width.min(9), 1),
+            Action::CloseDefinition,
+        ));
+    }
+}
+
 fn draw_modal(frame: &mut Frame, app: &mut App) {
+    if matches!(app.modal, Some(Modal::Definition(_))) {
+        draw_definition(frame, app);
+        return;
+    }
     if matches!(app.modal, Some(Modal::Workflow(_))) {
         crate::workflow_ui::draw(frame, app);
         return;
@@ -1859,6 +2047,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
     };
     let mut input_cursor = None;
     let rows = match modal {
+        Modal::Definition(_) => Vec::new(),
         Modal::Workflow(_) => Vec::new(),
         Modal::Repositories {
             manage,
@@ -1959,6 +2148,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
             text("Tab           Switch navigation / content focus", TEXT),
             text("Cmd+Up/Down   Scroll content by ten lines", TEXT),
             text("Enter         Open PR / comment / toggle completion", TEXT),
+            text("Click symbol  JS/TS function definition · Esc closes", TEXT),
             text("/             PR actions / worktree management", TEXT),
             text("Page Up/Down  Scroll a page · Space scrolls down", TEXT),
             text("Home / End    Jump to start / end", TEXT),
@@ -2266,6 +2456,59 @@ mod tests {
         app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
         app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
         assert_eq!(app.scroll, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn action_notices_render_once_with_outcome_colors() -> Result<()> {
+        use crate::{app::Notice, workflow::Wizard};
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30))?;
+        for (notice, color) in [
+            (Notice::success("merged"), GREEN),
+            (Notice::error("merge failed"), RED),
+            (Notice::info("Waiting for GitHub"), DIM),
+        ] {
+            app.notice = notice;
+            // An open wizard used to overwrite the footer with a second, red copy.
+            for modal in [
+                None,
+                Some(Modal::Workflow(Box::new(Wizard::Home(0)))),
+                Some(Modal::Workflow(Box::new(Wizard::Result {
+                    notice: app.notice.clone(),
+                }))),
+            ] {
+                app.modal = modal;
+                terminal.draw(|f| draw(f, &mut app))?;
+                let buffer = terminal.backend().buffer();
+                let mut matches = 0;
+                for cells in buffer.content.chunks(120) {
+                    let line: String = cells.iter().map(|c| c.symbol()).collect();
+                    if let Some(start) = line.find(&app.notice.message) {
+                        matches += line.matches(&app.notice.message).count();
+                        let column = line.get(..start).context("Notice prefix")?.width();
+                        for cell in cells.iter().skip(column).take(app.notice.message.width()) {
+                            assert_eq!(cell.fg, color);
+                        }
+                    }
+                }
+                assert_eq!(matches, 1, "notice must appear once: {}", app.notice);
+            }
+        }
+        // With no selected PR, the general status must not repeat the footer notice.
+        app.modal = None;
+        app.home = true;
+        app.inbox.clear();
+        terminal.draw(|f| draw(f, &mut app))?;
+        let output: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert_eq!(output.matches(&app.notice.message).count(), 1);
         Ok(())
     }
 
