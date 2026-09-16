@@ -159,6 +159,18 @@ pub struct Check {
     pub url: String,
 }
 
+/// Live GitHub state, independent of the pinned review snapshot.
+#[derive(Clone, Debug, Default)]
+pub struct CheckReport {
+    pub checks: Vec<Check>,
+    pub mergeable: String,
+    pub merge_state: String,
+    pub head: String,
+    pub base: String,
+    pub state: String,
+    pub rules_error: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModelChoice {
     pub model: String,
@@ -169,6 +181,35 @@ impl Default for ModelChoice {
         Self {
             model: "gpt-5.6-luna".into(),
             effort: "high".into(),
+        }
+    }
+}
+impl ModelChoice {
+    pub fn conflict_default() -> Self {
+        Self {
+            model: "gpt-6-astra".into(),
+            effort: "high".into(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ModelPurpose {
+    #[default]
+    Guide,
+    Conflicts,
+}
+impl ModelPurpose {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Guide => "Default guide model",
+            Self::Conflicts => "Default conflict resolve model",
+        }
+    }
+    pub fn recommended(self) -> ModelChoice {
+        match self {
+            Self::Guide => ModelChoice::default(),
+            Self::Conflicts => ModelChoice::conflict_default(),
         }
     }
 }

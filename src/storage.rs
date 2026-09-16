@@ -12,7 +12,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub repositories: BTreeMap<String, PathBuf>,
@@ -21,8 +21,21 @@ pub struct Config {
     pub review_repositories: BTreeMap<String, bool>,
     #[serde(default)]
     pub model: ModelChoice,
+    #[serde(default = "ModelChoice::conflict_default")]
+    pub conflict_model: ModelChoice,
     #[serde(default)]
     pub unified: bool,
+}
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            repositories: BTreeMap::new(),
+            review_repositories: BTreeMap::new(),
+            model: ModelChoice::default(),
+            conflict_model: ModelChoice::conflict_default(),
+            unified: false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -152,6 +165,11 @@ mod tests {
         );
         let old: Config = serde_json::from_str(r#"{"repositories":{},"unified":true}"#)?;
         assert!(old.review_repositories.is_empty());
+        assert_eq!(old.conflict_model, ModelChoice::conflict_default());
+        let saved: Config =
+            serde_json::from_str(r#"{"model":{"model":"custom-guide","effort":"low"}}"#)?;
+        assert_eq!(saved.model.model, "custom-guide");
+        assert_eq!(saved.conflict_model, ModelChoice::conflict_default());
         assert_eq!(
             fs::metadata(&storage.config)?.permissions().mode() & 0o777,
             0o600

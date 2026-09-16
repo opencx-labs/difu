@@ -1,5 +1,7 @@
 pub mod app;
+pub mod ci;
 pub mod codex;
+pub mod conflicts;
 pub mod context;
 pub mod diff;
 pub mod editor;

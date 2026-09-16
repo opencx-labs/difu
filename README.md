@@ -83,7 +83,7 @@ Each PR row shows its opened date, changed-file count, additions in green, and
 removals in red. Counts load in background batches; the list remains usable.
 Lists are cached per tab and filter selection. Returning home or switching tabs
 shows the saved list immediately while GitHub refreshes it in place. If a refresh
-fails, the cached list stays available; **F5** retries.
+fails, the cached list stays available; **r** retries.
 
 Select a PR to preview its description, chronological activity, inline review
 comments, and checks. **Enter** drills into that PR and selects **Guide**, starting
@@ -110,15 +110,15 @@ repository in the Repositories inbox.
 ### States and repository filters
 
 Authored and Repositories default to **Open**. Click **Open / Merged / Closed /
-All**, or use **F3** to cycle states. Closed means closed without merging.
+All**, or use **s** to cycle states. Closed means closed without merging.
 
 On your first visit to Repositories, choose from a searchable list of personal
 and organization repositories available through your GitHub login. Nothing is
 whitelisted automatically. Type to search, use arrows and **Space** or click to
 toggle a repository, then **Enter** or **Save selection** to apply. **Esc** cancels
-unsaved changes. **Shift+F4** edits the whitelist later.
+unsaved changes. **Shift+F** edits the whitelist later.
 
-**F4** opens repository filters. Enable individual whitelisted repositories or
+**f** opens repository filters. Enable individual whitelisted repositories or
 choose **All whitelisted** (**Ctrl+A**), then save. Both the whitelist and its
 enabled/disabled selections are remembered between launches. Disabling every
 repository shows an empty list; it never searches outside your whitelist.
@@ -179,15 +179,15 @@ reject the guide.
 
 Difu checks the open PR's head and base commit IDs through GitHub every 30 seconds.
 This metadata check does not fetch Git objects. Remote updates are announced
-without replacing your current diff or guide. **F5** syncs missing revisions and
+without replacing your current diff or guide. **r** syncs missing revisions and
 refreshes the review; a failed sync keeps your current review usable. If guide
-generation is still running, cancel it with **F8** before refreshing.
+generation is still running, cancel it with **x** before refreshing.
 
 Snapshot preparation shows a five-step progress bar: checking the local clone,
 checking/syncing revisions, finding the merge base, reading changed files, and
 building/validating the diff. The footer includes elapsed time and Git's live
-transfer percentage, size, and speed when available. **F8** cancels preparation;
-**F6** retries a failed preparation.
+transfer percentage, size, and speed when available. **x** cancels preparation;
+**g** retries a failed preparation.
 
 ### Comments, reviews, and PR actions
 
@@ -205,7 +205,10 @@ Closing with a comment performs two operations; a comment failure after closing
 is reported explicitly.
 
 With the diff focused, **>** marks the current line. **Up / Down** moves one row;
-**Command+Up / Down** moves ten. **Left / Right** chooses old/new code, and
+**Command+Up / Down** moves ten. In Guide and Diff, arrow keys, line selection,
+and mouse-wheel movement keep the highlighted code line near the viewport center.
+Scrolling clamps at the beginning and end without adding blank padding.
+**Left / Right** chooses old/new code, and
 **Alt+Left / Right** scrolls horizontally. **Shift+Up / Down** selects a line range
 within one file and side. **Enter** opens the comment editor: publish a standalone
 comment or add it to your GitHub pending review. Existing pending reviews are
@@ -222,7 +225,57 @@ added to a pending review are stored by GitHub.
 Type **@** for mention suggestions from visible organization members and PR
 participants. **Up / Down** chooses a suggestion and **Tab** inserts it. Suggestions
 are cached locally for 24 hours; expired data remains available during background
-refresh. **F5** in the editor explicitly refreshes suggestions.
+refresh. **Ctrl+R** in the editor explicitly refreshes suggestions.
+
+### Conflicts and failed checks
+
+Overview shows GitHub's live mergeability separately from the pinned review
+snapshot, including conflicts and required checks that have not reported yet.
+The preview's Open / Merged / Closed badge updates with live status even while the
+diff and guide stay pinned. An empty check rollup is a valid state. If GitHub is still calculating mergeability,
+difu says so. Check runs and merge status refresh every ten seconds.
+
+A **Failed tests** section appears beneath Checks when checks fail. Difu reads
+GitHub Actions job logs in the background and displays identifiable test names
+with short diagnostic excerpts. Recognized formats include Jest/Vitest, pytest,
+and Rust tests. Logs and parsed failures stay in memory for the session. When
+logs are unavailable, too large, use an unrecognized format, or belong to another
+provider, the section explains the limitation and links to the failed check.
+Refresh retries unavailable details; full logs remain available on GitHub.
+
+### Resolve conflicts
+
+Open **/ → PR controls → Resolve conflicts**. The initial confirmation explains
+that this action automatically commits and pushes after validation.
+
+Difu uses the existing local clone, syncing missing revisions if necessary, and
+creates a disposable detached worktree at the PR's head. It merges the latest
+base revision there and starts Codex using **Astra High** (`gpt-6-astra`, `high`)
+by default. Codex edits only conflicted text files and may read the repository
+for context. Its workspace-write sandbox has network access disabled. Hooks,
+connectors, project instructions and project configuration are disabled for the
+model invocation.
+
+Difu rejects edits outside the original conflict paths, Git index/HEAD changes,
+unresolved entries or markers, and changed file permissions. Binary, symlink,
+submodule and non-UTF-8 conflicts require manual resolution. Git's automatic
+changes in non-conflicted files are preserved. Both branch revisions are checked
+again before the merge commit and before a normal push to the PR's source branch,
+including a fork when permissions permit. Difu never force-pushes or retries a
+failed attempt automatically.
+
+The resolver is instructed **never to run project tests, typechecks, builds,
+linters or dependency installation locally**. Difu performs Git validation;
+project checks are delegated to CI. A successful push does not mean CI passed.
+
+Success, failure and cancellation discard the isolated attempt. Failures show the
+error; if a network interruption makes a push result uncertain, inspect GitHub
+before trying again. Cleanup failures report the remaining worktree path. The
+ordinary worktree manager still protects active or modified guide worktrees.
+
+At home, **/** offers **Default guide model** and **Default conflict resolve model**.
+Each setting has its own model and reasoning level; existing guide settings are
+preserved. Unavailable models report an error without substitution.
 
 ### Chapter completion and GitHub Viewed
 
@@ -256,22 +309,24 @@ bindings.
 | Alt+Left / Alt+Right | Scroll code horizontally |
 | Alt+Up / Alt+Down | Previous / next guide chapter |
 | 1 / 2 / 3 | Home: Review requests / Authored / Repositories; inside a PR: Overview / Guide / Diff |
-| F1 | Help |
-| F2 | Model and reasoning picker |
-| F3 | Cycle PR states in Authored / Repositories |
-| F4 | Filter whitelisted repositories |
-| Shift+F4 | Edit the repository whitelist |
-| F5 | Refresh |
-| F6 | Regenerate / retry |
-| F7 | Choose a local clone path |
-| F8 | Cancel generation or snapshot preparation |
+| ? | Help |
+| m | Model and reasoning picker |
+| s | Cycle PR states in Authored / Repositories |
+| f | Filter whitelisted repositories |
+| Shift+F | Edit the repository whitelist |
+| r | Refresh |
+| g | Regenerate / retry |
+| l | Choose a local clone path |
+| x | Cancel generation, snapshot preparation, or active conflict resolution |
+| Ctrl+R | Refresh mention suggestions in the comment/review editor |
 | Ctrl+B | Side-by-side / unified preference |
 | Ctrl+O | Open the PR on GitHub |
 | Esc | Close dialog / return home / quit |
 | Ctrl+C | Quit and clean up active work |
 
-In the clone dialog, paste a path, use Ctrl+U to clear it, then Enter. Some
-terminals require Fn with function keys; the footer also offers clickable actions.
+In the clone dialog, paste a path, use Ctrl+U to clear it, then Enter. Action
+shortcuts use plain characters outside text inputs. Plain letters in an input
+enter text; the footer also offers clickable actions.
 
 Command shortcuts require a terminal that forwards the Command (Super) modifier.
 Difu enables the enhanced keyboard protocol while running and restores it on exit.
@@ -288,13 +343,13 @@ On Linux, the equivalent modifier is Super; desktop shortcuts may also intercept
 
 ## Codex and caching
 
-The default is **Luna High** (`gpt-5.6-luna`, `high`). F2 discovers the models and
+The default is **Luna High** (`gpt-5.6-luna`, `high`). m discovers the models and
 reasoning levels available through your installed Codex. Luna High is pinned as
 a recommendation when available. Choosing a model saves it for the next opening
 or explicit regeneration; it does not silently restart a running generation.
 An unavailable model produces an error, with no automatic model substitution.
 
-Difu invokes `codex exec` non-interactively, using the existing login, an ephemeral
+Guide generation invokes `codex exec` non-interactively, using the existing login, an ephemeral
 session, a read-only sandbox, and a strict JSON output schema. User config and
 execution-policy rules are ignored for generation. Project instruction loading is
 disabled, and the clone/worktree are marked untrusted for this invocation so their
@@ -313,8 +368,8 @@ and merge base, the complete parsed diff, PR identity/title/description, model,
 reasoning level, prompt, and schema. Commit-message-only rewrites can reuse a
 guide; changed code or guide inputs require a matching cache entry or generation.
 Existing guides from older releases are reused when their original inputs match.
-Cached guides are validated again before use. F6 bypasses the guide cache.
-Damaged cache entries produce an error and can be replaced with F6.
+Cached guides are validated again before use. g bypasses the guide cache.
+Damaged cache entries produce an error and can be replaced with g.
 
 Guide generation shows brief Codex progress preambles alongside elapsed time
 when the model emits them. When commentary is absent, short headings from Codex's
@@ -330,7 +385,7 @@ Settings, cached PR lists, and guides use the OS's standard per-user directories
 | macOS | `~/Library/Application Support/difu/config.json` | `~/Library/Caches/difu/` |
 | Linux | `$XDG_CONFIG_HOME/difu/config.json` (default `~/.config`) | `$XDG_CACHE_HOME/difu/` (default `~/.cache`) |
 
-Settings remember clone paths, model/effort, diff preference, the repository
+Settings remember clone paths, guide and conflict model/effort, diff preference, the repository
 whitelist, and which whitelisted repositories are enabled. Writes are atomic
 and files are created with owner-only permissions. Guide cache files contain PR
 explanations and hunk references. PR-list cache files contain PR titles, authors,

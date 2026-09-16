@@ -2,7 +2,7 @@ use crate::{
     app::{Action, App, Focus, Modal, Review, View},
     context::Direction,
     diff::{DiffFile, DiffLine, Hunk, LineKind, split_rows},
-    model::{InboxTab, ModelChoice, PrState, PrSummary, clean},
+    model::{InboxTab, PrState, PrSummary, clean},
 };
 use ratatui::{
     Frame,
@@ -1181,10 +1181,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .values()
                 .filter(|v| **v)
                 .count();
-            let label = format!(
-                "F4 Repos {enabled}/{}",
-                app.config.review_repositories.len()
-            );
+            let label = format!("f Repos {enabled}/{}", app.config.review_repositories.len());
             let x = button(frame, app, 2, 6, &label, false, Action::Repositories(false));
             if x + 24 < area.width {
                 button(
@@ -1192,7 +1189,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     app,
                     x,
                     6,
-                    "Shift+F4 Whitelist",
+                    "Shift+F Whitelist",
                     false,
                     Action::Repositories(true),
                 );
@@ -1442,7 +1439,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let mut status = if app.home && app.inbox_loading && !app.inbox.is_empty() {
         "Showing cached PRs · Refreshing…".into()
     } else if app.home && app.inbox_error.is_some() && !app.inbox.is_empty() {
-        "Showing cached PRs · Refresh failed · F5 retry".into()
+        "Showing cached PRs · Refresh failed · r retry".into()
     } else if let Some(review) = app.review() {
         if let Some(job) = &review.generation {
             format!(
@@ -1468,7 +1465,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             format!("[{bar}] {step}/5 · {elapsed}s · {}", clean(activity))
         } else if let Some(error) = &review.guide_error {
             format!(
-                "{}: {} · F6 retry",
+                "{}: {} · g retry",
                 if review.preparation_failed {
                     "Snapshot"
                 } else {
@@ -1477,7 +1474,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 clean(error).replace('\n', " ")
             )
         } else if review.newer.is_some() {
-            "● Remote PR updated · F5 to sync and refresh".into()
+            "● Remote PR updated · r to sync and refresh".into()
         } else if let Some(model) = &review.guide_model {
             format!("Guide ready · {model}")
         } else {
@@ -1539,9 +1536,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 "/ Actions",
                 Action::Workflow(crate::workflow::WAction::Open),
             ),
-            ("F1 Help", Action::Help),
+            ("? Help", Action::Help),
             (
-                "F3 State",
+                "s State",
                 Action::SetState(match app.state() {
                     PrState::Open => PrState::Merged,
                     PrState::Merged => PrState::Closed,
@@ -1549,8 +1546,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     PrState::All => PrState::Open,
                 }),
             ),
-            ("F4 Repos", Action::Repositories(false)),
-            ("F5 Refresh", Action::Refresh),
+            ("f Repos", Action::Repositories(false)),
+            ("r Refresh", Action::Refresh),
             ("Enter Open", Action::OpenPr),
             ("Cmd+↑/↓ 10 lines", Action::FastScroll(10)),
         ]
@@ -1562,11 +1559,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ),
             ("Alt+↑/↓ Chapters", Action::Chapter(true)),
             ("Cmd+↑/↓ 10 lines", Action::FastScroll(10)),
-            ("F1 Help", Action::Help),
-            ("F2 Model", Action::Models),
-            ("F5 Refresh", Action::Refresh),
-            ("F6 Generate", Action::Regenerate),
-            ("F8 Cancel", Action::Cancel),
+            ("? Help", Action::Help),
+            ("m Model", Action::Models),
+            ("r Refresh", Action::Refresh),
+            ("g Generate", Action::Regenerate),
+            ("x Cancel", Action::Cancel),
             ("Ctrl+B Split", Action::ToggleLayout),
             ("Esc Home", Action::Back),
         ]
@@ -1576,8 +1573,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             continue;
         }
         if app.home
-            && ((label == "F3 State" && app.inbox_tab == InboxTab::ReviewRequests)
-                || (label == "F4 Repos" && app.inbox_tab != InboxTab::Repositories))
+            && ((label == "s State" && app.inbox_tab == InboxTab::ReviewRequests)
+                || (label == "f Repos" && app.inbox_tab != InboxTab::Repositories))
         {
             continue;
         }
@@ -1703,13 +1700,13 @@ fn inbox_rows(pr: &PrSummary, width: usize, selected: bool) -> Vec<TextRow> {
         }
         rows.push(line);
         if pr.stats_error {
-            rows.push(text("Stats stale · F5 retry", DIM));
+            rows.push(text("Stats stale · r retry", DIM));
         }
     } else {
         rows.extend(
             wrapped_text(
                 if pr.stats_error {
-                    "Stats unavailable · F5 retry"
+                    "Stats unavailable · r retry"
                 } else {
                     "Loading stats…"
                 },
@@ -1747,7 +1744,7 @@ fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
                         format!("No {} authored PRs.", app.state().label().to_lowercase())
                     }
                     InboxTab::Repositories if app.config.review_repositories.is_empty() => {
-                        "Choose repositories first. Shift+F4 opens the whitelist.".into()
+                        "Choose repositories first. Shift+F opens the whitelist.".into()
                     }
                     InboxTab::Repositories
                         if !app
@@ -1756,7 +1753,7 @@ fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
                             .values()
                             .any(|enabled| *enabled) =>
                     {
-                        "No repositories enabled. F4 opens filters.".into()
+                        "No repositories enabled. f opens filters.".into()
                     }
                     InboxTab::Repositories => format!(
                         "No {} PRs in the enabled repositories.",
@@ -2158,14 +2155,15 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
                 TEXT,
             ),
             text("              Inside PR: Overview / Guide / Diff", TEXT),
-            text("F3            Cycle Open / Merged / Closed / All", TEXT),
-            text("F4            Filter whitelisted repositories", TEXT),
-            text("Shift+F4      Edit the repository whitelist", TEXT),
-            text("F2            Choose model and reasoning", TEXT),
-            text("F5            Refresh / load the new PR revision", TEXT),
-            text("F6            Generate again / retry", TEXT),
-            text("F7            Choose another local clone path", TEXT),
-            text("F8            Cancel generation or snapshot loading", TEXT),
+            text("s             Cycle Open / Merged / Closed / All", TEXT),
+            text("f             Filter whitelisted repositories", TEXT),
+            text("Shift+F       Edit the repository whitelist", TEXT),
+            text("m             Choose model and reasoning", TEXT),
+            text("r             Refresh / load the new PR revision", TEXT),
+            text("g             Generate again / retry", TEXT),
+            text("l             Choose another local clone path", TEXT),
+            text("x             Cancel generation or snapshot loading", TEXT),
+            text("Ctrl+R        Refresh mentions in the editor", TEXT),
             text("Ctrl+B        Toggle side-by-side / unified", TEXT),
             text("Ctrl+O        Open PR on GitHub", TEXT),
             text("Mouse         Click items & links; wheel to scroll", TEXT),
@@ -2207,7 +2205,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
             let options = app.model_options(query);
             let selected = *selected;
             let mut rows = vec![
-                bold("Model & reasoning", ACCENT),
+                bold(app.model_purpose.label(), ACCENT),
                 text(
                     format!(
                         "Filter: {}",
@@ -2233,7 +2231,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
             let count = inner.height.saturating_sub(4) as usize;
             let start = selected.saturating_sub(count.saturating_sub(1));
             for (index, choice) in options.iter().enumerate().skip(start).take(count) {
-                let recommended = *choice == ModelChoice::default();
+                let recommended = *choice == app.model_purpose.recommended();
                 let label = format!(
                     "{} {}  {}",
                     if index == selected { "▸" } else { " " },
@@ -2456,6 +2454,42 @@ mod tests {
         app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
         app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
         assert_eq!(app.scroll, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn home_model_settings_save_independent_defaults() -> Result<()> {
+        use crate::{
+            model::{ModelChoice, ModelInfo, ModelPurpose},
+            workflow::{WAction, Wizard},
+        };
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        app.home = true;
+        app.models = vec![ModelInfo {
+            id: "gpt-6-astra".into(),
+            name: "Astra".into(),
+            efforts: vec!["high".into()],
+        }];
+        app.wizard(Wizard::Home(3));
+        app.workflow_action(WAction::Choose(3));
+        assert_eq!(app.model_purpose, ModelPurpose::Conflicts);
+        let conflict = ModelChoice {
+            model: "gpt-6-astra".into(),
+            effort: "medium".into(),
+        };
+        app.action(Action::ApplyModel(conflict.clone()));
+        assert_eq!(app.config.model, ModelChoice::default());
+        assert_eq!(app.storage.load_config()?.conflict_model, conflict);
+        app.wizard(Wizard::Home(2));
+        app.workflow_action(WAction::Choose(2));
+        assert_eq!(app.model_purpose, ModelPurpose::Guide);
+        app.action(Action::ApplyModel(ModelChoice {
+            model: "gpt-5.6-sol".into(),
+            effort: "low".into(),
+        }));
+        assert_eq!(app.storage.load_config()?.conflict_model, conflict);
+        assert_eq!(app.storage.load_config()?.model.model, "gpt-5.6-sol");
         Ok(())
     }
 
@@ -2840,6 +2874,72 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn code_cursor_tracks_the_viewport_center_and_clamps_at_document_ends() -> Result<()> {
+        use crate::{review::Side, workflow::Target};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+        let dir = tempfile::tempdir()?;
+        for width in [80, 180] {
+            for view in [View::Guide, View::Diff] {
+                let mut app = guide_app(dir.path());
+                app.view = view;
+                app.focus = Focus::Content;
+                app.workflow.side = Side::Right;
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))?;
+                terminal.draw(|f| draw(f, &mut app))?;
+                let row = app
+                    .document
+                    .as_ref()
+                    .context("Missing document")?
+                    .rows
+                    .iter()
+                    .position(|r| {
+                        matches!(r.right.target, Some(Target::Code { new: Some(30), .. }))
+                    })
+                    .context("Missing code line")?;
+                app.workflow.cursor = Some(row);
+                for (code, modifiers) in [
+                    (KeyCode::Down, KeyModifiers::NONE),
+                    (KeyCode::Down, KeyModifiers::SUPER),
+                    (KeyCode::Up, KeyModifiers::NONE),
+                    (KeyCode::Down, KeyModifiers::SHIFT),
+                ] {
+                    app.key_event(KeyEvent::new(code, modifiers));
+                    terminal.draw(|f| draw(f, &mut app))?;
+                    assert_eq!(
+                        app.workflow.cursor.context("Missing cursor")? - app.scroll,
+                        app.viewport / 2
+                    );
+                }
+                assert!(app.workflow.selection.is_some());
+                app.mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: app.content_rect.right().saturating_sub(2),
+                    row: app.content_rect.y + 2,
+                    modifiers: KeyModifiers::NONE,
+                });
+                terminal.draw(|f| draw(f, &mut app))?;
+                assert_eq!(
+                    app.workflow.cursor.context("Missing cursor")? - app.scroll,
+                    app.viewport / 2
+                );
+                app.move_diff(-i32::MAX, false);
+                assert_eq!(app.scroll, 0);
+                app.move_diff(i32::MAX, false);
+                let length = app
+                    .document
+                    .as_ref()
+                    .context("Missing document")?
+                    .rows
+                    .len();
+                assert_eq!(app.scroll, length.saturating_sub(app.viewport));
+                assert_eq!(app.workflow.cursor, length.checked_sub(1));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn line_focus_and_selection_keep_correct_side_and_file() -> Result<()> {
         use crate::{review::Side, workflow::Target};
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -2883,6 +2983,114 @@ mod tests {
         assert_eq!(app.workflow.cursor, current);
         Ok(())
     }
+    #[test]
+    fn character_shortcuts_keep_text_inputs_isolated() -> Result<()> {
+        use crate::{
+            editor::Editor,
+            model::ModelInfo,
+            process::Cancel,
+            workflow::{Compose, Kind, Wizard},
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        let key = app.inbox.first().context("Missing PR")?.key.clone();
+        let cancel = Cancel::default();
+        app.reviews
+            .get_mut(&key.id())
+            .context("Missing review")?
+            .preparation = Some(cancel.clone());
+        app.models = vec![ModelInfo {
+            id: "gpt-5.6-luna".into(),
+            name: "Luna".into(),
+            efforts: vec!["high".into()],
+        }];
+        for code in [KeyCode::Char('?'), KeyCode::Char('m'), KeyCode::Char('l')] {
+            app.key_event(KeyEvent::new(code, KeyModifiers::NONE));
+            assert!(match code {
+                KeyCode::Char('?') => matches!(app.modal, Some(Modal::Help)),
+                KeyCode::Char('m') => matches!(app.modal, Some(Modal::Models { .. })),
+                _ => matches!(app.modal, Some(Modal::Clone { .. })),
+            });
+            app.key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        app.home = true;
+        app.inbox_tab = InboxTab::Repositories;
+        app.repositories_loading = true; // No network in this input-routing test.
+        for (code, modifiers, manage) in [
+            (KeyCode::Char('f'), KeyModifiers::NONE, false),
+            (KeyCode::Char('F'), KeyModifiers::SHIFT, true),
+            (KeyCode::Char('F'), KeyModifiers::NONE, true),
+        ] {
+            app.key_event(KeyEvent::new(code, modifiers));
+            assert!(
+                matches!(app.modal, Some(Modal::Repositories { manage: actual, .. }) if actual == manage)
+            );
+            app.modal = None;
+        }
+        let letters = "?msfFrglx/";
+        for modal in [
+            Modal::Clone {
+                value: String::new(),
+                key: key.id(),
+            },
+            Modal::Models {
+                selected: 0,
+                effort: 0,
+                query: String::new(),
+            },
+            Modal::Repositories {
+                manage: true,
+                query: String::new(),
+                selected: 0,
+                choices: Default::default(),
+            },
+            Modal::Workflow(Box::new(Wizard::Compose(Compose {
+                key: key.clone(),
+                head: "head".into(),
+                kind: Kind::Review,
+                editor: Editor::default(),
+                choice: 0,
+                focus: 0,
+                mention: 0,
+            }))),
+        ] {
+            app.modal = Some(modal);
+            for c in letters.chars() {
+                app.key_event(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            let text = match app
+                .modal
+                .as_ref()
+                .context("Input was replaced by a shortcut")?
+            {
+                Modal::Clone { value, .. } => value.clone(),
+                Modal::Models { query, .. } | Modal::Repositories { query, .. } => query.clone(),
+                Modal::Workflow(w) => match w.as_ref() {
+                    Wizard::Compose(draft) => draft.editor.text(),
+                    _ => String::new(),
+                },
+                _ => String::new(),
+            };
+            assert_eq!(text, letters);
+            assert!(!cancel.cancelled());
+        }
+        app.modal = None;
+        app.key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert!(!cancel.cancelled());
+        app.key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(cancel.cancelled());
+        let conflict = Cancel::default();
+        app.workflow.busy = true;
+        app.workflow.conflict_cancel = Some(conflict.clone());
+        app.wizard(Wizard::Resolving {
+            activity: "Resolving".into(),
+        });
+        app.key_event(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert!(conflict.cancelled());
+        Ok(())
+    }
+
     #[test]
     fn all_text_inputs_position_a_cursor_and_wizard_keeps_drafts() -> Result<()> {
         use crate::{

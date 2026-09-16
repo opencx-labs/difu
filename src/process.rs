@@ -101,6 +101,23 @@ pub fn streaming_with_stderr(
     progress: impl Fn(&str) + Send + 'static,
     errors: impl Fn(&str) + Send + 'static,
 ) -> Result<Output> {
+    streaming_limit(command, input, cancel, progress, errors, None)
+}
+
+/// Cap captured CI logs while draining both pipes. Oversize logs are an explicit
+/// error, so callers never present a silently truncated failure list.
+pub fn run_limited(command: &mut Command, cancel: &Cancel, limit: usize) -> Result<Output> {
+    streaming_limit(command, None, cancel, |_| {}, |_| {}, Some(limit))
+}
+
+fn streaming_limit(
+    command: &mut Command,
+    input: Option<Vec<u8>>,
+    cancel: &Cancel,
+    progress: impl Fn(&str) + Send + 'static,
+    errors: impl Fn(&str) + Send + 'static,
+    limit: Option<usize>,
+) -> Result<Output> {
     cancel.check()?;
     let name = command.get_program().to_string_lossy().to_string();
     command
@@ -128,6 +145,25 @@ pub fn streaming_with_stderr(
         move || -> std::io::Result<Vec<u8>> {
             let mut reader = BufReader::new(stdout);
             let mut all = Vec::new();
+            if let Some(limit) = limit {
+                let mut chunk = [0; 8192];
+                let mut overflow = false;
+                loop {
+                    let count = reader.read(&mut chunk)?;
+                    if count == 0 {
+                        break;
+                    }
+                    let room = limit.saturating_sub(all.len());
+                    overflow |= count > room;
+                    all.extend(chunk.iter().take(count.min(room)));
+                }
+                if overflow {
+                    return Err(std::io::Error::other(
+                        "CI log exceeds the display size limit; use the full log link",
+                    ));
+                }
+                return Ok(all);
+            }
             let mut line = Vec::new();
             while reader.read_until(b'\n', &mut line)? > 0 {
                 progress(&String::from_utf8_lossy(&line));
@@ -149,7 +185,9 @@ pub fn streaming_with_stderr(
                     break;
                 }
                 for byte in chunk.iter().take(count) {
-                    all.push(*byte);
+                    if all.len() < limit.unwrap_or(usize::MAX) {
+                        all.push(*byte);
+                    }
                     if *byte == b'\r' || *byte == b'\n' {
                         if !line.is_empty() {
                             errors(&String::from_utf8_lossy(&line));
@@ -223,6 +261,24 @@ pub fn checked(command: &mut Command, cancel: &Cancel) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn log_capture_rejects_oversize_output_without_blocking_pipes() -> Result<()> {
+        let output = run_limited(
+            Command::new("sh").args(["-c", "printf small; printf error >&2"]),
+            &Cancel::default(),
+            32,
+        )?;
+        assert_eq!(output.stdout, b"small");
+        let error = run_limited(
+            Command::new("sh").args(["-c", "printf too-large; printf error >&2"]),
+            &Cancel::default(),
+            3,
+        )
+        .err()
+        .context("Expected size limit error")?;
+        assert!(error.to_string().contains("display size limit"));
+        Ok(())
+    }
     #[test]
     fn drains_both_pipes_and_sends_stdin() -> Result<()> {
         let output = run(

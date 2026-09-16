@@ -187,13 +187,27 @@ fn schema() -> Value {
 // An empty table is merged with inherited MCP configuration, so it does not
 // disable servers. Enumerate names without logging transports or credentials.
 fn isolation_overrides(root: &Path, worktree: &Path, cancel: &Cancel) -> Result<Vec<String>> {
+    isolated_instructions(
+        root,
+        worktree,
+        &format!("{INSTRUCTIONS}\n\n{PROGRESS_INSTRUCTIONS}"),
+        cancel,
+    )
+}
+
+fn isolated_instructions(
+    root: &Path,
+    worktree: &Path,
+    instructions: &str,
+    cancel: &Cancel,
+) -> Result<Vec<String>> {
     let mut args = vec![
         "-c".into(),
         "project_doc_max_bytes=0".into(),
         "-c".into(),
         format!(
             "developer_instructions={}",
-            serde_json::to_string(&format!("{INSTRUCTIONS}\n\n{PROGRESS_INSTRUCTIONS}"))?
+            serde_json::to_string(instructions)?
         ),
     ];
     let mut projects = Vec::new();
@@ -223,7 +237,7 @@ fn isolation_overrides(root: &Path, worktree: &Path, cancel: &Cancel) -> Result<
     )?;
     ensure!(
         output.code == 0,
-        "Cannot inspect Codex connector configuration; guide generation stopped: {}",
+        "Cannot inspect Codex connector configuration; operation stopped: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
     args.extend(disable_mcp_overrides(&output.stdout)?);
@@ -386,6 +400,95 @@ pub fn generate(
             "Generation and cleanup failed"
         })),
     }
+}
+
+/// Edit only the isolated conflict worktree. The caller audits and publishes it.
+pub(crate) fn resolve_conflicts(
+    root: &Path,
+    worktree: &Path,
+    files: &[String],
+    model: &ModelChoice,
+    cancel: &Cancel,
+    progress: std::sync::Arc<dyn Fn(String) + Send + Sync>,
+) -> Result<()> {
+    let instructions = include_str!("../prompts/conflicts.md");
+    let overrides = isolated_instructions(root, worktree, instructions, cancel)?;
+    let prompt = format!(
+        "Resolve these conflicted paths (JSON): {}\nEdit them directly. Leave all project checks to CI. Do not stage, commit or push; difu handles that.\n",
+        serde_json::to_string(files)?
+    );
+    let mut command = Command::new("codex");
+    command
+        .current_dir(worktree)
+        .env("GIT_ALLOW_PROTOCOL", "")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "exec",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--sandbox",
+            "workspace-write",
+            "--json",
+            "--color",
+            "never",
+            "--model",
+            &model.model,
+        ])
+        .args([
+            "-c",
+            &format!(
+                "model_reasoning_effort={}",
+                serde_json::to_string(&model.effort)?
+            ),
+        ])
+        .args([
+            "-c",
+            "model_reasoning_summary=\"auto\"",
+            "-c",
+            "approval_policy=\"never\"",
+            "-c",
+            "web_search=\"disabled\"",
+            "-c",
+            "sandbox_workspace_write.network_access=false",
+        ])
+        .args([
+            "--disable",
+            "apps",
+            "--disable",
+            "plugins",
+            "--disable",
+            "hooks",
+            "--disable",
+            "multi_agent",
+            "--disable",
+            "memories",
+            "--disable",
+            "browser_use",
+            "--disable",
+            "computer_use",
+        ])
+        .args(overrides)
+        .arg("-");
+    let response = process::streaming(
+        &mut command,
+        Some(prompt.into_bytes()),
+        cancel,
+        move |line| {
+            if let Ok(event) = serde_json::from_str::<Value>(line)
+                && let Some(message) = progress_message(&event)
+            {
+                progress(message);
+            }
+        },
+    )?;
+    ensure!(
+        response.code == 0,
+        "Codex conflict resolution failed: {}",
+        String::from_utf8_lossy(&response.stderr).trim()
+    );
+    cancel.check()
 }
 
 /// Discover real model/effort combinations through Codex's supported protocol.

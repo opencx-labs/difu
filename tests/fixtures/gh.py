@@ -55,6 +55,24 @@ if args[0] == 'search':
     else:
         url = f'https://github.com/example/project/pull/{number}'
     value = [dict(number=number, title=title, url=url, author=dict(login='author'), updatedAt='2026-09-15T00:00:00Z', createdAt='2026-09-10T12:30:00Z', isDraft=False)]
+elif args[0:2] == ['api', 'graphql'] and any('statusCheckRollup' in a for a in args):
+    mode = (root / 'status-case').read_text() if (root / 'status-case').exists() else 'normal'
+    check = dict(__typename='CheckRun', name='unit tests', status='IN_PROGRESS', conclusion=None, startedAt='2026-09-15T00:00:00Z', completedAt='', detailsUrl=url+'/checks', checkSuite=dict(app=dict(databaseId=15368)))
+    if mode in ('failure', 'rules-denied'):
+        check.update(status='COMPLETED', conclusion='FAILURE', detailsUrl='https://github.com/example/project/actions/runs/1/job/2')
+    contexts = dict(nodes=[check], pageInfo=dict(hasNextPage=False, endCursor=None))
+    rollup = None if mode in ('conflict', 'unknown') else dict(contexts=contexts)
+    pr = dict(mergeable='CONFLICTING' if mode=='conflict' else 'UNKNOWN' if mode=='unknown' else 'MERGEABLE', mergeStateStatus='DIRTY' if mode=='conflict' else 'CLEAN', headRefOid=revs['head'], baseRefOid=revs['base'], state='OPEN', baseRef=dict(name='main',branchProtectionRule=None), commits=dict(nodes=[dict(commit=dict(statusCheckRollup=rollup))]))
+    value = dict(data=dict(repository=dict(pullRequest=pr)))
+elif '/rules/branches/' in args[-1]:
+    mode = (root / 'status-case').read_text() if (root / 'status-case').exists() else 'normal'
+    if mode=='rules-denied':
+        print('Fixture rules access denied',file=sys.stderr);sys.exit(1)
+    value = [[dict(type='required_status_checks',parameters=dict(required_status_checks=[dict(context='lint'),dict(context='lint'),dict(context='typecheck')]))]] if mode=='conflict' else [[]]
+elif args[-1]=='repos/example/project/actions/jobs/2/logs':
+    print('2026-09-16T13:10:00Z  FAIL  mail.spec.ts > Mail > sends reply')
+    print('2026-09-16T13:10:01Z AssertionError: expected reply')
+    sys.exit(0)
 elif args[0:2] == ['api', 'graphql'] and 'changedFiles' in args[-1]:
     import re
     aliases = re.findall(r'(r[0-9]+): repository', args[-1])
