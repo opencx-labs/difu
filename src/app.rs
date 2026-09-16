@@ -33,6 +33,47 @@ pub enum Focus {
     Content,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum NoticeKind {
+    #[default]
+    Info,
+    Success,
+    Error,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Notice {
+    pub message: String,
+    pub kind: NoticeKind,
+}
+
+impl Notice {
+    pub fn info(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: NoticeKind::Info,
+        }
+    }
+    pub fn success(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: NoticeKind::Success,
+        }
+    }
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: NoticeKind::Error,
+        }
+    }
+}
+
+impl std::fmt::Display for Notice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 pub struct Generation {
     pub id: u64,
     pub cancel: Cancel,
@@ -72,6 +113,7 @@ pub struct Review {
 }
 
 pub enum Message {
+    Definition(u64, Result<Arc<crate::navigation::Definition>, String>),
     Workflow(crate::workflow::Event),
     Inbox(u64, Result<Vec<PrSummary>, String>),
     InboxStats(u64, Vec<(String, Option<PrStats>)>),
@@ -91,6 +133,13 @@ pub enum Message {
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    Definition {
+        path: String,
+        line: u64,
+        column: usize,
+        old: bool,
+    },
+    CloseDefinition,
     Workflow(crate::workflow::WAction),
     SelectPr(usize),
     OpenPr,
@@ -123,6 +172,7 @@ pub enum Action {
 }
 
 pub enum Modal {
+    Definition(crate::navigation::Viewer),
     Workflow(Box<crate::workflow::Wizard>),
     Clone {
         value: String,
@@ -168,7 +218,7 @@ pub struct App {
     pub models: Vec<ModelInfo>,
     pub models_loading: bool,
     pub models_error: Option<String>,
-    pub notice: String,
+    pub notice: Notice,
     pub quit: bool,
     pub epoch: u64,
     pub document: Option<crate::ui::Document>,
@@ -231,7 +281,7 @@ impl App {
             models: Vec::new(),
             models_loading: false,
             models_error: None,
-            notice: String::new(),
+            notice: Notice::default(),
             quit: false,
             epoch: 0,
             document: None,
@@ -282,7 +332,7 @@ impl App {
             Ok(handle) => self.jobs.push((cancel.clone(), handle)),
             Err(error) => {
                 cancel.cancel();
-                self.notice = format!("Could not start background work: {error}");
+                self.notice = Notice::error(format!("Could not start background work: {error}"));
             }
         }
         cancel
@@ -305,7 +355,7 @@ impl App {
     }
     fn save_config(&mut self) {
         if let Err(e) = self.storage.save_config(&self.config) {
-            self.notice = format!("Could not save settings: {e:#}");
+            self.notice = Notice::error(format!("Could not save settings: {e:#}"));
         }
     }
     pub fn load_inbox(&mut self) {
@@ -336,7 +386,9 @@ impl App {
                 self.select(self.selected);
             }
             Ok(None) => {}
-            Err(error) => self.notice = format!("Could not load cached PRs: {error:#}"),
+            Err(error) => {
+                self.notice = Notice::error(format!("Could not load cached PRs: {error:#}"))
+            }
         }
         let cached: HashMap<_, _> = self
             .inbox
@@ -413,7 +465,7 @@ impl App {
         self.scroll = 0;
         self.horizontal = 0;
         self.focus = Focus::Navigation;
-        self.notice.clear();
+        self.notice = Notice::default();
         self.load_inbox();
         self.invalidate();
         if tab == InboxTab::Repositories && self.config.review_repositories.is_empty() {
@@ -726,7 +778,7 @@ impl App {
                     r.guide_model = Some(model);
                     r.guide_error = None;
                     self.sync_progress(id);
-                    self.notice = "Loaded cached guide".into();
+                    self.notice = Notice::success("Loaded cached guide");
                     self.invalidate();
                     return;
                 }
@@ -826,7 +878,8 @@ impl App {
             return;
         };
         if review.generation.is_some() {
-            self.notice = "Cancel the current generation before refreshing its snapshot".into();
+            self.notice =
+                Notice::info("Cancel the current generation before refreshing its snapshot");
             return;
         }
         if review.preparing {
@@ -842,11 +895,13 @@ impl App {
             if let Some(root) = root {
                 self.prepare_revision(root, Arc::new(newer));
             } else {
-                self.notice = "Locate this repository's local clone before refreshing".into();
+                self.notice =
+                    Notice::info("Locate this repository's local clone before refreshing");
             }
         } else {
-            self.notice =
-                "This snapshot is current. Remote revisions are checked every 30 seconds.".into();
+            self.notice = Notice::info(
+                "This snapshot is current. Remote revisions are checked every 30 seconds.",
+            );
         }
     }
     pub fn load_models(&mut self) {
@@ -899,7 +954,7 @@ impl App {
         self.config.model = choice;
         self.save_config();
         self.modal = None;
-        self.notice = "Model saved. Open a PR or choose Regenerate to use it.".into();
+        self.notice = Notice::success("Model saved. Open a PR or choose Regenerate to use it.");
         self.invalidate();
     }
     pub fn tick(&mut self) {
@@ -915,7 +970,7 @@ impl App {
             {
                 let (_, handle) = self.jobs.swap_remove(index);
                 if handle.join().is_err() {
-                    self.notice = "A background worker stopped unexpectedly".into();
+                    self.notice = Notice::error("A background worker stopped unexpectedly");
                 }
             } else {
                 index += 1;
@@ -980,6 +1035,13 @@ impl App {
     }
     fn receive(&mut self, message: Message) {
         match message {
+            Message::Definition(id, output) => {
+                if let Some(Modal::Definition(viewer)) = &mut self.modal
+                    && viewer.id == id
+                {
+                    viewer.output = Some(output);
+                }
+            }
             Message::Workflow(event) => {
                 self.workflow_receive(event);
                 return;
@@ -998,13 +1060,16 @@ impl App {
                             .unwrap_or(0);
                         self.inbox_error = None;
                         if self.inbox.len() == 1000 {
-                            self.notice = "GitHub search returned its maximum 1,000 results".into();
+                            self.notice =
+                                Notice::info("GitHub search returned its maximum 1,000 results");
                         }
                         self.select(self.selected);
                     }
                     Err(error) => {
-                        self.notice =
-                            format!("Could not refresh {}: {error}", self.inbox_tab.label());
+                        self.notice = Notice::error(format!(
+                            "Could not refresh {}: {error}",
+                            self.inbox_tab.label()
+                        ));
                         self.inbox_error = Some(error);
                     }
                 }
@@ -1110,7 +1175,9 @@ impl App {
                             }
                         }
                         Ok(None) => {}
-                        Err(e) => self.notice = format!("Revision refresh failed: {e}"),
+                        Err(e) => {
+                            self.notice = Notice::error(format!("Revision refresh failed: {e}"))
+                        }
                     }
                 }
             }
@@ -1239,7 +1306,7 @@ impl App {
                     Err(e) => self.models_error = Some(e),
                 }
             }
-            Message::Notice(message) => self.notice = message,
+            Message::Notice(message) => self.notice = Notice::error(message),
             Message::Repositories(output) => {
                 self.repositories_loading = false;
                 match output {
@@ -1253,8 +1320,69 @@ impl App {
         }
         self.invalidate();
     }
+    fn open_definition(&mut self, path: String, line: u64, column: usize, old: bool) {
+        if self.modal.is_some() || self.home || self.view == View::Overview {
+            return;
+        }
+        let Some(review) = self.review() else {
+            return;
+        };
+        let (Some(root), Some(snapshot)) = (&review.root, &review.snapshot) else {
+            return;
+        };
+        let source_path = if old {
+            snapshot
+                .files
+                .iter()
+                .find(|f| f.path == path)
+                .map(|f| f.old_path.clone())
+                .unwrap_or(path)
+        } else {
+            path
+        };
+        let request = crate::navigation::Request {
+            root: root.clone(),
+            revision: if old {
+                snapshot.merge_base.clone()
+            } else {
+                snapshot.head.clone()
+            },
+            path: source_path,
+            line,
+            column,
+        };
+        let id = self.next_id();
+        let work = request.clone();
+        let cancel = self.spawn(move |tx, cancel| {
+            let output = result(crate::navigation::resolve(&work, &cancel).map(Arc::new));
+            let _ = tx.send(Message::Definition(id, output));
+        });
+        let output = cancel.cancelled().then(|| {
+            Err("Could not start definition resolution. Close this modal and try again.".into())
+        });
+        self.modal = Some(Modal::Definition(crate::navigation::Viewer {
+            id,
+            request,
+            output,
+            scroll: 0,
+            horizontal: 0,
+            viewport: 1,
+            cancel,
+        }));
+    }
     pub fn action(&mut self, action: Action) {
         match action {
+            Action::Definition {
+                path,
+                line,
+                column,
+                old,
+            } => self.open_definition(path, line, column, old),
+            Action::CloseDefinition => {
+                if matches!(self.modal, Some(Modal::Definition(_))) {
+                    self.modal = None;
+                }
+            }
             Action::Workflow(action) => self.workflow_action(action),
             Action::SelectPr(index) => self.select(index),
             Action::OpenPr => self.open(),
@@ -1606,6 +1734,35 @@ impl App {
             return;
         };
         match modal {
+            Modal::Definition(mut viewer) => {
+                let total = viewer
+                    .output
+                    .as_ref()
+                    .and_then(|r| r.as_ref().ok())
+                    .map_or(0, |d| d.source.lines().count());
+                let max = total.saturating_sub(viewer.viewport);
+                let step = if key.modifiers.contains(KeyModifiers::SUPER) {
+                    10
+                } else {
+                    1
+                };
+                match key.code {
+                    KeyCode::Up => viewer.scroll = viewer.scroll.saturating_sub(step),
+                    KeyCode::Down => viewer.scroll = viewer.scroll.saturating_add(step).min(max),
+                    KeyCode::PageUp => {
+                        viewer.scroll = viewer.scroll.saturating_sub(viewer.viewport)
+                    }
+                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                        viewer.scroll = viewer.scroll.saturating_add(viewer.viewport).min(max)
+                    }
+                    KeyCode::Home => viewer.scroll = 0,
+                    KeyCode::End => viewer.scroll = max,
+                    KeyCode::Left => viewer.horizontal = viewer.horizontal.saturating_sub(4),
+                    KeyCode::Right => viewer.horizontal = viewer.horizontal.saturating_add(4),
+                    _ => {}
+                }
+                self.modal = Some(Modal::Definition(viewer));
+            }
             Modal::Workflow(modal) => self.modal = Some(Modal::Workflow(modal)),
             Modal::Repositories {
                 manage,
@@ -1742,7 +1899,10 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
-                if matches!(self.modal, Some(Modal::Repositories { .. })) =>
+                if matches!(
+                    self.modal,
+                    Some(Modal::Repositories { .. } | Modal::Definition(_))
+                ) =>
             {
                 let code = if event.kind == MouseEventKind::ScrollDown {
                     KeyCode::Down
@@ -1813,6 +1973,54 @@ impl Drop for App {
 mod tests {
     use super::*;
     use anyhow::Context;
+    #[test]
+    fn definition_navigation_cancels_on_close_and_ignores_obsolete_results() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = App::new(
+            Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().into(),
+            },
+            Default::default(),
+        );
+        let cancel = Cancel::default();
+        app.modal = Some(Modal::Definition(crate::navigation::Viewer {
+            id: 42,
+            request: crate::navigation::Request {
+                root: dir.path().into(),
+                revision: "a".repeat(40),
+                path: "file.ts".into(),
+                line: 1,
+                column: 0,
+            },
+            output: None,
+            scroll: 0,
+            horizontal: 0,
+            viewport: 1,
+            cancel: cancel.clone(),
+        }));
+        app.receive(Message::Definition(41, Err("obsolete result".into())));
+        assert!(matches!(&app.modal, Some(Modal::Definition(v)) if v.output.is_none()));
+        app.receive(Message::Definition(
+            42,
+            Err("Cannot verify this object's method".into()),
+        ));
+        assert!(
+            matches!(&app.modal, Some(Modal::Definition(v)) if matches!(&v.output, Some(Err(e)) if e.contains("method")))
+        );
+        for (width, height) in [(1, 1), (24, 8), (80, 24)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))?;
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app))?;
+        }
+        app.key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(cancel.cancelled());
+        app.modal = Some(Modal::Help);
+        app.receive(Message::Definition(42, Err("late result".into())));
+        assert!(matches!(app.modal, Some(Modal::Help)));
+        Ok(())
+    }
+
     #[test]
     fn context_results_ignore_old_snapshots_and_apply_only_requested_hunks() -> Result<()> {
         let dir = tempfile::tempdir()?;

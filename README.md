@@ -125,7 +125,8 @@ repository shows an empty list; it never searches outside your whitelist.
 
 ## Reading a PR
 
-- **Overview:** description, chronological comments/reviews/commits, then checks.
+- **Overview:** a centered column (up to 110 terminal columns) with bordered cards
+  for the description, chronological comments/reviews/commits, and checks.
   Check states and durations refresh every ten seconds for the selected PR.
   Click a check to open its GitHub logs.
 - **Guide:** chapters connect explanations to changes across files. While
@@ -146,6 +147,28 @@ File headers stay visible while scrolling their diffs. Long paths wrap in file
 headers, chapter links, and the file tree. **Alt+Up / Alt+Down** jumps to the
 previous or next guide chapter. With the chapter pane focused, plain **Up / Down**
 moves between its file links and scrolls the corresponding diff into view.
+
+### Function definitions
+
+Click a function identifier in a JavaScript or TypeScript diff (including JSX and
+TSX) to open its definition in a scrollable modal. Definitions can live in
+unchanged tracked files. **Esc** closes the modal and preserves your chapter,
+focus, selection, and scroll position. Inside the modal, use the mouse wheel or
+arrow keys to scroll, **Cmd+Up/Down** to move ten lines, **PageUp/PageDown** to
+page, and **Left/Right** to pan long lines.
+
+Navigation reads local Git objects from the clicked revision: the merge base for
+old lines, and the PR head for new lines. It does not use uncommitted files, fetch
+objects, create a worktree, install dependencies, or run project code. The parser
+is bundled with difu.
+
+Resolution follows lexical bindings, ES module imports, namespace members,
+re-exports, and `tsconfig.json`/`jsconfig.json` path aliases, including relative
+configuration inheritance. It explains unsupported or ambiguous cases instead
+of guessing by name. Examples include type-dependent object methods, reassigned
+functions, CommonJS/dynamic imports, external configuration packages, workspace
+package entry points, and custom `rootDirs`/`moduleSuffixes` resolution. Cycles and
+source-size limits also produce an explanation in the modal.
 
 Guide generation has no automatic timeout. Its elapsed time and activity remain
 visible; cancel or retry explicitly. Every changed hunk must appear at least once

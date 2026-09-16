@@ -1,6 +1,6 @@
 use crate::{
     app::{Action, App, Modal},
-    ui::{self, ACCENT, BG, DIM, GREEN, PANEL, RED, TEXT},
+    ui::{self, ACCENT, BG, DIM, GREEN, PANEL, TEXT},
     workflow::{Kind, WAction, Wizard},
 };
 use ratatui::{
@@ -118,7 +118,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 DIM,
             ));
             let top = rows.len() as u16;
-            let editor_height = inner.height.saturating_sub(top + 9).max(1);
+            let editor_height = inner.height.saturating_sub(top + 11).max(1);
             let editor_rect = Rect::new(
                 inner.x,
                 inner.y + top,
@@ -169,6 +169,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     WAction::Choose(i),
                 ));
             }
+            rows.push(ui::text("", DIM));
             rows.push(action(
                 format!(
                     "{} [ Next: confirm ]",
@@ -176,6 +177,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 ),
                 WAction::Next,
             ));
+            rows.push(ui::text("", DIM));
             let options = app.mention_options(draft);
             if draft.focus == 0 && !options.is_empty() {
                 let room = inner.height.saturating_sub(rows.len() as u16) as usize;
@@ -229,9 +231,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             rows.push(action("[ Confirm · Enter ]", WAction::Submit));
             rows.push(action("[ Back · Esc ]", WAction::Back));
         }
-        Wizard::Result { message } => {
+        Wizard::Result { notice } => {
             rows.push(ui::bold("Result", ACCENT));
-            rows.extend(ui::prose(message, inner.width as usize));
+            for mut row in ui::prose(&notice.message, inner.width as usize) {
+                for span in &mut row.spans {
+                    span.style = span.style.fg(ui::notice_color(notice.kind));
+                }
+                rows.push(row);
+            }
             rows.push(action("[ Close · Enter / Esc ]", WAction::Back));
         }
         Wizard::Trees {
@@ -319,22 +326,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Paragraph::new("Working… waiting for confirmation")
                 .style(Style::default().fg(ACCENT).bg(BG)),
             Rect::new(inner.x, rect.bottom().saturating_sub(2), inner.width, 1),
-        );
-    }
-    if !app.notice.is_empty() {
-        frame.render_widget(
-            Paragraph::new(ui::crop(
-                &app.notice.replace('\n', " "),
-                0,
-                area.width.saturating_sub(4) as usize,
-            ))
-            .style(Style::default().fg(RED)),
-            Rect::new(
-                2,
-                area.height.saturating_sub(1),
-                area.width.saturating_sub(4),
-                1,
-            ),
         );
     }
     app.modal = Some(Modal::Workflow(Box::new(wizard)));

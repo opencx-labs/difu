@@ -1,6 +1,6 @@
 [package]
 name = "difu"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Your diff shifu: a terminal inbox and guided pull request reviewer"
@@ -13,6 +13,12 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 dirs = "6"
 nix = { version = "0.30", features = ["signal", "process", "fs"] }
+oxc_allocator = "=0.75.0"
+oxc_ast = "=0.75.0"
+oxc_parser = "=0.75.0"
+oxc_semantic = "=0.75.0"
+oxc_span = "=0.75.0"
+jsonc-parser = { version = "0.26", features = ["serde"] }
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "layout-cache"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
