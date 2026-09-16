@@ -134,14 +134,23 @@ repository shows an empty list; it never searches outside your whitelist.
   unified is selectable. Narrow windows temporarily use unified diffs and put
   chapter explanations above code, restoring your preference when widened.
 
+Each text hunk has **10 lines above** and **10 lines below** controls. Expansion
+applies to that hunk, including its appearances in other chapters, without
+expanding other hunks. Context comes from the pinned PR revisions in your local
+clone, never from uncommitted edits. If expansion reaches a neighboring hunk,
+a divider links to every guide chapter that explains it. File boundaries stop
+expansion; read failures remain visible with a retry option.
+
 File headers stay visible while scrolling their diffs. Long paths wrap in file
 headers, chapter links, and the file tree. **Alt+Up / Alt+Down** jumps to the
 previous or next guide chapter.
 
 Guide generation has no automatic timeout. Its elapsed time and activity remain
-visible; cancel or retry explicitly. Every changed hunk must appear exactly once
+visible; cancel or retry explicitly. Every changed hunk must appear at least once
 in the guide. Binary files, renames, and permission changes have metadata review
-units. Unknown, duplicate, or missing references reject the guide.
+units. A hunk may support multiple chapters; repeated references within one
+chapter are collapsed in their original order. Unknown or missing references
+reject the guide.
 
 Difu checks the open PR's head and base commit IDs through GitHub every 30 seconds.
 This metadata check does not fetch Git objects. Remote updates are announced
@@ -290,7 +299,10 @@ visible Linear Guide chapters from a reference recording and the corresponding
 PR description. The Linear API exposed PR metadata and descriptions but no
 generated Guide chapters, so the research is limited to that sample. The guide
 style connects logical changes in dependency order, using short causal
-explanations and links across files.
+explanations and links across files. Test changes are grouped into dedicated
+chapters by concern. Schema definitions, migrations, schema generation code, and
+generated schema artifacts have their own chapters, keeping implementation
+chapters focused on runtime logic.
 
 ## Development
 

@@ -1,0 +1,344 @@
+use anyhow::{Context, Result, ensure};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use difu::{
+    app::{Action, App, Review, View},
+    codex::{self, Chapter, Guide},
+    context::Direction,
+    model::{ModelChoice, PrDetail, PrKey, PrSummary},
+    process::{self, Cancel},
+    repo,
+    storage::Storage,
+};
+use std::{
+    fs,
+    path::Path,
+    process::Command,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+fn git(root: &Path, args: &[&str]) -> Result<String> {
+    process::checked(
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "user.name=Difu Test",
+                "-c",
+                "user.email=test@example.invalid",
+            ])
+            .args(args),
+        &Cancel::default(),
+    )
+    .map(|s| s.trim().to_owned())
+}
+
+fn fixture(root: &Path) -> Result<(App, PrDetail)> {
+    git(root, &["init"])?;
+    let original = (1..=80).map(|n| format!("line {n}\n")).collect::<String>();
+    fs::write(root.join("file.rs"), &original)?;
+    git(root, &["add", "file.rs"])?;
+    git(root, &["commit", "-m", "base"])?;
+    let base = git(root, &["rev-parse", "HEAD"])?;
+    fs::write(
+        root.join("file.rs"),
+        original
+            .replace("line 20\n", "changed 20\n")
+            .replace("line 32\n", "changed 32\n"),
+    )?;
+    git(root, &["commit", "-am", "head"])?;
+    let head = git(root, &["rev-parse", "HEAD"])?;
+    let key = PrKey {
+        owner: "example".into(),
+        repo: "repo".into(),
+        number: 1,
+    };
+    let pr = PrDetail {
+        key: key.clone(),
+        title: "Context".into(),
+        body: String::new(),
+        author: "test".into(),
+        head,
+        base,
+        head_branch: "feature".into(),
+        base_branch: "main".into(),
+        state: "open".into(),
+        additions: 2,
+        deletions: 2,
+        changed_files: 1,
+    };
+    let snapshot = repo::snapshot(root, &pr, &Cancel::default())?;
+    assert_eq!(
+        snapshot.files.first().context("Missing file")?.hunks.len(),
+        2
+    );
+    fs::write(
+        root.join("file.rs"),
+        "uncommitted changes must stay private\n",
+    )?;
+    let mut app = App::new(
+        Storage {
+            config: root.join("config.json"),
+            cache: root.into(),
+        },
+        Default::default(),
+    );
+    app.inbox.push(PrSummary {
+        key: key.clone(),
+        title: pr.title.clone(),
+        author: pr.author.clone(),
+        updated: String::new(),
+        created: String::new(),
+        stats: None,
+        stats_error: false,
+        draft: false,
+    });
+    let guide = Guide {
+        chapters: vec![
+            Chapter {
+                title: "First concern".into(),
+                explanation: "First change".into(),
+                hunks: vec!["f0-h0".into()],
+            },
+            Chapter {
+                title: "Second concern".into(),
+                explanation: "Second change".into(),
+                hunks: vec!["f0-h1".into()],
+            },
+            Chapter {
+                title: "Another use".into(),
+                explanation: "Reused change".into(),
+                hunks: vec!["f0-h1".into()],
+            },
+        ],
+    };
+    guide.validate(&snapshot)?;
+    app.reviews.insert(
+        key.id(),
+        Review {
+            root: Some(root.into()),
+            snapshot: Some(Arc::new(snapshot)),
+            guide: Some(Arc::new(guide)),
+            ..Default::default()
+        },
+    );
+    app.action(Action::SetView(View::Guide));
+    Ok((app, pr))
+}
+
+fn render(app: &mut App, width: u16) -> Result<()> {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 40))?;
+    terminal.draw(|frame| difu::ui::draw(frame, app))?;
+    Ok(())
+}
+
+fn click(app: &mut App, width: u16, matches: impl Fn(&Action) -> bool) -> Result<()> {
+    render(app, width)?;
+    let row = app
+        .document
+        .as_ref()
+        .context("Missing document")?
+        .rows
+        .iter()
+        .position(|row| row.right.action.as_ref().is_some_and(&matches))
+        .context("Missing control in document")?;
+    app.scroll = row.saturating_sub(5);
+    render(app, width)?;
+    let rect = app
+        .hits
+        .iter()
+        .rev()
+        .find(|(_, action)| matches(action))
+        .map(|(rect, _)| *rect)
+        .context("Missing clickable control")?;
+    app.mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: rect.x,
+        row: rect.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    Ok(())
+}
+
+fn wait_context(app: &mut App) -> Result<()> {
+    let started = Instant::now();
+    loop {
+        app.tick();
+        let state = app
+            .review()
+            .and_then(|r| r.context.get("file.rs"))
+            .context("Missing context state")?;
+        ensure!(state.error.is_none(), "Context error: {:?}", state.error);
+        if state.data.is_some() {
+            return Ok(());
+        }
+        ensure!(
+            started.elapsed() < Duration::from_secs(10),
+            "Context load timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn mouse_expansion_is_per_hunk_and_neighbor_links_navigate_in_both_layouts() -> Result<()> {
+    for width in [80, 180] {
+        let dir = tempfile::tempdir()?;
+        let (mut app, pr) = fixture(dir.path())?;
+        let snapshot = app
+            .review()
+            .and_then(|r| r.snapshot.clone())
+            .context("Missing snapshot")?;
+        let before = serde_json::to_vec(&snapshot)?;
+        let cache_key = codex::cache_key(&pr, &snapshot, &ModelChoice::default())?;
+        click(
+            &mut app,
+            width,
+            |a| matches!(a, Action::ExpandHunk(id, Direction::Below) if id == "f0-h0"),
+        )?;
+        wait_context(&mut app)?;
+        let review = app.review().context("Missing review")?;
+        assert_eq!(
+            review
+                .expanded
+                .get("f0-h0")
+                .context("Missing expansion")?
+                .below,
+            10
+        );
+        assert!(!review.expanded.contains_key("f0-h1"));
+        render(&mut app, width)?;
+        let doc = app.document.as_ref().context("Missing document")?;
+        let second = doc.sections.get(1).context("Missing second chapter")?.start;
+        let rows = doc
+            .rows
+            .iter()
+            .take(second)
+            .flat_map(|row| row.right.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(rows.contains("Neighboring hunk"));
+        assert!(rows.contains("Explained in Chapter 2: Second concern"));
+        assert!(rows.contains("Explained in Chapter 3: Another use"));
+        assert!(rows.contains("changed 32"));
+        assert!(!rows.contains("uncommitted"));
+        click(&mut app, width, |a| matches!(a, Action::GoToChapter(1)))?;
+        render(&mut app, width)?;
+        assert_eq!(
+            app.scroll,
+            app.document
+                .as_ref()
+                .and_then(|d| d.sections.get(1))
+                .context("Missing destination")?
+                .start
+        );
+        click(
+            &mut app,
+            width,
+            |a| matches!(a, Action::ExpandHunk(id, Direction::Below) if id == "f0-h0"),
+        )?;
+        assert_eq!(
+            app.review()
+                .and_then(|r| r.expanded.get("f0-h0"))
+                .context("Missing expansion")?
+                .below,
+            20
+        );
+        click(
+            &mut app,
+            width,
+            |a| matches!(a, Action::ExpandHunk(id, Direction::Above) if id == "f0-h0"),
+        )?;
+        assert_eq!(
+            app.review()
+                .and_then(|r| r.expanded.get("f0-h0"))
+                .context("Missing expansion")?
+                .above,
+            10
+        );
+        app.action(Action::SetView(View::Diff));
+        click(&mut app, width, |a| matches!(a, Action::GoToChapter(2)))?;
+        render(&mut app, width)?;
+        assert_eq!(app.view, View::Guide);
+        assert_eq!(
+            app.scroll,
+            app.document
+                .as_ref()
+                .and_then(|d| d.sections.get(2))
+                .context("Missing third chapter")?
+                .start
+        );
+        assert_eq!(serde_json::to_vec(&snapshot)?, before);
+        assert_eq!(
+            codex::cache_key(&pr, &snapshot, &ModelChoice::default())?,
+            cache_key
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("file.rs"))?,
+            "uncommitted changes must stay private\n"
+        );
+        app.shutdown();
+    }
+    Ok(())
+}
+
+#[test]
+fn context_read_failure_is_visible_and_can_be_retried() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (mut app, _) = fixture(dir.path())?;
+    fs::rename(dir.path().join(".git"), dir.path().join("git-backup"))?;
+    click(
+        &mut app,
+        180,
+        |a| matches!(a, Action::ExpandHunk(id, Direction::Below) if id == "f0-h0"),
+    )?;
+    let started = Instant::now();
+    loop {
+        app.tick();
+        if app
+            .review()
+            .and_then(|r| r.context.get("file.rs"))
+            .is_some_and(|s| s.error.is_some())
+        {
+            break;
+        }
+        ensure!(
+            started.elapsed() < Duration::from_secs(10),
+            "Missing context error"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(app.review().context("Missing review")?.expanded.is_empty());
+    render(&mut app, 180)?;
+    let text = app
+        .document
+        .as_ref()
+        .context("Missing document")?
+        .rows
+        .iter()
+        .flat_map(|r| r.right.spans.iter())
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(text.contains("Could not load context"));
+    fs::rename(dir.path().join("git-backup"), dir.path().join(".git"))?;
+    click(
+        &mut app,
+        180,
+        |a| matches!(a, Action::ExpandHunk(id, Direction::Below) if id == "f0-h0"),
+    )?;
+    wait_context(&mut app)?;
+    assert_eq!(
+        app.review()
+            .and_then(|r| r.expanded.get("f0-h0"))
+            .context("Missing expansion")?
+            .below,
+        10
+    );
+    app.shutdown();
+    Ok(())
+}

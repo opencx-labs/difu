@@ -1,5 +1,6 @@
 use crate::{
     codex::{self, Guide},
+    context::{Direction, Expansion, FileContext, FileState},
     diff::Snapshot,
     github,
     model::*,
@@ -49,6 +50,8 @@ pub struct Review {
     pub root: Option<PathBuf>,
     pub snapshot: Option<Arc<Snapshot>>,
     pub guide: Option<Arc<Guide>>,
+    pub context: HashMap<String, FileState>,
+    pub expanded: HashMap<String, Expansion>,
     pub guide_model: Option<ModelChoice>,
     pub generation: Option<Generation>,
     pub guide_error: Option<String>,
@@ -79,6 +82,7 @@ pub enum Message {
     SnapshotProgress(String, u64, repo::SnapshotProgress),
     Progress(String, u64, String),
     Guide(String, u64, ModelChoice, Result<Guide, String>),
+    Context(String, Arc<Snapshot>, String, Result<FileContext, String>),
     Models(Result<Vec<ModelInfo>, String>),
     Notice(String),
 }
@@ -98,6 +102,8 @@ pub enum Action {
     SelectFile(usize),
     Jump(usize),
     Chapter(bool),
+    GoToChapter(usize),
+    ExpandHunk(String, Direction),
     Link(String),
     Models,
     Locate,
@@ -161,6 +167,7 @@ pub struct App {
     pub quit: bool,
     pub epoch: u64,
     pub document: Option<crate::ui::Document>,
+    pub chapter_target: Option<usize>,
     pub hits: Vec<(ratatui::layout::Rect, Action)>,
     pub viewport: usize,
     pub content_rect: ratatui::layout::Rect,
@@ -222,6 +229,7 @@ impl App {
             quit: false,
             epoch: 0,
             document: None,
+            chapter_target: None,
             hits: Vec::new(),
             viewport: 20,
             content_rect: Default::default(),
@@ -602,6 +610,51 @@ impl App {
             review.preparation = Some(cancel);
         }
     }
+    fn expand_hunk(&mut self, hunk_id: String, direction: Direction) {
+        let Some(id) = self.key() else { return };
+        let Some(review) = self.reviews.get_mut(&id) else {
+            return;
+        };
+        let (Some(root), Some(snapshot)) = (review.root.clone(), review.snapshot.clone()) else {
+            return;
+        };
+        let Some((file, hunk)) = snapshot.find(&hunk_id) else {
+            return;
+        };
+        if !hunk.header.starts_with("@@ ") {
+            return;
+        }
+        let path = file.path.clone();
+        let state = review.context.entry(path.clone()).or_default();
+        if let Some(data) = &state.data {
+            data.expand(
+                &hunk_id,
+                review.expanded.entry(hunk_id.clone()).or_default(),
+                direction,
+            );
+            self.invalidate();
+            return;
+        }
+        if state.pending.contains(&(hunk_id.clone(), direction)) {
+            return;
+        }
+        let loading = !state.pending.is_empty();
+        state.pending.push((hunk_id.clone(), direction));
+        state.error = None;
+        if !loading {
+            self.spawn(move |tx, cancel| {
+                let output = (|| {
+                    let (file, _) = snapshot
+                        .find(&hunk_id)
+                        .ok_or_else(|| anyhow::anyhow!("Hunk no longer exists"))?;
+                    FileContext::new(file, repo::file_context(&root, &snapshot, file, &cancel)?)
+                })();
+                let _ = tx.send(Message::Context(id, snapshot, path, result(output)));
+            });
+        }
+        self.invalidate();
+    }
+
     pub fn generate(&mut self, force: bool) {
         let Some(id) = self.key() else {
             return;
@@ -1073,6 +1126,8 @@ impl App {
                             }
                             r.root = Some(root);
                             r.snapshot = Some(Arc::new(snapshot));
+                            r.context.clear();
+                            r.expanded.clear();
                             r.guide_error = None;
                             self.save_config();
                             self.generate_for(&id, false);
@@ -1113,6 +1168,36 @@ impl App {
                     }
                 }
             }
+            Message::Context(id, snapshot, path, output) => {
+                let Some(review) = self.reviews.get_mut(&id) else {
+                    return;
+                };
+                if !review
+                    .snapshot
+                    .as_ref()
+                    .is_some_and(|current| Arc::ptr_eq(current, &snapshot))
+                {
+                    return;
+                }
+                let Some(state) = review.context.get_mut(&path) else {
+                    return;
+                };
+                let pending = std::mem::take(&mut state.pending);
+                match output {
+                    Ok(data) => {
+                        for (hunk, direction) in pending {
+                            data.expand(
+                                &hunk,
+                                review.expanded.entry(hunk.clone()).or_default(),
+                                direction,
+                            );
+                        }
+                        state.data = Some(Arc::new(data));
+                        state.error = None;
+                    }
+                    Err(error) => state.error = Some(error),
+                }
+            }
             Message::Models(output) => {
                 self.models_loading = false;
                 match output {
@@ -1136,6 +1221,7 @@ impl App {
             Action::SelectPr(index) => self.select(index),
             Action::OpenPr => self.open(),
             Action::SetView(view) => {
+                self.chapter_target = None;
                 let Some(id) = self.key() else {
                     return;
                 };
@@ -1193,6 +1279,18 @@ impl App {
             Action::Jump(row) => {
                 self.scroll = row;
                 self.focus = Focus::Content;
+            }
+            Action::ExpandHunk(id, direction) => self.expand_hunk(id, direction),
+            Action::GoToChapter(index) => {
+                if self
+                    .review()
+                    .and_then(|r| r.guide.as_ref())
+                    .is_some_and(|g| index < g.chapters.len())
+                {
+                    self.action(Action::SetView(View::Guide));
+                    self.chapter_target = Some(index);
+                    self.focus = Focus::Content;
+                }
             }
             Action::Chapter(next) => {
                 if self.home || self.view != View::Guide {
@@ -1626,6 +1724,89 @@ impl Drop for App {
 mod tests {
     use super::*;
     use anyhow::Context;
+    #[test]
+    fn context_results_ignore_old_snapshots_and_apply_only_requested_hunks() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = App::new(
+            Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().into(),
+            },
+            Default::default(),
+        );
+        let files = crate::diff::parse(
+            "M\0file\0",
+            "diff --git a/file b/file\n@@ -2 +2 @@\n-old\n+new\n",
+        )?;
+        let snapshot = Arc::new(Snapshot {
+            base: "base".into(),
+            head: "head".into(),
+            merge_base: "base".into(),
+            head_tree: "head tree".into(),
+            base_tree: "base tree".into(),
+            files,
+        });
+        let old = Arc::new((*snapshot).clone());
+        let mut state = FileState::default();
+        state.pending.push(("f0-h0".into(), Direction::Below));
+        app.reviews.insert(
+            "pr".into(),
+            Review {
+                snapshot: Some(snapshot.clone()),
+                context: HashMap::from([("file".into(), state)]),
+                ..Default::default()
+            },
+        );
+        app.receive(Message::Context(
+            "pr".into(),
+            old,
+            "file".into(),
+            Err("stale failure".into()),
+        ));
+        let state = app
+            .reviews
+            .get("pr")
+            .and_then(|r| r.context.get("file"))
+            .ok_or_else(|| anyhow::anyhow!("Missing context state"))?;
+        assert!(state.error.is_none());
+        assert_eq!(state.pending.len(), 1);
+        let file = snapshot
+            .files
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Missing file"))?;
+        let hunk = file
+            .hunks
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("Missing hunk"))?;
+        let mut lines = hunk.lines.clone();
+        lines.push(crate::diff::DiffLine {
+            kind: crate::diff::LineKind::Context,
+            old: Some(3),
+            new: Some(3),
+            text: "tail".into(),
+        });
+        let data = FileContext::new(file, lines)?;
+        app.receive(Message::Context(
+            "pr".into(),
+            snapshot,
+            "file".into(),
+            Ok(data),
+        ));
+        let review = app
+            .reviews
+            .get("pr")
+            .ok_or_else(|| anyhow::anyhow!("Missing review"))?;
+        assert_eq!(review.expanded.len(), 1);
+        assert_eq!(review.expanded.get("f0-h0").map(|e| e.below), Some(1));
+        assert!(
+            review
+                .context
+                .get("file")
+                .is_some_and(|s| s.pending.is_empty() && s.data.is_some())
+        );
+        Ok(())
+    }
+
     #[test]
     fn commentary_takes_priority_over_summary_and_tool_activity() -> Result<()> {
         let dir = tempfile::tempdir()?;

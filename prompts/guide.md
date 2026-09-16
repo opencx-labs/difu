@@ -23,15 +23,26 @@ Write a sequence of chapters that teaches a reviewer how the change works:
 - Ground every claim in the diff and surrounding code. The PR description is
   context, not proof. If intent cannot be established, state the observable
   behavior and uncertainty. Do not invent business rationale or claim tests ran.
-- Place supporting tests with the behavior they demonstrate when useful.
-  Group mechanical, generated, and other lower-signal changes separately while
+- Cluster tests and their supporting fixtures into dedicated test chapters,
+  separate from implementation chapters. Use one test chapter for a single
+  concern; split into multiple test chapters when tests cover distinct concerns
+  (for example, signature validation, deduplication, and retry behavior). Group
+  by the behavior being tested, not by test filename. Explain the scenarios and
+  invariants each chapter verifies, without claiming the tests were run.
+- Put schema definitions, database migrations, schema generation code, and
+  generated schema artifacts into dedicated schema chapters, separate from
+  runtime logic and test chapters. Split schema chapters by concern when useful.
+  Explain the contract changes and their effect on the implementation.
+- Group remaining mechanical, generated, and other lower-signal changes separately while
   still accounting for them. Adapt chapter count to the actual change.
 - This is an explanation, not a scored review: do not give confidence scores,
   merge recommendations, reviewed checkboxes, or interactive follow-up prompts.
 
 Return only JSON matching the supplied schema. Each chapter has a title, an
 explanation, and an ordered array of hunk IDs from the input. Every input hunk ID
-must appear exactly once across the guide, including metadata-only review units.
+must appear at least once across the guide, including metadata-only review units.
+A hunk may appear in multiple chapters when it supports their explanations.
+List each hunk ID only once within a chapter.
 Use only those IDs as code references: difu resolves them to real files and code.
 Never invent IDs, URLs, or line references, and do not hide omitted changes.
 Read every supplied hunk before finalizing the chapter assignments.

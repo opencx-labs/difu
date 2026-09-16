@@ -18,7 +18,7 @@ pub struct Hunk {
     pub lines: Vec<DiffLine>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiffLine {
     pub kind: LineKind,
     pub old: Option<u64>,

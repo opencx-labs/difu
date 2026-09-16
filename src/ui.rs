@@ -1,5 +1,6 @@
 use crate::{
-    app::{Action, App, Focus, Modal, View},
+    app::{Action, App, Focus, Modal, Review, View},
+    context::Direction,
     diff::{DiffFile, DiffLine, Hunk, LineKind, split_rows},
     model::{InboxTab, ModelChoice, PrState, PrSummary, clean},
 };
@@ -365,23 +366,17 @@ fn code(line: Option<&DiffLine>, old: bool, width: usize, horizontal: usize) -> 
     spans
 }
 
-fn hunk_rows(
-    file: &DiffFile,
-    hunk: &Hunk,
-    width: usize,
-    split: bool,
-    horizontal: usize,
-    with_title: bool,
-) -> Vec<TextRow> {
+fn code_rows(lines: &[DiffLine], width: usize, split: bool, horizontal: usize) -> Vec<TextRow> {
     let mut rows = Vec::new();
-    if with_title {
-        rows.extend(file_header(file, width));
-    }
-    rows.push(text(format!(" {}", hunk.header), DIM));
     if split {
         let left = width.saturating_sub(1) / 2;
         let right = width.saturating_sub(left + 1);
-        for (old, new) in split_rows(hunk) {
+        let hunk = Hunk {
+            id: String::new(),
+            header: String::new(),
+            lines: lines.to_vec(),
+        };
+        for (old, new) in split_rows(&hunk) {
             let mut spans = code(old, true, left, horizontal);
             spans.push(span("│", BORDER));
             spans.extend(code(new, false, right, horizontal));
@@ -391,12 +386,120 @@ fn hunk_rows(
             });
         }
     } else {
-        for line in &hunk.lines {
+        for line in lines {
             rows.push(TextRow {
                 spans: code(Some(line), line.kind == LineKind::Remove, width, horizontal),
                 action: None,
             });
         }
+    }
+    rows
+}
+
+fn expansion_button(
+    review: &Review,
+    file: &DiffFile,
+    hunk: &Hunk,
+    direction: Direction,
+) -> Option<TextRow> {
+    if review.root.is_none() || !hunk.header.starts_with("@@ ") {
+        return None;
+    }
+    let state = review.context.get(&file.path);
+    let expanded = review.expanded.get(&hunk.id).copied().unwrap_or_default();
+    if let Some(data) = state.and_then(|s| s.data.as_ref()) {
+        if !data.can_expand(&hunk.id, expanded, direction) {
+            return None;
+        }
+    } else if direction == Direction::Above
+        && !hunk
+            .lines
+            .iter()
+            .find(|line| line.old.is_some() || line.new.is_some())
+            .is_some_and(|line| line.old.is_some_and(|n| n > 1) && line.new.is_some_and(|n| n > 1))
+    {
+        return None;
+    }
+    if state.is_some_and(|s| {
+        s.pending
+            .iter()
+            .any(|(id, d)| id == &hunk.id && *d == direction)
+    }) {
+        return Some(text("  Loading context…", DIM));
+    }
+    Some(link(
+        match direction {
+            Direction::Above => "  [ ↑ 10 lines above ]",
+            Direction::Below => "  [ ↓ 10 lines below ]",
+        },
+        Action::ExpandHunk(hunk.id.clone(), direction),
+    ))
+}
+
+fn hunk_rows(
+    file: &DiffFile,
+    hunk: &Hunk,
+    width: usize,
+    split: bool,
+    horizontal: usize,
+    with_title: bool,
+    review: &Review,
+) -> Vec<TextRow> {
+    let mut rows = Vec::new();
+    if with_title {
+        rows.extend(file_header(file, width));
+    }
+    rows.push(text(format!(" {}", hunk.header), DIM));
+    if let Some(button) = expansion_button(review, file, hunk, Direction::Above) {
+        rows.push(button);
+    }
+    let state = review.context.get(&file.path);
+    if let Some(error) = state.and_then(|s| s.error.as_ref()) {
+        rows.extend(prose(
+            &format!("Could not load context: {error}. Click an expansion button to retry."),
+            width,
+        ));
+    }
+    let data = state.and_then(|s| s.data.as_ref());
+    let expanded = review.expanded.get(&hunk.id).copied().unwrap_or_default();
+    if let Some(data) = data.filter(|_| hunk.header.starts_with("@@ ")) {
+        let expanded_view = expanded.above > 0 || expanded.below > 0;
+        for part in data.parts(&hunk.id, expanded) {
+            if expanded_view {
+                match part.owner {
+                    Some(id) if id != hunk.id => {
+                        rows.push(text("── Neighboring hunk ──", DIM));
+                        if let Some(guide) = &review.guide {
+                            for (index, chapter) in guide
+                                .chapters
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, c)| c.hunks.iter().any(|h| h == id))
+                            {
+                                for line in wrapped_text(
+                                    &format!(
+                                        "Explained in Chapter {}: {} →",
+                                        index + 1,
+                                        chapter.title
+                                    ),
+                                    width,
+                                ) {
+                                    rows.push(link(line, Action::GoToChapter(index)));
+                                }
+                            }
+                        }
+                    }
+                    Some(_) => rows.push(text("── This hunk ──", DIM)),
+                    None => rows.push(text("── Context ──", DIM)),
+                }
+            }
+            rows.extend(code_rows(part.lines, width, split, horizontal));
+        }
+    } else {
+        rows.extend(code_rows(&hunk.lines, width, split, horizontal));
+    }
+    if let Some(button) = expansion_button(review, file, hunk, Direction::Below) {
+        rows.push(button);
     }
     rows.push(TextRow::default());
     rows
@@ -596,6 +699,7 @@ fn build(app: &App, width: u16) -> Document {
                         split,
                         app.horizontal,
                         title,
+                        review,
                     ));
                 }
             }
@@ -661,6 +765,7 @@ fn build(app: &App, width: u16) -> Document {
                     width >= 80 && !app.config.unified,
                     app.horizontal,
                     i == 0,
+                    review,
                 ) {
                     append(&mut doc.rows, row);
                 }
@@ -892,6 +997,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Rect::new(main.x, main.y, doc.left_width, main.height),
             Action::Focus(Focus::Navigation),
         ));
+    }
+    if let Some(index) = app.chapter_target.take()
+        && let Some(section) = doc.sections.get(index)
+    {
+        app.scroll = section.start;
     }
     app.scroll = app.scroll.min(doc.max_scroll(main.height as usize));
     for y in 0..main.height {
@@ -1822,6 +1932,68 @@ mod tests {
         assert!(output.contains("[■■■■■■■■□□] 5/5"));
         assert!(output.contains("Building and validating the diff"));
         assert!(!output.contains("Receiving objects:"));
+        Ok(())
+    }
+
+    #[test]
+    fn reused_hunks_render_once_per_chapter_and_keep_navigation_in_both_layouts() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        for width in [80, 180] {
+            let mut app = guide_app(dir.path());
+            let review = app.reviews.values_mut().next().context("Missing review")?;
+            let snapshot =
+                std::sync::Arc::make_mut(review.snapshot.as_mut().context("Missing snapshot")?);
+            let line = snapshot
+                .files
+                .first_mut()
+                .and_then(|f| f.hunks.first_mut())
+                .and_then(|h| h.lines.first_mut())
+                .context("Missing shared hunk line")?;
+            line.text = "shared_hunk_line".into();
+            let guide: crate::codex::Guide = serde_json::from_value(serde_json::json!({
+                "chapters": [
+                    {"title": "First", "explanation": "First use", "hunks": ["h0", "h1", "h0"]},
+                    {"title": "Second", "explanation": "Second use", "hunks": ["h0", "h2", "h0"]}
+                ]
+            }))?;
+            guide.validate(snapshot)?;
+            review.guide = Some(std::sync::Arc::new(guide));
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))?;
+            terminal.draw(|frame| draw(frame, &mut app))?;
+            let doc = app.document.as_ref().context("Missing document")?;
+            assert_eq!(doc.sections.len(), 2);
+            let second = doc.sections.get(1).context("Missing second chapter")?.start;
+            for (start, end) in [(0, second), (second, doc.rows.len())] {
+                let rows = doc.rows.iter().skip(start).take(end - start);
+                let code = rows
+                    .flat_map(|row| row.right.spans.iter())
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                assert_eq!(code.matches("shared_hunk_line").count(), 1);
+                assert_eq!(
+                    doc.files
+                        .iter()
+                        .filter(|f| f.start >= start && f.start < end)
+                        .count(),
+                    2
+                );
+            }
+            app.key_event(crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Down,
+                crossterm::event::KeyModifiers::NONE,
+            ));
+            assert_eq!(app.scroll, second);
+            terminal.draw(|frame| draw(frame, &mut app))?;
+            let output: String = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(output.contains("shared_hunk_line"));
+        }
         Ok(())
     }
 
