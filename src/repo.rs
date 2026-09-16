@@ -195,6 +195,69 @@ fn sync_revisions(root: &Path, pr: &PrDetail, cancel: &Cancel, progress: &Progre
 pub fn snapshot(root: &Path, pr: &PrDetail, cancel: &Cancel) -> Result<Snapshot> {
     snapshot_with_progress(root, pr, cancel, Arc::new(|_| {}))
 }
+
+/// Read context from the same immutable revisions as the visible diff. Never
+/// consult the working tree, run diff helpers, or fetch missing objects here.
+pub fn file_context(
+    root: &Path,
+    snapshot: &Snapshot,
+    file: &diff::DiffFile,
+    cancel: &Cancel,
+) -> Result<Vec<diff::DiffLine>> {
+    sha(&snapshot.merge_base)?;
+    sha(&snapshot.head)?;
+    let paths = [
+        format!(":(literal){}", file.old_path),
+        format!(":(literal){}", file.path),
+    ];
+    let common = [
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--find-renames",
+        "--ignore-submodules=none",
+    ];
+    let names = process::checked(
+        git(root)
+            .args(common)
+            .args([
+                "--name-status",
+                "-z",
+                &snapshot.merge_base,
+                &snapshot.head,
+                "--",
+            ])
+            .args(&paths),
+        cancel,
+    )?;
+    let patch = process::checked(
+        git(root)
+            .args(common)
+            .args([
+                "--no-color",
+                "--unified=2147483647",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                &snapshot.merge_base,
+                &snapshot.head,
+                "--",
+            ])
+            .args(&paths),
+        cancel,
+    )?;
+    let files = diff::parse(&names, &patch)?;
+    let expanded = files
+        .into_iter()
+        .find(|candidate| candidate.path == file.path && candidate.old_path == file.old_path)
+        .context("The pinned file is unavailable for context expansion")?;
+    Ok(expanded
+        .hunks
+        .into_iter()
+        .filter(|hunk| hunk.header.starts_with("@@ "))
+        .flat_map(|hunk| hunk.lines)
+        .collect())
+}
+
 pub fn snapshot_with_progress(
     root: &Path,
     pr: &PrDetail,
@@ -372,6 +435,88 @@ mod tests {
         read(root, args, &Cancel::default())?;
         Ok(())
     }
+    #[test]
+    fn file_context_uses_pinned_revisions_and_literal_renamed_paths() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path();
+        ok(root, &["init"])?;
+        ok(root, &["config", "user.name", "Test"])?;
+        ok(root, &["config", "user.email", "test@example.invalid"])?;
+        ok(root, &["config", "commit.gpgsign", "false"])?;
+        let old_path = "old [file].rs";
+        let new_path = "new [file].rs";
+        let original = (1..=80).map(|n| format!("line {n}\n")).collect::<String>();
+        std::fs::write(root.join(old_path), &original)?;
+        ok(root, &["add", "."])?;
+        ok(root, &["commit", "-m", "base"])?;
+        let base = read(root, &["rev-parse", "HEAD"], &Cancel::default())?;
+        std::fs::rename(root.join(old_path), root.join(new_path))?;
+        std::fs::write(
+            root.join(new_path),
+            original
+                .replace("line 20\n", "changed 20\n")
+                .replace("line 60\n", "changed 60\n"),
+        )?;
+        ok(root, &["add", "."])?;
+        ok(root, &["commit", "-m", "head"])?;
+        let head = read(root, &["rev-parse", "HEAD"], &Cancel::default())?;
+        let names = process::checked(
+            git(root).args([
+                "diff",
+                "--find-renames",
+                "--name-status",
+                "-z",
+                &base,
+                &head,
+            ]),
+            &Cancel::default(),
+        )?;
+        let patch = process::checked(
+            git(root).args(["diff", "--find-renames", "--unified=3", &base, &head]),
+            &Cancel::default(),
+        )?;
+        let snapshot = Snapshot {
+            base: base.clone(),
+            head,
+            merge_base: base,
+            head_tree: String::new(),
+            base_tree: String::new(),
+            files: diff::parse(&names, &patch)?,
+        };
+        let file = snapshot.files.first().context("Missing renamed file")?;
+        assert_eq!(file.old_path, old_path);
+        assert_eq!(file.path, new_path);
+        assert_eq!(
+            file.hunks
+                .iter()
+                .filter(|h| h.header.starts_with("@@ "))
+                .count(),
+            2
+        );
+        std::fs::write(root.join(new_path), "precious uncommitted work\n")?;
+        ok(root, &["config", "diff.external", "false"])?;
+        let context = file_context(root, &snapshot, file, &Cancel::default())?;
+        assert_eq!(
+            context.first().map(|line| line.text.as_str()),
+            Some("line 1")
+        );
+        assert_eq!(
+            context.last().map(|line| line.text.as_str()),
+            Some("line 80")
+        );
+        assert!(
+            context
+                .iter()
+                .any(|line| line.kind == diff::LineKind::Add && line.text == "changed 20")
+        );
+        assert!(!context.iter().any(|line| line.text.contains("precious")));
+        assert_eq!(
+            std::fs::read_to_string(root.join(new_path))?,
+            "precious uncommitted work\n"
+        );
+        Ok(())
+    }
+
     #[test]
     fn worktree_cleanup_preserves_original_dirty_checkout() -> Result<()> {
         let dir = tempfile::tempdir()?;

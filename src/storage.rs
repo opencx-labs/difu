@@ -102,6 +102,36 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn cached_guides_collapse_duplicates_without_removing_cross_chapter_references() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let storage = Storage {
+            config: directory.path().join("config.json"),
+            cache: directory.path().into(),
+        };
+        fs::write(
+            storage.cache.join("reused.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "chapters": [
+                    {"title": "First", "explanation": "First use", "hunks": ["a", "b", "a"]},
+                    {"title": "Second", "explanation": "Second use", "hunks": ["a", "a"]}
+                ]
+            }))?,
+        )?;
+        let guide = storage
+            .load_guide("reused")?
+            .context("Missing cached guide")?;
+        assert_eq!(
+            guide
+                .chapters
+                .iter()
+                .map(|c| c.hunks.clone())
+                .collect::<Vec<_>>(),
+            vec![vec!["a", "b"], vec!["a"]]
+        );
+        Ok(())
+    }
     #[test]
     fn atomic_settings_and_private_cache_round_trip() -> Result<()> {
         let directory = tempfile::tempdir()?;

@@ -168,6 +168,12 @@ fn exercise(root: &Path) -> Result<()> {
     app.action(Action::OpenPr);
     assert_eq!(app.focus, difu::app::Focus::Navigation);
     wait(&mut app, |a| a.review().is_some_and(|r| r.guide.is_some()))?;
+    let guide = app
+        .review()
+        .and_then(|r| r.guide.as_ref())
+        .context("Missing guide")?;
+    assert_eq!(guide.chapters.len(), 2);
+    assert!(guide.chapters.iter().all(|c| c.hunks == ["f0-h0"]));
     // Revision checks are lightweight, spaced by 30 seconds, and pin open code.
     let revision_file = root.join("revisions.json");
     let original_revisions = fs::read(&revision_file)?;
@@ -398,7 +404,11 @@ fn exercise(root: &Path) -> Result<()> {
     })?;
     assert_eq!(fs::read_to_string(root.join("turns"))?, "turn\n");
     reopened.shutdown();
-    assert!(storage.load_guide(&cache_key)?.is_some());
+    let restored = storage
+        .load_guide(&cache_key)?
+        .context("Missing restored guide")?;
+    assert_eq!(restored.chapters.len(), 2);
+    assert!(restored.chapters.iter().all(|c| c.hunks == ["f0-h0"]));
     // Rewriting only the commit message preserves code and reuses the guide.
     git(
         &root.join("clone"),

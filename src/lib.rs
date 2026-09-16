@@ -1,5 +1,6 @@
 pub mod app;
 pub mod codex;
+pub mod context;
 pub mod diff;
 pub mod github;
 pub mod model;

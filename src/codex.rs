@@ -87,7 +87,20 @@ pub struct Guide {
 pub struct Chapter {
     pub title: String,
     pub explanation: String,
+    #[serde(deserialize_with = "deserialize_hunks")]
     pub hunks: Vec<String>,
+}
+
+// Generated and cached guides share this boundary. Keep the first occurrence
+// within each chapter, preserving order and references in other chapters.
+fn deserialize_hunks<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut hunks = Vec::<String>::deserialize(deserializer)?;
+    let mut seen = HashSet::new();
+    hunks.retain(|id| seen.insert(id.clone()));
+    Ok(hunks)
 }
 
 impl Guide {
@@ -113,10 +126,7 @@ impl Guide {
                     expected.contains(id.as_str()),
                     "Guide references an unknown hunk: {id}"
                 );
-                ensure!(
-                    seen.insert(id.as_str()),
-                    "Guide assigns hunk {id} more than once"
-                );
+                seen.insert(id.as_str());
             }
         }
         let missing: Vec<_> = expected.difference(&seen).copied().collect();
@@ -582,7 +592,7 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_omissions_inventions_and_duplicate_assignments() -> Result<()> {
+    fn validation_rejects_omissions_and_inventions() -> Result<()> {
         let s = snapshot()?;
         assert!(Guide { chapters: vec![] }.validate(&s).is_err());
         assert!(
@@ -594,18 +604,74 @@ mod tests {
         );
         assert!(
             Guide {
-                chapters: vec![chapter(vec!["f0-h0", "f0-h0"])]
-            }
-            .validate(&s)
-            .is_err()
-        );
-        assert!(
-            Guide {
                 chapters: vec![chapter(vec!["f0-h0"])]
             }
             .validate(&s)
             .is_ok()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn validation_accepts_a_hunk_reused_across_chapters() -> Result<()> {
+        let guide = Guide {
+            chapters: vec![chapter(vec!["f0-h0"]), chapter(vec!["f0-h0"])],
+        };
+        guide.validate(&snapshot()?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn parsing_collapses_nonadjacent_duplicates_only_within_each_chapter() -> Result<()> {
+        let guide: Guide = serde_json::from_value(json!({"chapters": [
+            {"title": "First", "explanation": "First use", "hunks": ["b", "a", "b", "c", "a"]},
+            {"title": "Second", "explanation": "Second use", "hunks": ["a", "b", "a"]}
+        ]}))?;
+        assert_eq!(
+            guide
+                .chapters
+                .iter()
+                .map(|c| c.hunks.clone())
+                .collect::<Vec<_>>(),
+            vec![vec!["b", "a", "c"], vec!["a", "b"]]
+        );
+        // Saving a parsed guide must not reintroduce duplicate IDs.
+        let saved = serde_json::to_value(&guide)?;
+        assert_eq!(
+            saved.pointer("/chapters/0/hunks"),
+            Some(&json!(["b", "a", "c"]))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn reused_hunks_do_not_hide_missing_metadata_or_unknown_ids() -> Result<()> {
+        let mut s = snapshot()?;
+        s.files.extend(crate::diff::parse(
+            "M\0metadata\0",
+            "diff --git a/metadata b/metadata\nold mode 100644\nnew mode 100755\n",
+        )?);
+        let metadata = s.files.last_mut().context("Missing metadata file")?;
+        let hunk = metadata
+            .hunks
+            .first_mut()
+            .context("Missing metadata hunk")?;
+        hunk.id = "metadata-hunk".into();
+        let mut guide: Guide = serde_json::from_value(json!({"chapters": [
+            {"title": "First", "explanation": "First use", "hunks": ["f0-h0", "f0-h0"]},
+            {"title": "Second", "explanation": "Second use", "hunks": ["f0-h0"]}
+        ]}))?;
+        assert!(guide.validate(&s).is_err());
+        let chapter = guide.chapters.last_mut().context("Missing chapter")?;
+        chapter.hunks.push("metadata-hunk".into());
+        guide.validate(&s)?;
+        guide
+            .chapters
+            .last_mut()
+            .context("Missing chapter")?
+            .hunks
+            .push("invented".into());
+        assert!(guide.validate(&s).is_err());
         Ok(())
     }
     #[test]
