@@ -19,3 +19,5 @@ pub mod ui;
 pub mod workflow;
 pub mod workflow_ui;
 pub mod worktrees;
+
+pub mod filter;

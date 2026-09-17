@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
@@ -16,9 +16,8 @@ use std::{
 pub struct Config {
     #[serde(default)]
     pub repositories: BTreeMap<String, PathBuf>,
-    /// Explicit whitelist for the repository inbox; values are active filters.
     #[serde(default)]
-    pub review_repositories: BTreeMap<String, bool>,
+    pub pinned_repositories: BTreeSet<String>,
     #[serde(default)]
     pub model: ModelChoice,
     #[serde(default = "ModelChoice::conflict_default")]
@@ -32,7 +31,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             repositories: BTreeMap::new(),
-            review_repositories: BTreeMap::new(),
+            pinned_repositories: BTreeSet::new(),
             model: ModelChoice::default(),
             conflict_model: ModelChoice::conflict_default(),
             unified: false,
@@ -65,9 +64,37 @@ impl Storage {
         if !self.config.exists() {
             return Ok(Config::default());
         }
-        serde_json::from_slice(&fs::read(&self.config)?)
-            .context("Cannot read difu config.json; fix its JSON or move it aside")
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&self.config)?)
+            .context("Cannot read difu config.json; fix its JSON or move it aside")?;
+        let mut config: Config = serde_json::from_value(value.clone())?;
+        if value.get("pinned_repositories").is_none() {
+            config.pinned_repositories = value
+                .get("review_repositories")
+                .and_then(serde_json::Value::as_object)
+                .map(|repos| repos.keys().cloned().collect())
+                .unwrap_or_default();
+            for name in &config.pinned_repositories {
+                crate::model::validate_repository(name)?;
+            }
+            self.save_config(&config)?;
+        }
+        Ok(config)
     }
+    pub fn load_repositories(&self) -> Result<Option<Vec<String>>> {
+        let path = self.cache.join("repositories.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let repos: Vec<String> = serde_json::from_slice(&fs::read(path)?)?;
+        for repo in &repos {
+            crate::model::validate_repository(repo)?;
+        }
+        Ok(Some(repos))
+    }
+    pub fn save_repositories(&self, repos: &[String]) -> Result<()> {
+        atomic_json(&self.cache.join("repositories.json"), &repos)
+    }
+
     pub fn save_config(&self, config: &Config) -> Result<()> {
         atomic_json(&self.config, config)
     }
@@ -149,6 +176,46 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn whitelist_migrates_once_and_repository_cache_survives_reopening() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let storage = Storage {
+            config: directory.path().join("config.json"),
+            cache: directory.path().join("cache"),
+        };
+        fs::create_dir_all(&storage.cache)?;
+        fs::write(
+            &storage.config,
+            r#"{
+            "repositories":{"owner/first":"/tmp/local-clone"},
+            "review_repositories":{"owner/first":true,"owner/second":false},
+            "model":{"model":"custom","effort":"high"},"unified":true
+        }"#,
+        )?;
+        let mut config = storage.load_config()?;
+        assert_eq!(
+            config.pinned_repositories,
+            BTreeSet::from(["owner/first".into(), "owner/second".into()])
+        );
+        assert_eq!(
+            config.repositories.get("owner/first"),
+            Some(&PathBuf::from("/tmp/local-clone"))
+        );
+        assert_eq!(config.model.model, "custom");
+        assert!(config.unified);
+        config.pinned_repositories.clear();
+        storage.save_config(&config)?;
+        assert!(storage.load_config()?.pinned_repositories.is_empty());
+        assert!(!fs::read_to_string(&storage.config)?.contains("review_repositories"));
+        assert!(storage.load_repositories()?.is_none());
+        storage.save_repositories(&["owner/first".into(), "owner/second".into()])?;
+        assert_eq!(
+            storage.load_repositories()?,
+            Some(vec!["owner/first".into(), "owner/second".into()])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn atomic_settings_and_private_cache_round_trip() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let storage = Storage {
@@ -157,17 +224,19 @@ mod tests {
         };
         let config = Config {
             unified: true,
-            review_repositories: BTreeMap::from([("owner/repo".into(), false)]),
+            pinned_repositories: BTreeSet::from(["owner/repo".into()]),
             ..Config::default()
         };
         storage.save_config(&config)?;
         assert!(storage.load_config()?.unified);
-        assert_eq!(
-            storage.load_config()?.review_repositories.get("owner/repo"),
-            Some(&false)
+        assert!(
+            storage
+                .load_config()?
+                .pinned_repositories
+                .contains("owner/repo")
         );
         let old: Config = serde_json::from_str(r#"{"repositories":{},"unified":true}"#)?;
-        assert!(old.review_repositories.is_empty());
+        assert!(old.pinned_repositories.is_empty());
         assert_eq!(old.conflict_model, ModelChoice::conflict_default());
         let saved: Config =
             serde_json::from_str(r#"{"model":{"model":"custom-guide","effort":"low"}}"#)?;

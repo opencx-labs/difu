@@ -3,15 +3,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum InboxTab {
     #[default]
-    ReviewRequests,
-    Authored,
+    MyPrs,
     Repositories,
 }
 impl InboxTab {
     pub fn label(self) -> &'static str {
         match self {
-            Self::ReviewRequests => "Review requests",
-            Self::Authored => "Authored",
+            Self::MyPrs => "My PRs",
             Self::Repositories => "Repositories",
         }
     }
