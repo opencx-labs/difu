@@ -143,6 +143,10 @@ impl Review {
 }
 
 pub enum Message {
+    Image(
+        crate::images::RenderKey,
+        Result<ratatui_image::sliced::SlicedProtocol, String>,
+    ),
     Failures(String, String, crate::ci::Failures),
     Definition(u64, Result<Arc<crate::navigation::Definition>, String>),
     Workflow(crate::workflow::Event),
@@ -164,6 +168,7 @@ pub enum Message {
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    Image(crate::images::Request),
     Definition {
         path: String,
         line: u64,
@@ -183,6 +188,7 @@ pub enum Action {
     AllRepositories,
     SaveRepositories,
     SelectFile(usize),
+    SelectDirectory(String),
     Jump(usize),
     Chapter(bool),
     GoToChapter(usize),
@@ -197,12 +203,14 @@ pub enum Action {
     Cancel,
     Help,
     ToggleLayout,
+    ToggleWrap,
     Scroll(i32),
     FastScroll(i32),
     Focus(Focus),
 }
 
 pub enum Modal {
+    Image(crate::images::Request),
     Definition(crate::navigation::Viewer),
     Workflow(Box<crate::workflow::Wizard>),
     Clone {
@@ -224,6 +232,7 @@ pub enum Modal {
 }
 
 pub struct App {
+    pub images: crate::images::State,
     pub workflow: crate::workflow::State,
     pub storage: Storage,
     pub config: Config,
@@ -245,6 +254,9 @@ pub struct App {
     pub nav_scroll: usize,
     pub horizontal: usize,
     pub file: usize,
+    pub directory: Option<String>,
+    pub tree_horizontal: usize,
+    pub tree_max_horizontal: usize,
     pub modal: Option<Modal>,
     pub models: Vec<ModelInfo>,
     pub model_purpose: ModelPurpose,
@@ -295,6 +307,7 @@ impl App {
             inbox_loading: false,
             inbox_error: None,
             workflow: Default::default(),
+            images: Default::default(),
             home: true,
             inbox_tab: InboxTab::ReviewRequests,
             authored_state: PrState::Open,
@@ -309,6 +322,9 @@ impl App {
             nav_scroll: 0,
             horizontal: 0,
             file: 0,
+            directory: None,
+            tree_horizontal: 0,
+            tree_max_horizontal: 0,
             modal: None,
             models: Vec::new(),
             model_purpose: ModelPurpose::Guide,
@@ -578,6 +594,8 @@ impl App {
         if index != self.selected {
             self.scroll = 0;
             self.file = 0;
+            self.directory = None;
+            self.tree_horizontal = 0;
             self.horizontal = 0;
         }
         if index != self.selected {
@@ -637,7 +655,7 @@ impl App {
         self.opened = Some(id.clone());
         self.home = false;
         self.view = View::Guide;
-        self.focus = Focus::Navigation;
+        self.focus = Focus::Content;
         self.scroll = 0;
         self.horizontal = 0;
         self.invalidate();
@@ -1087,6 +1105,7 @@ impl App {
     }
     fn receive(&mut self, message: Message) {
         match message {
+            Message::Image(key, output) => self.images.receive(key, output),
             Message::Definition(id, output) => {
                 if let Some(Modal::Definition(viewer)) = &mut self.modal
                     && viewer.id == id
@@ -1303,6 +1322,8 @@ impl App {
                             r.guide = None;
                             r.guide_model = None;
                             self.file = 0;
+                            self.directory = None;
+                            self.tree_horizontal = 0;
                             self.scroll = 0;
                             if let Some(detail) = &r.detail {
                                 self.config
@@ -1460,6 +1481,7 @@ impl App {
     }
     pub fn action(&mut self, action: Action) {
         match action {
+            Action::Image(request) => self.modal = Some(Modal::Image(request)),
             Action::Definition {
                 path,
                 line,
@@ -1490,7 +1512,7 @@ impl App {
                 self.view = view;
                 self.scroll = 0;
                 self.horizontal = 0;
-                self.focus = if view == View::Overview {
+                self.focus = if view != View::Diff {
                     Focus::Content
                 } else {
                     Focus::Navigation
@@ -1530,7 +1552,16 @@ impl App {
                 }
             }
             Action::SaveRepositories => self.save_repositories(),
+            Action::SelectDirectory(path) => {
+                self.workflow.cursor = None;
+                self.workflow.selection = None;
+                self.focus = Focus::Navigation;
+                self.directory = Some(path);
+                self.scroll = 0;
+                self.invalidate();
+            }
             Action::SelectFile(file) => {
+                self.directory = None;
                 self.workflow.cursor = None;
                 self.workflow.selection = None;
                 self.focus = Focus::Navigation;
@@ -1626,6 +1657,20 @@ impl App {
             }
             Action::Cancel => self.cancel(),
             Action::Help => self.modal = Some(Modal::Help),
+            Action::ToggleWrap => {
+                let mut config = self.config.clone();
+                config.wrap_diff = !config.wrap_diff;
+                if let Err(error) = self.storage.save_config(&config) {
+                    self.notice =
+                        Notice::error(format!("Could not save wrapping preference: {error:#}"));
+                    return;
+                }
+                self.config = config;
+                self.horizontal = 0;
+                self.workflow.cursor = None;
+                self.workflow.selection = None;
+                self.invalidate();
+            }
             Action::ToggleLayout => {
                 self.config.unified = !self.config.unified;
                 self.save_config();
@@ -1650,19 +1695,27 @@ impl App {
             && self.view != View::Overview
             && (self.view == View::Diff || self.review().is_none_or(|r| r.guide.is_none()))
         {
-            let count = self
+            let entries = self
                 .review()
                 .and_then(|r| r.snapshot.as_ref())
-                .map(|s| s.files.len())
+                .map(|s| crate::tree::entries(&s.files))
+                .unwrap_or_default();
+            let current = entries
+                .iter()
+                .position(|entry| match &self.directory {
+                    Some(path) => entry.file.is_none() && &entry.path == path,
+                    None => entry.file == Some(self.file),
+                })
                 .unwrap_or(0);
-            self.workflow.cursor = None;
-            self.workflow.selection = None;
-            self.file = self
-                .file
+            let next = current
                 .saturating_add_signed(delta as isize)
-                .min(count.saturating_sub(1));
-            self.scroll = 0;
-            self.invalidate();
+                .min(entries.len().saturating_sub(1));
+            if let Some(entry) = entries.get(next) {
+                self.action(match entry.file {
+                    Some(index) => Action::SelectFile(index),
+                    None => Action::SelectDirectory(entry.path.clone()),
+                });
+            }
         } else if self.focus == Focus::Navigation && self.view == View::Guide {
             let count = self.document.as_ref().map_or(0, |d| d.navigation.len());
             let index = self
@@ -1766,6 +1819,15 @@ impl App {
             KeyCode::End => {
                 self.move_scroll(i32::MAX);
             }
+            KeyCode::Left | KeyCode::Right if self.focus == Focus::Navigation => {
+                self.tree_horizontal = if key.code == KeyCode::Left {
+                    self.tree_horizontal.saturating_sub(4)
+                } else {
+                    self.tree_horizontal
+                        .saturating_add(4)
+                        .min(self.tree_max_horizontal)
+                };
+            }
             KeyCode::Left => self.horizontal = self.horizontal.saturating_sub(4),
             KeyCode::Right => self.horizontal = self.horizontal.saturating_add(4),
             KeyCode::Tab | KeyCode::BackTab => {
@@ -1811,6 +1873,7 @@ impl App {
                     key.code == KeyCode::Char('F') || key.modifiers.contains(KeyModifiers::SHIFT),
                 );
             }
+            KeyCode::Char('w') if plain => self.action(Action::ToggleWrap),
             KeyCode::Char('r') if plain => self.refresh(),
             KeyCode::Char('g') if plain => self.action(Action::Regenerate),
             KeyCode::Char('l') if plain => self.action(Action::Locate),
@@ -1835,6 +1898,14 @@ impl App {
             return;
         };
         match modal {
+            Modal::Image(request) => {
+                if key.code == KeyCode::Char('o')
+                    && let Ok(url) = request.browser_url()
+                {
+                    self.action(Action::Link(url.into()));
+                }
+                self.modal = Some(Modal::Image(request));
+            }
             Modal::Definition(mut viewer) => {
                 let total = viewer
                     .output
@@ -2038,13 +2109,18 @@ impl App {
     }
     pub fn paste(&mut self, text: String) {
         match &mut self.modal {
-            Some(Modal::Workflow(modal)) => {
-                if let crate::workflow::Wizard::Compose(draft) = modal.as_mut()
-                    && draft.focus == 0
-                {
+            Some(Modal::Workflow(modal)) => match modal.as_mut() {
+                crate::workflow::Wizard::Compose(draft) if draft.focus == 0 => {
                     draft.editor.insert(&text);
                 }
-            }
+                crate::workflow::Wizard::Controls {
+                    query, selected, ..
+                } => {
+                    query.insert(&text.replace(['\n', '\r', '\t'], " "));
+                    *selected = 0;
+                }
+                _ => {}
+            },
             Some(Modal::Clone { value, .. }) => value.push_str(text.trim()),
             Some(Modal::Repositories {
                 query, selected, ..

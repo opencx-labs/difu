@@ -26,6 +26,9 @@ pub(crate) fn column(area: Rect) -> Rect {
 /// Preserve span styling and link actions when an unbroken URL or branch name
 /// needs more rows. All widths are terminal cells, not UTF-8 bytes.
 fn flow(row: TextRow, width: usize) -> Vec<TextRow> {
+    if row.image.is_some() {
+        return vec![row];
+    }
     let width = width.max(1);
     let mut rows = Vec::new();
     let mut spans = Vec::new();
@@ -43,6 +46,7 @@ fn flow(row: TextRow, width: usize) -> Vec<TextRow> {
                     action: row.action.clone(),
                     target: None,
                     code_links: Vec::new(),
+                    image: None,
                 });
                 used = 0;
                 if ch == '\n' {
@@ -66,6 +70,7 @@ fn flow(row: TextRow, width: usize) -> Vec<TextRow> {
         action: row.action,
         target: None,
         code_links: Vec::new(),
+        image: None,
     });
     rows
 }
@@ -77,6 +82,9 @@ fn rule(width: usize, left: &str, right: &str) -> TextRow {
     )
 }
 fn padded(mut row: TextRow, width: usize, background: Color) -> TextRow {
+    if let Some(image) = &mut row.image {
+        image.inset += 2;
+    }
     let used: usize = row.spans.iter().map(Span::width).sum();
     let mut spans = vec![
         Span::styled("│", Style::default().fg(BORDER)),
@@ -96,6 +104,7 @@ fn padded(mut row: TextRow, width: usize, background: Color) -> TextRow {
         action: row.action,
         target: None,
         code_links: Vec::new(),
+        image: row.image,
     }
 }
 fn card(width: usize, header: Vec<TextRow>, body: Vec<TextRow>) -> Vec<TextRow> {
@@ -131,7 +140,11 @@ fn state_color(state: &str) -> Color {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn rows(review: &Review, width: u16) -> Vec<TextRow> {
+    rows_with_images(review, width, false)
+}
+pub(crate) fn rows_with_images(review: &Review, width: u16, images: bool) -> Vec<TextRow> {
     let width = width as usize;
     let inner = width.saturating_sub(4).max(1);
     let Some(pr) = review.detail.as_ref() else {
@@ -198,7 +211,7 @@ pub(crate) fn rows(review: &Review, width: u16) -> Vec<TextRow> {
     let body = if pr.body.trim().is_empty() {
         vec![text("No description provided.", DIM)]
     } else {
-        prose(&pr.body, inner)
+        crate::images::rows(&pr.body, inner, pr, images)
     };
     rows.extend(card(
         width,
@@ -225,7 +238,12 @@ pub(crate) fn rows(review: &Review, width: u16) -> Vec<TextRow> {
             ),
             text(date(&item.date), DIM),
         ];
-        let mut body = prose(&item.body, activity_width.saturating_sub(4).max(1));
+        let mut body = crate::images::rows(
+            &item.body,
+            activity_width.saturating_sub(4).max(1),
+            pr,
+            images,
+        );
         if !item.url.is_empty() {
             if !body.is_empty() {
                 body.push(TextRow::default());
@@ -234,6 +252,9 @@ pub(crate) fn rows(review: &Review, width: u16) -> Vec<TextRow> {
         }
         for mut row in card(activity_width, header, body) {
             row.spans.insert(0, Span::raw(" ".repeat(inset)));
+            if let Some(image) = &mut row.image {
+                image.inset += inset as u16;
+            }
             rows.push(row);
         }
     }

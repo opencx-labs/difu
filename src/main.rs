@@ -86,6 +86,7 @@ fn main() -> Result<()> {
             EnableMouseCapture,
             EnableBracketedPaste
         )?;
+        app.images.detect();
         app.start(pr);
         while !app.quit && !terminated.load(std::sync::atomic::Ordering::Relaxed) {
             app.tick();

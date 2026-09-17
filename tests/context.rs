@@ -101,16 +101,19 @@ fn fixture(root: &Path) -> Result<(App, PrDetail)> {
     let guide = Guide {
         chapters: vec![
             Chapter {
+                category: difu::codex::ChapterCategory::Regular,
                 title: "First concern".into(),
                 explanation: "First change".into(),
                 hunks: vec!["f0-h0".into()],
             },
             Chapter {
+                category: difu::codex::ChapterCategory::Regular,
                 title: "Second concern".into(),
                 explanation: "Second change".into(),
                 hunks: vec!["f0-h1".into()],
             },
             Chapter {
+                category: difu::codex::ChapterCategory::Regular,
                 title: "Another use".into(),
                 explanation: "Reused change".into(),
                 hunks: vec!["f0-h1".into()],

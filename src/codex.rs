@@ -79,16 +79,39 @@ fn progress_message(event: &Value) -> Option<String> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Guide {
+    #[serde(deserialize_with = "deserialize_chapters")]
     pub chapters: Vec<Chapter>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Chapter {
+    pub category: ChapterCategory,
     pub title: String,
     pub explanation: String,
     #[serde(deserialize_with = "deserialize_hunks")]
     pub hunks: Vec<String>,
+}
+
+/// Section order is explicit, independent of chapter titles or filenames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChapterCategory {
+    Schema,
+    Migrations,
+    Regular,
+    Generated,
+    Tests,
+}
+
+fn deserialize_chapters<'de, D>(deserializer: D) -> std::result::Result<Vec<Chapter>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut chapters = Vec::<Chapter>::deserialize(deserializer)?;
+    // Preserve the model's explanatory order inside each section.
+    chapters.sort_by_key(|chapter| chapter.category);
+    Ok(chapters)
 }
 
 // Generated and cached guides share this boundary. Keep the first occurrence
@@ -181,7 +204,7 @@ pub fn legacy_cache_key(pr: &PrDetail, snapshot: &Snapshot, model: &ModelChoice)
 }
 
 fn schema() -> Value {
-    json!({"type":"object","additionalProperties":false,"required":["chapters"],"properties":{"chapters":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["title","explanation","hunks"],"properties":{"title":{"type":"string"},"explanation":{"type":"string"},"hunks":{"type":"array","items":{"type":"string"}}}}}}})
+    json!({"type":"object","additionalProperties":false,"required":["chapters"],"properties":{"chapters":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["category","title","explanation","hunks"],"properties":{"category":{"type":"string","enum":["schema","migrations","regular","generated","tests"]},"title":{"type":"string"},"explanation":{"type":"string"},"hunks":{"type":"array","items":{"type":"string"}}}}}}})
 }
 
 // An empty table is merged with inherited MCP configuration, so it does not
@@ -629,6 +652,7 @@ mod tests {
     }
     fn chapter(hunks: Vec<&str>) -> Chapter {
         Chapter {
+            category: crate::codex::ChapterCategory::Regular,
             title: "Title".into(),
             explanation: "Explanation".into(),
             hunks: hunks.into_iter().map(String::from).collect(),
@@ -725,10 +749,52 @@ mod tests {
     }
 
     #[test]
+    fn chapter_categories_group_stably_and_require_explicit_classification() -> Result<()> {
+        let guide: Guide = serde_json::from_value(json!({"chapters": [
+            {"category":"tests","title":"Test one","explanation":"e","hunks":["f0-h0"]},
+            {"category":"generated","title":"Routes","explanation":"e","hunks":["f0-h0"]},
+            {"category":"regular","title":"Feature","explanation":"e","hunks":["f0-h0"]},
+            {"category":"tests","title":"Test two","explanation":"e","hunks":["f0-h0"]},
+            {"category":"generated","title":"Client","explanation":"e","hunks":["f0-h0"]},
+            {"category":"migrations","title":"Backfill","explanation":"e","hunks":["f0-h0"]},
+            {"category":"schema","title":"DTO","explanation":"e","hunks":["f0-h0"]}
+        ]}))?;
+        guide.validate(&snapshot()?)?;
+        assert_eq!(
+            guide
+                .chapters
+                .iter()
+                .map(|c| c.title.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "DTO", "Backfill", "Feature", "Routes", "Client", "Test one", "Test two"
+            ]
+        );
+        let round_trip: Guide = serde_json::from_value(serde_json::to_value(&guide)?)?;
+        assert_eq!(
+            round_trip
+                .chapters
+                .iter()
+                .map(|c| c.title.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "DTO", "Backfill", "Feature", "Routes", "Client", "Test one", "Test two"
+            ]
+        );
+        for invalid in [
+            json!({"title":"x","explanation":"e","hunks":["f0-h0"]}),
+            json!({"category":"guessed","title":"x","explanation":"e","hunks":["f0-h0"]}),
+        ] {
+            assert!(serde_json::from_value::<Guide>(json!({"chapters":[invalid]})).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn parsing_collapses_nonadjacent_duplicates_only_within_each_chapter() -> Result<()> {
         let guide: Guide = serde_json::from_value(json!({"chapters": [
-            {"title": "First", "explanation": "First use", "hunks": ["b", "a", "b", "c", "a"]},
-            {"title": "Second", "explanation": "Second use", "hunks": ["a", "b", "a"]}
+            {"category": "regular", "title": "First", "explanation": "First use", "hunks": ["b", "a", "b", "c", "a"]},
+            {"category": "regular", "title": "Second", "explanation": "Second use", "hunks": ["a", "b", "a"]}
         ]}))?;
         assert_eq!(
             guide
@@ -761,8 +827,8 @@ mod tests {
             .context("Missing metadata hunk")?;
         hunk.id = "metadata-hunk".into();
         let mut guide: Guide = serde_json::from_value(json!({"chapters": [
-            {"title": "First", "explanation": "First use", "hunks": ["f0-h0", "f0-h0"]},
-            {"title": "Second", "explanation": "Second use", "hunks": ["f0-h0"]}
+            {"category": "regular", "title": "First", "explanation": "First use", "hunks": ["f0-h0", "f0-h0"]},
+            {"category": "regular", "title": "Second", "explanation": "Second use", "hunks": ["f0-h0"]}
         ]}))?;
         assert!(guide.validate(&s).is_err());
         let chapter = guide.chapters.last_mut().context("Missing chapter")?;
@@ -838,7 +904,7 @@ mod tests {
     fn schema_rejects_unvalidated_reference_fields() {
         assert!(
             serde_json::from_str::<Guide>(
-                r#"{"chapters":[{"title":"t","explanation":"e","hunks":["f0-h0"],"line":123}]}"#
+                r#"{"chapters":[{"category": "regular", "title":"t","explanation":"e","hunks":["f0-h0"],"line":123}]}"#
             )
             .is_err()
         );

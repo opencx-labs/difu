@@ -76,25 +76,43 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 ));
             }
         }
-        Wizard::Controls { key, selected, .. } => {
+        Wizard::Controls {
+            key,
+            selected,
+            query,
+            ..
+        } => {
             rows.push(ui::bold(format!("PR controls · {}", key.id()), ACCENT));
-            rows.push(ui::text("↑↓ select · Enter open · Esc close", DIM));
+            rows.push(ui::text(
+                "Type to filter · ↑↓ select · Enter open · Ctrl+U clear · Esc close",
+                DIM,
+            ));
+            let input_width = inner.width.saturating_sub(8) as usize;
+            let (lines, (x, y)) = query.layout(input_width);
+            rows.push(ui::text(
+                format!(
+                    "Filter: {}",
+                    lines.get(y).map(String::as_str).unwrap_or_default()
+                ),
+                TEXT,
+            ));
+            if input_width > 0 && inner.height > 2 {
+                frame.set_cursor_position((
+                    inner.x + 8 + (x as u16).min(inner.width - 9),
+                    inner.y + 2,
+                ));
+            }
             rows.push(ui::text("", DIM));
-            for (i, label) in [
-                "Review PR",
-                "Merge",
-                "Squash merge",
-                "Merge with admin override",
-                "Squash merge with admin override",
-                "Close PR (optional comment)",
-                "Resolve conflicts",
-            ]
-            .iter()
-            .enumerate()
-            {
+            let commands = crate::workflow::control_commands(&query.text());
+            let available = inner.height.saturating_sub(5) as usize;
+            let start = selected.saturating_sub(available.saturating_sub(1));
+            if commands.is_empty() {
+                rows.push(ui::text("No matching commands.", DIM));
+            }
+            for (position, (id, label)) in commands.iter().enumerate().skip(start).take(available) {
                 rows.push(action(
-                    format!("{} {label}", if i == *selected { ">" } else { " " }),
-                    WAction::Choose(i),
+                    format!("{} {label}", if position == *selected { ">" } else { " " }),
+                    WAction::Choose(*id),
                 ));
             }
             if let Some(r) = app.review() {
