@@ -29,6 +29,26 @@ fn text(v: &Value, key: &str) -> String {
         .into()
 }
 
+/// The personal inbox is the union of authored PRs and review requests. Keep
+/// the freshest copy if a PR changes between the two GitHub search responses.
+pub fn my_prs(state: PrState, cancel: &Cancel) -> Result<Vec<PrSummary>> {
+    let mut prs = search_prs("--author=@me", state, cancel)?;
+    cancel.check()?;
+    prs.extend(search_prs("--review-requested=@me", state, cancel)?);
+    Ok(ordered_unique(prs))
+}
+
+fn ordered_unique(mut prs: Vec<PrSummary>) -> Vec<PrSummary> {
+    prs.sort_by(|a, b| {
+        b.updated
+            .cmp(&a.updated)
+            .then_with(|| a.key.id().cmp(&b.key.id()))
+    });
+    let mut seen = std::collections::HashSet::new();
+    prs.retain(|pr| seen.insert(pr.key.id()));
+    prs
+}
+
 pub fn inbox(
     tab: InboxTab,
     state: PrState,
@@ -45,19 +65,9 @@ pub fn inbox(
             }
             combined.extend(search_prs(&format!("--repo={repository}"), state, cancel)?);
         }
-        combined.sort_by(|a, b| {
-            b.updated
-                .cmp(&a.updated)
-                .then_with(|| a.key.id().cmp(&b.key.id()))
-        });
-        combined.dedup_by(|a, b| a.key == b.key);
-        return Ok(combined);
+        return Ok(ordered_unique(combined));
     }
-    let (scope, state) = match tab {
-        InboxTab::ReviewRequests => ("--review-requested=@me", PrState::Open),
-        _ => ("--author=@me", state),
-    };
-    search_prs(scope, state, cancel)
+    my_prs(state, cancel)
 }
 
 fn search_prs(scope: &str, state: PrState, cancel: &Cancel) -> Result<Vec<PrSummary>> {
@@ -602,6 +612,37 @@ pub fn open_url(url: &str, cancel: &Cancel) -> Result<()> {
 #[cfg(test)]
 mod inbox_tests {
     use super::*;
+    #[test]
+    fn personal_inbox_deduplicates_across_updates_and_repositories() -> Result<()> {
+        let pr = |repo: &str, number: u64, updated: &str, title: &str| PrSummary {
+            key: PrKey {
+                owner: "example".into(),
+                repo: repo.into(),
+                number,
+            },
+            title: title.into(),
+            author: "author".into(),
+            updated: updated.into(),
+            created: "2026-09-01T00:00:00Z".into(),
+            stats: None,
+            stats_error: false,
+            draft: false,
+        };
+        let prs = ordered_unique(vec![
+            pr("one", 1, "2026-09-17T00:00:00Z", "Old copy"),
+            pr("one", 2, "2026-09-18T00:00:00Z", "Another PR"),
+            pr("one", 1, "2026-09-19T00:00:00Z", "Fresh copy"),
+            pr("two", 1, "2026-09-18T00:00:00Z", "Other repository"),
+            pr("one", 2, "2026-09-18T00:00:00Z", "Duplicate"),
+        ]);
+        assert_eq!(prs.len(), 3);
+        assert_eq!(prs.first().context("Missing first PR")?.title, "Fresh copy");
+        assert_eq!(
+            prs.iter().map(|p| p.key.id()).collect::<Vec<_>>(),
+            ["example/one#1", "example/one#2", "example/two#1"]
+        );
+        Ok(())
+    }
 
     #[test]
     fn empty_rollups_required_rules_and_failed_checks_are_distinct() -> Result<()> {

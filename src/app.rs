@@ -11,7 +11,7 @@ use crate::{
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     path::PathBuf,
     sync::{
         Arc,
@@ -96,6 +96,7 @@ pub struct Review {
     pub snapshot: Option<Arc<Snapshot>>,
     pub guide: Option<Arc<Guide>>,
     pub context: HashMap<String, FileState>,
+    pub bounds: HashMap<String, crate::bounds::State>,
     pub expanded: HashMap<String, Expansion>,
     pub guide_model: Option<ModelChoice>,
     pub generation: Option<Generation>,
@@ -143,6 +144,13 @@ impl Review {
 }
 
 pub enum Message {
+    Bounds(
+        String,
+        Arc<Snapshot>,
+        String,
+        Result<crate::bounds::Bounds, String>,
+    ),
+    Clipboard(u64, Result<String, String>),
     Image(
         crate::images::RenderKey,
         Result<ratatui_image::sliced::SlicedProtocol, String>,
@@ -151,6 +159,7 @@ pub enum Message {
     Definition(u64, Result<Arc<crate::navigation::Definition>, String>),
     Workflow(crate::workflow::Event),
     Inbox(u64, Result<Vec<PrSummary>, String>),
+    InboxFinished(u64),
     InboxStats(u64, Vec<(String, Option<PrStats>)>),
     Repositories(Result<Vec<String>, String>),
     Detail(String, Result<PrDetail, String>),
@@ -168,6 +177,11 @@ pub enum Message {
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    Copy,
+    Filter,
+    SelectRepository(String),
+    OpenRepository,
+    PinRepository(String),
     Image(crate::images::Request),
     Definition {
         path: String,
@@ -183,10 +197,6 @@ pub enum Action {
     SetInbox(InboxTab),
     SetState(PrState),
     Back,
-    Repositories(bool),
-    ToggleRepository(String),
-    AllRepositories,
-    SaveRepositories,
     SelectFile(usize),
     SelectDirectory(String),
     Jump(usize),
@@ -222,16 +232,18 @@ pub enum Modal {
         effort: usize,
         query: String,
     },
-    Help,
-    Repositories {
-        manage: bool,
-        query: String,
-        selected: usize,
-        choices: BTreeMap<String, bool>,
-    },
+    Help(crate::help::State),
 }
 
 pub struct App {
+    pub hover: crate::hover::State,
+    pub preserve_diff_position: bool,
+    pub(crate) clipboard_id: u64,
+    pub(crate) clipboard: Option<String>,
+    pub filters: crate::filter::State,
+    pub repository: Option<String>,
+    pub repo_selected: Option<String>,
+    pub inbox_refreshed: Option<Instant>,
     pub images: crate::images::State,
     pub workflow: crate::workflow::State,
     pub storage: Storage,
@@ -242,7 +254,7 @@ pub struct App {
     pub inbox_error: Option<String>,
     pub home: bool,
     pub inbox_tab: InboxTab,
-    pub authored_state: PrState,
+    pub my_prs_state: PrState,
     pub repository_state: PrState,
     pub repository_options: Vec<String>,
     pub repositories_loading: bool,
@@ -308,9 +320,17 @@ impl App {
             inbox_error: None,
             workflow: Default::default(),
             images: Default::default(),
+            filters: Default::default(),
+            repository: None,
+            repo_selected: None,
+            hover: Default::default(),
+            preserve_diff_position: false,
+            clipboard_id: 0,
+            clipboard: None,
+            inbox_refreshed: None,
             home: true,
-            inbox_tab: InboxTab::ReviewRequests,
-            authored_state: PrState::Open,
+            inbox_tab: InboxTab::MyPrs,
+            my_prs_state: PrState::Open,
             repository_state: PrState::Open,
             repository_options: Vec::new(),
             repositories_loading: false,
@@ -390,6 +410,9 @@ impl App {
         if !self.home {
             return self.opened.clone();
         }
+        if self.repository_directory() || !self.visible_prs().contains(&self.selected) {
+            return None;
+        }
         self.inbox.get(self.selected).map(|p| p.key.id())
     }
     pub fn review(&self) -> Option<&Review> {
@@ -408,6 +431,10 @@ impl App {
         }
     }
     pub fn load_inbox(&mut self) {
+        if self.repository_directory() {
+            return;
+        }
+        self.inbox_refreshed = Some(Instant::now());
         if let Some(cancel) = self.inbox_cancel.take() {
             cancel.cancel();
         }
@@ -417,14 +444,8 @@ impl App {
         self.inbox_error = None;
         let tab = self.inbox_tab;
         let state = self.state();
-        let repositories = self
-            .config
-            .review_repositories
-            .iter()
-            .filter(|(_, enabled)| **enabled)
-            .map(|(name, _)| name.clone())
-            .collect::<Vec<_>>();
-        let cache_key = crate::storage::hash(format!("v1:{tab:?}:{state:?}:{repositories:?}"));
+        let repositories: Vec<_> = self.repository.iter().cloned().collect();
+        let cache_key = crate::storage::hash(format!("v2:{tab:?}:{state:?}:{repositories:?}"));
         match self.storage.load_inbox(&cache_key) {
             Ok(Some(inbox)) => {
                 let previous = self.inbox.get(self.selected).map(|p| p.key.id());
@@ -432,7 +453,7 @@ impl App {
                 self.selected = previous
                     .and_then(|id| self.inbox.iter().position(|p| p.key.id() == id))
                     .unwrap_or(0);
-                self.select(self.selected);
+                self.ensure_pr_selection();
             }
             Ok(None) => {}
             Err(error) => {
@@ -492,13 +513,13 @@ impl App {
                     "Could not cache PR counts: {error:#}"
                 )));
             }
+            let _ = tx.send(Message::InboxFinished(id));
         }));
     }
 
     pub fn state(&self) -> PrState {
         match self.inbox_tab {
-            InboxTab::ReviewRequests => PrState::Open,
-            InboxTab::Authored => self.authored_state,
+            InboxTab::MyPrs => self.my_prs_state,
             InboxTab::Repositories => self.repository_state,
         }
     }
@@ -507,6 +528,8 @@ impl App {
         self.opened = None;
         self.pending_open = None;
         self.inbox_tab = tab;
+        self.repository = None;
+        self.filters.focused = None;
         self.view = View::Overview;
         self.inbox.clear();
         self.selected = 0;
@@ -515,80 +538,16 @@ impl App {
         self.horizontal = 0;
         self.focus = Focus::Navigation;
         self.notice = Notice::default();
-        self.load_inbox();
-        self.invalidate();
-        if tab == InboxTab::Repositories && self.config.review_repositories.is_empty() {
-            self.choose_repositories(true);
-        }
-    }
-    fn choose_repositories(&mut self, manage: bool) {
-        let choices = match &self.modal {
-            Some(Modal::Repositories { choices, .. }) => choices.clone(),
-            _ => self.config.review_repositories.clone(),
-        };
-        self.modal = Some(Modal::Repositories {
-            manage,
-            query: String::new(),
-            selected: 0,
-            choices,
-        });
-        if manage && !self.repositories_loading {
-            self.repositories_loading = true;
-            self.repositories_error = None;
-            self.spawn(|tx, cancel| {
-                let _ = tx.send(Message::Repositories(result(github::repositories(&cancel))));
-            });
-        }
-    }
-    pub fn repository_choices(
-        &self,
-        manage: bool,
-        query: &str,
-        choices: &BTreeMap<String, bool>,
-    ) -> Vec<String> {
-        let mut names = choices.keys().cloned().collect::<Vec<_>>();
-        if manage {
-            names.extend(self.repository_options.iter().cloned());
-        }
-        names.sort_by_key(|r| r.to_lowercase());
-        names.dedup();
-        let query = query.to_lowercase();
-        names.retain(|r| r.to_lowercase().contains(&query));
-        names
-    }
-    fn toggle_repository(&mut self, name: String) {
-        if validate_repository(&name).is_err() {
-            return;
-        }
-        if let Some(Modal::Repositories {
-            manage, choices, ..
-        }) = &mut self.modal
-        {
-            if *manage {
-                if choices.remove(&name).is_none() {
-                    choices.insert(name, true);
-                }
-            } else if let Some(enabled) = choices.get_mut(&name) {
-                *enabled = !*enabled;
-            }
-        }
-    }
-    fn save_repositories(&mut self) {
-        if let Some(Modal::Repositories { choices, .. }) = self.modal.take() {
-            self.config.review_repositories = choices;
-            self.save_config();
-            // An explicitly empty whitelist stays empty, without reopening the picker.
-            self.inbox.clear();
-            self.selected = 0;
-            self.scroll = 0;
-            self.nav_scroll = 0;
-            self.pending_open = None;
+        if tab == InboxTab::Repositories {
+            self.load_repository_list();
+        } else {
             self.load_inbox();
-            self.invalidate();
         }
+        self.invalidate();
     }
+
     pub fn select(&mut self, index: usize) {
-        if index >= self.inbox.len() {
+        if index >= self.inbox.len() || !self.visible_prs().contains(&index) {
             return;
         }
         if index != self.selected {
@@ -633,6 +592,10 @@ impl App {
         });
     }
     pub fn open(&mut self) {
+        if self.repository_directory() {
+            self.open_repository();
+            return;
+        }
         let Some(id) = self.key() else {
             return;
         };
@@ -652,6 +615,9 @@ impl App {
         self.workflow.cursor = None;
         self.workflow.selection = None;
         self.workflow.nav = 0;
+        if self.home {
+            self.workflow.side = crate::review::Side::Right;
+        }
         self.opened = Some(id.clone());
         self.home = false;
         self.view = View::Guide;
@@ -893,6 +859,10 @@ impl App {
         }
     }
     pub fn refresh(&mut self) {
+        if self.repository_directory() {
+            self.load_repository_list();
+            return;
+        }
         if !self.home && self.view == View::Diff {
             if let Some(id) = self.key()
                 && let Some(r) = self.reviews.get_mut(&id)
@@ -934,6 +904,7 @@ impl App {
         let Some(review) = self.reviews.get_mut(&id) else {
             return;
         };
+        review.bounds.retain(|_, state| state.error.is_none());
         if review.generation.is_some() {
             self.notice =
                 Notice::info("Cancel the current generation before refreshing its snapshot");
@@ -1046,6 +1017,16 @@ impl App {
                 index += 1;
             }
         }
+        if self.home
+            && !self.repository_directory()
+            && !self.inbox_loading
+            && self
+                .inbox_refreshed
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(30))
+        {
+            self.load_inbox();
+        }
+        self.load_visible_bounds();
         self.poll_revisions();
         let Some(id) = self.key() else {
             return;
@@ -1105,6 +1086,37 @@ impl App {
     }
     fn receive(&mut self, message: Message) {
         match message {
+            Message::Bounds(id, snapshot, path, output) => {
+                let visible =
+                    self.key().as_ref() == Some(&id) && !self.home && self.view != View::Overview;
+                if let Some(review) = self.reviews.get_mut(&id)
+                    && review
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &snapshot))
+                {
+                    self.preserve_diff_position |= visible;
+                    let state = review.bounds.entry(path).or_default();
+                    state.loading = false;
+                    match output {
+                        Ok(data) => {
+                            state.data = Some(data);
+                            state.error = None;
+                        }
+                        Err(error) => state.error = Some(error),
+                    }
+                }
+            }
+            Message::Clipboard(id, output) => {
+                if id == self.clipboard_id {
+                    match output {
+                        Ok(text) => self.clipboard = Some(text),
+                        Err(error) => {
+                            self.notice = Notice::error(format!("Could not copy: {error}"))
+                        }
+                    }
+                }
+            }
             Message::Image(key, output) => self.images.receive(key, output),
             Message::Definition(id, output) => {
                 if let Some(Modal::Definition(viewer)) = &mut self.modal
@@ -1117,11 +1129,16 @@ impl App {
                 self.workflow_receive(event);
                 return;
             }
+            Message::InboxFinished(id) => {
+                if id == self.inbox_id {
+                    self.inbox_loading = false;
+                    self.inbox_refreshed = Some(Instant::now());
+                }
+            }
             Message::Inbox(id, output) => {
                 if id != self.inbox_id {
                     return;
                 }
-                self.inbox_loading = false;
                 match output {
                     Ok(inbox) => {
                         let previous = self.inbox.get(self.selected).map(|p| p.key.id());
@@ -1134,9 +1151,11 @@ impl App {
                             self.notice =
                                 Notice::info("GitHub search returned its maximum 1,000 results");
                         }
-                        self.select(self.selected);
+                        self.ensure_pr_selection();
                     }
                     Err(error) => {
+                        self.inbox_loading = false;
+                        self.inbox_refreshed = Some(Instant::now());
                         self.notice = Notice::error(format!(
                             "Could not refresh {}: {error}",
                             self.inbox_tab.label()
@@ -1337,6 +1356,7 @@ impl App {
                             self.workflow.selection = None;
                             self.workflow.nav = 0;
                             r.context.clear();
+                            r.bounds.clear();
                             r.expanded.clear();
                             r.guide_error = None;
                             self.save_config();
@@ -1419,7 +1439,10 @@ impl App {
             Message::Repositories(output) => {
                 self.repositories_loading = false;
                 match output {
-                    Ok(repositories) => self.repository_options = repositories,
+                    Ok(repositories) => {
+                        self.repository_options = repositories;
+                        self.ensure_repo_selection();
+                    }
                     Err(error) => self.repositories_error = Some(error),
                 }
             }
@@ -1480,7 +1503,26 @@ impl App {
         }));
     }
     pub fn action(&mut self, action: Action) {
+        self.preserve_diff_position = false;
+        if !matches!(action, Action::Filter) {
+            self.filters.focused = None;
+        }
         match action {
+            Action::Copy => self.copy_diff(),
+            Action::Filter => {
+                if let Some(kind) = self.filter_kind() {
+                    self.filters.focused = Some(kind);
+                    self.focus = Focus::Navigation;
+                }
+            }
+            Action::SelectRepository(name) => {
+                self.repo_selected = Some(name);
+                self.focus = Focus::Navigation;
+                self.scroll = 0;
+                self.invalidate();
+            }
+            Action::OpenRepository => self.open_repository(),
+            Action::PinRepository(name) => self.pin_repository(name),
             Action::Image(request) => self.modal = Some(Modal::Image(request)),
             Action::Definition {
                 path,
@@ -1497,6 +1539,9 @@ impl App {
             Action::SelectPr(index) => self.select(index),
             Action::OpenPr => self.open(),
             Action::SetView(view) => {
+                if self.home {
+                    self.workflow.side = crate::review::Side::Right;
+                }
                 self.workflow.cursor = None;
                 self.workflow.selection = None;
                 self.workflow.nav = 0;
@@ -1523,6 +1568,13 @@ impl App {
                 self.invalidate();
             }
             Action::Back => {
+                if self.repository_directory() {
+                    return;
+                }
+                if self.home {
+                    self.change_inbox(InboxTab::Repositories);
+                    return;
+                }
                 self.home = true;
                 self.opened = None;
                 self.pending_open = None;
@@ -1535,23 +1587,21 @@ impl App {
             }
             Action::SetInbox(tab) => self.change_inbox(tab),
             Action::SetState(state) => {
+                if self.repository_directory() {
+                    return;
+                }
                 match self.inbox_tab {
-                    InboxTab::Authored => self.authored_state = state,
+                    InboxTab::MyPrs => self.my_prs_state = state,
                     InboxTab::Repositories => self.repository_state = state,
-                    InboxTab::ReviewRequests => return,
                 }
-                self.change_inbox(self.inbox_tab);
+                self.inbox.clear();
+                self.selected = 0;
+                self.nav_scroll = 0;
+                self.scroll = 0;
+                self.pending_open = None;
+                self.load_inbox();
+                self.invalidate();
             }
-            Action::Repositories(manage) => self.choose_repositories(manage),
-            Action::ToggleRepository(name) => self.toggle_repository(name),
-            Action::AllRepositories => {
-                if let Some(Modal::Repositories { choices, .. }) = &mut self.modal {
-                    for enabled in choices.values_mut() {
-                        *enabled = true;
-                    }
-                }
-            }
-            Action::SaveRepositories => self.save_repositories(),
             Action::SelectDirectory(path) => {
                 self.workflow.cursor = None;
                 self.workflow.selection = None;
@@ -1656,7 +1706,7 @@ impl App {
                 }
             }
             Action::Cancel => self.cancel(),
-            Action::Help => self.modal = Some(Modal::Help),
+            Action::Help => self.modal = Some(Modal::Help(Default::default())),
             Action::ToggleWrap => {
                 let mut config = self.config.clone();
                 config.wrap_diff = !config.wrap_diff;
@@ -1686,11 +1736,33 @@ impl App {
     }
     fn move_scroll(&mut self, delta: i32) {
         if self.focus == Focus::Navigation && self.home {
-            let index = self
-                .selected
-                .saturating_add_signed(delta as isize)
-                .min(self.inbox.len().saturating_sub(1));
-            self.select(index);
+            if self.repository_directory() {
+                let names = self.visible_repositories();
+                let current = names
+                    .iter()
+                    .position(|n| Some(n) == self.repo_selected.as_ref())
+                    .unwrap_or(0);
+                let next = current
+                    .saturating_add_signed(delta as isize)
+                    .min(names.len().saturating_sub(1));
+                if let Some(name) = names.get(next) {
+                    self.repo_selected = Some(name.clone());
+                    self.scroll = 0;
+                    self.invalidate();
+                }
+            } else {
+                let visible = self.visible_prs();
+                let current = visible
+                    .iter()
+                    .position(|i| *i == self.selected)
+                    .unwrap_or(0);
+                let next = current
+                    .saturating_add_signed(delta as isize)
+                    .min(visible.len().saturating_sub(1));
+                if let Some(index) = visible.get(next) {
+                    self.select(*index);
+                }
+            }
         } else if self.focus == Focus::Navigation
             && self.view != View::Overview
             && (self.view == View::Diff || self.review().is_none_or(|r| r.guide.is_none()))
@@ -1698,7 +1770,7 @@ impl App {
             let entries = self
                 .review()
                 .and_then(|r| r.snapshot.as_ref())
-                .map(|s| crate::tree::entries(&s.files))
+                .map(|s| crate::tree::filtered(&s.files, &self.filters.files.text()))
                 .unwrap_or_default();
             let current = entries
                 .iter()
@@ -1736,6 +1808,9 @@ impl App {
         }
     }
     pub fn key_event(&mut self, key: KeyEvent) {
+        if self.hover.key(key) {
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
             return;
@@ -1748,6 +1823,10 @@ impl App {
             self.modal_key(key);
             return;
         }
+        if self.filters.focused.is_some() {
+            self.filter_key(key);
+            return;
+        }
         let plain = !key.modifiers.intersects(
             KeyModifiers::CONTROL
                 | KeyModifiers::ALT
@@ -1756,6 +1835,9 @@ impl App {
                 | KeyModifiers::META,
         );
         match key.code {
+            KeyCode::Char('c') if plain || key.modifiers == KeyModifiers::SUPER => {
+                self.action(Action::Copy)
+            }
             KeyCode::Char('/') => self.workflow_action(crate::workflow::WAction::Open),
             KeyCode::Up | KeyCode::Down
                 if key.modifiers.contains(KeyModifiers::SHIFT)
@@ -1769,7 +1851,7 @@ impl App {
                 if self.focus == Focus::Content
                     && !self.home
                     && self.view != View::Overview
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    && key.modifiers.contains(KeyModifiers::ALT) =>
             {
                 self.workflow.side = if key.code == KeyCode::Left {
                     crate::review::Side::Left
@@ -1791,7 +1873,12 @@ impl App {
                 self.action(Action::FastScroll(10))
             }
             KeyCode::Esc => {
-                if self.home {
+                if self.home
+                    && self.inbox_tab == InboxTab::Repositories
+                    && self.repository.is_some()
+                {
+                    self.action(Action::Back);
+                } else if self.home {
                     self.quit = true;
                 } else {
                     self.action(Action::Back);
@@ -1813,7 +1900,7 @@ impl App {
                 self.workflow.selection = None;
                 self.scroll = 0;
                 if self.focus == Focus::Navigation && self.home {
-                    self.select(0);
+                    self.move_scroll(i32::MIN);
                 }
             }
             KeyCode::End => {
@@ -1828,6 +1915,8 @@ impl App {
                         .min(self.tree_max_horizontal)
                 };
             }
+            KeyCode::Left | KeyCode::Right
+                if !self.home && self.view != View::Overview && self.config.wrap_diff => {}
             KeyCode::Left => self.horizontal = self.horizontal.saturating_sub(4),
             KeyCode::Right => self.horizontal = self.horizontal.saturating_add(4),
             KeyCode::Tab | KeyCode::BackTab => {
@@ -1839,39 +1928,39 @@ impl App {
                     }
             }
             KeyCode::Char('1') => self.action(if self.home {
-                Action::SetInbox(InboxTab::ReviewRequests)
+                Action::SetInbox(InboxTab::MyPrs)
             } else {
                 Action::SetView(View::Overview)
             }),
             KeyCode::Char('2') => self.action(if self.home {
-                Action::SetInbox(InboxTab::Authored)
+                Action::SetInbox(InboxTab::Repositories)
             } else {
                 Action::SetView(View::Guide)
             }),
-            KeyCode::Char('3') => self.action(if self.home {
-                Action::SetInbox(InboxTab::Repositories)
-            } else {
-                Action::SetView(View::Diff)
-            }),
+            KeyCode::Char('3') if !self.home => self.action(Action::SetView(View::Diff)),
             KeyCode::Char('?') if plain => self.action(Action::Help),
             KeyCode::Char('m') if plain => self.load_models(),
-            KeyCode::Char('s')
-                if plain && self.home && self.inbox_tab != InboxTab::ReviewRequests =>
+            KeyCode::Char('s' | '[' | ']')
+                if plain && self.home && !self.repository_directory() =>
             {
-                let state = match self.state() {
-                    PrState::Open => PrState::Merged,
-                    PrState::Merged => PrState::Closed,
-                    PrState::Closed => PrState::All,
-                    PrState::All => PrState::Open,
+                let index = PrState::ALL
+                    .iter()
+                    .position(|s| *s == self.state())
+                    .unwrap_or(0);
+                let next = if key.code == KeyCode::Char('[') {
+                    (index + 3) % 4
+                } else {
+                    (index + 1) % 4
                 };
-                self.action(Action::SetState(state));
+                if let Some(state) = PrState::ALL.get(next) {
+                    self.action(Action::SetState(*state));
+                }
             }
-            KeyCode::Char('f' | 'F')
-                if plain && self.home && self.inbox_tab == InboxTab::Repositories =>
-            {
-                self.choose_repositories(
-                    key.code == KeyCode::Char('F') || key.modifiers.contains(KeyModifiers::SHIFT),
-                );
+            KeyCode::Char('f') if plain => self.action(Action::Filter),
+            KeyCode::Char('*') if plain && self.repository_directory() => {
+                if let Some(name) = self.repo_selected.clone() {
+                    self.action(Action::PinRepository(name));
+                }
             }
             KeyCode::Char('w') if plain => self.action(Action::ToggleWrap),
             KeyCode::Char('r') if plain => self.refresh(),
@@ -1936,73 +2025,25 @@ impl App {
                 self.modal = Some(Modal::Definition(viewer));
             }
             Modal::Workflow(modal) => self.modal = Some(Modal::Workflow(modal)),
-            Modal::Repositories {
-                manage,
-                mut query,
-                mut selected,
-                choices,
-            } => {
-                let options = self.repository_choices(manage, &query, &choices);
+            Modal::Help(mut state) => {
+                let before = state.query.text();
+                let max = state.rows.saturating_sub(state.viewport);
                 match key.code {
-                    KeyCode::Up => selected = selected.saturating_sub(1),
-                    KeyCode::Down => {
-                        selected = selected
-                            .saturating_add(1)
-                            .min(options.len().saturating_sub(1))
+                    KeyCode::Up => state.scroll = state.scroll.saturating_sub(1),
+                    KeyCode::Down => state.scroll = state.scroll.saturating_add(1).min(max),
+                    KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(state.viewport),
+                    KeyCode::PageDown => {
+                        state.scroll = state.scroll.saturating_add(state.viewport).min(max)
                     }
-                    KeyCode::Backspace => {
-                        query.pop();
-                        selected = 0;
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.query = Default::default()
                     }
-                    KeyCode::Char(' ') => {
-                        self.modal = Some(Modal::Repositories {
-                            manage,
-                            query,
-                            selected,
-                            choices,
-                        });
-                        if let Some(name) = options.get(selected) {
-                            self.toggle_repository(name.clone());
-                        }
-                        return;
-                    }
-                    KeyCode::Enter => {
-                        self.modal = Some(Modal::Repositories {
-                            manage,
-                            query,
-                            selected,
-                            choices,
-                        });
-                        self.save_repositories();
-                        return;
-                    }
-                    KeyCode::Char('a')
-                        if key.modifiers.contains(KeyModifiers::CONTROL) && !manage =>
-                    {
-                        self.modal = Some(Modal::Repositories {
-                            manage,
-                            query,
-                            selected,
-                            choices,
-                        });
-                        self.action(Action::AllRepositories);
-                        return;
-                    }
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        query.push(c);
-                        selected = 0;
-                    }
-                    _ => {}
+                    _ => state.query.key(key),
                 }
-                self.modal = Some(Modal::Repositories {
-                    manage,
-                    query,
-                    selected,
-                    choices,
-                });
-            }
-            Modal::Help => {
-                self.modal = Some(Modal::Help);
+                if before != state.query.text() {
+                    state.scroll = 0;
+                }
+                self.modal = Some(Modal::Help(state));
             }
             Modal::Clone { mut value, key: id } => {
                 match key.code {
@@ -2059,22 +2100,19 @@ impl App {
         }
     }
     pub fn mouse(&mut self, event: MouseEvent) {
+        self.hover.mouse(event);
+        let definitions = self.hover.active();
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some((_, action)) = self
-                    .hits
-                    .iter()
-                    .rev()
-                    .find(|(rect, _)| rect.contains((event.column, event.row).into()))
-                {
+                if let Some((_, action)) = self.hits.iter().rev().find(|(rect, action)| {
+                    rect.contains((event.column, event.row).into())
+                        && (definitions || !matches!(action, Action::Definition { .. }))
+                }) {
                     self.action(action.clone());
                 }
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
-                if matches!(
-                    self.modal,
-                    Some(Modal::Repositories { .. } | Modal::Definition(_))
-                ) =>
+                if matches!(self.modal, Some(Modal::Definition(_) | Modal::Help(_))) =>
             {
                 let code = if event.kind == MouseEventKind::ScrollDown {
                     KeyCode::Down
@@ -2108,7 +2146,20 @@ impl App {
         }
     }
     pub fn paste(&mut self, text: String) {
+        if self.modal.is_none()
+            && let Some(kind) = self.filters.focused
+        {
+            self.filters
+                .editor_mut(kind)
+                .insert(&text.replace(['\n', '\r', '\t'], " "));
+            self.filter_changed();
+            return;
+        }
         match &mut self.modal {
+            Some(Modal::Help(state)) => {
+                state.query.insert(&text.replace(['\n', '\r', '\t'], " "));
+                state.scroll = 0;
+            }
             Some(Modal::Workflow(modal)) => match modal.as_mut() {
                 crate::workflow::Wizard::Compose(draft) if draft.focus == 0 => {
                     draft.editor.insert(&text);
@@ -2122,12 +2173,6 @@ impl App {
                 _ => {}
             },
             Some(Modal::Clone { value, .. }) => value.push_str(text.trim()),
-            Some(Modal::Repositories {
-                query, selected, ..
-            }) => {
-                query.push_str(text.trim());
-                *selected = 0;
-            }
             _ => {}
         }
     }
@@ -2140,6 +2185,194 @@ impl App {
         }
     }
 }
+impl App {
+    pub fn repository_directory(&self) -> bool {
+        self.home && self.inbox_tab == InboxTab::Repositories && self.repository.is_none()
+    }
+    pub fn filter_kind(&self) -> Option<crate::filter::Kind> {
+        use crate::filter::Kind;
+        if self.repository_directory() {
+            Some(Kind::Repositories)
+        } else if self.home {
+            Some(Kind::PullRequests)
+        } else if self.view == View::Diff
+            || (self.view == View::Guide && self.review().is_none_or(|r| r.guide.is_none()))
+        {
+            Some(Kind::Files)
+        } else {
+            None
+        }
+    }
+    pub fn visible_prs(&self) -> Vec<usize> {
+        crate::filter::prs(&self.inbox, &self.filters.prs.text())
+    }
+    pub fn visible_repositories(&self) -> Vec<String> {
+        let query = self.filters.repositories.text();
+        let mut names = self
+            .repository_options
+            .iter()
+            .filter(|name| crate::filter::matches(&query, name))
+            .cloned()
+            .collect::<Vec<_>>();
+        names.sort_by_key(|name| {
+            (
+                !self.config.pinned_repositories.contains(name),
+                name.to_lowercase(),
+                name.clone(),
+            )
+        });
+        names.dedup();
+        names
+    }
+    fn ensure_pr_selection(&mut self) {
+        let visible = self.visible_prs();
+        let index = if visible.contains(&self.selected) {
+            Some(self.selected)
+        } else {
+            visible.first().copied()
+        };
+        if let Some(index) = index {
+            if self.home {
+                self.select(index);
+            } else {
+                self.selected = index;
+            }
+        }
+        self.invalidate();
+    }
+    fn ensure_repo_selection(&mut self) {
+        let names = self.visible_repositories();
+        if !self
+            .repo_selected
+            .as_ref()
+            .is_some_and(|name| names.contains(name))
+        {
+            self.repo_selected = names.first().cloned();
+        }
+        self.invalidate();
+    }
+    fn load_repository_list(&mut self) {
+        if let Some(cancel) = self.inbox_cancel.take() {
+            cancel.cancel();
+        }
+        self.inbox_id = self.next_id();
+        self.inbox_loading = false;
+        if self.repositories_loading {
+            return;
+        }
+        match self.storage.load_repositories() {
+            Ok(Some(names)) => self.repository_options = names,
+            Ok(None) => {}
+            Err(error) => {
+                self.notice =
+                    Notice::error(format!("Could not load cached repositories: {error:#}"))
+            }
+        }
+        self.ensure_repo_selection();
+        self.repositories_loading = true;
+        self.repositories_error = None;
+        let storage = self.storage.clone();
+        self.spawn(move |tx, cancel| {
+            let output = github::repositories(&cancel);
+            if let Ok(names) = &output
+                && let Err(error) = storage.save_repositories(names)
+            {
+                let _ = tx.send(Message::Notice(format!(
+                    "Could not cache repositories: {error:#}"
+                )));
+            }
+            let _ = tx.send(Message::Repositories(result(output)));
+        });
+    }
+    fn open_repository(&mut self) {
+        if !self.repository_directory() {
+            return;
+        }
+        let Some(name) = self
+            .repo_selected
+            .clone()
+            .filter(|n| self.visible_repositories().contains(n))
+        else {
+            return;
+        };
+        self.repository = Some(name);
+        self.filters.focused = None;
+        self.inbox.clear();
+        self.selected = 0;
+        self.nav_scroll = 0;
+        self.scroll = 0;
+        self.focus = Focus::Navigation;
+        self.load_inbox();
+        self.invalidate();
+    }
+    fn pin_repository(&mut self, name: String) {
+        if !self.repository_options.contains(&name) {
+            return;
+        }
+        let mut config = self.config.clone();
+        if !config.pinned_repositories.remove(&name) {
+            config.pinned_repositories.insert(name);
+        }
+        if let Err(error) = self.storage.save_config(&config) {
+            self.notice = Notice::error(format!("Could not save repository pins: {error:#}"));
+            return;
+        }
+        self.config = config;
+        self.ensure_repo_selection();
+    }
+    fn filter_key(&mut self, key: KeyEvent) {
+        let Some(kind) = self.filters.focused else {
+            return;
+        };
+        if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+            self.filters.focused = None;
+            self.focus = Focus::Navigation;
+            return;
+        }
+        let before = self.filters.editor(kind).text();
+        if key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            *self.filters.editor_mut(kind) = Default::default();
+        } else {
+            self.filters.editor_mut(kind).key(key);
+        }
+        if before != self.filters.editor(kind).text() {
+            self.filter_changed();
+        }
+    }
+    fn filter_changed(&mut self) {
+        let focus = self.filters.focused;
+        self.nav_scroll = 0;
+        match self.filter_kind() {
+            Some(crate::filter::Kind::PullRequests) => {
+                self.pending_open = None;
+                self.ensure_pr_selection();
+            }
+            Some(crate::filter::Kind::Repositories) => self.ensure_repo_selection(),
+            Some(crate::filter::Kind::Files) => {
+                let entries = self
+                    .review()
+                    .and_then(|r| r.snapshot.as_ref())
+                    .map(|s| crate::tree::filtered(&s.files, &self.filters.files.text()))
+                    .unwrap_or_default();
+                let selected = entries.iter().any(|e| match &self.directory {
+                    Some(path) => e.file.is_none() && &e.path == path,
+                    None => e.file == Some(self.file),
+                });
+                if !selected && let Some(entry) = entries.first() {
+                    self.action(match entry.file {
+                        Some(index) => Action::SelectFile(index),
+                        None => Action::SelectDirectory(entry.path.clone()),
+                    });
+                }
+                self.tree_horizontal = 0;
+                self.invalidate();
+            }
+            None => {}
+        }
+        self.filters.focused = focus;
+    }
+}
+
 impl Drop for App {
     fn drop(&mut self) {
         self.shutdown();
@@ -2192,9 +2425,9 @@ mod tests {
         }
         app.key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(cancel.cancelled());
-        app.modal = Some(Modal::Help);
+        app.modal = Some(Modal::Help(Default::default()));
         app.receive(Message::Definition(42, Err("late result".into())));
-        assert!(matches!(app.modal, Some(Modal::Help)));
+        assert!(matches!(app.modal, Some(Modal::Help(_))));
         Ok(())
     }
 
@@ -2443,6 +2676,7 @@ mod tests {
             },
         );
         app.receive(Message::Inbox(2, Ok(vec![])));
+        app.receive(Message::InboxFinished(2));
         assert!(!app.inbox_loading);
         assert_eq!(app.key(), Some(id));
         assert!(app.review().is_some());

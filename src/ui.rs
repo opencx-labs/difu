@@ -645,14 +645,11 @@ fn expansion_button(
         if !data.can_expand(&hunk.id, expanded, direction) {
             return None;
         }
-    } else if direction == Direction::Above
-        && !hunk
-            .lines
-            .iter()
-            .find(|line| line.old.is_some() || line.new.is_some())
-            .is_some_and(|line| line.old.is_some_and(|n| n > 1) && line.new.is_some_and(|n| n > 1))
-    {
-        return None;
+    } else {
+        let bounds = review.bounds.get(&file.path)?.data?;
+        if !bounds.can_expand(hunk, direction) {
+            return None;
+        }
     }
     if state.is_some_and(|s| {
         s.pending
@@ -688,6 +685,16 @@ fn hunk_rows(
         rows.push(button);
     }
     let state = review.context.get(&file.path);
+    if let Some(error) = review
+        .bounds
+        .get(&file.path)
+        .and_then(|state| state.error.as_ref())
+    {
+        rows.extend(prose(
+            &format!("Could not read file boundaries: {error}. Press r to retry."),
+            width,
+        ));
+    }
     if let Some(error) = state.and_then(|s| s.error.as_ref()) {
         rows.extend(prose(
             &format!("Could not load context: {error}. Click an expansion button to retry."),
@@ -751,6 +758,33 @@ fn build(app: &App, width: u16) -> Document {
         guide_columns: false,
         left_width: 0,
     };
+    if app.repository_directory() {
+        if let Some(name) = &app.repo_selected {
+            append(&mut doc.rows, bold(name.clone(), TEXT));
+            append(&mut doc.rows, TextRow::default());
+            append(
+                &mut doc.rows,
+                link("Enter · Open pull requests", Action::OpenRepository),
+            );
+            append(
+                &mut doc.rows,
+                link(
+                    if app.config.pinned_repositories.contains(name) {
+                        "* · Unpin repository"
+                    } else {
+                        "* · Pin repository"
+                    },
+                    Action::PinRepository(name.clone()),
+                ),
+            );
+        } else {
+            append(
+                &mut doc.rows,
+                text("Select a repository to open its pull requests.", DIM),
+            );
+        }
+        return doc;
+    }
     let Some(review) = app.review() else {
         return doc;
     };
@@ -779,6 +813,12 @@ fn build(app: &App, width: u16) -> Document {
         }
         return doc;
     };
+    if app.filter_kind() == Some(crate::filter::Kind::Files)
+        && crate::tree::filtered(&snapshot.files, &app.filters.files.text()).is_empty()
+    {
+        append(&mut doc.rows, text("No matching files.", DIM));
+        return doc;
+    }
     if app.view == View::Guide
         && let Some(guide) = &review.guide
     {
@@ -1143,6 +1183,27 @@ fn paint_diff(
             }
         }
     }
+    if app.modal.is_none() {
+        for link in &row.code_links {
+            if let (Ok(column), Ok(width)) = (u16::try_from(link.column), u16::try_from(link.width))
+                && column < code.width
+            {
+                let rect = Rect::new(code.x + column, code.y, width.min(code.width - column), 1);
+                if app
+                    .hover
+                    .position
+                    .is_some_and(|position| rect.contains(position))
+                {
+                    app.hover.rect = Some(rect);
+                    for x in rect.x..rect.right() {
+                        if let Some(cell) = frame.buffer_mut().cell_mut((x, rect.y)) {
+                            cell.set_style(Style::default().add_modifier(Modifier::UNDERLINED));
+                        }
+                    }
+                }
+            }
+        }
+    }
     if focused {
         frame.render_widget(
             Paragraph::new(">").style(Style::default().fg(ACCENT)),
@@ -1174,9 +1235,46 @@ fn button(
     x + width + 1
 }
 
+// Map a code/header anchor through metadata-only layout changes, including
+// repeated chapter appearances and continuation rows of wrapped source lines.
+fn relocated_row(old: &Document, new: &Document, position: usize) -> Option<usize> {
+    let section = old
+        .sections
+        .iter()
+        .position(|s| position >= s.start && position < s.end);
+    let old_start = section
+        .and_then(|index| old.sections.get(index))
+        .map_or(0, |s| s.start);
+    let (start, end) = section
+        .and_then(|index| new.sections.get(index))
+        .map_or((0, new.rows.len()), |s| (s.start, s.end));
+    let (offset, target) = old
+        .rows
+        .iter()
+        .skip(position)
+        .enumerate()
+        .find_map(|(offset, row)| row.right.target.as_ref().map(|target| (offset, target)))?;
+    let occurrence = old
+        .rows
+        .iter()
+        .take(position + offset)
+        .skip(old_start)
+        .filter(|row| row.right.target.as_ref() == Some(target))
+        .count();
+    new.rows
+        .iter()
+        .enumerate()
+        .take(end)
+        .skip(start)
+        .filter(|(_, row)| row.right.target.as_ref() == Some(target))
+        .nth(occurrence)
+        .map(|(index, _)| index.saturating_sub(offset))
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     app.hits.clear();
+    app.hover.rect = None;
     frame.render_widget(
         Block::default().style(Style::default().bg(BG).fg(TEXT)),
         area,
@@ -1201,25 +1299,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let tabs = if app.home {
         vec![
             (
-                if area.width < 70 {
-                    "1 Reviews"
-                } else {
-                    "1 Review requests"
-                },
-                app.inbox_tab == InboxTab::ReviewRequests,
-                Action::SetInbox(InboxTab::ReviewRequests),
+                "1 My PRs",
+                app.inbox_tab == InboxTab::MyPrs,
+                Action::SetInbox(InboxTab::MyPrs),
             ),
             (
-                "2 Authored",
-                app.inbox_tab == InboxTab::Authored,
-                Action::SetInbox(InboxTab::Authored),
-            ),
-            (
-                if area.width < 70 {
-                    "3 Repos"
-                } else {
-                    "3 Repositories"
-                },
+                "2 Repositories",
                 app.inbox_tab == InboxTab::Repositories,
                 Action::SetInbox(InboxTab::Repositories),
             ),
@@ -1249,7 +1334,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             x = button(frame, app, x, 3, label, selected, action);
         }
     }
-    let filters = app.home && app.inbox_tab != InboxTab::ReviewRequests && area.height >= 14;
+    let filters = app.home && !app.repository_directory() && area.height >= 14;
     if filters {
         let mut x = 2;
         for state in PrState::ALL {
@@ -1265,37 +1350,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 );
             }
         }
-        if app.inbox_tab == InboxTab::Repositories {
-            let enabled = app
-                .config
-                .review_repositories
-                .values()
-                .filter(|v| **v)
-                .count();
-            let label = format!("f Repos {enabled}/{}", app.config.review_repositories.len());
-            let x = button(frame, app, 2, 6, &label, false, Action::Repositories(false));
-            if x + 24 < area.width {
-                button(
-                    frame,
-                    app,
-                    x,
-                    6,
-                    "Shift+F Whitelist",
-                    false,
-                    Action::Repositories(true),
-                );
-            }
-        }
     }
-    let content_y = if filters {
-        if app.inbox_tab == InboxTab::Repositories {
-            8
-        } else {
-            7
-        }
-    } else {
-        5
-    };
+    let content_y = if filters { 7 } else { 5 };
     let content = Rect::new(
         2,
         content_y,
@@ -1332,7 +1388,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(
             Block::default()
                 .borders(Borders::ALL)
-                .title(if app.view == View::Overview {
+                .title(if app.repository_directory() {
+                    " Repository "
+                } else if app.view == View::Overview {
                     " PR preview "
                 } else {
                     " Diff "
@@ -1374,7 +1432,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             nav.width.saturating_sub(2),
             nav.height.saturating_sub(2),
         );
-        if app.home {
+        if app.repository_directory() {
+            draw_repositories(frame, app, nav);
+        } else if app.home {
             draw_inbox(frame, app, nav);
         } else {
             draw_files(frame, app, nav);
@@ -1383,7 +1443,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.document.as_ref().is_none_or(|d| {
         d.epoch != app.epoch || d.width != main.width || d.horizontal != app.horizontal
     }) {
-        app.document = Some(build(app, main.width));
+        let next = build(app, main.width);
+        if app.preserve_diff_position
+            && let Some(previous) = &app.document
+        {
+            if let Some(cursor) = app.workflow.cursor {
+                app.workflow.cursor = relocated_row(previous, &next, cursor).or(Some(cursor));
+            }
+            app.scroll = relocated_row(previous, &next, app.scroll).unwrap_or(app.scroll);
+        }
+        app.preserve_diff_position = false;
+        app.document = Some(next);
     }
     let Some(doc) = app.document.take() else {
         return;
@@ -1528,7 +1598,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
     app.document = Some(doc);
-    let mut status = if app.home && app.inbox_loading && !app.inbox.is_empty() {
+    let mut status = if app.repository_directory() {
+        if let Some(error) = &app.repositories_error {
+            format!("Could not refresh repositories: {} · r retry", clean(error))
+        } else if app.repositories_loading {
+            "Showing cached repositories · refreshing…".into()
+        } else {
+            format!(
+                "{} repositories · * pin/unpin",
+                app.repository_options.len()
+            )
+        }
+    } else if app.home && app.inbox_loading && !app.inbox.is_empty() {
         "Showing cached PRs · Refreshing…".into()
     } else if app.home && app.inbox_error.is_some() && !app.inbox.is_empty() {
         "Showing cached PRs · Refresh failed · r retry".into()
@@ -1630,7 +1711,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ),
             ("? Help", Action::Help),
             (
-                "s State",
+                "[ / ] State",
                 Action::SetState(match app.state() {
                     PrState::Open => PrState::Merged,
                     PrState::Merged => PrState::Closed,
@@ -1638,7 +1719,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     PrState::All => PrState::Open,
                 }),
             ),
-            ("f Repos", Action::Repositories(false)),
+            ("f Filter", Action::Filter),
+            (
+                "* Pin",
+                Action::PinRepository(app.repo_selected.clone().unwrap_or_default()),
+            ),
+            ("Esc Repositories", Action::Back),
             ("r Refresh", Action::Refresh),
             ("Enter Open", Action::OpenPr),
             ("Cmd+↑/↓ 10 lines", Action::FastScroll(10)),
@@ -1649,7 +1735,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 "/ Actions",
                 Action::Workflow(crate::workflow::WAction::Open),
             ),
+            ("c / Cmd+C Copy", Action::Copy),
+            ("Cmd/Ctrl+click Definition", Action::Help),
             ("Alt+↑/↓ Chapters", Action::Chapter(true)),
+            ("f Filter", Action::Filter),
             (
                 if app.config.wrap_diff {
                     "w Unwrap"
@@ -1669,12 +1758,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ]
     };
     for (label, action) in footer {
+        if matches!(label, "c / Cmd+C Copy" | "Cmd/Ctrl+click Definition")
+            && app.view == View::Overview
+        {
+            continue;
+        }
         if label == "Alt+↑/↓ Chapters" && app.view != View::Guide {
             continue;
         }
-        if app.home
-            && ((label == "s State" && app.inbox_tab == InboxTab::ReviewRequests)
-                || (label == "f Repos" && app.inbox_tab != InboxTab::Repositories))
+        if (label == "[ / ] State" && app.repository_directory())
+            || (label == "* Pin" && !app.repository_directory())
+            || (label == "Esc Repositories"
+                && (app.inbox_tab != InboxTab::Repositories || app.repository.is_none()))
+            || (label == "f Filter" && app.filter_kind().is_none())
         {
             continue;
         }
@@ -1688,6 +1784,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         footer_x += width + 2;
     }
     let focused = match (app.focus, app.home, app.view, has_guide) {
+        (Focus::Navigation, true, _, _) if app.repository_directory() => "Repositories",
         (Focus::Navigation, true, _, _) => "PR list",
         (Focus::Navigation, false, View::Guide, true) => "Chapters",
         (Focus::Navigation, false, _, _) => "Files",
@@ -1819,49 +1916,128 @@ fn inbox_rows(pr: &PrSummary, width: usize, selected: bool) -> Vec<TextRow> {
     rows
 }
 
+fn draw_filter(frame: &mut Frame, app: &mut App, rect: Rect, kind: crate::filter::Kind) {
+    if rect.height < 2 {
+        return;
+    }
+    let rect = Rect::new(rect.x, rect.y + 1, rect.width, 1);
+    let focused = app.filters.focused == Some(kind) && app.modal.is_none();
+    let width = rect.width.saturating_sub(3) as usize;
+    let editor = app.filters.editor(kind);
+    let (lines, (x, y)) = editor.layout(width.max(1));
+    let value = if editor.chars.is_empty() && !focused {
+        "Filter…"
+    } else {
+        lines.get(y).map(String::as_str).unwrap_or_default()
+    };
+    frame.render_widget(
+        Paragraph::new(format!("f {}", crop(value, 0, width))).style(
+            Style::default()
+                .fg(if focused { ACCENT } else { DIM })
+                .bg(PANEL),
+        ),
+        rect,
+    );
+    app.hits.push((rect, Action::Filter));
+    if focused && rect.width >= 3 {
+        frame.set_cursor_position((rect.x + 2 + (x as u16).min(rect.width - 3), rect.y));
+    }
+}
+fn draw_repositories(frame: &mut Frame, app: &mut App, rect: Rect) {
+    paint(
+        frame,
+        Rect::new(rect.x, rect.y, rect.width, 1),
+        &bold("REPOSITORIES", DIM),
+        app,
+    );
+    draw_filter(frame, app, rect, crate::filter::Kind::Repositories);
+    let names = app.visible_repositories();
+    let mut rows = Vec::new();
+    for (pinned, title) in [(true, "PINNED"), (false, "REST")] {
+        rows.push((bold(title, DIM), None));
+        for name in names
+            .iter()
+            .filter(|n| app.config.pinned_repositories.contains(*n) == pinned)
+        {
+            let selected = app.repo_selected.as_ref() == Some(name);
+            rows.push((
+                text(
+                    format!(
+                        "{} {} {}",
+                        if selected { "▸" } else { " " },
+                        if pinned { "◆" } else { "◇" },
+                        name
+                    ),
+                    if selected { ACCENT } else { TEXT },
+                ),
+                Some(name.clone()),
+            ));
+        }
+    }
+    let selected = rows
+        .iter()
+        .position(|(_, name)| name.is_some() && *name == app.repo_selected)
+        .unwrap_or(0);
+    let available = rect.height.saturating_sub(2) as usize;
+    let start = selected.saturating_sub(available.saturating_sub(1));
+    for (offset, (row, name)) in rows.iter().skip(start).take(available).enumerate() {
+        let hit = Rect::new(rect.x, rect.y + 2 + offset as u16, rect.width, 1);
+        paint(frame, hit, row, app);
+        if let Some(name) = name {
+            app.hits.push((hit, Action::SelectRepository(name.clone())));
+            app.hits.push((
+                Rect::new(hit.x + 2, hit.y, hit.width.saturating_sub(2).min(1), 1),
+                Action::PinRepository(name.clone()),
+            ));
+        }
+    }
+    if names.is_empty() && rect.height > 4 {
+        let message = app
+            .repositories_error
+            .as_deref()
+            .unwrap_or(if app.repositories_loading {
+                "Loading repositories…"
+            } else if app.filters.repositories.chars.is_empty() {
+                "No repositories available."
+            } else {
+                "No matching repositories."
+            });
+        frame.render_widget(
+            Paragraph::new(clean(message))
+                .style(Style::default().fg(DIM))
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            Rect::new(rect.x, rect.y + 4, rect.width, rect.height - 4),
+        );
+    }
+}
 fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
+    let visible = app.visible_prs();
+    let title = app
+        .repository
+        .clone()
+        .unwrap_or_else(|| app.inbox_tab.label().to_uppercase());
     paint(
         frame,
         Rect::new(rect.x, rect.y, rect.width, 1),
         &bold(
-            format!(
-                "{}  {}",
-                app.inbox_tab.label().to_uppercase(),
-                app.inbox.len()
-            ),
+            format!("{title}  {}/{}", visible.len(), app.inbox.len()),
             DIM,
         ),
         app,
     );
-    if app.inbox.is_empty() {
-        let message = app.inbox_error.clone().unwrap_or_else(|| {
-            if app.inbox_loading {
-                "Loading GitHub…".into()
-            } else {
-                match app.inbox_tab {
-                    InboxTab::ReviewRequests => "No open PRs requesting your review.".into(),
-                    InboxTab::Authored => {
-                        format!("No {} authored PRs.", app.state().label().to_lowercase())
-                    }
-                    InboxTab::Repositories if app.config.review_repositories.is_empty() => {
-                        "Choose repositories first. Shift+F opens the whitelist.".into()
-                    }
-                    InboxTab::Repositories
-                        if !app
-                            .config
-                            .review_repositories
-                            .values()
-                            .any(|enabled| *enabled) =>
-                    {
-                        "No repositories enabled. f opens filters.".into()
-                    }
-                    InboxTab::Repositories => format!(
-                        "No {} PRs in the enabled repositories.",
-                        app.state().label().to_lowercase()
-                    ),
+    draw_filter(frame, app, rect, crate::filter::Kind::PullRequests);
+    if visible.is_empty() {
+        let message = if !app.inbox.is_empty() {
+            "No matching PRs.".into()
+        } else {
+            app.inbox_error.clone().unwrap_or_else(|| {
+                if app.inbox_loading {
+                    "Loading GitHub…".into()
+                } else {
+                    format!("No {} PRs.", app.state().label().to_lowercase())
                 }
-            }
-        });
+            })
+        };
         for (i, row) in prose(&message, rect.width as usize)
             .iter()
             .take(rect.height.saturating_sub(2) as usize)
@@ -1878,14 +2054,15 @@ fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
     }
     let width = usize::from(rect.width.saturating_sub(1));
     let available = usize::from(rect.height.saturating_sub(2));
-    app.nav_scroll = app.nav_scroll.min(app.selected);
-    let mut start = app.selected;
+    let selected = visible.iter().position(|i| *i == app.selected).unwrap_or(0);
+    app.nav_scroll = app.nav_scroll.min(selected);
+    let mut start = selected;
     let mut needed = app
         .inbox
-        .get(start)
+        .get(app.selected)
         .map_or(0, |pr| inbox_rows(pr, width, true).len());
     while start > app.nav_scroll {
-        let Some(pr) = app.inbox.get(start - 1) else {
+        let Some(pr) = visible.get(start - 1).and_then(|i| app.inbox.get(*i)) else {
             break;
         };
         let height = inbox_rows(pr, width, false).len() + 1;
@@ -1897,7 +2074,7 @@ fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
     }
     app.nav_scroll = start;
     let mut y = rect.y.saturating_add(2);
-    for index in app.nav_scroll..app.inbox.len() {
+    for index in visible.into_iter().skip(start) {
         if y >= rect.bottom() {
             break;
         }
@@ -1907,20 +2084,20 @@ fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
         let selected = index == app.selected;
         let rows = inbox_rows(pr, width, selected);
         let height = rows.len().min(usize::from(rect.bottom() - y)) as u16;
-        let row_rect = Rect::new(rect.x, y, rect.width.saturating_sub(1), height);
+        let hit = Rect::new(rect.x, y, rect.width.saturating_sub(1), height);
         frame.render_widget(
             Block::default().style(Style::default().bg(if selected { PANEL } else { BG })),
-            row_rect,
+            hit,
         );
-        for (offset, row) in rows.iter().take(usize::from(height)).enumerate() {
+        for (offset, row) in rows.iter().take(height as usize).enumerate() {
             paint(
                 frame,
-                Rect::new(rect.x, y + offset as u16, row_rect.width, 1),
+                Rect::new(rect.x, y + offset as u16, hit.width, 1),
                 row,
                 app,
             );
         }
-        app.hits.push((row_rect, Action::SelectPr(index)));
+        app.hits.push((hit, Action::SelectPr(index)));
         y = y.saturating_add(height).saturating_add(1);
     }
 }
@@ -1932,10 +2109,19 @@ fn draw_files(frame: &mut Frame, app: &mut App, rect: Rect) {
         &bold("FILES", DIM),
         app,
     );
+    draw_filter(frame, app, rect, crate::filter::Kind::Files);
     let Some(snapshot) = app.review().and_then(|r| r.snapshot.clone()) else {
         return;
     };
-    let entries = crate::tree::entries(&snapshot.files);
+    let entries = crate::tree::filtered(&snapshot.files, &app.filters.files.text());
+    if entries.is_empty() {
+        paint(
+            frame,
+            Rect::new(rect.x, rect.y.saturating_add(2), rect.width, 1),
+            &text("No matching files.", DIM),
+            app,
+        );
+    }
     let selected = |entry: &crate::tree::Entry| match &app.directory {
         Some(path) => entry.file.is_none() && &entry.path == path,
         None => entry.file == Some(app.file),
@@ -2089,7 +2275,82 @@ fn draw_definition(frame: &mut Frame, app: &mut App) {
     }
 }
 
+fn draw_help(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    let width = area.width.saturating_sub(4).min(100);
+    let height = area.height.saturating_sub(4).min(38);
+    let rect = Rect::new(
+        (area.width - width) / 2,
+        (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .title(" difu · keyboard & mouse ")
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(PANEL));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    app.hits.clear();
+    let Some(Modal::Help(state)) = &mut app.modal else {
+        return;
+    };
+    let input_width = inner.width.saturating_sub(8).max(1) as usize;
+    let (input, (x, y)) = state.query.layout(input_width);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Search: {}",
+            input.get(y).map(String::as_str).unwrap_or_default()
+        ))
+        .style(Style::default().fg(ACCENT)),
+        Rect::new(inner.x, inner.y, inner.width, inner.height.min(1)),
+    );
+    let cursor_x = inner.x.saturating_add(8).saturating_add(x as u16);
+    if cursor_x < inner.right() && inner.height > 0 {
+        frame.set_cursor_position((cursor_x, inner.y));
+    }
+    let matches = crate::help::entries(&state.query.text());
+    let mut rows = Vec::new();
+    for (key, description) in &matches {
+        rows.extend(prose(
+            &format!("{key:18} {description}"),
+            inner.width as usize,
+        ));
+    }
+    if rows.is_empty() {
+        rows.push(text("No matching shortcuts.", DIM));
+    }
+    state.viewport = inner.height.saturating_sub(3) as usize;
+    state.rows = rows.len();
+    state.scroll = state.scroll.min(rows.len().saturating_sub(state.viewport));
+    let scroll = state.scroll;
+    let viewport = state.viewport;
+    if inner.height > 1 {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} matches · ↑↓ scroll · Ctrl+U clear · Esc close",
+                matches.len()
+            ))
+            .style(Style::default().fg(DIM)),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        );
+    }
+    for (index, row) in rows.iter().skip(scroll).take(viewport).enumerate() {
+        paint(
+            frame,
+            Rect::new(inner.x, inner.y + 3 + index as u16, inner.width, 1),
+            row,
+            app,
+        );
+    }
+}
+
 fn draw_modal(frame: &mut Frame, app: &mut App) {
+    if matches!(app.modal, Some(Modal::Help(_))) {
+        draw_help(frame, app);
+        return;
+    }
     if matches!(app.modal, Some(Modal::Image(_))) {
         crate::images::draw_modal(frame, app);
         return;
@@ -2133,131 +2394,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
     let rows = match modal {
         Modal::Definition(_) | Modal::Image(_) => Vec::new(),
         Modal::Workflow(_) => Vec::new(),
-        Modal::Repositories {
-            manage,
-            query,
-            selected,
-            choices,
-        } => {
-            input_cursor = Some((
-                inner.x + 7 + (query.width().min(inner.width.saturating_sub(9) as usize) as u16),
-                inner.y + 1,
-            ));
-            let options = app.repository_choices(*manage, query, choices);
-            let mut rows = vec![
-                bold(
-                    if *manage {
-                        "Choose your repository whitelist"
-                    } else {
-                        "Filter whitelisted repositories"
-                    },
-                    ACCENT,
-                ),
-                text(
-                    format!(
-                        "Search: {}",
-                        crop(
-                            query,
-                            query
-                                .width()
-                                .saturating_sub(inner.width.saturating_sub(9) as usize),
-                            inner.width.saturating_sub(9) as usize
-                        )
-                    ),
-                    TEXT,
-                ),
-                text(
-                    "↑↓ select · Space/click toggle · Enter save · Esc cancel",
-                    DIM,
-                ),
-            ];
-            let mut save = bold("[ Save selection ]", ACCENT);
-            save.action = Some(Action::SaveRepositories);
-            rows.push(save);
-            if !manage {
-                let enabled = choices.values().filter(|v| **v).count();
-                let mut all = text(
-                    format!(
-                        "[ All whitelisted · Ctrl+A ]  {enabled}/{} enabled",
-                        choices.len()
-                    ),
-                    TEXT,
-                );
-                all.action = Some(Action::AllRepositories);
-                rows.push(all);
-                let mut edit = text("[ Edit whitelist ]", ACCENT);
-                edit.action = Some(Action::Repositories(true));
-                rows.push(edit);
-            }
-            if *manage && app.repositories_loading {
-                rows.push(text(
-                    "Loading your personal and organization repositories…",
-                    DIM,
-                ));
-            }
-            if *manage && let Some(error) = &app.repositories_error {
-                rows.extend(prose(error, inner.width as usize));
-            }
-            if options.is_empty() {
-                rows.push(text("No matching repositories.", DIM));
-            }
-            let count = (inner.height as usize).saturating_sub(rows.len());
-            let selected = (*selected).min(options.len().saturating_sub(1));
-            let start = selected.saturating_sub(count.saturating_sub(1));
-            for (index, name) in options.iter().enumerate().skip(start).take(count) {
-                let checked = if *manage {
-                    choices.contains_key(name)
-                } else {
-                    choices.get(name).copied().unwrap_or(false)
-                };
-                let mut row = text(
-                    format!(
-                        "{} [{}] {}",
-                        if index == selected { "▸" } else { " " },
-                        if checked { "x" } else { " " },
-                        name
-                    ),
-                    if index == selected { ACCENT } else { TEXT },
-                );
-                row.action = Some(Action::ToggleRepository(name.clone()));
-                rows.push(row);
-            }
-            rows
-        }
-        Modal::Help => vec![
-            bold("difu · keyboard & mouse", ACCENT),
-            text("", DIM),
-            text("↑ ↓           Navigate PRs, files, or code", TEXT),
-            text("Alt+↑ / ↓     Previous / next guide chapter", TEXT),
-            text("Tab           Switch navigation / content focus", TEXT),
-            text("Cmd+Up/Down   Scroll content by ten lines", TEXT),
-            text("Enter         Open PR / comment / toggle completion", TEXT),
-            text("Click symbol  JS/TS function definition · Esc closes", TEXT),
-            text("/             PR actions / worktree management", TEXT),
-            text("Page Up/Down  Scroll a page · Space scrolls down", TEXT),
-            text("Home / End    Jump to start / end", TEXT),
-            text("← → side · Alt+← → horizontal · Shift+↑↓ select", TEXT),
-            text("w             Toggle diff wrapping (saved)", TEXT),
-            text(
-                "1 / 2 / 3     Home: Reviews / Authored / Repositories",
-                TEXT,
-            ),
-            text("              Inside PR: Overview / Guide / Diff", TEXT),
-            text("s             Cycle Open / Merged / Closed / All", TEXT),
-            text("f             Filter whitelisted repositories", TEXT),
-            text("Shift+F       Edit the repository whitelist", TEXT),
-            text("m             Choose model and reasoning", TEXT),
-            text("r             Refresh / load the new PR revision", TEXT),
-            text("g             Generate again / retry", TEXT),
-            text("l             Choose another local clone path", TEXT),
-            text("x             Cancel generation or snapshot loading", TEXT),
-            text("Ctrl+R        Refresh mentions in the editor", TEXT),
-            text("Ctrl+B        Toggle side-by-side / unified", TEXT),
-            text("Ctrl+O        Open PR on GitHub", TEXT),
-            text("Mouse         Click items & links; wheel to scroll", TEXT),
-            text("Esc           Close dialog / back / quit", TEXT),
-            text("Ctrl+C        Quit and clean up running work", TEXT),
-        ],
+        Modal::Help(_) => Vec::new(),
         Modal::Clone { value, key } => {
             let mut rows = vec![bold("Locate your repository", ACCENT), text("", DIM)];
             rows.extend(prose(&format!("Choose the existing local clone for {key}. Difu remembers it for future reviews."),inner.width as usize));
@@ -2752,7 +2889,7 @@ mod tests {
         assert_eq!(app.file, 0);
         app.focus = Focus::Content;
         let tree_offset = app.tree_horizontal;
-        app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(app.horizontal, 4);
         assert_eq!(app.tree_horizontal, tree_offset);
         Ok(())
@@ -3442,16 +3579,209 @@ mod tests {
                 .iter()
                 .any(|c| c.symbol() == ">" && c.fg == ACCENT)
         );
-        app.key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
         assert_eq!(app.workflow.side, Side::Left);
         assert_eq!(app.horizontal, 0);
-        app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(app.horizontal, 4);
         let current = app.workflow.cursor;
         app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
         assert_eq!(app.workflow.cursor, current);
         Ok(())
     }
+    #[test]
+    fn arrows_scroll_unwrapped_code_and_alt_arrows_select_sides() -> Result<()> {
+        use crate::review::{Anchor, Side};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        for view in [View::Guide, View::Diff] {
+            for unified in [false, true] {
+                let mut app = guide_app(dir.path());
+                assert_eq!(app.workflow.side, Side::Right);
+                app.config.unified = unified;
+                app.action(Action::SetView(view));
+                app.focus = Focus::Content;
+                app.workflow.selection = Some(Anchor {
+                    path: "file".into(),
+                    side: Side::Right,
+                    start: 1,
+                    end: 2,
+                });
+                app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+                assert_eq!(app.horizontal, 4);
+                assert_eq!(app.workflow.side, Side::Right);
+                assert!(app.workflow.selection.is_some());
+                app.key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+                assert_eq!(app.workflow.side, Side::Left);
+                assert_eq!(app.horizontal, 4);
+                assert!(app.workflow.selection.is_none());
+                app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+                assert_eq!(app.workflow.side, Side::Right);
+                assert_eq!(app.horizontal, 4);
+                app.key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+                assert_eq!(app.horizontal, 0);
+                app.config.wrap_diff = true;
+                app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+                assert_eq!(app.horizontal, 0);
+                app.key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+                assert_eq!(app.workflow.side, Side::Left);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn searchable_help_filters_keys_and_descriptions_without_triggering_actions() -> Result<()> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        app.action(Action::Help);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))?;
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        app.paste("COPY".into());
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        assert_eq!(crate::help::entries("COPY").len(), 1);
+        assert_eq!(crate::help::entries("Cmd+C").len(), 1);
+        assert!(app.clipboard.is_none());
+        app.key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(
+            matches!(&app.modal, Some(Modal::Help(state)) if state.scroll == 1 && state.query.text().is_empty())
+        );
+        app.paste("no such shortcut".into());
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        assert!(matches!(&app.modal, Some(Modal::Help(state)) if state.scroll == 0));
+        app.key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        assert!(!app.home);
+        Ok(())
+    }
+
+    #[test]
+    fn copy_shortcuts_preserve_review_position_and_copy_whole_wrapped_source_lines() -> Result<()> {
+        use crate::{
+            review::{Anchor, Side},
+            workflow::Target,
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        for view in [View::Guide, View::Diff] {
+            for unified in [false, true] {
+                let mut app = guide_app(dir.path());
+                let id = app.key().context("Missing PR")?;
+                let snapshot = std::sync::Arc::make_mut(
+                    app.reviews
+                        .get_mut(&id)
+                        .and_then(|r| r.snapshot.as_mut())
+                        .context("Missing snapshot")?,
+                );
+                let source = format!("\t界 {}  ", "long_source_word ".repeat(40));
+                snapshot
+                    .files
+                    .first_mut()
+                    .and_then(|f| f.hunks.first_mut())
+                    .and_then(|h| h.lines.first_mut())
+                    .context("Missing source")?
+                    .text = source.clone();
+                app.config.unified = unified;
+                app.config.wrap_diff = true;
+                app.action(Action::SetView(view));
+                app.focus = Focus::Content;
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 35))?;
+                terminal.draw(|frame| draw(frame, &mut app))?;
+                let doc = app.document.as_ref().context("Missing document")?;
+                let (index, path) = doc
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, row)| match &row.right.target {
+                        Some(Target::Code {
+                            path, new: Some(3), ..
+                        }) => Some((index, path.clone())),
+                        _ => None,
+                    })
+                    .context("Missing code")?;
+                app.workflow.cursor = Some(index);
+                app.workflow.side = Side::Right;
+                app.workflow.selection = Some(Anchor {
+                    path: path.clone(),
+                    side: Side::Right,
+                    start: 1,
+                    end: 1,
+                });
+                let scroll = app.scroll;
+                for modifier in [KeyModifiers::NONE, KeyModifiers::SUPER] {
+                    app.key_event(KeyEvent::new(KeyCode::Char('c'), modifier));
+                    assert_eq!(
+                        app.clipboard.as_deref(),
+                        Some(format!("{source}\nline_2\nline_3").as_str())
+                    );
+                    assert_eq!(app.workflow.cursor, Some(index));
+                    assert_eq!(app.workflow.selection.as_ref().map(|a| a.start), Some(1));
+                    assert_eq!(app.scroll, scroll);
+                    assert_eq!(app.focus, Focus::Content);
+                }
+                app.workflow.selection = None;
+                app.key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+                assert_eq!(app.clipboard.as_deref(), Some("line_3"));
+                app.workflow.cursor = app.document.as_ref().and_then(|doc| {
+                    doc.rows
+                        .iter()
+                        .position(|row| matches!(row.right.target, Some(Target::Header { .. })))
+                });
+                app.key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+                assert_eq!(app.clipboard.as_deref(), Some(path.as_str()));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sidebar_filters_keep_shortcuts_as_text_and_hide_nonmatching_file_content() -> Result<()> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        app.action(Action::SetView(View::Diff));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 35))?;
+        app.key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        for c in "r[]*界".chars() {
+            app.key_event(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        assert_eq!(app.filters.files.text(), "r[]*界");
+        assert!(app.modal.is_none());
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        assert!(
+            app.document
+                .as_ref()
+                .context("Missing filtered document")?
+                .files
+                .is_empty()
+        );
+        assert_eq!(app.filters.focused, Some(crate::filter::Kind::Files));
+        app.key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!app.home);
+        assert_eq!(app.filters.files.text(), "r[]*界");
+        app.key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        app.key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        assert!(app.filters.files.text().is_empty());
+        assert!(
+            !app.document
+                .as_ref()
+                .context("Missing unfiltered document")?
+                .files
+                .is_empty()
+        );
+        assert_eq!(app.filters.focused, None);
+        app.action(Action::SetView(View::Guide));
+        app.key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert_eq!(app.filters.focused, None);
+        Ok(())
+    }
+
     #[test]
     fn character_shortcuts_keep_text_inputs_isolated() -> Result<()> {
         use crate::{
@@ -3477,7 +3807,7 @@ mod tests {
         for code in [KeyCode::Char('?'), KeyCode::Char('m'), KeyCode::Char('l')] {
             app.key_event(KeyEvent::new(code, KeyModifiers::NONE));
             assert!(match code {
-                KeyCode::Char('?') => matches!(app.modal, Some(Modal::Help)),
+                KeyCode::Char('?') => matches!(app.modal, Some(Modal::Help(_))),
                 KeyCode::Char('m') => matches!(app.modal, Some(Modal::Models { .. })),
                 _ => matches!(app.modal, Some(Modal::Clone { .. })),
             });
@@ -3485,18 +3815,10 @@ mod tests {
         }
         app.home = true;
         app.inbox_tab = InboxTab::Repositories;
-        app.repositories_loading = true; // No network in this input-routing test.
-        for (code, modifiers, manage) in [
-            (KeyCode::Char('f'), KeyModifiers::NONE, false),
-            (KeyCode::Char('F'), KeyModifiers::SHIFT, true),
-            (KeyCode::Char('F'), KeyModifiers::NONE, true),
-        ] {
-            app.key_event(KeyEvent::new(code, modifiers));
-            assert!(
-                matches!(app.modal, Some(Modal::Repositories { manage: actual, .. }) if actual == manage)
-            );
-            app.modal = None;
-        }
+        app.key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+        assert_eq!(app.filters.focused, Some(crate::filter::Kind::Repositories));
+        app.key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.inbox_tab = InboxTab::MyPrs;
         let letters = "?msfFrglx/";
         for modal in [
             Modal::Clone {
@@ -3507,12 +3829,6 @@ mod tests {
                 selected: 0,
                 effort: 0,
                 query: String::new(),
-            },
-            Modal::Repositories {
-                manage: true,
-                query: String::new(),
-                selected: 0,
-                choices: Default::default(),
             },
             Modal::Workflow(Box::new(Wizard::Compose(Compose {
                 key: key.clone(),
@@ -3534,7 +3850,7 @@ mod tests {
                 .context("Input was replaced by a shortcut")?
             {
                 Modal::Clone { value, .. } => value.clone(),
-                Modal::Models { query, .. } | Modal::Repositories { query, .. } => query.clone(),
+                Modal::Models { query, .. } => query.clone(),
                 Modal::Workflow(w) => match w.as_ref() {
                     Wizard::Compose(draft) => draft.editor.text(),
                     _ => String::new(),
@@ -3614,12 +3930,6 @@ mod tests {
                 selected: 0,
                 effort: 0,
                 query: "luna".into(),
-            },
-            Modal::Repositories {
-                manage: true,
-                query: "example".into(),
-                selected: 0,
-                choices: Default::default(),
             },
         ] {
             app.modal = Some(modal);

@@ -73,17 +73,19 @@ Difu reuses those logins; you do not enter an API key into the TUI.
 difu
 ```
 
-`difu` opens a home screen with three inboxes:
+`difu` opens a home screen with two tabs:
 
-1. **Review requests** — open PRs explicitly requesting your review.
-2. **Authored** — PRs you created.
-3. **Repositories** — PRs from repositories you explicitly whitelist.
+1. **My PRs** — PRs you authored or were directly requested to review, deduplicated
+   and sorted by latest update.
+2. **Repositories** — repositories available through your GitHub login, grouped
+   into **Pinned** and **Rest**, alphabetically within each group.
 
 Each PR row shows its opened date, changed-file count, additions in green, and
 removals in red. Counts load in background batches; the list remains usable.
-Lists are cached per tab and filter selection. Returning home or switching tabs
-shows the saved list immediately while GitHub refreshes it in place. If a refresh
-fails, the cached list stays available; **r** retries.
+PR lists are cached separately for each scope and state. Cached lists appear
+immediately and refresh in the background when opened and every 30 seconds while
+visible. Repository names are also cached, refreshing when you enter Repositories
+or press **r**. Failed refreshes keep cached data available.
 
 Select a PR to preview its description, chronological activity, inline review
 comments, and checks. **Enter** drills into that PR and selects **Guide**, starting
@@ -104,8 +106,8 @@ uncommitted files are preserved. Diffs are computed locally from the merge base
 to the PR head (a three-dot diff). Difu does not clone repositories automatically.
 GitHub.com is supported in v1.
 Lists show the most recently updated PRs first. GitHub search returns up to
-1,000 results for Review requests or Authored, and up to 1,000 per enabled
-repository in the Repositories inbox.
+1,000 results for each authored/review-requested query, and up to 1,000 for
+the selected repository.
 
 ### PR images
 
@@ -120,21 +122,25 @@ show an explanation and a browser link. Previews are limited to 10 MiB and
 requests can reuse your `gh` authentication; credentials are never forwarded
 to other image hosts.
 
-### States and repository filters
+### States, pinned repositories, and filters
 
-Authored and Repositories default to **Open**. Click **Open / Merged / Closed /
-All**, or use **s** to cycle states. Closed means closed without merging.
+My PRs and repository PR lists default to **Open**. Click **Open / Merged / Closed /
+All**, use **[** / **]** to cycle backward/forward, or **s** to cycle forward.
+The selector wraps at either end. Closed means closed without merging.
 
-On your first visit to Repositories, choose from a searchable list of personal
-and organization repositories available through your GitHub login. Nothing is
-whitelisted automatically. Type to search, use arrows and **Space** or click to
-toggle a repository, then **Enter** or **Save selection** to apply. **Esc** cancels
-unsaved changes. **Shift+F** edits the whitelist later.
+In Repositories, press **\*** or click the pin beside a repository to pin/unpin it
+locally. Pins survive restarts and do not change GitHub stars. Existing whitelist
+entries migrate into Pinned, including previously disabled entries.
+**Enter** opens the selected repository's PR list with a preview on the right;
+**Esc** returns to Pinned / Rest. Opening a PR and returning with **Esc** keeps you
+in that repository's list.
 
-**f** opens repository filters. Enable individual whitelisted repositories or
-choose **All whitelisted** (**Ctrl+A**), then save. Both the whitelist and its
-enabled/disabled selections are remembered between launches. Disabling every
-repository shows an empty list; it never searches outside your whitelist.
+Each repository, PR, and Files sidebar has a filter input at the top. Press **f**
+to focus it, then type to filter immediately by repository name, PR title or author,
+or file/directory path. Matching ignores case. **Enter** or **Esc** returns focus
+to the list and retains the query; **Ctrl+U** clears it. Queries last for the
+session. File matches retain their parent directories; matching a directory shows
+all its children. Guide chapter links are unchanged.
 
 ## Reading a PR
 
@@ -163,8 +169,13 @@ moves between its file links and scrolls the corresponding diff into view.
 
 ### Function definitions
 
-Click a function identifier in a JavaScript or TypeScript diff (including JSX and
-TSX) to open its definition in a scrollable modal. Definitions can live in
+Hovering a symbol gives it a dotted underline; holding **Command** or **Ctrl**
+makes the underline solid. Command requires the terminal to forward enhanced
+keyboard events and the click; use Ctrl if it intercepts Command. The footer
+shows the gesture. Ordinary clicks focus the code line.
+
+Hold **Command** or **Ctrl** and click a function identifier in a JavaScript or
+TypeScript diff (including JSX and TSX) to open its definition in a scrollable modal. Definitions can live in
 unchanged tracked files. **Esc** closes the modal and preserves your chapter,
 focus, selection, and scroll position. Inside the modal, use the mouse wheel or
 arrow keys to scroll, **Cmd+Up/Down** to move ten lines, **PageUp/PageDown** to
@@ -223,8 +234,8 @@ With the diff focused, **>** marks the current line. **Up / Down** moves one row
 **Command+Up / Down** moves ten. In Guide and Diff, arrow keys, line selection,
 and mouse-wheel movement keep the highlighted code line near the viewport center.
 Scrolling clamps at the beginning and end without adding blank padding.
-**Left / Right** chooses old/new code, and
-**Alt+Left / Right** scrolls horizontally. **Shift+Up / Down** selects a line range
+**Left / Right** scrolls unwrapped code horizontally.
+**Alt+Left / Right** chooses old/new code; new is selected by default. **Shift+Up / Down** selects a line range
 within one file and side. **Enter** opens the comment editor: publish a standalone
 comment or add it to your GitHub pending review. Existing pending reviews are
 reused; pending comments stay private until the review is submitted.
@@ -320,19 +331,21 @@ bindings.
 | Shift+Up / Shift+Down | Select code lines within one file and side |
 | Page Up / Page Down / Space | Scroll a page |
 | Home / End | Start / end |
-| Left / Right | Scroll the focused Files tree horizontally; in code, select old/new diff side |
-| Alt+Left / Alt+Right | Scroll the focused tree or unwrapped code horizontally |
+| Left / Right | Scroll the focused Files tree or unwrapped code horizontally |
+| Alt+Left / Alt+Right | Select old/new diff side; new is selected by default |
 | Alt+Up / Alt+Down | Previous / next guide chapter |
-| 1 / 2 / 3 | Home: Review requests / Authored / Repositories; inside a PR: Overview / Guide / Diff |
-| ? | Help |
+| 1 / 2 / 3 | Home: 1 My PRs / 2 Repositories; inside a PR: Overview / Guide / Diff |
+| ? | Search shortcut help; type to filter, Up/Down to scroll, Esc to close |
 | m | Model and reasoning picker |
-| s | Cycle PR states in Authored / Repositories |
-| f | Filter whitelisted repositories |
-| Shift+F | Edit the repository whitelist |
+| [ / ] / s | Previous / next / next PR state |
+| f | Focus the repository, PR, or Files filter |
+| Ctrl+U | Clear the focused filter |
+| * | Pin/unpin the selected repository locally |
 | r | Refresh |
 | g | Regenerate / retry |
 | l | Choose a local clone path |
 | x | Cancel generation, snapshot preparation, or active conflict resolution |
+| c / Command+C | Copy focused source line, selected range, or file heading path |
 | Ctrl+R | Refresh mention suggestions in the comment/review editor |
 | w | Toggle diff wrapping (saved between launches) |
 | Ctrl+B | Side-by-side / unified preference |
@@ -408,12 +421,34 @@ Settings, cached PR lists, and guides use the OS's standard per-user directories
 | Linux | `$XDG_CONFIG_HOME/difu/config.json` (default `~/.config`) | `$XDG_CACHE_HOME/difu/` (default `~/.cache`) |
 
 Settings remember clone paths, guide and conflict model/effort, diff preference, the repository
-whitelist, and which whitelisted repositories are enabled. Writes are atomic
+local pins. Writes are atomic
 and files are created with owner-only permissions. Guide cache files contain PR
 explanations and hunk references. PR-list cache files contain PR titles, authors,
-opened dates, and counts. Mention caches contain GitHub logins; progress caches
+opened dates, and counts. The repository directory cache contains repository names. Mention caches contain GitHub logins; progress caches
 contain completed chapter-file sections. Remove the cache directory to clear
 cached data. GitHub pending reviews and Viewed state are unaffected.
+
+Expansion controls appear only when more source lines exist. File boundaries load
+in the background from pinned local Git objects and are cached per revision;
+reading boundaries requires no fetch or worktree. **r** retries a failed boundary
+read. Full context remains loaded on demand.
+
+### Copying code
+
+Focus the code pane in Guide or Diff and press **c** or **Command+C** to copy the
+current source line or the range selected with **Shift+Up/Down**. Copying uses the
+active old/new side, preserves indentation, and excludes line numbers and diff
+markers. Wrapped or horizontally clipped lines copy in full. A file heading
+copies its path. Copying keeps your focus, selection, and scroll position.
+
+Selections spanning hidden context read the pinned local Git revision and cache
+that context; they do not copy uncommitted working-tree changes or fetch anything.
+Clipboard writes use OSC 52, with no extra executable dependency. The terminal
+(and any multiplexer) must permit clipboard writes. Ghostty permits them by
+default; see its [clipboard configuration](https://ghostty.org/docs/config/reference#clipboard-write).
+Difu reports “Sent to terminal clipboard” because the protocol cannot confirm
+that the terminal accepted the write. Command+C must be forwarded by your terminal;
+**c** works when the terminal intercepts the Command shortcut. Ctrl+C still quits.
 
 ## Worktrees and safety
 

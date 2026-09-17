@@ -13,7 +13,7 @@ use std::{
     path::PathBuf,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Target {
     Header {
         path: String,
@@ -943,7 +943,8 @@ impl App {
             }
             Some(target) => {
                 let Some(mut anchor) = target.line(self.workflow.side) else {
-                    self.notice = Notice::info("Choose a side with a code line using Left/Right");
+                    self.notice =
+                        Notice::info("Choose a side with a code line using Alt+Left/Right");
                     return;
                 };
                 if let Some(start) = &self.workflow.selection

@@ -140,7 +140,40 @@ fn render(app: &mut App, width: u16) -> Result<()> {
     Ok(())
 }
 
+fn wait_bounds(app: &mut App, width: u16) -> Result<()> {
+    render(app, width)?;
+    let started = Instant::now();
+    loop {
+        app.tick();
+        let review = app.review().context("Missing review")?;
+        if review
+            .context
+            .get("file.rs")
+            .is_some_and(|state| state.data.is_some())
+            || review
+                .bounds
+                .get("file.rs")
+                .is_some_and(|state| state.data.is_some())
+        {
+            return Ok(());
+        }
+        if let Some(error) = review
+            .bounds
+            .get("file.rs")
+            .and_then(|state| state.error.as_ref())
+        {
+            anyhow::bail!("Boundary read failed: {error}");
+        }
+        ensure!(
+            started.elapsed() < Duration::from_secs(10),
+            "Boundary read timed out"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn click(app: &mut App, width: u16, matches: impl Fn(&Action) -> bool) -> Result<()> {
+    wait_bounds(app, width)?;
     render(app, width)?;
     let row = app
         .document
@@ -294,6 +327,7 @@ fn mouse_expansion_is_per_hunk_and_neighbor_links_navigate_in_both_layouts() -> 
 fn context_read_failure_is_visible_and_can_be_retried() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let (mut app, _) = fixture(dir.path())?;
+    wait_bounds(&mut app, 180)?;
     fs::rename(dir.path().join(".git"), dir.path().join("git-backup"))?;
     click(
         &mut app,
@@ -342,6 +376,172 @@ fn context_read_failure_is_visible_and_can_be_retried() -> Result<()> {
             .below,
         10
     );
+    app.shutdown();
+    Ok(())
+}
+
+#[test]
+fn copying_across_hunks_reads_pinned_context_and_preserves_the_review() -> Result<()> {
+    use crossterm::{
+        clipboard::CopyToClipboard,
+        event::{KeyCode, KeyEvent},
+        execute,
+    };
+    use difu::{
+        app::Focus,
+        review::{Anchor, Side},
+        workflow::Target,
+    };
+    let dir = tempfile::tempdir()?;
+    let (mut app, _) = fixture(dir.path())?;
+    render(&mut app, 160)?;
+    let cursor = app
+        .document
+        .as_ref()
+        .context("Missing document")?
+        .rows
+        .iter()
+        .position(|row| matches!(row.right.target, Some(Target::Code { new: Some(32), .. })))
+        .context("Missing selected line")?;
+    app.workflow.cursor = Some(cursor);
+    app.workflow.side = Side::Right;
+    app.workflow.selection = Some(Anchor {
+        path: "file.rs".into(),
+        side: Side::Right,
+        start: 20,
+        end: 20,
+    });
+    app.focus = Focus::Content;
+    let scroll = app.scroll;
+    app.key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
+    wait_context(&mut app)?;
+    app.tick();
+    let expected = (20..=32)
+        .map(|n| {
+            if n == 20 || n == 32 {
+                format!("changed {n}")
+            } else {
+                format!("line {n}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut encoded = Vec::new();
+    execute!(&mut encoded, CopyToClipboard::to_clipboard_from(&expected))?;
+    let mut output = Vec::new();
+    app.flush_clipboard(&mut output);
+    assert_eq!(output, encoded);
+    assert_eq!(app.workflow.cursor, Some(cursor));
+    assert_eq!(app.workflow.selection.as_ref().map(|a| a.start), Some(20));
+    assert_eq!(app.scroll, scroll);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.rs"))?,
+        "uncommitted changes must stay private\n"
+    );
+    // Repeating the copy uses the loaded immutable context synchronously.
+    app.key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    let mut again = Vec::new();
+    app.flush_clipboard(&mut again);
+    assert_eq!(again, encoded);
+    app.shutdown();
+    Ok(())
+}
+
+#[test]
+fn boundaries_hide_controls_at_file_edges_and_reuse_the_pinned_cache() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (mut app, pr) = fixture(dir.path())?;
+    render(&mut app, 180)?;
+    assert!(
+        !app.hits
+            .iter()
+            .any(|(_, action)| matches!(action, Action::ExpandHunk(..))),
+        "Unknown boundaries must not offer speculative expansion"
+    );
+    let selected = app
+        .document
+        .as_ref()
+        .context("Missing document")?
+        .rows
+        .iter()
+        .position(|row| {
+            matches!(
+                row.right.target,
+                Some(difu::workflow::Target::Code { new: Some(20), .. })
+            )
+        })
+        .context("Missing cursor line")?;
+    app.workflow.cursor = Some(selected);
+    wait_bounds(&mut app, 180)?;
+    render(&mut app, 180)?;
+    let cursor = app.workflow.cursor.context("Lost cursor")?;
+    assert!(
+        matches!(
+            app.document
+                .as_ref()
+                .and_then(|doc| doc.rows.get(cursor))
+                .and_then(|row| row.right.target.as_ref()),
+            Some(difu::workflow::Target::Code { new: Some(20), .. })
+        ),
+        "Boundary hydration must preserve the focused source line"
+    );
+    let snapshot = app
+        .review()
+        .and_then(|review| review.snapshot.clone())
+        .context("Missing snapshot")?;
+    let file = snapshot.files.first().context("Missing file")?;
+    let bounds = difu::bounds::load(dir.path(), &snapshot, file, dir.path(), &Cancel::default())?;
+    assert_eq!(bounds, difu::bounds::Bounds { old: 80, new: 80 });
+    // The working copy has only one private line, so these must be pinned counts.
+    assert!(
+        file.hunks
+            .iter()
+            .all(|hunk| bounds.can_expand(hunk, Direction::Above)
+                && bounds.can_expand(hunk, Direction::Below))
+    );
+    let mut full = file.clone();
+    full.hunks = vec![difu::diff::Hunk {
+        id: "whole".into(),
+        header: "@@ -1,80 +1,80 @@".into(),
+        lines: repo::file_context(dir.path(), &snapshot, file, &Cancel::default())?,
+    }];
+    let whole = full.hunks.first().context("Missing full hunk")?;
+    assert!(!bounds.can_expand(whole, Direction::Above));
+    assert!(!bounds.can_expand(whole, Direction::Below));
+    fs::rename(dir.path().join(".git"), dir.path().join("git-backup"))?;
+    assert_eq!(
+        difu::bounds::load(dir.path(), &snapshot, file, dir.path(), &Cancel::default())?,
+        bounds
+    );
+    let mut newer = snapshot.as_ref().clone();
+    newer.head = "a".repeat(40);
+    assert!(
+        difu::bounds::load(dir.path(), &newer, file, dir.path(), &Cancel::default()).is_err(),
+        "Changed revisions must not reuse old boundaries"
+    );
+    fs::rename(dir.path().join("git-backup"), dir.path().join(".git"))?;
+    // Render the whole file through both views: neither expansion control belongs at its edges.
+    let review = app
+        .reviews
+        .get_mut(&pr.key.id())
+        .context("Missing review")?;
+    review.guide = None;
+    review.snapshot = Some(Arc::new(difu::diff::Snapshot {
+        files: vec![full],
+        ..snapshot.as_ref().clone()
+    }));
+    for view in [View::Guide, View::Diff] {
+        app.action(Action::SetView(view));
+        render(&mut app, 180)?;
+        assert!(
+            !app.document
+                .as_ref()
+                .context("Missing document")?
+                .rows
+                .iter()
+                .any(|row| matches!(row.right.action, Some(Action::ExpandHunk(..))))
+        );
+    }
     app.shutdown();
     Ok(())
 }

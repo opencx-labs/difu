@@ -162,8 +162,8 @@ fn exercise(root: &Path) -> Result<()> {
     assert!(overview.contains("2026-09-10"));
     assert!(overview.contains("1 file"));
 
-    assert!(overview.contains("1 Review requests"));
-    assert!(overview.contains("2 Authored"));
+    assert!(overview.contains("1 My PRs"));
+    assert!(overview.contains("2 Repositories"));
     assert!(!overview.contains("2 Guide"));
     // Card layout reflows the activity into a taller, bounded column. Checks
     // and their click targets must remain reachable after scrolling and resize.
@@ -280,7 +280,7 @@ fn exercise(root: &Path) -> Result<()> {
     app.modal = None;
     app.action(Action::SetView(View::Overview));
     assert!(!app.home);
-    assert!(!render(&mut app, 160)?.contains("REVIEW REQUESTS"));
+    assert!(!render(&mut app, 160)?.contains("MY PRS"));
     app.key_event(crossterm::event::KeyEvent::new(
         crossterm::event::KeyCode::Esc,
         crossterm::event::KeyModifiers::NONE,
@@ -290,51 +290,77 @@ fn exercise(root: &Path) -> Result<()> {
     wait(&mut app, |a| !a.inbox_loading)?;
 
     render(&mut app, 160)?;
-    let authored_tab = app
-        .hits
-        .iter()
-        .find_map(|(rect, action)| {
-            matches!(action, Action::SetInbox(InboxTab::Authored)).then_some(*rect)
-        })
-        .context("Missing clickable Authored tab")?;
-    app.mouse(crossterm::event::MouseEvent {
-        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        column: authored_tab.x,
-        row: authored_tab.y,
-        modifiers: crossterm::event::KeyModifiers::NONE,
-    });
-    wait(&mut app, |a| !a.inbox_loading)?;
-    assert_eq!(app.inbox.first().context("No authored PR")?.key.number, 2);
+    assert_eq!(app.inbox.len(), 2);
+    assert!(app.inbox.iter().any(|p| p.key.number == 1));
+    assert!(app.inbox.iter().any(|p| p.key.number == 2));
     assert_eq!(app.state(), PrState::Open);
-    for state in [PrState::Merged, PrState::Closed, PrState::All] {
-        app.key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+    for state in [
+        PrState::Merged,
+        PrState::Closed,
+        PrState::All,
+        PrState::Open,
+    ] {
+        app.key_event(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
         assert_eq!(app.state(), state);
         wait(&mut app, |a| !a.inbox_loading)?;
         assert!(app.inbox_error.is_none());
     }
+    app.key_event(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+    assert_eq!(app.state(), PrState::All);
+    assert_eq!(
+        app.inbox.len(),
+        2,
+        "State switches should restore cached PRs synchronously"
+    );
+    wait(&mut app, |a| !a.inbox_loading)?;
+    app.action(Action::SetState(PrState::Open));
+    wait(&mut app, |a| !a.inbox_loading)?;
+    // Filters use the local list; punctuation stays text while the input is focused.
+    let searches_before = fs::read_to_string(root.join("searches.jsonl"))?;
+    app.key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+    app.paste("My AUTHORED".into());
+    assert_eq!(app.visible_prs().len(), 1);
+    assert_eq!(app.key().as_deref(), Some("example/project#2"));
+    app.key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(app.visible_prs().len(), 1);
+    assert_eq!(
+        fs::read_to_string(root.join("searches.jsonl"))?,
+        searches_before
+    );
+    app.key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
+    app.key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    app.key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    // Periodic hydration preserves selection and loads no other state or repository.
+    let selected = app.key();
+    app.inbox_refreshed = Some(Instant::now() - Duration::from_secs(31));
+    app.tick();
+    assert!(app.inbox_loading);
+    assert_eq!(app.key(), selected);
+    wait(&mut app, |a| !a.inbox_loading)?;
+    assert_eq!(app.key(), selected);
     app.action(Action::SetInbox(InboxTab::Repositories));
-    wait(&mut app, |a| !a.inbox_loading && !a.repositories_loading)?;
+    wait(&mut app, |a| !a.repositories_loading)?;
+    assert!(app.repository_directory());
     assert!(app.inbox.is_empty());
     assert_eq!(app.repository_options.len(), 2);
-    assert!(render(&mut app, 160)?.contains("Choose your repository whitelist"));
-    app.paste("second".into());
-    let filtered = render(&mut app, 160)?;
-    assert!(filtered.contains("example/second"));
-    assert!(!filtered.contains("example/project"));
-    for _ in 0..6 {
-        app.key_event(crossterm::event::KeyEvent::new(
-            crossterm::event::KeyCode::Backspace,
-            crossterm::event::KeyModifiers::NONE,
-        ));
-    }
-    app.action(Action::ToggleRepository("example/project".into()));
-    app.action(Action::ToggleRepository("example/second".into()));
-    app.action(Action::SaveRepositories);
-    wait(&mut app, |a| !a.inbox_loading)?;
-    assert_eq!(app.inbox.len(), 2);
-    app.key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-    app.action(Action::ToggleRepository("example/project".into()));
-    app.action(Action::SaveRepositories);
+    let directory = render(&mut app, 160)?;
+    assert!(directory.contains("PINNED") && directory.contains("REST"));
+    assert!(app.modal.is_none());
+    app.action(Action::PinRepository("example/second".into()));
+    assert_eq!(
+        app.visible_repositories().first().map(String::as_str),
+        Some("example/second")
+    );
+    assert!(
+        storage
+            .load_config()?
+            .pinned_repositories
+            .contains("example/second")
+    );
+    app.action(Action::SelectRepository("example/second".into()));
+    app.key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(!app.repository_directory());
+    assert_eq!(app.repository.as_deref(), Some("example/second"));
     wait(&mut app, |a| !a.inbox_loading)?;
     assert_eq!(app.inbox.len(), 1);
     assert_eq!(
@@ -345,38 +371,25 @@ fn exercise(root: &Path) -> Result<()> {
             .repository(),
         "example/second"
     );
+    app.key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.repository_directory());
+    assert!(!app.quit);
     assert_eq!(
-        storage
-            .load_config()?
-            .review_repositories
-            .get("example/project"),
-        Some(&false)
+        app.repository_options.len(),
+        2,
+        "Repository cache is restored before refresh"
     );
+    wait(&mut app, |a| !a.repositories_loading)?;
+    app.key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(
-        storage
-            .load_config()?
-            .review_repositories
-            .get("example/second"),
-        Some(&true)
+        app.inbox.len(),
+        1,
+        "Repository PR cache is restored before refresh"
     );
-    app.key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-    app.action(Action::AllRepositories);
-    // Cancelling must preserve the saved active filters.
-    app.key_event(crossterm::event::KeyEvent::new(
-        crossterm::event::KeyCode::Esc,
-        crossterm::event::KeyModifiers::NONE,
-    ));
-    assert_eq!(
-        app.config.review_repositories.get("example/project"),
-        Some(&false)
-    );
-    app.key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-    app.action(Action::ToggleRepository("example/second".into()));
-    app.action(Action::SaveRepositories);
     wait(&mut app, |a| !a.inbox_loading)?;
-    assert!(app.inbox.is_empty());
     let searches = fs::read_to_string(root.join("searches.jsonl"))?;
     assert!(searches.contains("--author=@me"));
+    assert!(searches.contains("--review-requested=@me"));
     assert!(searches.contains("--merged=false"));
     assert!(searches.contains("--merged\""));
     app.shutdown();

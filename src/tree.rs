@@ -61,3 +61,72 @@ pub fn entries(files: &[DiffFile]) -> Vec<Entry> {
     }
     entries
 }
+
+/// Include every matching path and the ancestors needed to keep its hierarchy.
+/// Matching a directory also matches the full paths of all its descendants.
+pub fn filtered(files: &[DiffFile], query: &str) -> Vec<Entry> {
+    let entries = entries(files);
+    if query.is_empty() {
+        return entries;
+    }
+    let mut visible = std::collections::HashSet::new();
+    for entry in &entries {
+        if crate::filter::matches(query, &entry.path) {
+            visible.insert(entry.path.as_str());
+            let mut path = entry.path.as_str();
+            while let Some((parent, _)) = path.rsplit_once('/') {
+                visible.insert(parent);
+                path = parent;
+            }
+        }
+    }
+    entries
+        .iter()
+        .filter(|entry| visible.contains(entry.path.as_str()))
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filtering_retains_ancestors_and_directory_children_without_sibling_prefixes() {
+        let files = [
+            "src/nested/one.ts",
+            "src/nested/two.ts",
+            "src-other/three.ts",
+            "界/four.ts",
+        ]
+        .into_iter()
+        .map(|path| DiffFile {
+            path: path.into(),
+            old_path: path.into(),
+            status: "modified".into(),
+            hunks: vec![],
+            additions: 0,
+            deletions: 0,
+        })
+        .collect::<Vec<_>>();
+        let paths = |query| {
+            filtered(&files, query)
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(paths("ONE.TS"), ["src", "src/nested", "src/nested/one.ts"]);
+        assert_eq!(
+            paths("NESTED"),
+            [
+                "src",
+                "src/nested",
+                "src/nested/one.ts",
+                "src/nested/two.ts"
+            ]
+        );
+        assert_eq!(paths("界"), ["界", "界/four.ts"]);
+        assert!(paths("absent").is_empty());
+        assert_eq!(filtered(&files, ""), entries(&files));
+    }
+}
