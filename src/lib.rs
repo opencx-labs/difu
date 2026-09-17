@@ -1,11 +1,13 @@
 pub mod app;
 pub mod ci;
+pub mod clipboard;
 pub mod codex;
 pub mod conflicts;
 pub mod context;
 pub mod diff;
 pub mod editor;
 pub mod github;
+pub mod help;
 pub mod images;
 pub mod model;
 pub mod navigation;

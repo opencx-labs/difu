@@ -330,7 +330,7 @@ bindings.
 | Alt+Left / Alt+Right | Scroll the focused tree or unwrapped code horizontally |
 | Alt+Up / Alt+Down | Previous / next guide chapter |
 | 1 / 2 / 3 | Home: 1 My PRs / 2 Repositories; inside a PR: Overview / Guide / Diff |
-| ? | Help |
+| ? | Search shortcut help; type to filter, Up/Down to scroll, Esc to close |
 | m | Model and reasoning picker |
 | [ / ] / s | Previous / next / next PR state |
 | f | Focus the repository, PR, or Files filter |
@@ -340,6 +340,7 @@ bindings.
 | g | Regenerate / retry |
 | l | Choose a local clone path |
 | x | Cancel generation, snapshot preparation, or active conflict resolution |
+| c / Command+C | Copy focused source line, selected range, or file heading path |
 | Ctrl+R | Refresh mention suggestions in the comment/review editor |
 | w | Toggle diff wrapping (saved between launches) |
 | Ctrl+B | Side-by-side / unified preference |
@@ -421,6 +422,23 @@ explanations and hunk references. PR-list cache files contain PR titles, authors
 opened dates, and counts. The repository directory cache contains repository names. Mention caches contain GitHub logins; progress caches
 contain completed chapter-file sections. Remove the cache directory to clear
 cached data. GitHub pending reviews and Viewed state are unaffected.
+
+### Copying code
+
+Focus the code pane in Guide or Diff and press **c** or **Command+C** to copy the
+current source line or the range selected with **Shift+Up/Down**. Copying uses the
+active old/new side, preserves indentation, and excludes line numbers and diff
+markers. Wrapped or horizontally clipped lines copy in full. A file heading
+copies its path. Copying keeps your focus, selection, and scroll position.
+
+Selections spanning hidden context read the pinned local Git revision and cache
+that context; they do not copy uncommitted working-tree changes or fetch anything.
+Clipboard writes use OSC 52, with no extra executable dependency. The terminal
+(and any multiplexer) must permit clipboard writes. Ghostty permits them by
+default; see its [clipboard configuration](https://ghostty.org/docs/config/reference#clipboard-write).
+Difu reports “Sent to terminal clipboard” because the protocol cannot confirm
+that the terminal accepted the write. Command+C must be forwarded by your terminal;
+**c** works when the terminal intercepts the Command shortcut. Ctrl+C still quits.
 
 ## Worktrees and safety
 

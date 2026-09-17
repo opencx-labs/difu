@@ -143,6 +143,7 @@ impl Review {
 }
 
 pub enum Message {
+    Clipboard(u64, Result<String, String>),
     Image(
         crate::images::RenderKey,
         Result<ratatui_image::sliced::SlicedProtocol, String>,
@@ -169,6 +170,7 @@ pub enum Message {
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    Copy,
     Filter,
     SelectRepository(String),
     OpenRepository,
@@ -223,10 +225,12 @@ pub enum Modal {
         effort: usize,
         query: String,
     },
-    Help,
+    Help(crate::help::State),
 }
 
 pub struct App {
+    pub(crate) clipboard_id: u64,
+    pub(crate) clipboard: Option<String>,
     pub filters: crate::filter::State,
     pub repository: Option<String>,
     pub repo_selected: Option<String>,
@@ -310,6 +314,8 @@ impl App {
             filters: Default::default(),
             repository: None,
             repo_selected: None,
+            clipboard_id: 0,
+            clipboard: None,
             inbox_refreshed: None,
             home: true,
             inbox_tab: InboxTab::MyPrs,
@@ -1064,6 +1070,16 @@ impl App {
     }
     fn receive(&mut self, message: Message) {
         match message {
+            Message::Clipboard(id, output) => {
+                if id == self.clipboard_id {
+                    match output {
+                        Ok(text) => self.clipboard = Some(text),
+                        Err(error) => {
+                            self.notice = Notice::error(format!("Could not copy: {error}"))
+                        }
+                    }
+                }
+            }
             Message::Image(key, output) => self.images.receive(key, output),
             Message::Definition(id, output) => {
                 if let Some(Modal::Definition(viewer)) = &mut self.modal
@@ -1453,6 +1469,7 @@ impl App {
             self.filters.focused = None;
         }
         match action {
+            Action::Copy => self.copy_diff(),
             Action::Filter => {
                 if let Some(kind) = self.filter_kind() {
                     self.filters.focused = Some(kind);
@@ -1647,7 +1664,7 @@ impl App {
                 }
             }
             Action::Cancel => self.cancel(),
-            Action::Help => self.modal = Some(Modal::Help),
+            Action::Help => self.modal = Some(Modal::Help(Default::default())),
             Action::ToggleWrap => {
                 let mut config = self.config.clone();
                 config.wrap_diff = !config.wrap_diff;
@@ -1773,6 +1790,9 @@ impl App {
                 | KeyModifiers::META,
         );
         match key.code {
+            KeyCode::Char('c') if plain || key.modifiers == KeyModifiers::SUPER => {
+                self.action(Action::Copy)
+            }
             KeyCode::Char('/') => self.workflow_action(crate::workflow::WAction::Open),
             KeyCode::Up | KeyCode::Down
                 if key.modifiers.contains(KeyModifiers::SHIFT)
@@ -1958,8 +1978,25 @@ impl App {
                 self.modal = Some(Modal::Definition(viewer));
             }
             Modal::Workflow(modal) => self.modal = Some(Modal::Workflow(modal)),
-            Modal::Help => {
-                self.modal = Some(Modal::Help);
+            Modal::Help(mut state) => {
+                let before = state.query.text();
+                let max = state.rows.saturating_sub(state.viewport);
+                match key.code {
+                    KeyCode::Up => state.scroll = state.scroll.saturating_sub(1),
+                    KeyCode::Down => state.scroll = state.scroll.saturating_add(1).min(max),
+                    KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(state.viewport),
+                    KeyCode::PageDown => {
+                        state.scroll = state.scroll.saturating_add(state.viewport).min(max)
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        state.query = Default::default()
+                    }
+                    _ => state.query.key(key),
+                }
+                if before != state.query.text() {
+                    state.scroll = 0;
+                }
+                self.modal = Some(Modal::Help(state));
             }
             Modal::Clone { mut value, key: id } => {
                 match key.code {
@@ -2028,7 +2065,7 @@ impl App {
                 }
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
-                if matches!(self.modal, Some(Modal::Definition(_))) =>
+                if matches!(self.modal, Some(Modal::Definition(_) | Modal::Help(_))) =>
             {
                 let code = if event.kind == MouseEventKind::ScrollDown {
                     KeyCode::Down
@@ -2072,6 +2109,10 @@ impl App {
             return;
         }
         match &mut self.modal {
+            Some(Modal::Help(state)) => {
+                state.query.insert(&text.replace(['\n', '\r', '\t'], " "));
+                state.scroll = 0;
+            }
             Some(Modal::Workflow(modal)) => match modal.as_mut() {
                 crate::workflow::Wizard::Compose(draft) if draft.focus == 0 => {
                     draft.editor.insert(&text);
@@ -2337,9 +2378,9 @@ mod tests {
         }
         app.key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(cancel.cancelled());
-        app.modal = Some(Modal::Help);
+        app.modal = Some(Modal::Help(Default::default()));
         app.receive(Message::Definition(42, Err("late result".into())));
-        assert!(matches!(app.modal, Some(Modal::Help)));
+        assert!(matches!(app.modal, Some(Modal::Help(_))));
         Ok(())
     }
 

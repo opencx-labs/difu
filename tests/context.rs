@@ -345,3 +345,70 @@ fn context_read_failure_is_visible_and_can_be_retried() -> Result<()> {
     app.shutdown();
     Ok(())
 }
+
+#[test]
+fn copying_across_hunks_reads_pinned_context_and_preserves_the_review() -> Result<()> {
+    use crossterm::{
+        clipboard::CopyToClipboard,
+        event::{KeyCode, KeyEvent},
+        execute,
+    };
+    use difu::{
+        app::Focus,
+        review::{Anchor, Side},
+        workflow::Target,
+    };
+    let dir = tempfile::tempdir()?;
+    let (mut app, _) = fixture(dir.path())?;
+    render(&mut app, 160)?;
+    let cursor = app
+        .document
+        .as_ref()
+        .context("Missing document")?
+        .rows
+        .iter()
+        .position(|row| matches!(row.right.target, Some(Target::Code { new: Some(32), .. })))
+        .context("Missing selected line")?;
+    app.workflow.cursor = Some(cursor);
+    app.workflow.side = Side::Right;
+    app.workflow.selection = Some(Anchor {
+        path: "file.rs".into(),
+        side: Side::Right,
+        start: 20,
+        end: 20,
+    });
+    app.focus = Focus::Content;
+    let scroll = app.scroll;
+    app.key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
+    wait_context(&mut app)?;
+    app.tick();
+    let expected = (20..=32)
+        .map(|n| {
+            if n == 20 || n == 32 {
+                format!("changed {n}")
+            } else {
+                format!("line {n}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut encoded = Vec::new();
+    execute!(&mut encoded, CopyToClipboard::to_clipboard_from(&expected))?;
+    let mut output = Vec::new();
+    app.flush_clipboard(&mut output);
+    assert_eq!(output, encoded);
+    assert_eq!(app.workflow.cursor, Some(cursor));
+    assert_eq!(app.workflow.selection.as_ref().map(|a| a.start), Some(20));
+    assert_eq!(app.scroll, scroll);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("file.rs"))?,
+        "uncommitted changes must stay private\n"
+    );
+    // Repeating the copy uses the loaded immutable context synchronously.
+    app.key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+    let mut again = Vec::new();
+    app.flush_clipboard(&mut again);
+    assert_eq!(again, encoded);
+    app.shutdown();
+    Ok(())
+}

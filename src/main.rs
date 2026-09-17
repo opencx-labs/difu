@@ -90,6 +90,7 @@ fn main() -> Result<()> {
         app.start(pr);
         while !app.quit && !terminated.load(std::sync::atomic::Ordering::Relaxed) {
             app.tick();
+            app.flush_clipboard(&mut io::stdout().lock());
             terminal.draw(|frame| difu::ui::draw(frame, &mut app))?;
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {

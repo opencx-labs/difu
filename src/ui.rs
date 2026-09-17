@@ -1660,6 +1660,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 "/ Actions",
                 Action::Workflow(crate::workflow::WAction::Open),
             ),
+            ("c / Cmd+C Copy", Action::Copy),
             ("Alt+↑/↓ Chapters", Action::Chapter(true)),
             ("f Filter", Action::Filter),
             (
@@ -1681,6 +1682,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ]
     };
     for (label, action) in footer {
+        if label == "c / Cmd+C Copy" && app.view == View::Overview {
+            continue;
+        }
         if label == "Alt+↑/↓ Chapters" && app.view != View::Guide {
             continue;
         }
@@ -1702,6 +1706,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         footer_x += width + 2;
     }
     let focused = match (app.focus, app.home, app.view, has_guide) {
+        (Focus::Navigation, true, _, _) if app.repository_directory() => "Repositories",
         (Focus::Navigation, true, _, _) => "PR list",
         (Focus::Navigation, false, View::Guide, true) => "Chapters",
         (Focus::Navigation, false, _, _) => "Files",
@@ -2192,7 +2197,82 @@ fn draw_definition(frame: &mut Frame, app: &mut App) {
     }
 }
 
+fn draw_help(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    let width = area.width.saturating_sub(4).min(100);
+    let height = area.height.saturating_sub(4).min(38);
+    let rect = Rect::new(
+        (area.width - width) / 2,
+        (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, rect);
+    let block = Block::bordered()
+        .title(" difu · keyboard & mouse ")
+        .border_style(Style::default().fg(ACCENT))
+        .style(Style::default().bg(PANEL));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    app.hits.clear();
+    let Some(Modal::Help(state)) = &mut app.modal else {
+        return;
+    };
+    let input_width = inner.width.saturating_sub(8).max(1) as usize;
+    let (input, (x, y)) = state.query.layout(input_width);
+    frame.render_widget(
+        Paragraph::new(format!(
+            "Search: {}",
+            input.get(y).map(String::as_str).unwrap_or_default()
+        ))
+        .style(Style::default().fg(ACCENT)),
+        Rect::new(inner.x, inner.y, inner.width, inner.height.min(1)),
+    );
+    let cursor_x = inner.x.saturating_add(8).saturating_add(x as u16);
+    if cursor_x < inner.right() && inner.height > 0 {
+        frame.set_cursor_position((cursor_x, inner.y));
+    }
+    let matches = crate::help::entries(&state.query.text());
+    let mut rows = Vec::new();
+    for (key, description) in &matches {
+        rows.extend(prose(
+            &format!("{key:18} {description}"),
+            inner.width as usize,
+        ));
+    }
+    if rows.is_empty() {
+        rows.push(text("No matching shortcuts.", DIM));
+    }
+    state.viewport = inner.height.saturating_sub(3) as usize;
+    state.rows = rows.len();
+    state.scroll = state.scroll.min(rows.len().saturating_sub(state.viewport));
+    let scroll = state.scroll;
+    let viewport = state.viewport;
+    if inner.height > 1 {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "{} matches · ↑↓ scroll · Ctrl+U clear · Esc close",
+                matches.len()
+            ))
+            .style(Style::default().fg(DIM)),
+            Rect::new(inner.x, inner.y + 1, inner.width, 1),
+        );
+    }
+    for (index, row) in rows.iter().skip(scroll).take(viewport).enumerate() {
+        paint(
+            frame,
+            Rect::new(inner.x, inner.y + 3 + index as u16, inner.width, 1),
+            row,
+            app,
+        );
+    }
+}
+
 fn draw_modal(frame: &mut Frame, app: &mut App) {
+    if matches!(app.modal, Some(Modal::Help(_))) {
+        draw_help(frame, app);
+        return;
+    }
     if matches!(app.modal, Some(Modal::Image(_))) {
         crate::images::draw_modal(frame, app);
         return;
@@ -2236,47 +2316,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
     let rows = match modal {
         Modal::Definition(_) | Modal::Image(_) => Vec::new(),
         Modal::Workflow(_) => Vec::new(),
-        Modal::Help => vec![
-            bold("difu · keyboard & mouse", ACCENT),
-            text("", DIM),
-            text("↑ ↓           Navigate PRs, files, or code", TEXT),
-            text("Alt+↑ / ↓     Previous / next guide chapter", TEXT),
-            text("Tab           Switch navigation / content focus", TEXT),
-            text("Cmd+Up/Down   Scroll content by ten lines", TEXT),
-            text("Enter         Open PR / comment / toggle completion", TEXT),
-            text("Click symbol  JS/TS function definition · Esc closes", TEXT),
-            text("/             PR actions / worktree management", TEXT),
-            text("Page Up/Down  Scroll a page · Space scrolls down", TEXT),
-            text("Home / End    Jump to start / end", TEXT),
-            text("← → side · Alt+← → horizontal · Shift+↑↓ select", TEXT),
-            text("w             Toggle diff wrapping (saved)", TEXT),
-            text("1 / 2         Home: My PRs / Repositories", TEXT),
-            text("              Inside PR: Overview / Guide / Diff", TEXT),
-            text(
-                "[ / ]         Previous / next PR state (s also cycles)",
-                TEXT,
-            ),
-            text(
-                "f             Focus the sidebar filter; Enter/Esc returns",
-                TEXT,
-            ),
-            text("Ctrl+U        Clear the focused filter", TEXT),
-            text(
-                "*             Pin/unpin the selected repository locally",
-                TEXT,
-            ),
-            text("m             Choose model and reasoning", TEXT),
-            text("r             Refresh / load the new PR revision", TEXT),
-            text("g             Generate again / retry", TEXT),
-            text("l             Choose another local clone path", TEXT),
-            text("x             Cancel generation or snapshot loading", TEXT),
-            text("Ctrl+R        Refresh mentions in the editor", TEXT),
-            text("Ctrl+B        Toggle side-by-side / unified", TEXT),
-            text("Ctrl+O        Open PR on GitHub", TEXT),
-            text("Mouse         Click items & links; wheel to scroll", TEXT),
-            text("Esc           Close dialog / back / quit", TEXT),
-            text("Ctrl+C        Quit and clean up running work", TEXT),
-        ],
+        Modal::Help(_) => Vec::new(),
         Modal::Clone { value, key } => {
             let mut rows = vec![bold("Locate your repository", ACCENT), text("", DIM)];
             rows.extend(prose(&format!("Choose the existing local clone for {key}. Difu remembers it for future reviews."),inner.width as usize));
@@ -3472,6 +3512,114 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn searchable_help_filters_keys_and_descriptions_without_triggering_actions() -> Result<()> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        app.action(Action::Help);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24))?;
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        app.paste("COPY".into());
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        assert_eq!(crate::help::entries("COPY").len(), 1);
+        assert_eq!(crate::help::entries("Cmd+C").len(), 1);
+        assert!(app.clipboard.is_none());
+        app.key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(
+            matches!(&app.modal, Some(Modal::Help(state)) if state.scroll == 1 && state.query.text().is_empty())
+        );
+        app.paste("no such shortcut".into());
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        assert!(matches!(&app.modal, Some(Modal::Help(state)) if state.scroll == 0));
+        app.key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        assert!(!app.home);
+        Ok(())
+    }
+
+    #[test]
+    fn copy_shortcuts_preserve_review_position_and_copy_whole_wrapped_source_lines() -> Result<()> {
+        use crate::{
+            review::{Anchor, Side},
+            workflow::Target,
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        for view in [View::Guide, View::Diff] {
+            for unified in [false, true] {
+                let mut app = guide_app(dir.path());
+                let id = app.key().context("Missing PR")?;
+                let snapshot = std::sync::Arc::make_mut(
+                    app.reviews
+                        .get_mut(&id)
+                        .and_then(|r| r.snapshot.as_mut())
+                        .context("Missing snapshot")?,
+                );
+                let source = format!("\t界 {}  ", "long_source_word ".repeat(40));
+                snapshot
+                    .files
+                    .first_mut()
+                    .and_then(|f| f.hunks.first_mut())
+                    .and_then(|h| h.lines.first_mut())
+                    .context("Missing source")?
+                    .text = source.clone();
+                app.config.unified = unified;
+                app.config.wrap_diff = true;
+                app.action(Action::SetView(view));
+                app.focus = Focus::Content;
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 35))?;
+                terminal.draw(|frame| draw(frame, &mut app))?;
+                let doc = app.document.as_ref().context("Missing document")?;
+                let (index, path) = doc
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, row)| match &row.right.target {
+                        Some(Target::Code {
+                            path, new: Some(3), ..
+                        }) => Some((index, path.clone())),
+                        _ => None,
+                    })
+                    .context("Missing code")?;
+                app.workflow.cursor = Some(index);
+                app.workflow.side = Side::Right;
+                app.workflow.selection = Some(Anchor {
+                    path: path.clone(),
+                    side: Side::Right,
+                    start: 1,
+                    end: 1,
+                });
+                let scroll = app.scroll;
+                for modifier in [KeyModifiers::NONE, KeyModifiers::SUPER] {
+                    app.key_event(KeyEvent::new(KeyCode::Char('c'), modifier));
+                    assert_eq!(
+                        app.clipboard.as_deref(),
+                        Some(format!("{source}\nline_2\nline_3").as_str())
+                    );
+                    assert_eq!(app.workflow.cursor, Some(index));
+                    assert_eq!(app.workflow.selection.as_ref().map(|a| a.start), Some(1));
+                    assert_eq!(app.scroll, scroll);
+                    assert_eq!(app.focus, Focus::Content);
+                }
+                app.workflow.selection = None;
+                app.key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+                assert_eq!(app.clipboard.as_deref(), Some("line_3"));
+                app.workflow.cursor = app.document.as_ref().and_then(|doc| {
+                    doc.rows
+                        .iter()
+                        .position(|row| matches!(row.right.target, Some(Target::Header { .. })))
+                });
+                app.key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+                assert_eq!(app.clipboard.as_deref(), Some(path.as_str()));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn sidebar_filters_keep_shortcuts_as_text_and_hide_nonmatching_file_content() -> Result<()> {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let dir = tempfile::tempdir()?;
@@ -3540,7 +3688,7 @@ mod tests {
         for code in [KeyCode::Char('?'), KeyCode::Char('m'), KeyCode::Char('l')] {
             app.key_event(KeyEvent::new(code, KeyModifiers::NONE));
             assert!(match code {
-                KeyCode::Char('?') => matches!(app.modal, Some(Modal::Help)),
+                KeyCode::Char('?') => matches!(app.modal, Some(Modal::Help(_))),
                 KeyCode::Char('m') => matches!(app.modal, Some(Modal::Models { .. })),
                 _ => matches!(app.modal, Some(Modal::Clone { .. })),
             });
