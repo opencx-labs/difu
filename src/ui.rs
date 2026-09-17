@@ -26,6 +26,7 @@ const REMOVE_BG: Color = Color::Rgb(49, 25, 31);
 
 #[derive(Clone, Default)]
 pub struct TextRow {
+    pub image: Option<crate::images::PreviewRow>,
     pub spans: Vec<Span<'static>>,
     pub action: Option<Action>,
     pub target: Option<crate::workflow::Target>,
@@ -110,6 +111,7 @@ pub(crate) fn text(value: impl Into<String>, color: Color) -> TextRow {
         action: None,
         target: None,
         code_links: Vec::new(),
+        image: None,
     }
 }
 pub(crate) fn bold(value: impl Into<String>, color: Color) -> TextRow {
@@ -121,6 +123,7 @@ pub(crate) fn bold(value: impl Into<String>, color: Color) -> TextRow {
         action: None,
         target: None,
         code_links: Vec::new(),
+        image: None,
     }
 }
 pub(crate) fn link(value: impl Into<String>, action: Action) -> TextRow {
@@ -134,6 +137,7 @@ pub(crate) fn link(value: impl Into<String>, action: Action) -> TextRow {
         action: Some(action),
         target: None,
         code_links: Vec::new(),
+        image: None,
     }
 }
 fn append(rows: &mut Vec<Row>, right: TextRow) {
@@ -219,6 +223,7 @@ pub(crate) fn prose(source: &str, width: usize) -> Vec<TextRow> {
                     action: None,
                     target: None,
                     code_links: Vec::new(),
+                    image: None,
                 }
             });
         }
@@ -517,12 +522,50 @@ fn code_links(
     links
 }
 
+// Offsets are terminal-cell positions in the original line. Keeping the source
+// line intact preserves definition links and review anchors on every wrap row.
+fn code_offsets(
+    line: Option<&DiffLine>,
+    old: bool,
+    width: usize,
+    layout: (usize, bool),
+) -> Vec<usize> {
+    let (horizontal, wrap) = layout;
+    if !wrap {
+        return vec![horizontal];
+    }
+    let Some(line) = line else { return Vec::new() };
+    let number = if old { line.old } else { line.new };
+    let prefix = format!(
+        "{:>5}   ",
+        number.map(|n| n.to_string()).unwrap_or_default()
+    )
+    .width();
+    let available = width.saturating_sub(prefix);
+    let mut offsets = vec![0];
+    if available == 0 {
+        return offsets;
+    }
+    let mut position = 0;
+    let mut used = 0;
+    for ch in clean(&line.text).replace('\t', "    ").chars() {
+        let size = ch.width().unwrap_or(0);
+        if used > 0 && used + size > available {
+            offsets.push(position);
+            used = 0;
+        }
+        used += size;
+        position += size;
+    }
+    offsets
+}
+
 fn code_rows(
     path: &str,
     lines: &[DiffLine],
     width: usize,
     split: bool,
-    horizontal: usize,
+    layout: (usize, bool),
 ) -> Vec<TextRow> {
     let mut rows = Vec::new();
     if split {
@@ -534,41 +577,54 @@ fn code_rows(
             lines: lines.to_vec(),
         };
         for (old, new) in split_rows(&hunk) {
-            let mut spans = code(old, true, left, horizontal);
-            spans.push(span("│", BORDER));
-            spans.extend(code(new, false, right, horizontal));
-            let mut links = code_links(path, old, true, left, horizontal, 0);
-            links.extend(code_links(path, new, false, right, horizontal, left + 1));
-            rows.push(TextRow {
-                spans,
-                code_links: links,
-                action: None,
-                target: Some(crate::workflow::Target::Code {
-                    path: path.into(),
-                    old: old.and_then(|l| l.old),
-                    new: new.and_then(|l| l.new),
-                }),
-            });
+            let old_offsets = code_offsets(old, true, left, layout);
+            let new_offsets = code_offsets(new, false, right, layout);
+            for index in 0..old_offsets.len().max(new_offsets.len()) {
+                let old_offset = old_offsets.get(index).copied();
+                let new_offset = new_offsets.get(index).copied();
+                let old = old.filter(|_| old_offset.is_some());
+                let new = new.filter(|_| new_offset.is_some());
+                let mut spans = code(old, true, left, old_offset.unwrap_or(0));
+                spans.push(span("│", BORDER));
+                spans.extend(code(new, false, right, new_offset.unwrap_or(0)));
+                let mut links = code_links(path, old, true, left, old_offset.unwrap_or(0), 0);
+                links.extend(code_links(
+                    path,
+                    new,
+                    false,
+                    right,
+                    new_offset.unwrap_or(0),
+                    left + 1,
+                ));
+                rows.push(TextRow {
+                    spans,
+                    code_links: links,
+                    image: None,
+                    action: None,
+                    target: Some(crate::workflow::Target::Code {
+                        path: path.into(),
+                        old: old.and_then(|l| l.old),
+                        new: new.and_then(|l| l.new),
+                    }),
+                });
+            }
         }
     } else {
         for line in lines {
-            rows.push(TextRow {
-                spans: code(Some(line), line.kind == LineKind::Remove, width, horizontal),
-                code_links: code_links(
-                    path,
-                    Some(line),
-                    line.kind == LineKind::Remove,
-                    width,
-                    horizontal,
-                    0,
-                ),
-                action: None,
-                target: Some(crate::workflow::Target::Code {
-                    path: path.into(),
-                    old: line.old,
-                    new: line.new,
-                }),
-            });
+            let old = line.kind == LineKind::Remove;
+            for offset in code_offsets(Some(line), old, width, layout) {
+                rows.push(TextRow {
+                    spans: code(Some(line), old, width, offset),
+                    code_links: code_links(path, Some(line), old, width, offset, 0),
+                    image: None,
+                    action: None,
+                    target: Some(crate::workflow::Target::Code {
+                        path: path.into(),
+                        old: line.old,
+                        new: line.new,
+                    }),
+                });
+            }
         }
     }
     rows
@@ -619,7 +675,7 @@ fn hunk_rows(
     hunk: &Hunk,
     width: usize,
     split: bool,
-    horizontal: usize,
+    horizontal: (usize, bool),
     with_title: bool,
     review: &Review,
 ) -> Vec<TextRow> {
@@ -699,7 +755,7 @@ fn build(app: &App, width: u16) -> Document {
         return doc;
     };
     if app.view == View::Overview {
-        for row in crate::overview::rows(review, width) {
+        for row in crate::overview::rows_with_images(review, width, app.images.supported()) {
             append(&mut doc.rows, row);
         }
         return doc;
@@ -732,7 +788,33 @@ fn build(app: &App, width: u16) -> Document {
         let code_width = width.saturating_sub(if wide { doc.left_width + 3 } else { 0 }) as usize;
         let code_width = code_width.saturating_sub(2);
         let split = wide && !app.config.unified;
+        let mut previous_category = None;
         for (chapter_index, chapter) in guide.chapters.iter().enumerate() {
+            if previous_category != Some(chapter.category) {
+                let label = match chapter.category {
+                    crate::codex::ChapterCategory::Schema => Some("Manual schemas / DTOs"),
+                    crate::codex::ChapterCategory::Migrations => Some("Database migrations"),
+                    crate::codex::ChapterCategory::Regular if previous_category.is_some() => {
+                        Some("Implementation")
+                    }
+                    crate::codex::ChapterCategory::Generated => Some("Generated code"),
+                    crate::codex::ChapterCategory::Tests => Some("Tests"),
+                    _ => None,
+                };
+                if let Some(label) = label {
+                    let divider = bold(format!("── {label} ──"), ACCENT);
+                    if wide {
+                        doc.rows.push(Row {
+                            left: divider,
+                            right: text("─".repeat(code_width), BORDER),
+                        });
+                    } else {
+                        append(&mut doc.rows, divider);
+                    }
+                    doc.rows.push(Row::default());
+                }
+                previous_category = Some(chapter.category);
+            }
             let start = doc.rows.len();
             let prose_width = if wide {
                 doc.left_width as usize
@@ -807,7 +889,7 @@ fn build(app: &App, width: u16) -> Document {
                         hunk,
                         code_width,
                         split,
-                        app.horizontal,
+                        (app.horizontal, app.config.wrap_diff),
                         title,
                         review,
                     ));
@@ -909,7 +991,16 @@ fn build(app: &App, width: u16) -> Document {
             }
         }
     } else {
-        if let Some(file) = snapshot.files.get(app.file) {
+        for (_, file) in snapshot.files.iter().enumerate().filter(|(index, file)| {
+            app.directory
+                .as_ref()
+                .map_or(*index == app.file, |directory| {
+                    file.path
+                        .strip_prefix(directory)
+                        .is_some_and(|rest| rest.starts_with('/'))
+                })
+        }) {
+            let start = doc.rows.len();
             let collapsed = review.interaction.github.viewed.contains(&file.path)
                 && review.interaction.github.head == snapshot.head;
             if collapsed {
@@ -927,7 +1018,7 @@ fn build(app: &App, width: u16) -> Document {
                     hunk,
                     width.saturating_sub(2) as usize,
                     width >= 80 && !app.config.unified,
-                    app.horizontal,
+                    (app.horizontal, app.config.wrap_diff),
                     i == 0,
                     review,
                 ) {
@@ -935,7 +1026,7 @@ fn build(app: &App, width: u16) -> Document {
                 }
             }
             doc.files.push(FileSection {
-                start: 0,
+                start,
                 end: doc.rows.len(),
                 header: file_header(file, width.saturating_sub(2) as usize),
             });
@@ -1399,6 +1490,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             );
         }
     }
+    crate::images::draw_inline(frame, app, &doc, main);
     if let Some(file) = doc
         .files
         .iter()
@@ -1558,6 +1650,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 Action::Workflow(crate::workflow::WAction::Open),
             ),
             ("Alt+↑/↓ Chapters", Action::Chapter(true)),
+            (
+                if app.config.wrap_diff {
+                    "w Unwrap"
+                } else {
+                    "w Wrap"
+                },
+                Action::ToggleWrap,
+            ),
             ("Cmd+↑/↓ 10 lines", Action::FastScroll(10)),
             ("? Help", Action::Help),
             ("m Model", Action::Models),
@@ -1832,68 +1932,51 @@ fn draw_files(frame: &mut Frame, app: &mut App, rect: Rect) {
         &bold("FILES", DIM),
         app,
     );
-    let files = app.review().and_then(|r| r.snapshot.clone());
-    let Some(snapshot) = files else {
+    let Some(snapshot) = app.review().and_then(|r| r.snapshot.clone()) else {
         return;
     };
-    let mut entries = Vec::<(String, Option<usize>)>::new();
-    let mut previous = Vec::<String>::new();
-    let mut selected_row = 0;
-    for (index, file) in snapshot.files.iter().enumerate() {
-        let parts = file.path.split('/').collect::<Vec<_>>();
-        let Some((_, parents)) = parts.split_last() else {
-            continue;
-        };
-        let common = parents
-            .iter()
-            .zip(&previous)
-            .take_while(|(a, b)| **a == b.as_str())
-            .count();
-        for (depth, parent) in parents.iter().enumerate().skip(common) {
-            entries.extend(
-                wrapped_text(
-                    &format!("{}{parent}/", "  ".repeat(depth.min(5))),
-                    rect.width.saturating_sub(1) as usize,
-                )
-                .into_iter()
-                .map(|line| (line, None)),
-            );
-        }
-        previous = parents.iter().map(|s| s.to_string()).collect();
-        let label = format!(
-            "{}{} {}",
-            "  ".repeat(parents.len().min(5)),
-            if index == app.file { "▸" } else { " " },
-            parts.last().unwrap_or(&"")
-        );
-        entries.extend(
-            wrapped_text(&label, rect.width.saturating_sub(1) as usize)
-                .into_iter()
-                .map(|line| (line, Some(index))),
-        );
-        if index == app.file {
-            selected_row = entries.len().saturating_sub(1);
-        }
-    }
+    let entries = crate::tree::entries(&snapshot.files);
+    let selected = |entry: &crate::tree::Entry| match &app.directory {
+        Some(path) => entry.file.is_none() && &entry.path == path,
+        None => entry.file == Some(app.file),
+    };
+    let selected_row = entries.iter().position(selected).unwrap_or(0);
+    let width = rect.width.saturating_sub(2) as usize;
+    app.tree_max_horizontal = entries
+        .iter()
+        .map(|entry| entry.label().width().saturating_sub(width))
+        .max()
+        .unwrap_or(0);
+    app.tree_horizontal = app.tree_horizontal.min(app.tree_max_horizontal);
     let height = rect.height.saturating_sub(2) as usize;
     let start = selected_row.saturating_sub(height.saturating_sub(1));
-    for (offset, (label, index)) in entries.iter().skip(start).take(height).enumerate() {
-        let y = rect.y + 2 + offset as u16;
-        let color = if *index == Some(app.file) {
+    for (offset, entry) in entries.iter().enumerate().skip(start).take(height) {
+        let y = rect.y + 2 + (offset - start) as u16;
+        let active = offset == selected_row;
+        let color = if active {
             ACCENT
-        } else if index.is_some() {
+        } else if entry.file.is_some() {
             TEXT
         } else {
             DIM
         };
-        let row = text(crop(label, 0, rect.width.saturating_sub(1) as usize), color);
-        paint(frame, Rect::new(rect.x, y, rect.width - 1, 1), &row, app);
-        if let Some(index) = index {
-            app.hits.push((
-                Rect::new(rect.x, y, rect.width - 1, 1),
-                Action::SelectFile(*index),
-            ));
-        }
+        let row = text(
+            format!(
+                "{} {}",
+                if active { "▸" } else { " " },
+                crop(&entry.label(), app.tree_horizontal, width)
+            ),
+            color,
+        );
+        let hit = Rect::new(rect.x, y, rect.width, 1);
+        paint(frame, hit, &row, app);
+        app.hits.push((
+            hit,
+            match entry.file {
+                Some(index) => Action::SelectFile(index),
+                None => Action::SelectDirectory(entry.path.clone()),
+            },
+        ));
     }
 }
 
@@ -2007,6 +2090,10 @@ fn draw_definition(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_modal(frame: &mut Frame, app: &mut App) {
+    if matches!(app.modal, Some(Modal::Image(_))) {
+        crate::images::draw_modal(frame, app);
+        return;
+    }
     if matches!(app.modal, Some(Modal::Definition(_))) {
         draw_definition(frame, app);
         return;
@@ -2044,7 +2131,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
     };
     let mut input_cursor = None;
     let rows = match modal {
-        Modal::Definition(_) => Vec::new(),
+        Modal::Definition(_) | Modal::Image(_) => Vec::new(),
         Modal::Workflow(_) => Vec::new(),
         Modal::Repositories {
             manage,
@@ -2150,6 +2237,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
             text("Page Up/Down  Scroll a page · Space scrolls down", TEXT),
             text("Home / End    Jump to start / end", TEXT),
             text("← → side · Alt+← → horizontal · Shift+↑↓ select", TEXT),
+            text("w             Toggle diff wrapping (saved)", TEXT),
             text(
                 "1 / 2 / 3     Home: Reviews / Authored / Repositories",
                 TEXT,
@@ -2336,11 +2424,13 @@ mod tests {
                 guide: Some(Arc::new(Guide {
                     chapters: vec![
                         Chapter {
+                            category: crate::codex::ChapterCategory::Regular,
                             title: "First chapter".into(),
                             explanation: "Changes across two files.".into(),
                             hunks: vec!["h0".into(), "h1".into()],
                         },
                         Chapter {
+                            category: crate::codex::ChapterCategory::Regular,
                             title: "Second chapter".into(),
                             explanation: "The final file.".into(),
                             hunks: vec!["h2".into()],
@@ -2408,13 +2498,391 @@ mod tests {
     }
 
     #[test]
-    fn default_navigation_focus_and_fast_scroll_preserve_shortcut_meanings() -> Result<()> {
+    fn pr_command_filter_keeps_keyboard_mouse_and_cursor_on_matching_commands() -> Result<()> {
+        use crate::{
+            editor::Editor,
+            review::Operation,
+            workflow::{Kind, WAction, Wizard},
+        };
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        let key = app.inbox.first().context("Missing PR")?.key.clone();
+        // Opening a composer in this UI test must not start a live GitHub lookup.
+        app.workflow.mentions_loading.insert(key.id());
+        let open_menu = |app: &mut App| {
+            app.wizard(Wizard::Controls {
+                key: key.clone(),
+                head: "head".into(),
+                selected: 0,
+                query: Editor::default(),
+            })
+        };
+        open_menu(&mut app);
+        for ch in "ADMIN merge".chars() {
+            app.key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(
+            crate::workflow::control_commands("ADMIN merge")
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            [3, 4]
+        );
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 35))?;
+        terminal.draw(|f| draw(f, &mut app))?;
+        let choices = app
+            .hits
+            .iter()
+            .filter_map(|(_, action)| match action {
+                Action::Workflow(WAction::Choose(id)) => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(choices, [3, 4]);
+        let cursor = terminal.get_cursor_position()?;
+        assert!(cursor.x > 0 && cursor.x < 120 && cursor.y > 0 && cursor.y < 35);
+        app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&app.modal, Some(Modal::Workflow(w)) if matches!(w.as_ref(), Wizard::Confirm {operation: Operation::Merge{squash:true, admin:true},..}))
+        );
+        assert!(!app.workflow.busy);
+        open_menu(&mut app);
+        app.paste("resolve\nconflicts".into());
+        terminal.draw(|f| draw(f, &mut app))?;
+        let action = app
+            .hits
+            .iter()
+            .find_map(|(_, a)| match a {
+                Action::Workflow(WAction::Choose(6)) => Some(a.clone()),
+                _ => None,
+            })
+            .context("Missing filtered mouse action")?;
+        app.action(action);
+        assert!(
+            matches!(&app.modal,Some(Modal::Workflow(w)) if matches!(w.as_ref(),Wizard::Resolve {..}))
+        );
+        assert!(!app.workflow.busy);
+        open_menu(&mut app);
+        app.paste("no matching command 界".into());
+        app.key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&app.modal,Some(Modal::Workflow(w)) if matches!(w.as_ref(),Wizard::Controls {..}))
+        );
+        terminal.draw(|f| draw(f, &mut app))?;
+        assert!(
+            !app.hits
+                .iter()
+                .any(|(_, a)| matches!(a, Action::Workflow(WAction::Choose(_))))
+        );
+        app.key_event(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert!(
+            matches!(&app.modal,Some(Modal::Workflow(w)) if matches!(w.as_ref(),Wizard::Controls {query,..} if query.text().ends_with(' ')))
+        );
+        app.key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        app.paste("close".into());
+        app.key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&app.modal,Some(Modal::Workflow(w)) if matches!(w.as_ref(),Wizard::Compose(draft) if matches!(draft.kind, Kind::Close)))
+        );
+        open_menu(&mut app);
+        app.key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn section_dividers_render_once_without_becoming_chapters_or_navigation_targets() -> Result<()>
+    {
+        use crate::codex::{ChapterCategory, Guide};
+        let dir = tempfile::tempdir()?;
+        for width in [80, 180] {
+            let mut app = guide_app(dir.path());
+            let id = app.key().context("Missing key")?;
+            let r = app.reviews.get_mut(&id).context("Missing review")?;
+            let mut chapter = r
+                .guide
+                .as_ref()
+                .and_then(|g| g.chapters.first())
+                .cloned()
+                .context("Missing chapter")?;
+            chapter.hunks = vec!["h0".into()];
+            let chapters = [
+                ChapterCategory::Schema,
+                ChapterCategory::Migrations,
+                ChapterCategory::Regular,
+                ChapterCategory::Generated,
+                ChapterCategory::Generated,
+                ChapterCategory::Tests,
+                ChapterCategory::Tests,
+            ]
+            .into_iter()
+            .map(|category| {
+                let mut c = chapter.clone();
+                c.category = category;
+                c
+            })
+            .collect();
+            r.guide = Some(std::sync::Arc::new(Guide { chapters }));
+            let doc = build(&app, width);
+            assert_eq!(doc.sections.len(), 7);
+            assert_eq!(doc.navigation.len(), 7);
+            let mut positions = Vec::new();
+            for label in [
+                "── Manual schemas / DTOs ──",
+                "── Database migrations ──",
+                "── Implementation ──",
+                "── Generated code ──",
+                "── Tests ──",
+            ] {
+                let hits = doc
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| {
+                        row.left
+                            .spans
+                            .iter()
+                            .chain(&row.right.spans)
+                            .any(|s| s.content == label)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(hits.len(), 1);
+                let (index, row) = hits.first().context("Missing divider")?;
+                assert!(row.left.action.is_none() && row.right.action.is_none());
+                assert!(row.right.target.is_none());
+                positions.push(*index);
+            }
+            assert!(
+                positions
+                    .windows(2)
+                    .all(|pair| matches!(pair, [a, b] if a < b))
+            );
+            for item in &doc.navigation {
+                assert!(doc.rows.get(item.row).is_some_and(|row| matches!(&row.right.target,
+                    Some(crate::workflow::Target::Header {chapter: Some(index), ..}) if *index == item.chapter)));
+            }
+            let regular_only = guide_app(dir.path());
+            let doc = build(&regular_only, width);
+            assert!(
+                !doc.rows
+                    .iter()
+                    .flat_map(|row| row.left.spans.iter().chain(&row.right.spans))
+                    .any(|span| span.content == "── Generated code ──"
+                        || span.content == "── Tests ──")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn directories_select_descendants_and_horizontal_scroll_stays_in_tree() -> Result<()> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        let id = app.key().context("Missing key")?;
+        let snapshot = std::sync::Arc::make_mut(
+            app.reviews
+                .get_mut(&id)
+                .and_then(|r| r.snapshot.as_mut())
+                .context("Missing snapshot")?,
+        );
+        for (file, path) in snapshot.files.iter_mut().zip([
+            "src/nested/long-child-file-name.ts",
+            "src/root.ts",
+            "src-extra/outside.ts",
+        ]) {
+            file.path = path.into();
+        }
+        app.action(Action::SetView(View::Diff));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 35))?;
+        terminal.draw(|f| draw(f, &mut app))?;
+        let directory = app
+            .hits
+            .iter()
+            .find_map(|(_, action)| match action {
+                Action::SelectDirectory(path) if path == "src" => Some(action.clone()),
+                _ => None,
+            })
+            .context("Directory must be clickable")?;
+        app.action(directory);
+        terminal.draw(|f| draw(f, &mut app))?;
+        let doc = app.document.as_ref().context("Missing document")?;
+        assert_eq!(doc.files.len(), 2);
+        let paths = doc
+            .rows
+            .iter()
+            .filter_map(|row| match &row.right.target {
+                Some(crate::workflow::Target::Code { path, .. }) => Some(path.as_str()),
+                _ => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            paths,
+            std::collections::BTreeSet::from(["src/nested/long-child-file-name.ts", "src/root.ts"])
+        );
+        assert!(
+            doc.files
+                .windows(2)
+                .all(|pair| matches!(pair, [a, b] if a.end == b.start && b.start > a.start))
+        );
+        let rows = doc.rows.len();
+        let epoch = app.epoch;
+        for _ in 0..3 {
+            app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        }
+        assert!(app.tree_horizontal > 0);
+        assert_eq!(app.horizontal, 0);
+        assert_eq!(app.epoch, epoch);
+        terminal.draw(|f| draw(f, &mut app))?;
+        assert_eq!(app.document.as_ref().map(|d| d.rows.len()), Some(rows));
+        assert!(
+            app.hits
+                .iter()
+                .filter(|(_, a)| matches!(a, Action::SelectFile(_) | Action::SelectDirectory(_)))
+                .all(|(r, _)| r.height == 1)
+        );
+        app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.directory.as_deref(), Some("src/nested"));
+        terminal.draw(|f| draw(f, &mut app))?;
+        assert_eq!(app.document.as_ref().map(|d| d.files.len()), Some(1));
+        app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(app.directory.is_none());
+        assert_eq!(app.file, 0);
+        app.focus = Focus::Content;
+        let tree_offset = app.tree_horizontal;
+        app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        assert_eq!(app.horizontal, 4);
+        assert_eq!(app.tree_horizontal, tree_offset);
+        Ok(())
+    }
+
+    #[test]
+    fn wrapped_code_preserves_complete_text_side_anchors_and_definition_columns() -> Result<()> {
+        use crate::workflow::Target;
+        let source = "\tconst 界界 = longFunctionName(argumentOne, argumentTwo);";
+        let old = DiffLine {
+            kind: LineKind::Remove,
+            old: Some(42),
+            new: None,
+            text: source.into(),
+        };
+        let new = DiffLine {
+            kind: LineKind::Add,
+            old: None,
+            new: Some(50),
+            text: "short();".into(),
+        };
+        let width = 26;
+        let offsets = code_offsets(Some(&old), true, width, (0, true));
+        let reconstructed: String = offsets
+            .iter()
+            .map(|offset| crop(source, *offset, width - 8))
+            .collect();
+        assert_eq!(reconstructed, source.replace('\t', "    "));
+        let rows = code_rows("file.ts", &[old.clone(), new], 53, true, (0, true));
+        assert!(rows.len() > 1);
+        assert!(matches!(
+            rows.first().and_then(|r| r.target.as_ref()),
+            Some(Target::Code {
+                old: Some(42),
+                new: Some(50),
+                ..
+            })
+        ));
+        assert!(rows.iter().skip(1).all(|r| matches!(
+            r.target,
+            Some(Target::Code {
+                old: Some(42),
+                new: None,
+                ..
+            })
+        )));
+        let expected_column = source
+            .find("longFunctionName")
+            .context("Missing function")?;
+        assert!(rows.iter().skip(1).flat_map(|r| &r.code_links).any(|link| matches!(link.action, Action::Definition {line:42, column, old:true, ..} if column == expected_column)));
+        assert!(
+            rows.iter()
+                .all(|r| r.spans.iter().map(|s| s.width()).sum::<usize>() <= 53)
+        );
+        let unified = code_rows("file.ts", &[old], width, false, (0, true));
+        assert_eq!(unified.len(), offsets.len());
+        assert!(unified.iter().all(|r| matches!(
+            r.target,
+            Some(Target::Code {
+                old: Some(42),
+                new: None,
+                ..
+            })
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn wrapping_toggle_applies_to_both_views_and_persists_without_stealing_input() -> Result<()> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        for view in [View::Guide, View::Diff] {
+            for width in [80, 180] {
+                let mut app = guide_app(dir.path());
+                let id = app.key().context("Missing key")?;
+                let snapshot = std::sync::Arc::make_mut(
+                    app.reviews
+                        .get_mut(&id)
+                        .and_then(|r| r.snapshot.as_mut())
+                        .context("Missing snapshot")?,
+                );
+                let line = snapshot
+                    .files
+                    .first_mut()
+                    .and_then(|f| f.hunks.first_mut())
+                    .and_then(|h| h.lines.first_mut())
+                    .context("Missing line")?;
+                line.text = "someLongFunctionName(argument); ".repeat(20);
+                app.action(Action::SetView(view));
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 35))?;
+                terminal.draw(|f| draw(f, &mut app))?;
+                let before = app.document.as_ref().context("Missing doc")?.rows.len();
+                app.key_event(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+                terminal.draw(|f| draw(f, &mut app))?;
+                assert!(
+                    app.document
+                        .as_ref()
+                        .context("Missing wrapped doc")?
+                        .rows
+                        .len()
+                        > before
+                );
+                assert!(app.storage.load_config()?.wrap_diff);
+                let restarted = App::new(app.storage.clone(), app.storage.load_config()?);
+                assert!(restarted.config.wrap_diff);
+                app.key_event(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+                terminal.draw(|f| draw(f, &mut app))?;
+                assert_eq!(app.document.as_ref().map(|d| d.rows.len()), Some(before));
+                assert!(!app.storage.load_config()?.wrap_diff);
+                app.modal = Some(Modal::Clone {
+                    value: String::new(),
+                    key: id,
+                });
+                app.key_event(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
+                assert!(matches!(&app.modal, Some(Modal::Clone {value, ..}) if value == "w"));
+                assert!(!app.config.wrap_diff);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn default_focus_and_fast_scroll_preserve_shortcut_meanings() -> Result<()> {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         let dir = tempfile::tempdir()?;
         let mut app = guide_app(dir.path());
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 30))?;
         app.action(Action::SetView(View::Guide));
-        assert_eq!(app.focus, Focus::Navigation);
+        assert_eq!(app.focus, Focus::Content);
         terminal.draw(|f| draw(f, &mut app))?;
         let output: String = terminal
             .backend()
@@ -2425,7 +2893,8 @@ mod tests {
             .collect();
         assert!(output.contains("Alt+↑/↓ Chapters"));
         assert!(output.contains("Cmd+↑/↓ 10 lines"));
-        assert!(output.contains("Focus: Chapters"));
+        assert!(output.contains("Focus: Diff"));
+        app.key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let next_file = app
             .document
             .as_ref()
@@ -2607,8 +3076,8 @@ mod tests {
             line.text = "shared_hunk_line".into();
             let guide: crate::codex::Guide = serde_json::from_value(serde_json::json!({
                 "chapters": [
-                    {"title": "First", "explanation": "First use", "hunks": ["h0", "h1", "h0"]},
-                    {"title": "Second", "explanation": "Second use", "hunks": ["h0", "h2", "h0"]}
+                    {"category": "regular", "title": "First", "explanation": "First use", "hunks": ["h0", "h1", "h0"]},
+                    {"category": "regular", "title": "Second", "explanation": "Second use", "hunks": ["h0", "h2", "h0"]}
                 ]
             }))?;
             guide.validate(snapshot)?;

@@ -14,7 +14,7 @@ track chapter completion, and merge or close PRs without leaving the terminal.
 - **[GitHub CLI](https://cli.github.com/)** (`gh`) for GitHub authentication and PR data.
 - **[Codex CLI](https://github.com/openai/codex)** for guide generation using your
   existing login. The integration has been tested with Codex CLI 0.154.0.
-- **[Rust 1.88 or newer](https://www.rust-lang.org/tools/install)** when building
+- **[Rust 1.90 or newer](https://www.rust-lang.org/tools/install)** when building
   from source.
 
 Git, `gh`, and `codex` must be available on your `PATH`. If you use Homebrew, install
@@ -45,7 +45,7 @@ Linux. You can also download them from [GitHub Releases](https://github.com/open
 
 ### Build from source
 
-With Git and Rust 1.88+ installed:
+With Git and Rust 1.90+ installed:
 
 ```sh
 git clone https://github.com/opencx-labs/difu.git
@@ -88,7 +88,7 @@ fails, the cached list stays available; **r** retries.
 Select a PR to preview its description, chronological activity, inline review
 comments, and checks. **Enter** drills into that PR and selects **Guide**, starting
 or retrieving its guide. Inside the PR, the tabs are **Overview / Guide / Diff**;
-**Esc** returns home. Guide and Diff start with chapters or files focused; the
+**Esc** returns home. Guide starts with code focused; Diff starts with files focused. The
 border highlights the focused pane, the footer names it, and **Tab** switches focus. You can also launch directly:
 
 ```sh
@@ -106,6 +106,19 @@ GitHub.com is supported in v1.
 Lists show the most recently updated PRs first. GitHub search returns up to
 1,000 results for Review requests or Authored, and up to 1,000 per enabled
 repository in the Repositories inbox.
+
+### PR images
+
+Descriptions and activity comments show inline PNG, JPEG, WebP, and GIF previews
+(the first GIF frame). Click an image to enlarge it; **Esc** returns to the same
+review position. The image modal also offers **o** to open it in your browser.
+
+Images load in the background and are cached locally. Terminals without a
+supported graphics protocol, inaccessible attachments, and unsupported formats
+show an explanation and a browser link. Previews are limited to 10 MiB and
+8192 pixels per dimension; the disk cache retains up to 256 MiB. GitHub image
+requests can reuse your `gh` authentication; credentials are never forwarded
+to other image hosts.
 
 ### States and repository filters
 
@@ -193,6 +206,8 @@ transfer percentage, size, and speed when available. **x** cancels preparation;
 
 Press **/** inside a PR for its action wizard. At home, **/** offers **PR controls**
 for the selected PR and **Memory management** for temporary worktrees.
+Type in PR controls to filter commands. Use arrows and Enter to choose a match,
+Backspace to edit, or **Ctrl+U** to clear the filter.
 
 PR controls support comment/approve/request-changes reviews, merge, squash merge,
 either merge method with the admin flag, and closing with an optional comment.
@@ -297,7 +312,7 @@ bindings.
 
 | Key | Action |
 | --- | --- |
-| Up / Down | Select a PR or chapter file; move the focused code line |
+| Up / Down | Select a PR, directory, file, or chapter link; move the focused code line |
 | Command+Up / Command+Down | Focus content and move ten lines |
 | Tab / Shift+Tab | Switch navigation/content focus |
 | Enter | Open PR; comment on a code line; toggle a file heading |
@@ -305,8 +320,8 @@ bindings.
 | Shift+Up / Shift+Down | Select code lines within one file and side |
 | Page Up / Page Down / Space | Scroll a page |
 | Home / End | Start / end |
-| Left / Right | Select old/new diff side |
-| Alt+Left / Alt+Right | Scroll code horizontally |
+| Left / Right | Scroll the focused Files tree horizontally; in code, select old/new diff side |
+| Alt+Left / Alt+Right | Scroll the focused tree or unwrapped code horizontally |
 | Alt+Up / Alt+Down | Previous / next guide chapter |
 | 1 / 2 / 3 | Home: Review requests / Authored / Repositories; inside a PR: Overview / Guide / Diff |
 | ? | Help |
@@ -319,10 +334,17 @@ bindings.
 | l | Choose a local clone path |
 | x | Cancel generation, snapshot preparation, or active conflict resolution |
 | Ctrl+R | Refresh mention suggestions in the comment/review editor |
+| w | Toggle diff wrapping (saved between launches) |
 | Ctrl+B | Side-by-side / unified preference |
 | Ctrl+O | Open the PR on GitHub |
 | Esc | Close dialog / return home / quit |
 | Ctrl+C | Quit and clean up active work |
+
+The Files tree stays expanded. Select a directory with arrows or a click to see
+all changed files beneath it. Tree names stay on one line and scroll horizontally;
+chapter links and diff headers still wrap. Guide view opens with the code pane
+focused; use Tab to focus chapter navigation. Press `w` to toggle code wrapping
+in either split or unified diffs. This preference is saved between launches.
 
 In the clone dialog, paste a path, use Ctrl+U to clear it, then Enter. Action
 shortcuts use plain characters outside text inputs. Plain letters in an input
@@ -437,9 +459,18 @@ PR description. The Linear API exposed PR metadata and descriptions but no
 generated Guide chapters, so the research is limited to that sample. The guide
 style connects logical changes in dependency order, using short causal
 explanations and links across files. Test changes are grouped into dedicated
-chapters by concern. Schema definitions, migrations, schema generation code, and
-generated schema artifacts have their own chapters, keeping implementation
-chapters focused on runtime logic.
+chapters by concern. The guide groups chapters in this order:
+
+1. **Manual schemas / DTOs**
+2. **Database migrations**
+3. **Implementation**
+4. **Generated code**, including TanStack route trees, generated schemas, clients,
+   and types
+5. **Tests**
+
+Each group can contain multiple chapters with a divider between groups. Empty
+groups are omitted. Difu enforces the group order while preserving chapter order
+within each group.
 
 ## Development
 

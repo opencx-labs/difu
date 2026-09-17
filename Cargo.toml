@@ -1,12 +1,17 @@
 [package]
 name = "difu"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.90"
 description = "Your diff shifu: a terminal inbox and guided pull request reviewer"
 license = "MIT"
 
 [dependencies]
+ratatui-image = { version = "=11.0.8", default-features = false, features = ["crossterm"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+scraper = { version = "0.24", default-features = false }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4", features = ["derive"] }

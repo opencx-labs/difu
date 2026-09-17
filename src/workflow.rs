@@ -120,6 +120,28 @@ impl Compose {
         }
     }
 }
+/// Keep stable command IDs shared by filtering, keyboard selection, and mouse hits.
+pub fn control_commands(query: &str) -> Vec<(usize, &'static str)> {
+    let query = query.to_lowercase();
+    let terms = query.split_whitespace().collect::<Vec<_>>();
+    [
+        "Review PR",
+        "Merge",
+        "Squash merge",
+        "Merge with admin override",
+        "Squash merge with admin override",
+        "Close PR (optional comment)",
+        "Resolve conflicts",
+    ]
+    .into_iter()
+    .enumerate()
+    .filter(|(_, label)| {
+        let label = label.to_lowercase();
+        terms.iter().all(|term| label.contains(term))
+    })
+    .collect()
+}
+
 #[derive(Clone, Debug)]
 pub enum Wizard {
     Resolve {
@@ -135,6 +157,7 @@ pub enum Wizard {
         key: PrKey,
         head: String,
         selected: usize,
+        query: Editor,
     },
     Compose(Compose),
     Confirm {
@@ -252,6 +275,7 @@ impl App {
                         key: pr.key.clone(),
                         head: pr.head.clone(),
                         selected: 0,
+                        query: Editor::default(),
                     });
                     self.load_viewed();
                 } else {
@@ -701,22 +725,39 @@ impl App {
                 }
             }
             Wizard::Resolving { .. } => {}
-            Wizard::Home(_) | Wizard::Controls { .. } => {
-                let count = if self.home && matches!(wizard, Wizard::Home(_)) {
-                    4
-                } else {
-                    7
-                };
-                // Restore below; choosing a menu entry goes through the same mouse action path.
-                let selected = match &mut wizard {
-                    Wizard::Home(i) | Wizard::Controls { selected: i, .. } => i,
-                    _ => return,
-                };
+            Wizard::Home(selected) => match key.code {
+                KeyCode::Up => *selected = selected.saturating_sub(1),
+                KeyCode::Down => *selected = selected.saturating_add(1).min(3),
+                KeyCode::Enter => action = Some(WAction::Choose(*selected)),
+                _ => {}
+            },
+            Wizard::Controls {
+                selected, query, ..
+            } => {
+                let commands = control_commands(&query.text());
                 match key.code {
                     KeyCode::Up => *selected = selected.saturating_sub(1),
-                    KeyCode::Down => *selected = (*selected + 1).min(count - 1),
-                    KeyCode::Enter => action = Some(WAction::Choose(*selected)),
-                    _ => {}
+                    KeyCode::Down => {
+                        *selected = selected
+                            .saturating_add(1)
+                            .min(commands.len().saturating_sub(1))
+                    }
+                    KeyCode::Enter => {
+                        if let Some((id, _)) = commands.get(*selected) {
+                            action = Some(WAction::Choose(*id));
+                        }
+                    }
+                    KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                        *query = Editor::default();
+                        *selected = 0;
+                    }
+                    _ => {
+                        let before = query.text();
+                        query.key(key);
+                        if query.text() != before {
+                            *selected = 0;
+                        }
+                    }
                 }
             }
             Wizard::Compose(draft) => {

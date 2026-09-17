@@ -99,6 +99,7 @@ fn modal_uses_pinned_revisions_and_restores_review_in_all_diff_layouts() -> Resu
     let snapshot = repo::snapshot(root, &pr, &Cancel::default())?;
     let guide = Guide {
         chapters: vec![Chapter {
+            category: difu::codex::ChapterCategory::Regular,
             title: "Navigate".into(),
             explanation: "Keep this chapter and scroll position".into(),
             hunks: snapshot.units().map(|(_, h)| h.id.clone()).collect(),

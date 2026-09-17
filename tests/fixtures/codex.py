@@ -29,8 +29,8 @@ else:
     print(json.dumps(dict(type='turn.started')), flush=True)
     output = Path(args[args.index('--output-last-message')+1])
     output.write_text(json.dumps(dict(chapters=[
-        dict(title='Use the new behavior', explanation='The entry point calls `new()` to select the new behavior.', hunks=hunks + hunks),
-        dict(title='Follow the entry point', explanation='The same entry point demonstrates how the behavior is reached.', hunks=hunks),
+        dict(category='regular', title='Use the new behavior', explanation='The entry point calls `new()` to select the new behavior.', hunks=hunks + hunks),
+        dict(category='regular', title='Follow the entry point', explanation='The same entry point demonstrates how the behavior is reached.', hunks=hunks),
     ])))
     with (root / 'turns').open('a') as f:
         f.write('turn\n')

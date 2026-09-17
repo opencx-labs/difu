@@ -197,7 +197,7 @@ fn exercise(root: &Path) -> Result<()> {
             .is_some_and(|r| r.checks.first().is_some_and(|c| c.state == "pending"))
     );
     app.action(Action::OpenPr);
-    assert_eq!(app.focus, difu::app::Focus::Navigation);
+    assert_eq!(app.focus, difu::app::Focus::Content);
     wait(&mut app, |a| a.review().is_some_and(|r| r.guide.is_some()))?;
     let guide = app
         .review()

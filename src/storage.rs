@@ -25,6 +25,8 @@ pub struct Config {
     pub conflict_model: ModelChoice,
     #[serde(default)]
     pub unified: bool,
+    #[serde(default)]
+    pub wrap_diff: bool,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -34,6 +36,7 @@ impl Default for Config {
             model: ModelChoice::default(),
             conflict_model: ModelChoice::conflict_default(),
             unified: false,
+            wrap_diff: false,
         }
     }
 }
@@ -127,8 +130,8 @@ mod tests {
             storage.cache.join("reused.json"),
             serde_json::to_vec(&serde_json::json!({
                 "chapters": [
-                    {"title": "First", "explanation": "First use", "hunks": ["a", "b", "a"]},
-                    {"title": "Second", "explanation": "Second use", "hunks": ["a", "a"]}
+                    {"category": "regular", "title": "First", "explanation": "First use", "hunks": ["a", "b", "a"]},
+                    {"category": "regular", "title": "Second", "explanation": "Second use", "hunks": ["a", "a"]}
                 ]
             }))?,
         )?;
