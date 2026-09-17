@@ -169,8 +169,13 @@ moves between its file links and scrolls the corresponding diff into view.
 
 ### Function definitions
 
-Click a function identifier in a JavaScript or TypeScript diff (including JSX and
-TSX) to open its definition in a scrollable modal. Definitions can live in
+Hovering a symbol gives it a dotted underline; holding **Command** or **Ctrl**
+makes the underline solid. Command requires the terminal to forward enhanced
+keyboard events and the click; use Ctrl if it intercepts Command. The footer
+shows the gesture. Ordinary clicks focus the code line.
+
+Hold **Command** or **Ctrl** and click a function identifier in a JavaScript or
+TypeScript diff (including JSX and TSX) to open its definition in a scrollable modal. Definitions can live in
 unchanged tracked files. **Esc** closes the modal and preserves your chapter,
 focus, selection, and scroll position. Inside the modal, use the mouse wheel or
 arrow keys to scroll, **Cmd+Up/Down** to move ten lines, **PageUp/PageDown** to
@@ -229,8 +234,8 @@ With the diff focused, **>** marks the current line. **Up / Down** moves one row
 **Command+Up / Down** moves ten. In Guide and Diff, arrow keys, line selection,
 and mouse-wheel movement keep the highlighted code line near the viewport center.
 Scrolling clamps at the beginning and end without adding blank padding.
-**Left / Right** chooses old/new code, and
-**Alt+Left / Right** scrolls horizontally. **Shift+Up / Down** selects a line range
+**Left / Right** scrolls unwrapped code horizontally.
+**Alt+Left / Right** chooses old/new code; new is selected by default. **Shift+Up / Down** selects a line range
 within one file and side. **Enter** opens the comment editor: publish a standalone
 comment or add it to your GitHub pending review. Existing pending reviews are
 reused; pending comments stay private until the review is submitted.
@@ -326,8 +331,8 @@ bindings.
 | Shift+Up / Shift+Down | Select code lines within one file and side |
 | Page Up / Page Down / Space | Scroll a page |
 | Home / End | Start / end |
-| Left / Right | Scroll the focused Files tree horizontally; in code, select old/new diff side |
-| Alt+Left / Alt+Right | Scroll the focused tree or unwrapped code horizontally |
+| Left / Right | Scroll the focused Files tree or unwrapped code horizontally |
+| Alt+Left / Alt+Right | Select old/new diff side; new is selected by default |
 | Alt+Up / Alt+Down | Previous / next guide chapter |
 | 1 / 2 / 3 | Home: 1 My PRs / 2 Repositories; inside a PR: Overview / Guide / Diff |
 | ? | Search shortcut help; type to filter, Up/Down to scroll, Esc to close |
@@ -422,6 +427,11 @@ explanations and hunk references. PR-list cache files contain PR titles, authors
 opened dates, and counts. The repository directory cache contains repository names. Mention caches contain GitHub logins; progress caches
 contain completed chapter-file sections. Remove the cache directory to clear
 cached data. GitHub pending reviews and Viewed state are unaffected.
+
+Expansion controls appear only when more source lines exist. File boundaries load
+in the background from pinned local Git objects and are cached per revision;
+reading boundaries requires no fetch or worktree. **r** retries a failed boundary
+read. Full context remains loaded on demand.
 
 ### Copying code
 

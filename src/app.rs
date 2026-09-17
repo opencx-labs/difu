@@ -96,6 +96,7 @@ pub struct Review {
     pub snapshot: Option<Arc<Snapshot>>,
     pub guide: Option<Arc<Guide>>,
     pub context: HashMap<String, FileState>,
+    pub bounds: HashMap<String, crate::bounds::State>,
     pub expanded: HashMap<String, Expansion>,
     pub guide_model: Option<ModelChoice>,
     pub generation: Option<Generation>,
@@ -143,6 +144,12 @@ impl Review {
 }
 
 pub enum Message {
+    Bounds(
+        String,
+        Arc<Snapshot>,
+        String,
+        Result<crate::bounds::Bounds, String>,
+    ),
     Clipboard(u64, Result<String, String>),
     Image(
         crate::images::RenderKey,
@@ -229,6 +236,8 @@ pub enum Modal {
 }
 
 pub struct App {
+    pub hover: crate::hover::State,
+    pub preserve_diff_position: bool,
     pub(crate) clipboard_id: u64,
     pub(crate) clipboard: Option<String>,
     pub filters: crate::filter::State,
@@ -314,6 +323,8 @@ impl App {
             filters: Default::default(),
             repository: None,
             repo_selected: None,
+            hover: Default::default(),
+            preserve_diff_position: false,
             clipboard_id: 0,
             clipboard: None,
             inbox_refreshed: None,
@@ -604,6 +615,9 @@ impl App {
         self.workflow.cursor = None;
         self.workflow.selection = None;
         self.workflow.nav = 0;
+        if self.home {
+            self.workflow.side = crate::review::Side::Right;
+        }
         self.opened = Some(id.clone());
         self.home = false;
         self.view = View::Guide;
@@ -890,6 +904,7 @@ impl App {
         let Some(review) = self.reviews.get_mut(&id) else {
             return;
         };
+        review.bounds.retain(|_, state| state.error.is_none());
         if review.generation.is_some() {
             self.notice =
                 Notice::info("Cancel the current generation before refreshing its snapshot");
@@ -1011,6 +1026,7 @@ impl App {
         {
             self.load_inbox();
         }
+        self.load_visible_bounds();
         self.poll_revisions();
         let Some(id) = self.key() else {
             return;
@@ -1070,6 +1086,27 @@ impl App {
     }
     fn receive(&mut self, message: Message) {
         match message {
+            Message::Bounds(id, snapshot, path, output) => {
+                let visible =
+                    self.key().as_ref() == Some(&id) && !self.home && self.view != View::Overview;
+                if let Some(review) = self.reviews.get_mut(&id)
+                    && review
+                        .snapshot
+                        .as_ref()
+                        .is_some_and(|current| Arc::ptr_eq(current, &snapshot))
+                {
+                    self.preserve_diff_position |= visible;
+                    let state = review.bounds.entry(path).or_default();
+                    state.loading = false;
+                    match output {
+                        Ok(data) => {
+                            state.data = Some(data);
+                            state.error = None;
+                        }
+                        Err(error) => state.error = Some(error),
+                    }
+                }
+            }
             Message::Clipboard(id, output) => {
                 if id == self.clipboard_id {
                     match output {
@@ -1319,6 +1356,7 @@ impl App {
                             self.workflow.selection = None;
                             self.workflow.nav = 0;
                             r.context.clear();
+                            r.bounds.clear();
                             r.expanded.clear();
                             r.guide_error = None;
                             self.save_config();
@@ -1465,6 +1503,7 @@ impl App {
         }));
     }
     pub fn action(&mut self, action: Action) {
+        self.preserve_diff_position = false;
         if !matches!(action, Action::Filter) {
             self.filters.focused = None;
         }
@@ -1500,6 +1539,9 @@ impl App {
             Action::SelectPr(index) => self.select(index),
             Action::OpenPr => self.open(),
             Action::SetView(view) => {
+                if self.home {
+                    self.workflow.side = crate::review::Side::Right;
+                }
                 self.workflow.cursor = None;
                 self.workflow.selection = None;
                 self.workflow.nav = 0;
@@ -1766,6 +1808,9 @@ impl App {
         }
     }
     pub fn key_event(&mut self, key: KeyEvent) {
+        if self.hover.key(key) {
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.quit = true;
             return;
@@ -1806,7 +1851,7 @@ impl App {
                 if self.focus == Focus::Content
                     && !self.home
                     && self.view != View::Overview
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    && key.modifiers.contains(KeyModifiers::ALT) =>
             {
                 self.workflow.side = if key.code == KeyCode::Left {
                     crate::review::Side::Left
@@ -1870,6 +1915,8 @@ impl App {
                         .min(self.tree_max_horizontal)
                 };
             }
+            KeyCode::Left | KeyCode::Right
+                if !self.home && self.view != View::Overview && self.config.wrap_diff => {}
             KeyCode::Left => self.horizontal = self.horizontal.saturating_sub(4),
             KeyCode::Right => self.horizontal = self.horizontal.saturating_add(4),
             KeyCode::Tab | KeyCode::BackTab => {
@@ -2053,14 +2100,14 @@ impl App {
         }
     }
     pub fn mouse(&mut self, event: MouseEvent) {
+        self.hover.mouse(event);
+        let definitions = self.hover.active();
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some((_, action)) = self
-                    .hits
-                    .iter()
-                    .rev()
-                    .find(|(rect, _)| rect.contains((event.column, event.row).into()))
-                {
+                if let Some((_, action)) = self.hits.iter().rev().find(|(rect, action)| {
+                    rect.contains((event.column, event.row).into())
+                        && (definitions || !matches!(action, Action::Definition { .. }))
+                }) {
                     self.action(action.clone());
                 }
             }

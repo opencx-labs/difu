@@ -107,6 +107,7 @@ fn modal_uses_pinned_revisions_and_restores_review_in_all_diff_layouts() -> Resu
     };
     fs::write(root.join("library.ts"), "uncommitted private content")?;
     let worktrees = git(root, &["worktree", "list", "--porcelain"])?;
+    fs::create_dir(root.join("cache"))?;
     let mut app = App::new(
         Storage {
             config: root.join("settings.json"),
@@ -148,7 +149,61 @@ fn modal_uses_pinned_revisions_and_restores_review_in_all_diff_layouts() -> Resu
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 35))?;
         for old in [true, false] {
             terminal.draw(|f| difu::ui::draw(f, &mut app))?;
+            // Finish independent metadata hydration before measuring modal restoration.
+            // Boundary tests separately verify that hydration preserves the source anchor.
+            let started = Instant::now();
+            loop {
+                app.tick();
+                let review = app.review().context("Missing review")?;
+                if !review.bounds.is_empty() && review.bounds.values().all(|state| !state.loading) {
+                    ensure!(
+                        review.bounds.values().all(|state| state.error.is_none()),
+                        "Could not read fixture boundaries"
+                    );
+                    break;
+                }
+                ensure!(
+                    started.elapsed() < Duration::from_secs(10),
+                    "Boundary hydration timed out"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            terminal.draw(|f| difu::ui::draw(f, &mut app))?;
             let link = app.hits.iter().find(|(_, action)| matches!(action, Action::Definition { path, line: 4, column, old: side } if path == "a-new.ts" && *side == old && *column == "\tconst label = '界'; ".len())).map(|(rect, _)| *rect).context("Missing symbol hit region")?;
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: link.x,
+                row: link.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            terminal.draw(|f| difu::ui::draw(f, &mut app))?;
+            assert_eq!(app.hover.rect, Some(link));
+            assert!(!app.hover.active());
+            assert!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((link.x, link.y))
+                    .context("Missing hovered cell")?
+                    .modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+            );
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: link.x,
+                row: link.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(
+                app.modal.is_none(),
+                "Plain clicks should focus a line without opening a definition"
+            );
+            if old {
+                app.key_event(KeyEvent::new(
+                    KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftSuper),
+                    KeyModifiers::SUPER,
+                ));
+            }
             let saved = (
                 app.scroll,
                 app.horizontal,
@@ -162,7 +217,11 @@ fn modal_uses_pinned_revisions_and_restores_review_in_all_diff_layouts() -> Resu
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: link.x,
                 row: link.y,
-                modifiers: KeyModifiers::NONE,
+                modifiers: if old {
+                    KeyModifiers::NONE
+                } else {
+                    KeyModifiers::CONTROL
+                },
             });
             wait(&mut app)?;
             let Some(Modal::Definition(viewer)) = &app.modal else {
@@ -191,6 +250,23 @@ fn modal_uses_pinned_revisions_and_restores_review_in_all_diff_layouts() -> Resu
             }
             app.key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
             assert!(app.modal.is_none());
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            });
+            terminal.draw(|f| difu::ui::draw(f, &mut app))?;
+            assert!(app.hover.rect.is_none());
+            assert!(
+                !terminal
+                    .backend()
+                    .buffer()
+                    .cell((link.x, link.y))
+                    .context("Missing old hovered cell")?
+                    .modifier
+                    .contains(ratatui::style::Modifier::UNDERLINED)
+            );
             assert_eq!(
                 saved,
                 (

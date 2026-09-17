@@ -645,14 +645,11 @@ fn expansion_button(
         if !data.can_expand(&hunk.id, expanded, direction) {
             return None;
         }
-    } else if direction == Direction::Above
-        && !hunk
-            .lines
-            .iter()
-            .find(|line| line.old.is_some() || line.new.is_some())
-            .is_some_and(|line| line.old.is_some_and(|n| n > 1) && line.new.is_some_and(|n| n > 1))
-    {
-        return None;
+    } else {
+        let bounds = review.bounds.get(&file.path)?.data?;
+        if !bounds.can_expand(hunk, direction) {
+            return None;
+        }
     }
     if state.is_some_and(|s| {
         s.pending
@@ -688,6 +685,16 @@ fn hunk_rows(
         rows.push(button);
     }
     let state = review.context.get(&file.path);
+    if let Some(error) = review
+        .bounds
+        .get(&file.path)
+        .and_then(|state| state.error.as_ref())
+    {
+        rows.extend(prose(
+            &format!("Could not read file boundaries: {error}. Press r to retry."),
+            width,
+        ));
+    }
     if let Some(error) = state.and_then(|s| s.error.as_ref()) {
         rows.extend(prose(
             &format!("Could not load context: {error}. Click an expansion button to retry."),
@@ -1176,6 +1183,27 @@ fn paint_diff(
             }
         }
     }
+    if app.modal.is_none() {
+        for link in &row.code_links {
+            if let (Ok(column), Ok(width)) = (u16::try_from(link.column), u16::try_from(link.width))
+                && column < code.width
+            {
+                let rect = Rect::new(code.x + column, code.y, width.min(code.width - column), 1);
+                if app
+                    .hover
+                    .position
+                    .is_some_and(|position| rect.contains(position))
+                {
+                    app.hover.rect = Some(rect);
+                    for x in rect.x..rect.right() {
+                        if let Some(cell) = frame.buffer_mut().cell_mut((x, rect.y)) {
+                            cell.set_style(Style::default().add_modifier(Modifier::UNDERLINED));
+                        }
+                    }
+                }
+            }
+        }
+    }
     if focused {
         frame.render_widget(
             Paragraph::new(">").style(Style::default().fg(ACCENT)),
@@ -1207,9 +1235,46 @@ fn button(
     x + width + 1
 }
 
+// Map a code/header anchor through metadata-only layout changes, including
+// repeated chapter appearances and continuation rows of wrapped source lines.
+fn relocated_row(old: &Document, new: &Document, position: usize) -> Option<usize> {
+    let section = old
+        .sections
+        .iter()
+        .position(|s| position >= s.start && position < s.end);
+    let old_start = section
+        .and_then(|index| old.sections.get(index))
+        .map_or(0, |s| s.start);
+    let (start, end) = section
+        .and_then(|index| new.sections.get(index))
+        .map_or((0, new.rows.len()), |s| (s.start, s.end));
+    let (offset, target) = old
+        .rows
+        .iter()
+        .skip(position)
+        .enumerate()
+        .find_map(|(offset, row)| row.right.target.as_ref().map(|target| (offset, target)))?;
+    let occurrence = old
+        .rows
+        .iter()
+        .take(position + offset)
+        .skip(old_start)
+        .filter(|row| row.right.target.as_ref() == Some(target))
+        .count();
+    new.rows
+        .iter()
+        .enumerate()
+        .take(end)
+        .skip(start)
+        .filter(|(_, row)| row.right.target.as_ref() == Some(target))
+        .nth(occurrence)
+        .map(|(index, _)| index.saturating_sub(offset))
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     app.hits.clear();
+    app.hover.rect = None;
     frame.render_widget(
         Block::default().style(Style::default().bg(BG).fg(TEXT)),
         area,
@@ -1378,7 +1443,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.document.as_ref().is_none_or(|d| {
         d.epoch != app.epoch || d.width != main.width || d.horizontal != app.horizontal
     }) {
-        app.document = Some(build(app, main.width));
+        let next = build(app, main.width);
+        if app.preserve_diff_position
+            && let Some(previous) = &app.document
+        {
+            if let Some(cursor) = app.workflow.cursor {
+                app.workflow.cursor = relocated_row(previous, &next, cursor).or(Some(cursor));
+            }
+            app.scroll = relocated_row(previous, &next, app.scroll).unwrap_or(app.scroll);
+        }
+        app.preserve_diff_position = false;
+        app.document = Some(next);
     }
     let Some(doc) = app.document.take() else {
         return;
@@ -1661,6 +1736,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 Action::Workflow(crate::workflow::WAction::Open),
             ),
             ("c / Cmd+C Copy", Action::Copy),
+            ("Cmd/Ctrl+click Definition", Action::Help),
             ("Alt+↑/↓ Chapters", Action::Chapter(true)),
             ("f Filter", Action::Filter),
             (
@@ -1682,7 +1758,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ]
     };
     for (label, action) in footer {
-        if label == "c / Cmd+C Copy" && app.view == View::Overview {
+        if matches!(label, "c / Cmd+C Copy" | "Cmd/Ctrl+click Definition")
+            && app.view == View::Overview
+        {
             continue;
         }
         if label == "Alt+↑/↓ Chapters" && app.view != View::Guide {
@@ -2811,7 +2889,7 @@ mod tests {
         assert_eq!(app.file, 0);
         app.focus = Focus::Content;
         let tree_offset = app.tree_horizontal;
-        app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(app.horizontal, 4);
         assert_eq!(app.tree_horizontal, tree_offset);
         Ok(())
@@ -3501,16 +3579,57 @@ mod tests {
                 .iter()
                 .any(|c| c.symbol() == ">" && c.fg == ACCENT)
         );
-        app.key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        app.key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
         assert_eq!(app.workflow.side, Side::Left);
         assert_eq!(app.horizontal, 0);
-        app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+        app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(app.horizontal, 4);
         let current = app.workflow.cursor;
         app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
         assert_eq!(app.workflow.cursor, current);
         Ok(())
     }
+    #[test]
+    fn arrows_scroll_unwrapped_code_and_alt_arrows_select_sides() -> Result<()> {
+        use crate::review::{Anchor, Side};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        for view in [View::Guide, View::Diff] {
+            for unified in [false, true] {
+                let mut app = guide_app(dir.path());
+                assert_eq!(app.workflow.side, Side::Right);
+                app.config.unified = unified;
+                app.action(Action::SetView(view));
+                app.focus = Focus::Content;
+                app.workflow.selection = Some(Anchor {
+                    path: "file".into(),
+                    side: Side::Right,
+                    start: 1,
+                    end: 2,
+                });
+                app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+                assert_eq!(app.horizontal, 4);
+                assert_eq!(app.workflow.side, Side::Right);
+                assert!(app.workflow.selection.is_some());
+                app.key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+                assert_eq!(app.workflow.side, Side::Left);
+                assert_eq!(app.horizontal, 4);
+                assert!(app.workflow.selection.is_none());
+                app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+                assert_eq!(app.workflow.side, Side::Right);
+                assert_eq!(app.horizontal, 4);
+                app.key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+                assert_eq!(app.horizontal, 0);
+                app.config.wrap_diff = true;
+                app.key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+                assert_eq!(app.horizontal, 0);
+                app.key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+                assert_eq!(app.workflow.side, Side::Left);
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn searchable_help_filters_keys_and_descriptions_without_triggering_actions() -> Result<()> {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

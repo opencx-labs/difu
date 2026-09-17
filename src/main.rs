@@ -3,9 +3,9 @@ use clap::Parser;
 use crossterm::{
     cursor::SetCursorStyle,
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-        PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags,
+        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
 };
@@ -73,6 +73,7 @@ fn main() -> Result<()> {
             SetCursorStyle::DefaultUserShape,
             PopKeyboardEnhancementFlags,
             DisableMouseCapture,
+            DisableFocusChange,
             DisableBracketedPaste
         );
         ratatui::restore();
@@ -81,9 +82,14 @@ fn main() -> Result<()> {
     let result = (|| -> Result<()> {
         execute!(
             io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            ),
             SetCursorStyle::BlinkingBar,
             EnableMouseCapture,
+            EnableFocusChange,
             EnableBracketedPaste
         )?;
         app.images.detect();
@@ -91,10 +97,12 @@ fn main() -> Result<()> {
         while !app.quit && !terminated.load(std::sync::atomic::Ordering::Relaxed) {
             app.tick();
             app.flush_clipboard(&mut io::stdout().lock());
-            terminal.draw(|frame| difu::ui::draw(frame, &mut app))?;
+            let frame = terminal.draw(|frame| difu::ui::draw(frame, &mut app))?;
+            app.hover.render(&mut io::stdout().lock(), frame.buffer)?;
             if event::poll(Duration::from_millis(50))? {
                 match event::read()? {
-                    Event::Key(key) if key.kind != KeyEventKind::Release => app.key_event(key),
+                    Event::Key(key) => app.key_event(key),
+                    Event::FocusLost => app.hover = Default::default(),
                     Event::Mouse(mouse) => app.mouse(mouse),
                     Event::Paste(text) => app.paste(text),
                     Event::Resize(..) => app.invalidate(),
@@ -109,6 +117,7 @@ fn main() -> Result<()> {
         SetCursorStyle::DefaultUserShape,
         PopKeyboardEnhancementFlags,
         DisableMouseCapture,
+        DisableFocusChange,
         DisableBracketedPaste
     );
     ratatui::restore();

@@ -1,4 +1,5 @@
 pub mod app;
+pub mod bounds;
 pub mod ci;
 pub mod clipboard;
 pub mod codex;
@@ -8,6 +9,7 @@ pub mod diff;
 pub mod editor;
 pub mod github;
 pub mod help;
+pub mod hover;
 pub mod images;
 pub mod model;
 pub mod navigation;
