@@ -2120,8 +2120,70 @@ impl Ui {
         } else {
             0
         };
-        let requests_height =
-            u16::from(!session.pending.is_empty()) + u16::from(!session.queue.is_empty());
+        let mut activity_rows =
+            transcript::activity(&session, area.width, chrono::Utc::now().timestamp_millis());
+        let steering = session
+            .entries
+            .iter()
+            .filter(|entry| {
+                entry.kind == "userMessage"
+                    && session.turn_id.as_deref().is_some_and(|turn| {
+                        entry.data.get("difuSteeringTurn").and_then(Value::as_str) == Some(turn)
+                    })
+            })
+            .collect::<Vec<_>>();
+        if !steering.is_empty() {
+            activity_rows.push(Line::default());
+            activity_rows.extend(
+                wrapped(
+                    "Messages to be submitted after the next tool call",
+                    area.width,
+                )
+                .into_iter()
+                .map(|text| Line::from(Span::styled(text, Style::default().fg(DIM)))),
+            );
+            for entry in steering {
+                activity_rows.extend(
+                    wrapped(
+                        &format!("  ↳ {}", crate::model::clean(&entry.text)),
+                        area.width,
+                    )
+                    .into_iter()
+                    .map(|text| Line::from(Span::styled(text, Style::default().fg(DIM)))),
+                );
+            }
+        }
+        if !session.queue.is_empty() {
+            activity_rows.push(Line::default());
+            activity_rows.extend(
+                wrapped(
+                    if session
+                        .pending
+                        .iter()
+                        .any(|p| p.id == "difu-missing-guidance")
+                    {
+                        "Messages queued until repository guidance is answered · click to edit"
+                    } else {
+                        "Messages queued for the next turn · click to edit"
+                    },
+                    area.width,
+                )
+                .into_iter()
+                .map(|text| Line::from(Span::styled(text, Style::default().fg(DIM)))),
+            );
+            for prompt in &session.queue {
+                activity_rows.extend(
+                    wrapped(
+                        &format!("  ↳ {}", crate::model::clean(prompt.text())),
+                        area.width,
+                    )
+                    .into_iter()
+                    .map(|text| Line::from(Span::styled(text, Style::default().fg(DIM)))),
+                );
+            }
+        }
+        let activity_height = (activity_rows.len().min(usize::from(area.height / 3))) as u16;
+        let requests_height = u16::from(!session.pending.is_empty()) + activity_height;
         let (model, effort) = match &session.job {
             Job::Guide { model, .. } | Job::Conflict { model, .. } => {
                 (model.model.as_str(), model.effort.as_str())
@@ -2175,18 +2237,6 @@ impl Ui {
                     .into_iter()
                     .map(|text| Line::from(Span::styled(text, Style::default().fg(RED)))),
             );
-        }
-        if !session.queue.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!("{} follow-up(s) queued", session.queue.len()),
-                Style::default().fg(ACCENT),
-            )));
-        }
-        if session.status.active() {
-            lines.push(Line::from(Span::styled(
-                transcript::activity(&session),
-                Style::default().fg(ACCENT),
-            )));
         }
         self.conversation_lines = lines.len();
         let position = self.positions.entry(id.clone()).or_default();
@@ -2269,19 +2319,25 @@ impl Ui {
                 true,
             );
         }
-        if !session.queue.is_empty() {
-            self.button(
-                frame,
-                Rect::new(
-                    area.x,
-                    body.bottom() + u16::from(!session.pending.is_empty()),
-                    area.width,
-                    1,
-                ),
-                &format!("{} queued message(s) · click to edit", session.queue.len()),
-                Action::Queue,
-                false,
+        if activity_height > 0 {
+            let activity_area = Rect::new(
+                area.x,
+                body.bottom() + u16::from(!session.pending.is_empty()),
+                area.width,
+                activity_height,
             );
+            frame.render_widget(
+                Paragraph::new(
+                    activity_rows
+                        .into_iter()
+                        .take(usize::from(activity_height))
+                        .collect::<Vec<_>>(),
+                ),
+                activity_area,
+            );
+            if !session.queue.is_empty() {
+                self.hits.push((activity_area, Action::Queue));
+            }
         }
         if composer_height > 0 {
             let composer = Rect::new(
@@ -3402,6 +3458,89 @@ mod tests {
         ui.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
         ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
         assert_eq!(ui.clipboard.as_deref(), Some("/"));
+        Ok(())
+    }
+    #[test]
+    fn activity_and_pending_messages_stay_above_composer_when_reading_history() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.status = Status::Running;
+        session.turn_id = Some("active".into());
+        session.turn_started_at = Some(chrono::Utc::now().timestamp_millis());
+        for _ in 0..50 {
+            session.note("agentMessage", "Older conversation line");
+        }
+        session.entries.push(Entry {
+            id: "tool".into(),
+            kind: "commandExecution".into(),
+            data: serde_json::json!({"command":"git diff --stat"}),
+            started_at: session.turn_started_at,
+            ..Entry::default()
+        });
+        session.entries.push(Entry {
+            id: "review".into(),
+            kind: "autoApprovalReview".into(),
+            data: serde_json::json!({"targetItemId":"tool"}),
+            started_at: session.turn_started_at,
+            ..Entry::default()
+        });
+        session.entries.push(Entry {
+            id: "steer".into(),
+            kind: "userMessage".into(),
+            text: "Focus on navigation".into(),
+            data: serde_json::json!({"difuSteeringTurn":"active"}),
+            ..Entry::default()
+        });
+        session.queue.push("Explain the result next".into());
+        let position = ui.positions.get_mut("one").context("position")?;
+        position.follow = false;
+        position.conversation = 0;
+        let (screen, _) = draw(&mut ui, 200, 60)?;
+        let activity = screen
+            .find("Reviewing approval request")
+            .context("activity")?;
+        let steering = screen
+            .find("Messages to be submitted after the next tool call")
+            .context("steering")?;
+        let queued = screen
+            .find("Messages queued for the next turn")
+            .context("queued")?;
+        let composer = screen.find("Message · Enter steer").context("composer")?;
+        assert!(activity < steering && steering < queued && queued < composer);
+        assert!(screen.contains("git diff --stat"));
+        assert!(screen.contains("Explain the result next"));
+        assert_eq!(ui.positions.get("one").context("position")?.conversation, 0);
+        Ok(())
+    }
+    #[test]
+    fn composer_accepts_ghostty_word_navigation_without_switching_focus() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        ui.paste("hello, 世界 foo_bar");
+        for (code, expected) in [
+            (KeyCode::Char('b'), 10),
+            (KeyCode::Left, 7),
+            (KeyCode::Char('f'), 9),
+            (KeyCode::Right, 17),
+        ] {
+            ui.key(KeyEvent::new(code, KeyModifiers::ALT));
+            assert_eq!(ui.focus, Focus::Composer);
+            assert!(ui.modal.is_none());
+            let draft = &ui.positions.get("one").context("draft")?.draft;
+            assert_eq!(draft.cursor, expected);
+            assert_eq!(draft.text(), "hello, 世界 foo_bar");
+        }
         Ok(())
     }
     #[test]

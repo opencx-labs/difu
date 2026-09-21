@@ -714,3 +714,10 @@ Progress records worktree preparation, setup, model time, tool calls, validation
 and cleanup. The response schema requires a nonempty chapter assignment for every
 hunk, including metadata-only changes. Difu reconstructs the ordered chapters and
 validates complete coverage before accepting or caching the guide.
+
+Agent activity stays above the composer with a shimmering status, the current tool
+or approval review, and pending steering messages underneath. Explicit next-turn
+messages remain a separate editable queue. During a worktree guidance prompt,
+messages and answers are saved until you choose whether to copy the guidance;
+the existing conversation is retained. Ghostty's Option+Left/Right word shortcuts
+work in text inputs, including its translated Alt+b/f key events.

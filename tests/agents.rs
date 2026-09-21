@@ -772,10 +772,63 @@ fn empty_sessions_defer_worktrees_until_editing_and_restore_permissions() -> Res
     control(
         &storage,
         &id,
-        message("need edit: make the requested change"),
+        message("need edit with questions: make the requested change"),
     )?;
     let awaiting = wait(&storage, &id, |s| s.status == Status::Waiting)?;
     assert_eq!(awaiting.thread_id, thread);
+    assert_eq!(awaiting.pending_question_count(), 2);
+    let before_guidance = fs::read_to_string(root.join("protocol.jsonl"))?;
+    control(&storage, &id, message("chat only: are you there?"))?;
+    control(
+        &storage,
+        &id,
+        Control::AnswerQuestion {
+            request: serde_json::json!("difu-async:workspace-question"),
+            question: "0".into(),
+            answer: Some("Full\nAdditional note: keep the same conversation".into()),
+        },
+    )?;
+    let queued = session(&storage, &id)?;
+    assert_eq!(queued.thread_id, thread);
+    assert_eq!(queued.status, Status::Waiting);
+    assert_eq!(queued.pending_question_count(), 1);
+    assert_eq!(queued.queue.len(), 2);
+    assert_eq!(
+        queued.queue.first().map(|p| p.text()),
+        Some("chat only: are you there?")
+    );
+    assert!(
+        queued
+            .queue
+            .last()
+            .is_some_and(|p| p.text().contains("Additional note:"))
+    );
+    assert!(!queued.guidance_checked);
+    assert!(
+        !queued
+            .workspace
+            .as_ref()
+            .context("worktree")?
+            .join("AGENTS.md")
+            .exists()
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("protocol.jsonl"))?,
+        before_guidance
+    );
+    // A repeated answer cannot enqueue a second copy.
+    assert!(
+        control(
+            &storage,
+            &id,
+            Control::AnswerQuestion {
+                request: serde_json::json!("difu-async:workspace-question"),
+                question: "0".into(),
+                answer: Some("Full".into()),
+            }
+        )
+        .is_err()
+    );
     control(
         &storage,
         &id,
@@ -785,7 +838,15 @@ fn empty_sessions_defer_worktrees_until_editing_and_restore_permissions() -> Res
         },
     )?;
     let editing = wait(&storage, &id, |s| {
-        s.status == Status::Idle && s.workspace_ready
+        s.status == Status::Idle
+            && s.workspace_ready
+            && s.queue.is_empty()
+            && s.entries
+                .iter()
+                .any(|e| e.kind == "userMessage" && e.text.contains("Additional note:"))
+            && s.workspace
+                .as_ref()
+                .is_some_and(|p| p.join("new.txt").exists())
     })?;
     assert_eq!(editing.thread_id, thread);
     assert_eq!(
@@ -823,7 +884,7 @@ fn empty_sessions_defer_worktrees_until_editing_and_restore_permissions() -> Res
             .iter()
             .filter(|e| e.kind == "userMessage")
             .count(),
-        2
+        4
     );
     // Isolation disabled uses the selected checkout without a worktree or read-only transition.
     let Reply::Launched(direct) = client::request(
@@ -852,6 +913,80 @@ fn empty_sessions_defer_worktrees_until_editing_and_restore_permissions() -> Res
             .count(),
         2
     );
+    daemon.stop()?;
+    Ok(())
+}
+
+#[test]
+fn guidance_wait_survives_frontend_reconnect_and_service_restart_without_permission() -> Result<()>
+{
+    let tmp = tempfile::Builder::new()
+        .prefix("difu-guidance-reconnect-")
+        .tempdir_in("/tmp")?;
+    let root = tmp.path();
+    let repo = root.join("repo");
+    fs::create_dir(&repo)?;
+    git(&repo, &["init"])?;
+    fs::write(repo.join("tracked.txt"), "original\n")?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-m", "base"])?;
+    fs::write(repo.join("AGENTS.md"), "Untracked repository guidance\n")?;
+    let bin = root.join("bin");
+    fs::create_dir(&bin)?;
+    let codex = bin.join("codex");
+    fs::write(&codex, include_str!("fixtures/agent_codex.py"))?;
+    fs::set_permissions(&codex, fs::Permissions::from_mode(0o700))?;
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").context("PATH")?,
+    )))?;
+    let storage = Storage {
+        config: root.join("config.json"),
+        cache: root.join("cache"),
+    };
+    let start = || {
+        support::Service::start(&storage, |c| {
+            c.env("PATH", &path).env("DIFU_AGENT_FIXTURE", root);
+        })
+    };
+    let mut daemon = start()?;
+    let id = launch(&storage, &repo, "finish guided task")?;
+    let waiting = wait(&storage, &id, |s| s.status == Status::Waiting)?;
+    let workspace = waiting.workspace.context("workspace")?;
+    // Each read uses a fresh frontend connection. Disconnecting does not answer
+    // questions or copy files; the persisted request remains actionable.
+    for _ in 0..3 {
+        let current = session(&storage, &id)?;
+        assert_eq!(current.pending_question_count(), 1);
+        assert!(!current.guidance_checked);
+        assert!(!workspace.join("AGENTS.md").exists());
+        assert!(!root.join("protocol.jsonl").exists());
+    }
+    daemon.stop()?;
+    let mut daemon = start()?;
+    assert_eq!(session(&storage, &id)?.status, Status::Interrupted);
+    assert!(!workspace.join("AGENTS.md").exists());
+    assert!(!root.join("protocol.jsonl").exists());
+    control(&storage, &id, Control::Resume)?;
+    let resumed = wait(&storage, &id, |s| s.status == Status::Waiting)?;
+    assert_eq!(resumed.pending_question_count(), 1);
+    assert_eq!(resumed.workspace.as_ref(), Some(&workspace));
+    assert!(!resumed.guidance_checked);
+    assert!(!root.join("protocol.jsonl").exists());
+    control(
+        &storage,
+        &id,
+        Control::AnswerQuestion {
+            request: serde_json::json!("difu-missing-guidance"),
+            question: "copy_guidance".into(),
+            answer: Some("Continue without copying".into()),
+        },
+    )?;
+    let ready = wait(&storage, &id, |s| {
+        s.status == Status::Idle && s.thread_id.is_some()
+    })?;
+    assert!(ready.guidance_checked);
+    assert_eq!(ready.pending_question_count(), 0);
+    assert!(!workspace.join("AGENTS.md").exists());
     daemon.stop()?;
     Ok(())
 }
