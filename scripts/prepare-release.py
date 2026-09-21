@@ -24,7 +24,7 @@ def main() -> None:
     }
     formula = [
         "class Difu < Formula",
-        '  desc "Terminal pull request reader with AI-generated review guides"',
+        '  desc "Codex agents and guided pull request reviews in the terminal"',
         '  homepage "https://github.com/opencx-labs/difu"',
         f'  version "{version}"',
         '  license "MIT"',
@@ -57,7 +57,7 @@ def main() -> None:
             "    <<~EOS",
             "      Git, GitHub CLI (gh), and Codex CLI must already be on your PATH.",
             "      Authenticate if needed with `gh auth login` and `codex login`.",
-            "      Run `difu` to open your review inbox.",
+            "      Run `difu` to open Agents; switch to Reviews for pull requests.",
             "    EOS",
             "  end",
             "",

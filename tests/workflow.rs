@@ -1,3 +1,4 @@
+mod support;
 use anyhow::{Context, Result, ensure};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use difu::{
@@ -142,6 +143,7 @@ fn exercise(root: &Path) -> Result<()> {
         config: root.join("config.json"),
         cache: root.to_owned(),
     };
+    let _service = support::Service::start(&storage, |_| {})?;
     let mut config = Config::default();
     config
         .repositories
@@ -541,7 +543,7 @@ fn exercise(root: &Path) -> Result<()> {
     );
     assert_eq!(fs::read_to_string(root.join("turns"))?, "turn\n");
     synced.shutdown();
-    let mut already_local = App::new(storage, config);
+    let mut already_local = App::new(storage.clone(), config);
     already_local.start(Some(PrKey::from_url(
         "https://github.com/example/project/pull/1",
     )?));
@@ -554,7 +556,48 @@ fn exercise(root: &Path) -> Result<()> {
             .count(),
         fetches_before + 1
     );
+    // Closing the UI only detaches its observer; the service owns the guide job.
+    fs::write(root.join("hold-guide"), "")?;
+    already_local.generate(true);
+    wait(&mut already_local, |_| root.join("guide-waiting").exists())?;
     already_local.shutdown();
+    use difu::agents::{Reply, Request, Status, client};
+    let Reply::Sessions(sessions) = client::request(&storage, Request::List)? else {
+        anyhow::bail!("Missing session list");
+    };
+    let running = sessions
+        .iter()
+        .find(|s| s.kind == "Guide" && s.status.active())
+        .context("Guide stopped when its frontend closed")?;
+    fs::remove_file(root.join("hold-guide"))?;
+    let started = Instant::now();
+    loop {
+        let Reply::Session(session) = client::request(
+            &storage,
+            Request::Read {
+                id: running.id.clone(),
+                version: None,
+            },
+        )?
+        else {
+            anyhow::bail!("Missing guide session");
+        };
+        if session.status == Status::Completed {
+            assert!(session.guide.is_some());
+            break;
+        }
+        ensure!(
+            session.status != Status::Failed,
+            "Detached guide failed: {:?}",
+            session.error
+        );
+        ensure!(
+            started.elapsed() < Duration::from_secs(10),
+            "Detached guide did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert_eq!(fs::read_to_string(root.join("turns"))?, "turn\nturn\n");
     Ok(())
 }
 

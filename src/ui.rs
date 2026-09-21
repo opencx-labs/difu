@@ -13,12 +13,21 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-pub(crate) const BG: Color = Color::Rgb(12, 14, 18);
-pub(crate) const PANEL: Color = Color::Rgb(18, 21, 27);
+pub(crate) const BG: Color = Color::Reset;
+pub(crate) const INK: Color = Color::Rgb(12, 14, 18);
+pub(crate) const PANEL: Color = Color::Reset;
 pub(crate) const TEXT: Color = Color::Rgb(220, 225, 232);
 pub(crate) const DIM: Color = Color::Rgb(130, 140, 156);
 pub(crate) const BORDER: Color = Color::Rgb(42, 48, 61);
-pub(crate) const ACCENT: Color = Color::Rgb(183, 161, 255);
+pub(crate) const ACCENT: Color = Color::Rgb(0, 255, 65);
+/// Dark theme tint with white text (approximately 12:1 contrast).
+pub(crate) fn user_message_style() -> Style {
+    let background = match ACCENT {
+        Color::Rgb(r, g, b) => Color::Rgb(r / 4, g / 4, b / 4),
+        _ => Color::Rgb(0, 63, 16),
+    };
+    Style::default().bg(background).fg(Color::White)
+}
 pub(crate) const GREEN: Color = Color::Rgb(114, 216, 163);
 pub(crate) const RED: Color = Color::Rgb(247, 137, 145);
 const ADD_BG: Color = Color::Rgb(18, 43, 32);
@@ -26,6 +35,7 @@ const REMOVE_BG: Color = Color::Rgb(49, 25, 31);
 
 #[derive(Clone, Default)]
 pub struct TextRow {
+    pub hunk: Option<String>,
     pub image: Option<crate::images::PreviewRow>,
     pub spans: Vec<Span<'static>>,
     pub action: Option<Action>,
@@ -44,6 +54,8 @@ pub struct Row {
     pub right: TextRow,
 }
 pub struct Section {
+    pub category_start: usize,
+    pub category: TextRow,
     pub start: usize,
     pub end: usize,
     pub left: Vec<TextRow>,
@@ -85,9 +97,38 @@ fn wrapped_text(value: &str, width: usize) -> Vec<String> {
         .collect()
 }
 
-fn file_header(file: &DiffFile, width: usize) -> Vec<TextRow> {
+fn file_header(
+    file: &DiffFile,
+    width: usize,
+    chapter: Option<usize>,
+    review: &Review,
+) -> Vec<TextRow> {
+    let hint = match chapter {
+        Some(chapter)
+            if review
+                .interaction
+                .progress
+                .completed
+                .contains(&(chapter, file.path.clone())) =>
+        {
+            "Enter: reopen section"
+        }
+        Some(_) => "Enter: complete section",
+        None if review.interaction.github.viewed.contains(&file.path)
+            && review
+                .snapshot
+                .as_ref()
+                .is_some_and(|s| s.head == review.interaction.github.head) =>
+        {
+            "Enter: mark unviewed"
+        }
+        None => "Enter: mark viewed",
+    };
     wrapped_text(
-        &format!("{}   +{} −{}", file.path, file.additions, file.deletions),
+        &format!(
+            "{}   +{} −{}  ·  {hint}",
+            file.path, file.additions, file.deletions
+        ),
         width,
     )
     .into_iter()
@@ -112,6 +153,7 @@ pub(crate) fn text(value: impl Into<String>, color: Color) -> TextRow {
         target: None,
         code_links: Vec::new(),
         image: None,
+        hunk: None,
     }
 }
 pub(crate) fn bold(value: impl Into<String>, color: Color) -> TextRow {
@@ -124,6 +166,7 @@ pub(crate) fn bold(value: impl Into<String>, color: Color) -> TextRow {
         target: None,
         code_links: Vec::new(),
         image: None,
+        hunk: None,
     }
 }
 pub(crate) fn link(value: impl Into<String>, action: Action) -> TextRow {
@@ -138,6 +181,7 @@ pub(crate) fn link(value: impl Into<String>, action: Action) -> TextRow {
         target: None,
         code_links: Vec::new(),
         image: None,
+        hunk: None,
     }
 }
 fn append(rows: &mut Vec<Row>, right: TextRow) {
@@ -147,111 +191,8 @@ fn append(rows: &mut Vec<Row>, right: TextRow) {
     });
 }
 
-fn inline(source: &str) -> Vec<Span<'static>> {
-    let mut spans = Vec::new();
-    let mut buffer = String::new();
-    let mut code = false;
-    let mut strong = false;
-    let mut chars = source.chars().peekable();
-    while let Some(c) = chars.next() {
-        let toggle = c == '`' || (c == '*' && chars.peek() == Some(&'*'));
-        if toggle {
-            if !buffer.is_empty() {
-                spans.push(Span::styled(
-                    std::mem::take(&mut buffer),
-                    Style::default()
-                        .fg(if code { ACCENT } else { TEXT })
-                        .add_modifier(if strong {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ));
-            }
-            if c == '`' {
-                code = !code;
-            } else {
-                chars.next();
-                strong = !strong;
-            }
-        } else {
-            buffer.push(c);
-        }
-    }
-    if !buffer.is_empty() {
-        spans.push(Span::styled(
-            buffer,
-            Style::default()
-                .fg(if code { ACCENT } else { TEXT })
-                .add_modifier(if strong {
-                    Modifier::BOLD
-                } else {
-                    Modifier::empty()
-                }),
-        ));
-    }
-    spans
-}
 pub(crate) fn prose(source: &str, width: usize) -> Vec<TextRow> {
-    let mut rows = Vec::new();
-    let source = clean(source);
-    let mut fence = false;
-    for line in source.lines() {
-        if line.starts_with("```") {
-            fence = !fence;
-            rows.push(text(if fence { "┌ code" } else { "└────" }, DIM));
-            continue;
-        }
-        let heading = line.starts_with('#');
-        let line = if heading {
-            line.trim_start_matches('#').trim()
-        } else {
-            line
-        };
-        if line.is_empty() {
-            rows.push(TextRow::default());
-            continue;
-        }
-        for wrapped in textwrap::wrap(line, width.max(1)) {
-            rows.push(if heading {
-                bold(wrapped.into_owned(), TEXT)
-            } else if fence {
-                text(wrapped.into_owned(), DIM)
-            } else {
-                TextRow {
-                    spans: inline(&wrapped),
-                    action: None,
-                    target: None,
-                    code_links: Vec::new(),
-                    image: None,
-                }
-            });
-        }
-        // Retain clickable web destinations in Markdown without trusting terminal
-        // escape sequences or allowing file/command URI schemes.
-        let mut rest = line;
-        while let Some(start) = rest.find("](") {
-            let Some(suffix) = rest.get(start.saturating_add(2)..) else {
-                break;
-            };
-            rest = suffix;
-            let Some(end) = rest.find(')') else {
-                break;
-            };
-            let Some(url) = rest.get(..end) else {
-                break;
-            };
-            let url = url.trim_matches(|c| c == '<' || c == '>');
-            if url.starts_with("https://") || url.starts_with("http://") {
-                rows.push(link(format!("↗ {url}"), Action::Link(url.into())));
-            }
-            let Some(suffix) = rest.get(end.saturating_add(1)..) else {
-                break;
-            };
-            rest = suffix;
-        }
-    }
-    rows
+    crate::markdown::rows(source, width)
 }
 
 /// Crop by terminal cells, never UTF-8 bytes. A clipped wide glyph becomes a
@@ -316,6 +257,20 @@ fn code(line: Option<&DiffLine>, old: bool, width: usize, horizontal: usize) -> 
             })
             .bg(bg),
     )];
+    spans.extend(syntax_spans(&content).into_iter().map(|mut span| {
+        span.style = span.style.bg(bg);
+        span
+    }));
+    spans.push(Span::styled(
+        " ".repeat(code_width.saturating_sub(content.width())),
+        Style::default().bg(bg),
+    ));
+    spans
+}
+
+pub(crate) fn syntax_spans(content: &str) -> Vec<Span<'static>> {
+    let bg = Color::Reset;
+    let mut spans = Vec::new();
     // A small lexical highlighter keeps rendering independent of language parsers.
     // Diff colors remain meaningful for every file type.
     let mut token = String::new();
@@ -393,10 +348,6 @@ fn code(line: Option<&DiffLine>, old: bool, width: usize, horizontal: usize) -> 
         }
     }
     emit(&mut token, &mut spans, quoted);
-    spans.push(Span::styled(
-        " ".repeat(code_width.saturating_sub(content.width())),
-        Style::default().bg(bg),
-    ));
     spans
 }
 
@@ -600,6 +551,7 @@ fn code_rows(
                     spans,
                     code_links: links,
                     image: None,
+                    hunk: None,
                     action: None,
                     target: Some(crate::workflow::Target::Code {
                         path: path.into(),
@@ -617,6 +569,7 @@ fn code_rows(
                     spans: code(Some(line), old, width, offset),
                     code_links: code_links(path, Some(line), old, width, offset, 0),
                     image: None,
+                    hunk: None,
                     action: None,
                     target: Some(crate::workflow::Target::Code {
                         path: path.into(),
@@ -654,7 +607,7 @@ fn expansion_button(
     if state.is_some_and(|s| {
         s.pending
             .iter()
-            .any(|(id, d)| id == &hunk.id && *d == direction)
+            .any(|(id, d, _)| id == &hunk.id && *d == direction)
     }) {
         return Some(text("  Loading context…", DIM));
     }
@@ -673,12 +626,12 @@ fn hunk_rows(
     width: usize,
     split: bool,
     horizontal: (usize, bool),
-    with_title: bool,
+    with_title: (bool, Option<usize>),
     review: &Review,
 ) -> Vec<TextRow> {
     let mut rows = Vec::new();
-    if with_title {
-        rows.extend(file_header(file, width));
+    if with_title.0 {
+        rows.extend(file_header(file, width, with_title.1, review));
     }
     rows.push(text(format!(" {}", hunk.header), DIM));
     if let Some(button) = expansion_button(review, file, hunk, Direction::Above) {
@@ -743,6 +696,9 @@ fn hunk_rows(
         rows.push(button);
     }
     rows.push(TextRow::default());
+    for row in &mut rows {
+        row.hunk = Some(hunk.id.clone());
+    }
     rows
 }
 
@@ -829,20 +785,21 @@ fn build(app: &App, width: u16) -> Document {
         let code_width = code_width.saturating_sub(2);
         let split = wide && !app.config.unified;
         let mut previous_category = None;
+        let mut category_start = 0;
+        let mut category_header = TextRow::default();
         for (chapter_index, chapter) in guide.chapters.iter().enumerate() {
             if previous_category != Some(chapter.category) {
                 let label = match chapter.category {
                     crate::codex::ChapterCategory::Schema => Some("Manual schemas / DTOs"),
                     crate::codex::ChapterCategory::Migrations => Some("Database migrations"),
-                    crate::codex::ChapterCategory::Regular if previous_category.is_some() => {
-                        Some("Implementation")
-                    }
+                    crate::codex::ChapterCategory::Regular => Some("Implementation"),
                     crate::codex::ChapterCategory::Generated => Some("Generated code"),
                     crate::codex::ChapterCategory::Tests => Some("Tests"),
-                    _ => None,
                 };
                 if let Some(label) = label {
                     let divider = bold(format!("── {label} ──"), ACCENT);
+                    category_start = doc.rows.len();
+                    category_header = divider.clone();
                     if wide {
                         doc.rows.push(Row {
                             left: divider,
@@ -909,7 +866,10 @@ fn build(app: &App, width: u16) -> Document {
                         links.push((file.path.clone(), right.len()));
                     }
                     if title {
-                        headers.push((right.len(), file_header(file, code_width)));
+                        headers.push((
+                            right.len(),
+                            file_header(file, code_width, Some(chapter_index), review),
+                        ));
                     }
                     let collapsed = review
                         .interaction
@@ -918,7 +878,12 @@ fn build(app: &App, width: u16) -> Document {
                         .contains(&(chapter_index, file.path.clone()));
                     if collapsed {
                         if title {
-                            right.extend(file_header(file, code_width));
+                            right.extend(file_header(
+                                file,
+                                code_width,
+                                Some(chapter_index),
+                                review,
+                            ));
                             right
                                 .push(text("✓ Chapter section completed · Enter to reopen", GREEN));
                         }
@@ -930,7 +895,7 @@ fn build(app: &App, width: u16) -> Document {
                         code_width,
                         split,
                         (app.horizontal, app.config.wrap_diff),
-                        title,
+                        (title, Some(chapter_index)),
                         review,
                     ));
                 }
@@ -1022,6 +987,8 @@ fn build(app: &App, width: u16) -> Document {
                 }
             }
             doc.sections.push(Section {
+                category_start,
+                category: category_header.clone(),
                 start,
                 end: doc.rows.len(),
                 left,
@@ -1044,7 +1011,7 @@ fn build(app: &App, width: u16) -> Document {
             let collapsed = review.interaction.github.viewed.contains(&file.path)
                 && review.interaction.github.head == snapshot.head;
             if collapsed {
-                for row in file_header(file, width.saturating_sub(2) as usize) {
+                for row in file_header(file, width.saturating_sub(2) as usize, None, review) {
                     append(&mut doc.rows, row);
                 }
                 append(
@@ -1059,7 +1026,7 @@ fn build(app: &App, width: u16) -> Document {
                     width.saturating_sub(2) as usize,
                     width >= 80 && !app.config.unified,
                     (app.horizontal, app.config.wrap_diff),
-                    i == 0,
+                    (i == 0, None),
                     review,
                 ) {
                     append(&mut doc.rows, row);
@@ -1068,7 +1035,7 @@ fn build(app: &App, width: u16) -> Document {
             doc.files.push(FileSection {
                 start,
                 end: doc.rows.len(),
-                header: file_header(file, width.saturating_sub(2) as usize),
+                header: file_header(file, width.saturating_sub(2) as usize, None, review),
             });
         }
     }
@@ -1176,9 +1143,9 @@ fn paint_diff(
         for x in code.x + offset..(code.x + offset + width).min(code.right()) {
             if let Some(cell) = frame.buffer_mut().cell_mut((x, code.y)) {
                 cell.set_bg(if selected {
-                    Color::Rgb(55, 48, 78)
+                    Color::Rgb(18, 64, 34)
                 } else {
-                    PANEL
+                    Color::Rgb(18, 21, 27)
                 });
             }
         }
@@ -1226,7 +1193,7 @@ fn button(
     frame.render_widget(
         Paragraph::new(format!("  {label}  ")).style(
             Style::default()
-                .fg(if active { BG } else { DIM })
+                .fg(if active { INK } else { DIM })
                 .bg(if active { ACCENT } else { PANEL }),
         ),
         rect,
@@ -1505,6 +1472,31 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .position(|item| item.chapter == index)
             .unwrap_or(0);
     }
+    let main = if let Some(section) = doc
+        .sections
+        .iter()
+        .rev()
+        .find(|s| s.category_start <= app.scroll)
+        && app.scroll > section.category_start
+        && main.height > 2
+    {
+        paint(
+            frame,
+            Rect::new(main.x, main.y, main.width, 1),
+            &section.category,
+            app,
+        );
+        Rect::new(
+            main.x,
+            main.y + 1,
+            main.width,
+            main.height.saturating_sub(1),
+        )
+    } else {
+        main
+    };
+    app.content_rect = main;
+    app.viewport = usize::from(main.height);
     app.scroll = app.scroll.min(doc.max_scroll(main.height as usize));
     for y in 0..main.height {
         let index = app.scroll + y as usize;
@@ -1917,21 +1909,23 @@ fn inbox_rows(pr: &PrSummary, width: usize, selected: bool) -> Vec<TextRow> {
 }
 
 fn draw_filter(frame: &mut Frame, app: &mut App, rect: Rect, kind: crate::filter::Kind) {
-    if rect.height < 2 {
+    if rect.height < 3 {
         return;
     }
-    let rect = Rect::new(rect.x, rect.y + 1, rect.width, 1);
+    let rect = Rect::new(rect.x, rect.y + 2, rect.width, 1);
     let focused = app.filters.focused == Some(kind) && app.modal.is_none();
     let width = rect.width.saturating_sub(3) as usize;
     let editor = app.filters.editor(kind);
-    let (lines, (x, y)) = editor.layout(width.max(1));
-    let value = if editor.chars.is_empty() && !focused {
-        "Filter…"
-    } else {
-        lines.get(y).map(String::as_str).unwrap_or_default()
-    };
+    let (lines, (x, y)) =
+        editor.styled_layout(width.max(1), Style::default().bg(ACCENT).fg(crate::ui::INK));
+    let mut spans = vec![Span::raw("f ")];
+    if editor.chars.is_empty() && !focused {
+        spans.push(Span::raw("Filter…"));
+    } else if let Some(line) = lines.get(y) {
+        spans.extend(line.spans.clone());
+    }
     frame.render_widget(
-        Paragraph::new(format!("f {}", crop(value, 0, width))).style(
+        Paragraph::new(Line::from(spans)).style(
             Style::default()
                 .fg(if focused { ACCENT } else { DIM })
                 .bg(PANEL),
@@ -1978,10 +1972,10 @@ fn draw_repositories(frame: &mut Frame, app: &mut App, rect: Rect) {
         .iter()
         .position(|(_, name)| name.is_some() && *name == app.repo_selected)
         .unwrap_or(0);
-    let available = rect.height.saturating_sub(2) as usize;
+    let available = rect.height.saturating_sub(4) as usize;
     let start = selected.saturating_sub(available.saturating_sub(1));
     for (offset, (row, name)) in rows.iter().skip(start).take(available).enumerate() {
-        let hit = Rect::new(rect.x, rect.y + 2 + offset as u16, rect.width, 1);
+        let hit = Rect::new(rect.x, rect.y + 4 + offset as u16, rect.width, 1);
         paint(frame, hit, row, app);
         if let Some(name) = name {
             app.hits.push((hit, Action::SelectRepository(name.clone())));
@@ -2040,12 +2034,12 @@ fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
         };
         for (i, row) in prose(&message, rect.width as usize)
             .iter()
-            .take(rect.height.saturating_sub(2) as usize)
+            .take(rect.height.saturating_sub(4) as usize)
             .enumerate()
         {
             paint(
                 frame,
-                Rect::new(rect.x, rect.y + 2 + i as u16, rect.width, 1),
+                Rect::new(rect.x, rect.y + 4 + i as u16, rect.width, 1),
                 row,
                 app,
             );
@@ -2053,7 +2047,7 @@ fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
         return;
     }
     let width = usize::from(rect.width.saturating_sub(1));
-    let available = usize::from(rect.height.saturating_sub(2));
+    let available = usize::from(rect.height.saturating_sub(4));
     let selected = visible.iter().position(|i| *i == app.selected).unwrap_or(0);
     app.nav_scroll = app.nav_scroll.min(selected);
     let mut start = selected;
@@ -2073,7 +2067,7 @@ fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
         start -= 1;
     }
     app.nav_scroll = start;
-    let mut y = rect.y.saturating_add(2);
+    let mut y = rect.y.saturating_add(4);
     for index in visible.into_iter().skip(start) {
         if y >= rect.bottom() {
             break;
@@ -2117,7 +2111,7 @@ fn draw_files(frame: &mut Frame, app: &mut App, rect: Rect) {
     if entries.is_empty() {
         paint(
             frame,
-            Rect::new(rect.x, rect.y.saturating_add(2), rect.width, 1),
+            Rect::new(rect.x, rect.y.saturating_add(4), rect.width, 1),
             &text("No matching files.", DIM),
             app,
         );
@@ -2134,10 +2128,10 @@ fn draw_files(frame: &mut Frame, app: &mut App, rect: Rect) {
         .max()
         .unwrap_or(0);
     app.tree_horizontal = app.tree_horizontal.min(app.tree_max_horizontal);
-    let height = rect.height.saturating_sub(2) as usize;
+    let height = rect.height.saturating_sub(4) as usize;
     let start = selected_row.saturating_sub(height.saturating_sub(1));
     for (offset, entry) in entries.iter().enumerate().skip(start).take(height) {
-        let y = rect.y + 2 + (offset - start) as u16;
+        let y = rect.y + 4 + (offset - start) as u16;
         let active = offset == selected_row;
         let color = if active {
             ACCENT
@@ -2297,13 +2291,15 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
         return;
     };
     let input_width = inner.width.saturating_sub(8).max(1) as usize;
-    let (input, (x, y)) = state.query.layout(input_width);
+    let (input, (x, y)) = state
+        .query
+        .styled_layout(input_width, Style::default().bg(ACCENT).fg(crate::ui::INK));
+    let mut spans = vec![Span::raw("Search: ")];
+    if let Some(line) = input.get(y) {
+        spans.extend(line.spans.clone());
+    }
     frame.render_widget(
-        Paragraph::new(format!(
-            "Search: {}",
-            input.get(y).map(String::as_str).unwrap_or_default()
-        ))
-        .style(Style::default().fg(ACCENT)),
+        Paragraph::new(Line::from(spans)).style(Style::default().fg(ACCENT)),
         Rect::new(inner.x, inner.y, inner.width, inner.height.min(1)),
     );
     let cursor_x = inner.x.saturating_add(8).saturating_add(x as u16);
@@ -2399,20 +2395,19 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
             let mut rows = vec![bold("Locate your repository", ACCENT), text("", DIM)];
             rows.extend(prose(&format!("Choose the existing local clone for {key}. Difu remembers it for future reviews."),inner.width as usize));
             rows.push(text("", DIM));
-            input_cursor = Some((
-                inner.x + 2 + (value.width().min(inner.width.saturating_sub(4) as usize) as u16),
-                inner.y + rows.len() as u16,
-            ));
-            rows.push(bold(
-                crop(
-                    &format!("> {value}"),
-                    value
-                        .width()
-                        .saturating_sub(inner.width.saturating_sub(4) as usize),
-                    inner.width as usize,
-                ),
-                TEXT,
-            ));
+            let (lines, (x, y)) = value.styled_layout(
+                inner.width.saturating_sub(4) as usize,
+                Style::default().bg(ACCENT).fg(crate::ui::INK),
+            );
+            input_cursor = Some((inner.x + 2 + x as u16, inner.y + rows.len() as u16));
+            let mut spans = vec![Span::raw("> ")];
+            if let Some(line) = lines.get(y) {
+                spans.extend(line.spans.clone());
+            }
+            rows.push(TextRow {
+                spans,
+                ..Default::default()
+            });
             rows.push(text("", DIM));
             rows.extend(prose(
                 "Enter to open · Ctrl+U to clear · Esc to cancel",
@@ -2423,27 +2418,23 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
         Modal::Models {
             selected, query, ..
         } => {
-            input_cursor = Some((
-                inner.x + 8 + (query.width().min(inner.width.saturating_sub(9) as usize) as u16),
-                inner.y + 1,
-            ));
-            let options = app.model_options(query);
+            let (lines, (x, y)) = query.styled_layout(
+                inner.width.saturating_sub(9) as usize,
+                Style::default().bg(ACCENT).fg(crate::ui::INK),
+            );
+            input_cursor = Some((inner.x + 8 + x as u16, inner.y + 1));
+            let options = app.model_options(&query.text());
             let selected = *selected;
+            let mut spans = vec![Span::raw("Filter: ")];
+            if let Some(line) = lines.get(y) {
+                spans.extend(line.spans.clone());
+            }
             let mut rows = vec![
                 bold(app.model_purpose.label(), ACCENT),
-                text(
-                    format!(
-                        "Filter: {}",
-                        crop(
-                            query,
-                            query
-                                .width()
-                                .saturating_sub(inner.width.saturating_sub(9) as usize),
-                            inner.width.saturating_sub(9) as usize
-                        )
-                    ),
-                    DIM,
-                ),
+                TextRow {
+                    spans,
+                    ..Default::default()
+                },
                 text("↑↓ select · Enter apply · Esc close", DIM),
                 text("", DIM),
             ];
@@ -2800,6 +2791,44 @@ mod tests {
                 assert!(doc.rows.get(item.row).is_some_and(|row| matches!(&row.right.target,
                     Some(crate::workflow::Target::Header {chapter: Some(index), ..}) if *index == item.chapter)));
             }
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 30))?;
+            terminal.draw(|frame| draw(frame, &mut app))?;
+            let sections = app
+                .document
+                .as_ref()
+                .context("Missing document")?
+                .sections
+                .iter()
+                .map(|section| {
+                    (
+                        section.start + 10,
+                        section
+                            .category
+                            .spans
+                            .iter()
+                            .map(|s| s.content.as_ref())
+                            .collect::<String>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            for (position, category) in sections {
+                app.scroll = position;
+                terminal.draw(|frame| draw(frame, &mut app))?;
+                let header = (app.content_rect.x..app.content_rect.right())
+                    .filter_map(|x| {
+                        terminal
+                            .backend()
+                            .buffer()
+                            .cell((x, app.content_rect.y - 1))
+                    })
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(
+                    header.contains(&category),
+                    "Missing sticky {category}: {header}"
+                );
+            }
             let regular_only = guide_app(dir.path());
             let doc = build(&regular_only, width);
             assert!(
@@ -2895,6 +2924,80 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn diff_backgrounds_cover_syntax_and_padding_in_both_layouts() -> Result<()> {
+        let lines = [
+            DiffLine {
+                kind: LineKind::Remove,
+                old: Some(1),
+                new: None,
+                text: "const old = 'value';".into(),
+            },
+            DiffLine {
+                kind: LineKind::Add,
+                old: None,
+                new: Some(1),
+                text: "const new = 'value';".into(),
+            },
+        ];
+        for split in [false, true] {
+            for layout in [(0, false), (5, false), (0, true)] {
+                let width = 35;
+                let rows = code_rows("file.ts", &lines, width, split, layout);
+                for row in rows {
+                    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+                        width as u16,
+                        1,
+                    ))?;
+                    terminal.draw(|frame| {
+                        frame.render_widget(
+                            Paragraph::new(Line::from(row.spans.clone())),
+                            frame.area(),
+                        )
+                    })?;
+                    let unified_background = if matches!(
+                        row.target,
+                        Some(crate::workflow::Target::Code { new: None, .. })
+                    ) {
+                        REMOVE_BG
+                    } else {
+                        ADD_BG
+                    };
+                    for x in 0..width as u16 {
+                        let expected = if split {
+                            match x {
+                                0..=16 => REMOVE_BG,
+                                17 => Color::Reset,
+                                _ => ADD_BG,
+                            }
+                        } else {
+                            unified_background
+                        };
+                        assert_eq!(
+                            terminal.backend().buffer().cell((x, 0)).context("cell")?.bg,
+                            expected
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            code(
+                Some(&DiffLine {
+                    kind: LineKind::Context,
+                    old: Some(2),
+                    new: Some(2),
+                    text: "unchanged".into()
+                }),
+                false,
+                35,
+                0
+            )
+            .iter()
+            .all(|span| span.style.bg == Some(Color::Reset))
+        );
+        Ok(())
+    }
     #[test]
     fn wrapped_code_preserves_complete_text_side_anchors_and_definition_columns() -> Result<()> {
         use crate::workflow::Target;
@@ -3001,11 +3104,13 @@ mod tests {
                 assert_eq!(app.document.as_ref().map(|d| d.rows.len()), Some(before));
                 assert!(!app.storage.load_config()?.wrap_diff);
                 app.modal = Some(Modal::Clone {
-                    value: String::new(),
+                    value: Default::default(),
                     key: id,
                 });
                 app.key_event(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE));
-                assert!(matches!(&app.modal, Some(Modal::Clone {value, ..}) if value == "w"));
+                assert!(
+                    matches!(&app.modal, Some(Modal::Clone {value, ..}) if value.text() == "w")
+                );
                 assert!(!app.config.wrap_diff);
             }
         }
@@ -3042,9 +3147,15 @@ mod tests {
         assert_eq!(app.scroll, next_file);
         assert_eq!(app.focus, Focus::Navigation);
         app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
-        assert_eq!(app.scroll, 0);
+        let first_chapter = app
+            .document
+            .as_ref()
+            .and_then(|d| d.sections.first())
+            .context("Missing chapter")?
+            .start;
+        assert_eq!(app.scroll, first_chapter);
         app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER));
-        assert_eq!(app.workflow.cursor, Some(10));
+        assert_eq!(app.workflow.cursor, Some(first_chapter + 10));
         assert_eq!(app.focus, Focus::Content);
         app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
         assert_eq!(app.scroll, 0);
@@ -3370,7 +3481,14 @@ mod tests {
             app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
             assert_eq!(app.scroll, last);
             app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
-            assert_eq!(app.scroll, 0);
+            assert_eq!(
+                app.scroll,
+                app.document
+                    .as_ref()
+                    .and_then(|d| d.sections.first())
+                    .context("Missing chapter")?
+                    .start
+            );
         }
         Ok(())
     }
@@ -3822,13 +3940,13 @@ mod tests {
         let letters = "?msfFrglx/";
         for modal in [
             Modal::Clone {
-                value: String::new(),
+                value: Default::default(),
                 key: key.id(),
             },
             Modal::Models {
                 selected: 0,
                 effort: 0,
-                query: String::new(),
+                query: Default::default(),
             },
             Modal::Workflow(Box::new(Wizard::Compose(Compose {
                 key: key.clone(),
@@ -3849,8 +3967,8 @@ mod tests {
                 .as_ref()
                 .context("Input was replaced by a shortcut")?
             {
-                Modal::Clone { value, .. } => value.clone(),
-                Modal::Models { query, .. } => query.clone(),
+                Modal::Clone { value, .. } => value.text(),
+                Modal::Models { query, .. } => query.text(),
                 Modal::Workflow(w) => match w.as_ref() {
                     Wizard::Compose(draft) => draft.editor.text(),
                     _ => String::new(),

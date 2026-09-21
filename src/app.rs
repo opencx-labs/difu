@@ -224,13 +224,13 @@ pub enum Modal {
     Definition(crate::navigation::Viewer),
     Workflow(Box<crate::workflow::Wizard>),
     Clone {
-        value: String,
+        value: crate::editor::Editor,
         key: String,
     },
     Models {
         selected: usize,
         effort: usize,
-        query: String,
+        query: crate::editor::Editor,
     },
     Help(crate::help::State),
 }
@@ -638,7 +638,8 @@ impl App {
             self.modal = Some(Modal::Clone {
                 value: std::env::current_dir()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_default(),
+                    .unwrap_or_default()
+                    .into(),
                 key: id,
             });
         }
@@ -696,7 +697,24 @@ impl App {
             review.preparation = Some(cancel);
         }
     }
+    fn adjust_focused_hunk(&mut self, amount: i32) {
+        if self.home || self.view == View::Overview {
+            return;
+        }
+        let hunk = self
+            .workflow
+            .cursor
+            .and_then(|cursor| self.document.as_ref()?.rows.get(cursor))
+            .and_then(|row| row.right.hunk.clone());
+        if let Some(hunk) = hunk {
+            self.expand_hunk_by(hunk.clone(), Direction::Above, amount);
+            self.expand_hunk_by(hunk, Direction::Below, amount);
+        }
+    }
     fn expand_hunk(&mut self, hunk_id: String, direction: Direction) {
+        self.expand_hunk_by(hunk_id, direction, 10);
+    }
+    fn expand_hunk_by(&mut self, hunk_id: String, direction: Direction, amount: i32) {
         let Some(id) = self.key() else { return };
         let Some(review) = self.reviews.get_mut(&id) else {
             return;
@@ -713,19 +731,28 @@ impl App {
         let path = file.path.clone();
         let state = review.context.entry(path.clone()).or_default();
         if let Some(data) = &state.data {
-            data.expand(
+            data.adjust(
                 &hunk_id,
                 review.expanded.entry(hunk_id.clone()).or_default(),
                 direction,
+                amount,
             );
+            self.preserve_diff_position = true;
             self.invalidate();
             return;
         }
-        if state.pending.contains(&(hunk_id.clone(), direction)) {
+        if amount == 10
+            && state
+                .pending
+                .contains(&(hunk_id.clone(), direction, amount))
+        {
             return;
         }
         let loading = !state.pending.is_empty();
-        state.pending.push((hunk_id.clone(), direction));
+        if amount < 0 && state.pending.is_empty() {
+            return;
+        }
+        state.pending.push((hunk_id.clone(), direction, amount));
         state.error = None;
         if !loading {
             self.spawn(move |tx, cancel| {
@@ -813,16 +840,21 @@ impl App {
         let storage = self.storage.clone();
         let job_id = id.to_owned();
         let choice = model.clone();
-        let cancel = self.spawn(move |tx, cancel| {
+        let cancel = Cancel::default();
+        let remote_cancel = cancel.clone();
+        self.spawn(move |tx, observer| {
             let progress_tx = tx.clone();
             let progress_id = job_id.clone();
-            let output = codex::generate(
-                &root,
-                &pr,
-                &snapshot,
-                &choice,
+            let output = crate::agents::client::review_job(
                 &storage,
-                &cancel,
+                crate::agents::Job::Guide {
+                    root,
+                    pr: Box::new((*pr).clone()),
+                    snapshot: Box::new((*snapshot).clone()),
+                    model: choice.clone(),
+                },
+                &observer,
+                &remote_cancel,
                 move |message| {
                     let _ = progress_tx.send(Message::Progress(
                         progress_id.clone(),
@@ -830,7 +862,12 @@ impl App {
                         message,
                     ));
                 },
-            );
+            )
+            .and_then(|session| {
+                session
+                    .guide
+                    .ok_or_else(|| anyhow::anyhow!("Completed guide job has no guide"))
+            });
             let _ = tx.send(Message::Guide(job_id, generation, choice, result(output)));
         });
         let Some(review) = self.reviews.get_mut(id) else {
@@ -940,7 +977,7 @@ impl App {
         self.modal = Some(Modal::Models {
             selected: 0,
             effort: 0,
-            query: String::new(),
+            query: Default::default(),
         });
         if self.models_loading || !self.models.is_empty() {
             return;
@@ -999,6 +1036,9 @@ impl App {
         self.invalidate();
     }
     pub fn tick(&mut self) {
+        self.tick_visible(true);
+    }
+    pub fn tick_visible(&mut self, visible: bool) {
         while let Ok(message) = self.receiver.try_recv() {
             self.receive(message);
         }
@@ -1016,6 +1056,11 @@ impl App {
             } else {
                 index += 1;
             }
+        }
+        // Drain already-requested results in the background, but only poll GitHub
+        // for the Reviews screen while it is visible.
+        if !visible {
+            return;
         }
         if self.home
             && !self.repository_directory()
@@ -1415,13 +1460,15 @@ impl App {
                 let pending = std::mem::take(&mut state.pending);
                 match output {
                     Ok(data) => {
-                        for (hunk, direction) in pending {
-                            data.expand(
+                        for (hunk, direction, amount) in pending {
+                            data.adjust(
                                 &hunk,
                                 review.expanded.entry(hunk.clone()).or_default(),
                                 direction,
+                                amount,
                             );
                         }
+                        self.preserve_diff_position = true;
                         state.data = Some(Arc::new(data));
                         state.error = None;
                     }
@@ -1681,7 +1728,8 @@ impl App {
                             .review()
                             .and_then(|r| r.root.as_ref())
                             .map(|p| p.display().to_string())
-                            .unwrap_or_default(),
+                            .unwrap_or_default()
+                            .into(),
                         key: id,
                     });
                 }
@@ -1808,6 +1856,27 @@ impl App {
         }
     }
     pub fn key_event(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::SUPER) {
+            let editor = match &self.modal {
+                Some(Modal::Help(state)) => Some(&state.query),
+                Some(Modal::Clone { value, .. }) => Some(value),
+                Some(Modal::Models { query, .. }) => Some(query),
+                Some(Modal::Workflow(wizard)) => match wizard.as_ref() {
+                    crate::workflow::Wizard::Controls { query, .. } => Some(query),
+                    crate::workflow::Wizard::Compose(draft) if draft.focus == 0 => {
+                        Some(&draft.editor)
+                    }
+                    _ => None,
+                },
+                None => self.filters.focused.map(|kind| self.filters.editor(kind)),
+                _ => None,
+            };
+            if let Some(editor) = editor {
+                self.clipboard = editor.selected_text();
+                return;
+            }
+        }
+
         if self.hover.key(key) {
             return;
         }
@@ -1835,6 +1904,20 @@ impl App {
                 | KeyModifiers::META,
         );
         match key.code {
+            KeyCode::Char('{' | '}') if plain => {
+                self.adjust_focused_hunk(if key.code == KeyCode::Char('}') {
+                    1
+                } else {
+                    -1
+                });
+            }
+            KeyCode::Char('[' | ']') if plain && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.adjust_focused_hunk(if key.code == KeyCode::Char(']') {
+                    1
+                } else {
+                    -1
+                });
+            }
             KeyCode::Char('c') if plain || key.modifiers == KeyModifiers::SUPER => {
                 self.action(Action::Copy)
             }
@@ -2029,14 +2112,18 @@ impl App {
                 let before = state.query.text();
                 let max = state.rows.saturating_sub(state.viewport);
                 match key.code {
-                    KeyCode::Up => state.scroll = state.scroll.saturating_sub(1),
-                    KeyCode::Down => state.scroll = state.scroll.saturating_add(1).min(max),
+                    KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        state.scroll = state.scroll.saturating_sub(1)
+                    }
+                    KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        state.scroll = state.scroll.saturating_add(1).min(max)
+                    }
                     KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(state.viewport),
                     KeyCode::PageDown => {
                         state.scroll = state.scroll.saturating_add(state.viewport).min(max)
                     }
                     KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        state.query = Default::default()
+                        state.query.clear()
                     }
                     _ => state.query.key(key),
                 }
@@ -2048,21 +2135,15 @@ impl App {
             Modal::Clone { mut value, key: id } => {
                 match key.code {
                     KeyCode::Enter => {
-                        if !value.trim().is_empty() {
-                            self.prepare(PathBuf::from(value.trim()));
+                        if !value.text().trim().is_empty() {
+                            self.prepare(PathBuf::from(value.text().trim()));
                         }
                         return;
-                    }
-                    KeyCode::Backspace => {
-                        value.pop();
                     }
                     KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         value.clear()
                     }
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        value.push(c)
-                    }
-                    _ => {}
+                    _ => value.key(key),
                 }
                 self.modal = Some(Modal::Clone { value, key: id });
             }
@@ -2071,25 +2152,28 @@ impl App {
                 effort,
                 mut query,
             } => {
-                let options = self.model_options(&query);
+                let options = self.model_options(&query.text());
                 match key.code {
-                    KeyCode::Up => selected = selected.saturating_sub(1),
-                    KeyCode::Down => selected = (selected + 1).min(options.len().saturating_sub(1)),
+                    KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        selected = selected.saturating_sub(1)
+                    }
+                    KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        selected = (selected + 1).min(options.len().saturating_sub(1))
+                    }
                     KeyCode::Enter => {
                         if let Some(choice) = options.get(selected) {
                             self.apply_model(choice.clone());
                             return;
                         }
                     }
-                    KeyCode::Backspace => {
-                        query.pop();
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        query.clear();
                         selected = 0;
                     }
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        query.push(c);
+                    _ => {
+                        query.key(key);
                         selected = 0;
                     }
-                    _ => {}
                 }
                 self.modal = Some(Modal::Models {
                     selected,
@@ -2172,7 +2256,13 @@ impl App {
                 }
                 _ => {}
             },
-            Some(Modal::Clone { value, .. }) => value.push_str(text.trim()),
+            Some(Modal::Clone { value, .. }) => value.insert(text.trim()),
+            Some(Modal::Models {
+                query, selected, ..
+            }) => {
+                query.insert(text.trim());
+                *selected = 0;
+            }
             _ => {}
         }
     }
@@ -2331,7 +2421,7 @@ impl App {
         }
         let before = self.filters.editor(kind).text();
         if key.code == KeyCode::Char('u') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            *self.filters.editor_mut(kind) = Default::default();
+            self.filters.editor_mut(kind).clear();
         } else {
             self.filters.editor_mut(kind).key(key);
         }
@@ -2455,7 +2545,7 @@ mod tests {
         });
         let old = Arc::new((*snapshot).clone());
         let mut state = FileState::default();
-        state.pending.push(("f0-h0".into(), Direction::Below));
+        state.pending.push(("f0-h0".into(), Direction::Below, 10));
         app.reviews.insert(
             "pr".into(),
             Review {

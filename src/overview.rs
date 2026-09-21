@@ -47,6 +47,7 @@ fn flow(row: TextRow, width: usize) -> Vec<TextRow> {
                     target: None,
                     code_links: Vec::new(),
                     image: None,
+                    hunk: None,
                 });
                 used = 0;
                 if ch == '\n' {
@@ -71,6 +72,7 @@ fn flow(row: TextRow, width: usize) -> Vec<TextRow> {
         target: None,
         code_links: Vec::new(),
         image: None,
+        hunk: None,
     });
     rows
 }
@@ -105,6 +107,7 @@ fn padded(mut row: TextRow, width: usize, background: Color) -> TextRow {
         target: None,
         code_links: Vec::new(),
         image: row.image,
+        hunk: row.hunk,
     }
 }
 fn card(width: usize, header: Vec<TextRow>, body: Vec<TextRow>) -> Vec<TextRow> {
@@ -175,7 +178,7 @@ pub(crate) fn rows_with_images(review: &Review, width: u16, images: bool) -> Vec
                 Span::styled(
                     format!(" {} ", clean(&pr.state)),
                     Style::default()
-                        .fg(BG)
+                        .fg(crate::ui::INK)
                         .bg(state_color(&pr.state))
                         .add_modifier(ratatui::style::Modifier::BOLD),
                 ),

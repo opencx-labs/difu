@@ -25,3 +25,10 @@ pub mod workflow_ui;
 pub mod worktrees;
 
 pub mod filter;
+
+pub mod agents;
+pub mod shell;
+
+pub mod voice;
+
+mod markdown;

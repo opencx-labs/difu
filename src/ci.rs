@@ -95,6 +95,9 @@ fn clean_line(line: &str) -> String {
         }
     }
     let text = output.trim();
+    if chrono::DateTime::parse_from_rfc3339(text).is_ok() {
+        return String::new();
+    }
     let text = text
         .split_once(' ')
         .filter(|(prefix, _)| chrono::DateTime::parse_from_rfc3339(prefix).is_ok())
@@ -134,6 +137,42 @@ fn test_name(line: &str) -> Option<String> {
     }
     None
 }
+fn progress_name(name: &str) -> String {
+    let parts = name.rsplit_once(' ');
+    if let Some((name, duration)) = parts
+        && duration
+            .strip_suffix("ms")
+            .or_else(|| duration.strip_suffix('s'))
+            .is_some_and(|n| n.parse::<f64>().is_ok())
+    {
+        name.to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+fn boundary(line: &str) -> bool {
+    [
+        "✓",
+        "✔",
+        "PASS ",
+        "Test Files ",
+        "Tests ",
+        "Test Suites:",
+        "Tests:",
+        "Duration ",
+        "⎯",
+        "##[group]",
+        "##[endgroup]",
+        "Error: Process completed",
+        "Process completed",
+        "failures:",
+        "test result:",
+    ]
+    .iter()
+    .any(|p| line.starts_with(p))
+        || (line.starts_with("test ")
+            && (line.ends_with(" ... ok") || line.ends_with(" ... ignored")))
+}
 pub(crate) fn parse(log: &str) -> Failures {
     let mut tests: Vec<FailedTest> = Vec::new();
     let mut current = None;
@@ -149,19 +188,50 @@ pub(crate) fn parse(log: &str) -> Failures {
             }
             continue;
         }
-        if let Some(name) = test_name(&line) {
-            current = tests.iter().position(|t| t.name == name);
-            if current.is_none() {
-                if tests.len() >= 50 {
-                    extra = true;
-                    continue;
+        if let Some(raw) = test_name(&line) {
+            let progress =
+                ["× ", "✕ ", "✖ "].iter().any(|p| line.starts_with(p)) && !raw.contains(" > ");
+            let name = if progress { progress_name(&raw) } else { raw };
+            let matches = tests
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| {
+                    t.name == name
+                        || (!progress && name.ends_with(&format!(" > {}", t.name)))
+                        || (progress && t.name.ends_with(&format!(" > {name}")))
+                })
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>();
+            let index = if matches.len() == 1 {
+                matches.first().copied()
+            } else {
+                None
+            };
+            let index = if let Some(index) = index {
+                if !progress && let Some(test) = tests.get_mut(index) {
+                    test.name = name;
+                    test.excerpt.clear();
                 }
+                Some(index)
+            } else if tests.len() < 50 {
                 tests.push(FailedTest {
                     name,
                     excerpt: Vec::new(),
                 });
-                current = tests.len().checked_sub(1);
-            }
+                tests.len().checked_sub(1)
+            } else {
+                extra = true;
+                None
+            };
+            // Progress rows interleave passing tests and unrelated suites. Only a
+            // diagnostic heading (or Rust stdout section) owns following lines.
+            current = if progress || line.starts_with("FAILED ") {
+                None
+            } else {
+                index
+            };
+        } else if boundary(&line) {
+            current = None;
         } else if let Some(test) = current.and_then(|i| tests.get_mut(i))
             && !line.is_empty()
             && test.excerpt.len() < 6
@@ -204,6 +274,29 @@ mod tests {
                 .is_empty()
         );
         assert!(parse("FAIL src/file.spec.ts").tests.is_empty());
+    }
+    #[test]
+    fn vitest_progress_never_leaks_passing_tests_into_failure_details() {
+        let parsed = parse(
+            "× finds no unregistered calls 172ms\n✓ src/other.spec.ts (5 tests) 480ms\n✓ unrelated passing test\n× keeps verified agents 4423ms\n✓ propagates other failures 8ms\n⎯⎯ Failed Tests 2 ⎯⎯\nFAIL src/privacy.spec.ts > raw writes > finds no unregistered calls\nAssertionError: Unregistered writers: src/import.ts\n2026-09-17T19:00:58.6322973Z\n- Expected\n+ Received\nFAIL src/agents.spec.ts > verify > keeps verified agents\nAssertionError: expected two agents\n✓ another passing test\nunrelated trailing output",
+        );
+        assert_eq!(parsed.tests.len(), 2);
+        assert!(parsed.tests.iter().all(|t| t.name.contains(".spec.ts >")));
+        let excerpts = parsed
+            .tests
+            .iter()
+            .flat_map(|t| t.excerpt.iter())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            excerpts.contains("Unregistered writers") && excerpts.contains("expected two agents")
+        );
+        assert!(
+            !excerpts.contains("passing")
+                && !excerpts.contains("2026-")
+                && !excerpts.contains("unrelated")
+        );
     }
     #[test]
     fn refuses_unrelated_log_links() -> Result<()> {
