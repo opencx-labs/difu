@@ -88,14 +88,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 DIM,
             ));
             let input_width = inner.width.saturating_sub(8) as usize;
-            let (lines, (x, y)) = query.layout(input_width);
-            rows.push(ui::text(
-                format!(
-                    "Filter: {}",
-                    lines.get(y).map(String::as_str).unwrap_or_default()
-                ),
-                TEXT,
-            ));
+            let (lines, (x, y)) =
+                query.styled_layout(input_width, Style::default().bg(ACCENT).fg(crate::ui::INK));
+            let mut spans = vec![ratatui::text::Span::raw("Filter: ")];
+            if let Some(line) = lines.get(y) {
+                spans.extend(line.spans.clone());
+            }
+            rows.push(ui::TextRow {
+                spans,
+                ..Default::default()
+            });
             if input_width > 0 && inner.height > 2 {
                 frame.set_cursor_position((
                     inner.x + 8 + (x as u16).min(inner.width - 9),
@@ -171,7 +173,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             frame.render_widget(block, editor_rect);
             app.hits
                 .push((editor_rect, Action::Workflow(WAction::FocusEditor)));
-            let (lines, (x, y)) = draft.editor.layout(input.width as usize);
+            let (lines, (x, y)) = draft.editor.styled_layout(
+                input.width as usize,
+                Style::default().bg(ACCENT).fg(crate::ui::INK),
+            );
             let start = y.saturating_sub(input.height.saturating_sub(1) as usize);
             for (i, line) in lines
                 .iter()
@@ -180,7 +185,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .enumerate()
             {
                 frame.render_widget(
-                    Paragraph::new(line.as_str()).style(Style::default().fg(TEXT)),
+                    Paragraph::new(line.clone()).style(Style::default().fg(TEXT)),
                     Rect::new(input.x, input.y + i as u16, input.width, 1),
                 );
             }

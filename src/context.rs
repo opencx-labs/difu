@@ -17,7 +17,7 @@ pub struct Expansion {
 #[derive(Default)]
 pub struct FileState {
     pub data: Option<Arc<FileContext>>,
-    pub pending: Vec<(String, Direction)>,
+    pub pending: Vec<(String, Direction, i32)>,
     pub error: Option<String>,
 }
 
@@ -77,18 +77,19 @@ impl FileContext {
     }
 
     pub fn expand(&self, id: &str, expansion: &mut Expansion, direction: Direction) {
+        self.adjust(id, expansion, direction, 10);
+    }
+
+    pub fn adjust(&self, id: &str, expansion: &mut Expansion, direction: Direction, amount: i32) {
         if let Some(original) = self.original(id) {
-            match direction {
-                Direction::Above => {
-                    expansion.above = expansion.above.saturating_add(10).min(original.start)
-                }
-                Direction::Below => {
-                    expansion.below = expansion
-                        .below
-                        .saturating_add(10)
-                        .min(self.lines.len().saturating_sub(original.end))
-                }
-            }
+            let (value, limit) = match direction {
+                Direction::Above => (&mut expansion.above, original.start),
+                Direction::Below => (
+                    &mut expansion.below,
+                    self.lines.len().saturating_sub(original.end),
+                ),
+            };
+            *value = value.saturating_add_signed(amount as isize).min(limit);
         }
     }
 

@@ -1,12 +1,13 @@
 [package]
 name = "difu"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 rust-version = "1.90"
-description = "Your diff shifu: a terminal inbox and guided pull request reviewer"
+description = "Your diff shifu: Codex agents and guided pull request reviews"
 license = "MIT"
 
 [dependencies]
+arboard = { version = "3.6.1", features = ["wayland-data-control"] }
 ratatui-image = { version = "=11.0.8", default-features = false, features = ["crossterm"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 ureq = { version = "3", default-features = false, features = ["rustls"] }
@@ -33,6 +34,12 @@ tempfile = "3"
 textwrap = "0.16"
 unicode-width = "0.2"
 url = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = "0.16"
+security-framework = "3"
+tungstenite = { version = "0.28", features = ["rustls-tls-webpki-roots"] }
+base64 = "0.22"
 
 [profile.release]
 lto = "thin"

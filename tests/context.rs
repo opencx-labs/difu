@@ -545,3 +545,58 @@ fn boundaries_hide_controls_at_file_edges_and_reuse_the_pinned_cache() -> Result
     app.shutdown();
     Ok(())
 }
+
+#[test]
+fn brace_keys_adjust_only_focused_hunk_one_line_and_keep_source_anchor() -> Result<()> {
+    use crossterm::event::{KeyCode, KeyEvent};
+    use difu::workflow::Target;
+    for width in [80, 180] {
+        for view in [View::Guide, View::Diff] {
+            let dir = tempfile::tempdir()?;
+            let (mut app, _) = fixture(dir.path())?;
+            app.action(Action::SetView(view));
+            render(&mut app, width)?;
+            let cursor = app
+                .document
+                .as_ref()
+                .context("Missing document")?
+                .rows
+                .iter()
+                .position(|r| matches!(r.right.target, Some(Target::Code { new: Some(20), .. })))
+                .context("Missing selected line")?;
+            app.workflow.cursor = Some(cursor);
+            for _ in 0..3 {
+                app.key_event(KeyEvent::new(KeyCode::Char('}'), KeyModifiers::SHIFT));
+            }
+            wait_context(&mut app)?;
+            render(&mut app, width)?;
+            let review = app.review().context("Missing review")?;
+            let expansion = review.expanded.get("f0-h0").context("Missing expansion")?;
+            assert_eq!((expansion.above, expansion.below), (3, 3));
+            assert!(!review.expanded.contains_key("f0-h1"));
+            let row = app
+                .document
+                .as_ref()
+                .and_then(|d| d.rows.get(app.workflow.cursor?))
+                .context("Missing anchor")?;
+            assert!(matches!(
+                row.right.target,
+                Some(Target::Code { new: Some(20), .. })
+            ));
+            for _ in 0..5 {
+                app.key_event(KeyEvent::new(KeyCode::Char('{'), KeyModifiers::SHIFT));
+                render(&mut app, width)?;
+            }
+            let expansion = app
+                .review()
+                .and_then(|r| r.expanded.get("f0-h0"))
+                .context("Missing expansion")?;
+            assert_eq!((expansion.above, expansion.below), (0, 0));
+            assert_eq!(
+                fs::read_to_string(dir.path().join("file.rs"))?,
+                "uncommitted changes must stay private\n"
+            );
+        }
+    }
+    Ok(())
+}

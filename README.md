@@ -2,8 +2,9 @@
 
 *dīfu* is your diff *shīfu*... guides you through the depths of every diff... may you fathom whatever slop you're feasting your eyes on
 
-A terminal review app for GitHub pull requests, built in Rust with Ratatui and
-Crossterm. Browse your review inbox, read PR activity, and follow AI-generated
+A terminal workspace for Codex agents and GitHub pull request reviews, built in
+Rust with Ratatui and Crossterm. Launch background coding agents, browse your
+review inbox, read PR activity, and follow AI-generated
 chapters that explain related changes across files. Write comments and reviews,
 track chapter completion, and merge or close PRs without leaving the terminal.
 
@@ -65,7 +66,8 @@ gh auth login
 codex login
 ```
 
-Difu reuses those logins; you do not enter an API key into the TUI.
+Difu reuses those logins for coding and reviews. Optional voice dictation uses a
+separate OpenAI API key and API billing.
 
 ## Quick start
 
@@ -73,7 +75,164 @@ Difu reuses those logins; you do not enter an API key into the TUI.
 difu
 ```
 
-`difu` opens a home screen with two tabs:
+`difu` opens **Agents** by default. The top tabs are **Agents / Reviews**; click
+one or use **Ctrl+1 / Ctrl+2** to switch while preserving your place.
+
+### Agents
+
+Press **n** (or `/new`) to open an empty session immediately. Repository, model,
+reasoning, and isolation defaults live in **/actions → Default repository, model,
+reasoning and worktree**. Without a saved repository, difu uses the current Git
+repository; outside one, it asks you to choose and remembers that choice.
+
+No Codex turn runs until your first message. With isolation enabled, questions and
+investigation run read-only in the original repository. When the agent requests
+editing, difu stops the read-only turn, creates a branch/worktree from the pinned
+starting commit, and continues the same conversation there. No clone or fetch is
+needed. Existing local changes are never copied into that worktree. Missing local
+guidance still requires your approval before copying. With isolation disabled,
+the session works in the selected repository directly.
+
+Model and reasoning inherit your Codex configuration unless overridden. During
+read-only investigation, filesystem writes and permission escalation are disabled.
+After switching to the worktree, difu restores the inherited sandbox and approval
+settings. A restart never automatically replays a task or workspace transition.
+
+The searchable session list previews conversations. **Enter** opens a session;
+**Esc** returns. The conversation stays in the center, with independently toggled
+side panes: **Ctrl+B** for agents and **Ctrl+D** for Changes. Visibility is remembered.
+Changes compares the workspace with its session-start commit and includes later
+commits, staged/unstaged edits, and non-ignored untracked files. It never stages
+files or changes your index. Changes display is limited to 32 MiB; larger results
+produce an explicit error.
+
+In the composer, **Enter** sends a message and steers an active turn immediately.
+**Ctrl+Enter** explicitly queues it for the next turn; **Shift+Enter** inserts a
+newline. Drafts remain until delivery is acknowledged. Shift+arrows selects text;
+typing replaces the selection, and Command+C copies it. **Shift+Alt+Left/Right**
+extends the selection by a word; **Alt+Backspace** deletes the previous word.
+**Cmd+Backspace** deletes the entire current line; **Cmd+Left/Right** moves to its
+start/end. Ghostty’s translated **Ctrl+U** and **Ctrl+A/E** work too;
+**Ctrl+U** still clears filter/search inputs. **Cmd+Z** undoes edits in all text inputs.
+With an empty composer, **Up** recalls sent prompts from the current session.
+**Down** moves forward and restores your original draft past the newest prompt.
+Recalled prompts are editable and never sent automatically.
+
+Type **/** in an empty composer for native commands: `/compact`, `/model`,
+`/skills`, `/status`, `/diff`, `/new`, `/rename`, `/help`, `/voice`, and `/actions`.
+Commands filter as you type. A slash inside an existing message stays literal.
+The skills picker discovers enabled skills for the session's actual directory;
+selecting one attaches it to the draft without sending. `/actions` (or Esc then /)
+opens searchable session controls: continue, interrupt, rename, change model,
+archive/unarchive, toggle panes, and delete a clean inactive worktree.
+
+In Agents, `/` commands, `$` workspace skills, and `@` workspace files and folders
+appear above the message input. Choose a suggestion with arrows and Enter;
+selecting a skill or path inserts it without sending the message.
+The session list puts active agents first and shows turn time beside the title,
+with cached green additions and red deletions below. Local Git counts refresh
+every ten seconds while working and after a turn finishes. Archived sessions
+remain available through the actions menu.
+
+
+Conversation tools show their action, target, state, and duration; click or press
+Enter to expand details. Up/Down focuses transcript entries, PageUp/PageDown and
+the wheel scroll, and End returns to live output. Reading earlier output keeps
+your place. **Alt+Up** opens pending questions in place of the composer. Answer one question
+at a time with **Enter**, or skip it without answering with **Ctrl+]**.
+On a suggested choice, **n** opens a note beneath it. **Enter** submits the choice
+and its note together; **Esc** returns to the choices while keeping the note.
+**Alt+Up** advances; **Alt+Down** returns to the previous question, or the composer
+from the first question. Question drafts survive dismissal and session switching.
+Asynchronous question cards remain available after the agent finishes its turn
+and across service restarts. Answers steer a running turn or start a follow-up
+when idle, using the normal chat delivery path. Only the question, chosen answer,
+and any additional note are sent.
+Outgoing queued messages have a separate editable queue. Down from the final
+transcript entry focuses the composer. Up in an empty composer recalls this
+session’s previous prompts; Down walks forward and restores your draft.
+
+Codex keeps its normal global configuration and memory settings and reads
+AGENTS.md and skills from the session workspace. Before launching an isolated
+session, difu asks before copying any missing untracked or ignored guidance from
+the source clone. It copies only the listed guidance files after agreement.
+
+ **?** opens
+searchable shortcut help. **Tab** switches directly between the session list and
+the selected session’s input (opening it if needed). **Cmd+Up/Down** focuses and navigates message blocks. The focused block has a dim
+background; moving down past the final block returns to the input. Typing while
+reading messages focuses the composer and inserts your text; navigation and
+modified shortcuts keep their existing behavior. **f** filters sessions, and **r**
+refreshes/reconnects. In Changes, arrows scroll, Shift+Up/Down selects lines, and
+**c / Command+C** copies through the terminal clipboard protocol.
+
+#### Messages, attachments, and session names
+
+User messages have a dim green background with white text. Your newest sent prompt
+stays pinned above the conversation; click it to read the full prompt. Drag across
+conversation text and press **Ctrl+C / Cmd+C** to copy. Ctrl+C quits only when no
+chat text is selected.
+
+The composer starts at one line and grows up to ten lines. Pasted code receives
+syntax highlighting. Pastes of **500 characters or more** appear as
+`[Pasted content · N chars]`; sending and copying include the full text. Press
+**Ctrl+V / Cmd+V** on or immediately after a token to expand it. Elsewhere these
+keys paste normally (Command shortcuts depend on terminal forwarding).
+
+Paste/drop local image or video paths, or use **Ctrl+V / Cmd+V** for clipboard
+images. Removable `[image 1]` and `[video 1]` tokens appear above the input. Difu
+keeps private session copies, including unsent attachment drafts, so original
+files can move or change. Nothing is sent to Codex before you send the message.
+Images use Codex’s image input; videos are supplied as local paths, without frame
+extraction or a promise that every Codex model can interpret the video. Copies
+remain until explicit workspace cleanup.
+
+After the first successful coding turn, **Luna Medium** generates a short title
+from the task and response. Naming runs in the background once. Failure keeps the
+existing title, and a manual rename always wins.
+
+#### Voice dictation (macOS)
+
+Open `/voice` to enable hold-Space dictation. Use `OPENAI_API_KEY`, or enter a key
+in the masked settings input to store it in **macOS Keychain**. Difu does not save
+keys in its configuration or write recordings to disk. Transcription uses OpenAI's
+`gpt-live-transcribe` with automatic language detection and separate API billing.
+Microphone permission is required. Voice capture is not available on Linux yet.
+
+Tap Space to type a space; hold it to dictate. The composer shows connection,
+listening, audio levels, and transcription progress. Releasing inserts the final
+transcript at the saved cursor without sending. Esc cancels; failures preserve
+the draft. Terminals without key-release reporting use repeat cessation to detect
+release. Press Enter explicitly to send the resulting message.
+
+A private local service owns sessions and review jobs. Closing difu or its terminal
+leaves them running, including pending approvals. Reopen difu to reconnect. There
+is no difu concurrency limit. Only sessions launched through difu are listed;
+existing external Codex conversations are not imported. Guide and conflict jobs
+appear with distinct labels and keep their existing workflow restrictions.
+
+After a service crash or machine restart, history is restored and interrupted work
+requires explicit continuation. Pending queued prompts are retained as unsent text,
+not replayed. Completed publication actions are never automatically retried.
+Interrupting preserves edits; archiving hides the session and keeps its workspace.
+Cleanup is separate and refuses active, modified, untracked, ignored, or Git-locked
+worktrees. It never deletes an existing user directory. Removing a clean worktree
+retains its named branch and commits.
+
+Every isolated coding session receives a mandatory instruction at start and resume:
+**do not run local tests, linting, typechecks, builds, CI scripts, or validation
+suites; rely on PR CI.** Git inspection and diff checks remain allowed. This is
+agent guidance, not an operating-system command block. Coding agents commit, push,
+or open a PR only when explicitly requested by the task. Review conflict jobs retain
+their separately authorized automatic, validated push behavior.
+
+Session history and managed coding worktrees live in an `agents` directory beside
+`config.json`, with owner-only directory/socket access. The service uses Codex's
+app-server interface and existing login. No additional daemon package is required.
+
+### Reviews
+
+The Reviews home screen keeps its two nested tabs:
 
 1. **My PRs** — PRs you authored or were directly requested to review, deduplicated
    and sorted by latest update.
@@ -351,7 +510,7 @@ bindings.
 | Ctrl+B | Side-by-side / unified preference |
 | Ctrl+O | Open the PR on GitHub |
 | Esc | Close dialog / return home / quit |
-| Ctrl+C | Quit and clean up active work |
+| Ctrl+C | Quit; coding agents and review jobs keep running |
 
 The Files tree stays expanded. Select a directory with arrows or a click to see
 all changed files beneath it. Tree names stay on one line and scroll horizontally;
@@ -464,8 +623,9 @@ checkout filters, recursive submodules, and LFS downloads are disabled. The guid
 therefore sees committed LFS pointers and submodule references, not downloaded
 assets or nested checkouts. Difu does not run project builds or tests.
 
-Owned subprocess groups are terminated on cancellation. Worktrees are removed on
-completion, failure, normal exit, Ctrl+C, SIGTERM, and SIGHUP. Cleanup does not use
+Owned subprocess groups are terminated on explicit cancellation. Guide worktrees
+are removed on job completion or failure. Closing the TUI leaves the background
+service and its review jobs running. Cleanup does not use
 `--force`: if a worktree unexpectedly contains changes, difu reports and preserves
 its path. An uncatchable kill or power loss can leave a temporary worktree; inspect
 the home **/ → Memory management** dialog. It lists remaining worktrees and offers
@@ -531,3 +691,21 @@ cargo test --locked --test codex_smoke -- --ignored --nocapture
 ## License
 
 [MIT](LICENSE).
+
+### Review presentation
+
+PR previews render Markdown tables, headings, lists, emphasis, links, and code
+blocks. Inline images use a larger preview area and open in a full modal when
+clicked. App and panel backgrounds inherit the terminal background, including
+Ghostty transparency and blur. Selected controls retain their accent highlight.
+
+Guide category headings remain visible while scrolling through their chapters.
+In Guide and Diff, **Shift+] (`}`)** adds one context line on each side of the
+focused hunk; **Shift+[ (`{`)** removes one, stopping at the original diff context.
+Context comes from pinned local Git revisions, without fetching or reading dirty
+working-copy contents. The selected source line stays anchored.
+
+Guide generation supplies the complete diff directly in a compact initial Codex
+prompt. Additional repository reads are reserved for specific uncertainties.
+Progress records worktree preparation, setup, model time, tool calls, validation,
+and cleanup. Full-hunk validation remains mandatory before a guide is accepted.

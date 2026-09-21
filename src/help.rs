@@ -11,6 +11,7 @@ pub struct State {
 pub fn entries(query: &str) -> Vec<(&'static str, &'static str)> {
     let query = query.to_lowercase();
     [
+        ("Ctrl+1 / Ctrl+2", "Switch Agents / Reviews"),
         ("↑ / ↓", "Navigate repositories, PRs, files, or code"),
         ("Alt+↑ / ↓", "Previous / next guide chapter"),
         ("Tab / Shift+Tab", "Switch navigation / content focus"),
@@ -37,6 +38,10 @@ pub fn entries(query: &str) -> Vec<(&'static str, &'static str)> {
         ("Alt+← / →", "Select old / new diff side (new by default)"),
         ("Shift+↑ / ↓", "Select code lines within one file and side"),
         ("w", "Toggle diff wrapping (saved)"),
+        (
+            "Shift+[ / Shift+]",
+            "Decrease / increase focused hunk context by one line per side",
+        ),
         ("1 / 2", "Home: My PRs / Repositories"),
         ("1 / 2 / 3", "Inside PR: Overview / Guide / Diff"),
         (
@@ -45,6 +50,17 @@ pub fn entries(query: &str) -> Vec<(&'static str, &'static str)> {
         ),
         ("f", "Focus sidebar filter; Enter/Esc returns to the list"),
         ("Ctrl+U", "Clear the focused filter or search input"),
+        ("Cmd+Z", "Undo the last edit in any text input"),
+        ("Alt+Backspace", "Delete the previous word in a text input"),
+        (
+            "Cmd+Backspace / Ctrl+U",
+            "Delete input line; Ctrl+U clears filters",
+        ),
+        (
+            "Cmd+← / → · Ctrl+A/E",
+            "Move to the start / end of the input line",
+        ),
+        ("Shift+Alt+← / →", "Extend input selection by a word"),
         ("*", "Pin/unpin the selected repository locally"),
         ("?", "Search keyboard and mouse shortcuts"),
         ("m", "Choose model and reasoning"),
@@ -60,7 +76,7 @@ pub fn entries(query: &str) -> Vec<(&'static str, &'static str)> {
         ("Ctrl+O", "Open PR on GitHub"),
         ("Mouse", "Click items and links; wheel to scroll"),
         ("Esc", "Close dialog / back / quit"),
-        ("Ctrl+C", "Quit and clean up running work"),
+        ("Ctrl+C", "Quit; agents and review jobs keep running"),
     ]
     .into_iter()
     .filter(|(key, description)| {

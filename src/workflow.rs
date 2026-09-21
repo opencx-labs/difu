@@ -249,15 +249,33 @@ impl App {
                 self.wizard(Wizard::Resolving {
                     activity: "Preparing conflict resolution…".into(),
                 });
-                let cancel = self.spawn(move |tx, cancel| {
+                let cancel = crate::process::Cancel::default();
+                let remote_cancel = cancel.clone();
+                let storage = self.storage.clone();
+                self.spawn(move |tx, observer| {
                     let progress_tx = tx.clone();
-                    let progress = std::sync::Arc::new(move |activity| {
-                        let _ = progress_tx
-                            .send(Message::Workflow(Event::ResolutionProgress(activity)));
-                    });
-                    let output = result(crate::conflicts::resolve(
-                        &root, &key, &head, &model, &cancel, progress,
-                    ));
+                    let output = result(
+                        crate::agents::client::review_job(
+                            &storage,
+                            crate::agents::Job::Conflict {
+                                root,
+                                key: key.clone(),
+                                head,
+                                model,
+                            },
+                            &observer,
+                            &remote_cancel,
+                            move |activity| {
+                                let _ = progress_tx
+                                    .send(Message::Workflow(Event::ResolutionProgress(activity)));
+                            },
+                        )
+                        .and_then(|session| {
+                            session
+                                .result
+                                .ok_or_else(|| anyhow::anyhow!("Conflict job has no result"))
+                        }),
+                    );
                     let _ = tx.send(Message::Workflow(Event::Resolved(key, output)));
                 });
                 self.workflow.conflict_cancel = Some(cancel);
@@ -736,8 +754,10 @@ impl App {
             } => {
                 let commands = control_commands(&query.text());
                 match key.code {
-                    KeyCode::Up => *selected = selected.saturating_sub(1),
-                    KeyCode::Down => {
+                    KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        *selected = selected.saturating_sub(1)
+                    }
+                    KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                         *selected = selected
                             .saturating_add(1)
                             .min(commands.len().saturating_sub(1))
@@ -748,7 +768,7 @@ impl App {
                         }
                     }
                     KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
-                        *query = Editor::default();
+                        query.clear();
                         *selected = 0;
                     }
                     _ => {
@@ -770,6 +790,7 @@ impl App {
                     action = Some(WAction::Next);
                 } else if draft.focus == 0
                     && !options.is_empty()
+                    && !key.modifiers.contains(KeyModifiers::SHIFT)
                     && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab)
                 {
                     match key.code {

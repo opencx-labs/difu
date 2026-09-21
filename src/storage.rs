@@ -13,7 +13,28 @@ use std::{
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentDefaults {
+    pub repository: Option<PathBuf>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub isolated: bool,
+}
+impl Default for AgentDefaults {
+    fn default() -> Self {
+        Self {
+            repository: None,
+            model: None,
+            effort: None,
+            isolated: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub agent_defaults: AgentDefaults,
     #[serde(default)]
     pub repositories: BTreeMap<String, PathBuf>,
     #[serde(default)]
@@ -26,16 +47,29 @@ pub struct Config {
     pub unified: bool,
     #[serde(default)]
     pub wrap_diff: bool,
+    #[serde(default = "enabled")]
+    pub agent_list_visible: bool,
+    #[serde(default)]
+    pub agent_changes_visible: bool,
+    #[serde(default)]
+    pub voice_enabled: bool,
+}
+fn enabled() -> bool {
+    true
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
+            agent_defaults: AgentDefaults::default(),
             repositories: BTreeMap::new(),
             pinned_repositories: BTreeSet::new(),
             model: ModelChoice::default(),
             conflict_model: ModelChoice::conflict_default(),
             unified: false,
             wrap_diff: false,
+            agent_list_visible: true,
+            agent_changes_visible: false,
+            voice_enabled: false,
         }
     }
 }

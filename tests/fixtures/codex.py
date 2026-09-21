@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import json, os, re, sys
+import json, os, re, sys, time
 from pathlib import Path
 root = Path(os.environ['DIFU_TEST_FIXTURE'])
 args = sys.argv[1:]
@@ -22,11 +22,15 @@ else:
     assert args[args.index('--sandbox')+1] == 'read-only'
     assert args[args.index('--model')+1] == 'gpt-5.6-luna'
     prompt = sys.stdin.read()
-    match = re.search(r'Review input JSON file: (.+)', prompt)
-    manifest = json.loads(Path(match.group(1)).read_text())
+    manifest = json.loads(prompt.split('Review input JSON:\n', 1)[1])
+    assert 'Review input JSON file:' not in prompt
     assert Path('main.rs').read_text() == 'fn main() {\n    new();\n}\n'
-    hunks = [h['id'] for f in manifest['snapshot']['files'] for h in f['hunks']]
+    hunks = [h['id'] for f in manifest['files'] for h in f['hunks']]
     print(json.dumps(dict(type='turn.started')), flush=True)
+    if (root / 'hold-guide').exists():
+        (root / 'guide-waiting').write_text('waiting')
+        while (root / 'hold-guide').exists():
+            time.sleep(0.03)
     output = Path(args[args.index('--output-last-message')+1])
     output.write_text(json.dumps(dict(chapters=[
         dict(category='regular', title='Use the new behavior', explanation='The entry point calls `new()` to select the new behavior.', hunks=hunks + hunks),

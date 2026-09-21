@@ -482,17 +482,33 @@ pub(crate) fn rows(source: &str, width: usize, pr: &PrDetail, supported: bool) -
             crate::model::clean(&reference.label)
         };
         let request = Request::new(reference.source, label.clone(), pr);
+        if let Ok(url) = request.browser_url()
+            && matches!(
+                std::path::Path::new(url.path())
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
+                Some("svg" | "svgz")
+            )
+        {
+            rows.push(link(
+                format!("↗ {label} · SVG image · open in browser"),
+                Action::Link(url.into()),
+            ));
+            continue;
+        }
         for mut row in prose(&format!("Image: {label} · click to enlarge"), width) {
             row.action = Some(Action::Image(request.clone()));
             rows.push(row);
         }
         if supported {
-            for offset in 0..12 {
+            for offset in 0..24 {
                 rows.push(TextRow {
                     image: Some(PreviewRow {
                         request: request.clone(),
                         offset,
-                        height: 12,
+                        height: 24,
                         width: u16::try_from(width).unwrap_or(u16::MAX),
                         inset: 0,
                     }),
@@ -742,6 +758,40 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn preview_html_picture_and_comments_do_not_leak_markup() {
+        let source = r#"Intro **bold**.
+
+<!-- greptile_comment -->
+<!-- greptile_summary -->
+
+<h2><a href="https://example.com/retrigger"><picture><source media="(prefers-color-scheme: dark)" srcset="https://example.com/dark.svg"><source media="(prefers-color-scheme: light)" srcset="https://example.com/light.svg"><img src="https://example.com/badge.svg" alt="Retrigger"></picture></a></h2>
+
+<details><summary>Summary</summary>
+
+Useful summary text.
+
+</details>"#;
+        let output = rows(source, 80, &pr(), true);
+        assert!(output.iter().all(|row| row.image.is_none()));
+        assert!(output.iter().any(|row| matches!(&row.action, Some(Action::Link(url)) if url == "https://example.com/badge.svg")));
+        let rendered = output
+            .iter()
+            .map(|r| {
+                r.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains("greptile_comment"), "{rendered}");
+        assert!(
+            !rendered.contains("<source") && !rendered.contains("srcset="),
+            "{rendered}"
+        );
+        assert!(rendered.contains("Summary") && rendered.contains("Useful summary text."));
+    }
+    #[test]
     fn urls_and_credentials_remain_scoped() -> Result<()> {
         let request = Request::new("docs/screen%20shot.png".into(), "Screen".into(), &pr());
         assert_eq!(
@@ -905,17 +955,17 @@ mod tests {
         };
         let rows = crate::overview::rows_with_images(&review, 84, true);
         let previews: Vec<_> = rows.iter().filter_map(|r| r.image.as_ref()).collect();
-        assert_eq!(previews.len(), 24);
+        assert_eq!(previews.len(), 48);
         assert!(
             previews
                 .iter()
-                .take(12)
+                .take(24)
                 .all(|p| p.inset == 2 && p.width == 80)
         );
         assert!(
             previews
                 .iter()
-                .skip(12)
+                .skip(24)
                 .all(|p| p.inset == 4 && p.width == 78)
         );
         app.inbox.push(PrSummary {
