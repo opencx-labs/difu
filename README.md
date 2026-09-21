@@ -118,9 +118,12 @@ With an empty composer, **Up** recalls sent prompts from the current session.
 **Down** moves forward and restores your original draft past the newest prompt.
 Recalled prompts are editable and never sent automatically.
 
-Type **/** in an empty composer for native commands: `/compact`, `/model`,
+Type **/** in an empty composer for native commands: `/compact`, `/model`, `/effort`,
 `/skills`, `/status`, `/diff`, `/new`, `/rename`, `/help`, `/voice`, and `/actions`.
-Commands filter as you type. A slash inside an existing message stays literal.
+Commands filter as you type. Backspace removes an empty `/`, `$`, or `@` trigger.
+A slash inside an existing message stays literal. `/model` and `/effort` suggest
+Codex’s available models and supported reasoning levels: type to filter, use
+Up/Down to select, Enter to fill, and Enter again to apply.
 The skills picker discovers enabled skills for the session's actual directory;
 selecting one attaches it to the draft without sending. `/actions` (or Esc then /)
 opens searchable session controls: continue, interrupt, rename, change model,

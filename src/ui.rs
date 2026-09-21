@@ -278,7 +278,9 @@ pub(crate) fn syntax_spans(content: &str) -> Vec<Span<'static>> {
     let mut token = String::new();
     let mut quoted = false;
     let mut quote = '\0';
-    let comment = content.trim_start().starts_with("//") || content.trim_start().starts_with('#');
+    let comment = content.trim_start().starts_with("//")
+        || content.trim_start().starts_with('#')
+        || content.trim_start().starts_with("--");
     let emit = |token: &mut String, spans: &mut Vec<Span<'static>>, quoted: bool| {
         if token.is_empty() {
             return;
@@ -308,12 +310,52 @@ pub(crate) fn syntax_spans(content: &str) -> Vec<Span<'static>> {
             "class",
             "def",
             "from",
-            "SELECT",
-            "UPDATE",
-            "WHERE",
-            "SET",
+            "select",
+            "update",
+            "where",
+            "set",
+            "insert",
+            "into",
+            "delete",
+            "with",
+            "as",
+            "and",
+            "or",
+            "not",
+            "exists",
+            "is",
+            "distinct",
+            "null",
+            "true",
+            "false",
+            "join",
+            "left",
+            "right",
+            "inner",
+            "outer",
+            "on",
+            "group",
+            "by",
+            "order",
+            "having",
+            "limit",
+            "offset",
+            "union",
+            "all",
+            "case",
+            "when",
+            "then",
+            "end",
+            "returning",
+            "conflict",
+            "do",
+            "nothing",
+            "begin",
+            "commit",
+            "rollback",
+            "timestamp",
         ]
-        .contains(&token.as_str())
+        .contains(&token.to_ascii_lowercase().as_str())
         {
             ACCENT
         } else if token.chars().all(|c| c.is_ascii_digit()) {

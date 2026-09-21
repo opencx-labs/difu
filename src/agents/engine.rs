@@ -303,18 +303,25 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                 let mut kind = string(item, "type");
                 let mut text = item_text(item);
                 if kind == "userMessage"
-                    && let Some(index) = session.entries.iter().rposition(|e| {
-                        matches!(e.kind.as_str(), "sending" | "sending_context")
-                            && (e.text == text
-                                || e.data.get("wire_text").and_then(Value::as_str)
-                                    == Some(text.as_str()))
+                    && !session.entries.iter().any(|entry| entry.id == id)
+                    && let Some(entry) = session.entries.iter_mut().find(|entry| {
+                        matches!(
+                            entry.kind.as_str(),
+                            "sending" | "sending_context" | "userMessage"
+                        ) && entry
+                            .data
+                            .get("wire_text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|wire| wire == text || entry.text == text)
                     })
                 {
-                    let sending = session.entries.remove(index);
-                    if sending.kind == "sending_context" {
+                    // Reconcile the server echo in place: delayed echoes must not move
+                    // an older prompt after a newer steering message.
+                    entry.id = id.clone();
+                    if entry.kind == "sending_context" {
                         kind = "system".into();
                     }
-                    text = sending.text;
+                    text = entry.text.clone();
                 }
                 if let Some(entry) = session.entries.iter_mut().find(|e| e.id == id) {
                     let user_message = kind == "userMessage";
@@ -494,6 +501,7 @@ fn send_turn(
         "turn/start"
     };
     // Store intent before sending: a lost reply must never trigger automatic replay.
+    let mut sending_id = None;
     store.update(id, |s| {
         if !steer {
             s.status = Status::Starting;
@@ -516,6 +524,7 @@ fn send_turn(
             text,
         );
         if let Some(entry) = s.entries.last_mut() {
+            sending_id = Some(entry.id.clone());
             entry.data =
                 json!({"wire_text":wire_text,"attachments":prompt.attachments(),"prompt":prompt});
         }
@@ -525,6 +534,16 @@ fn send_turn(
     match result {
         Ok(response) => {
             store.update(id, |s| {
+                // Steering may be acknowledged without a userMessage event.
+                // Record accepted user input immediately; never promote failed sends.
+                if !internal
+                    && let Some(entry) = s.entries.iter_mut().find(|entry| {
+                        Some(&entry.id) == sending_id.as_ref() && entry.kind == "sending"
+                    })
+                {
+                    entry.kind = "userMessage".into();
+                }
+
                 if session.waiting_for_workspace() && !steer {
                     s.permissions = json!({"sandbox":isolation::read_only_policy(&session),"approvalPolicy":"never",
                         "approvalsReviewer":session.inherited_permissions.get("approvalsReviewer")});
@@ -1026,6 +1045,47 @@ fn validate_response(pending: &Pending, response: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delayed_user_echoes_preserve_prompt_order_and_do_not_duplicate() -> Result<()> {
+        let mut session = Session::new(
+            "test".into(),
+            Job::Coding(super::super::Launch {
+                repository: ".".into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: "task".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        for text in ["first steering message", "> Question?\nAnswer with notes"] {
+            session.note("userMessage", text);
+            session.entries.last_mut().context("message")?.data = json!({"wire_text":text});
+        }
+        session.note("agentMessage", "Continuing the task");
+        let echo = json!({"method":"item/completed","params":{"item":{
+            "id":"first-server-id","type":"userMessage",
+            "content":[{"type":"text","text":"first steering message"}]
+        }}});
+        apply_event(&mut session, &echo);
+        apply_event(&mut session, &echo);
+        assert_eq!(session.entries.len(), 3);
+        assert_eq!(
+            session.entries.first().map(|e| e.id.as_str()),
+            Some("first-server-id")
+        );
+        assert_eq!(
+            session
+                .entries
+                .iter()
+                .rev()
+                .find(|e| e.kind == "userMessage")
+                .map(|e| e.text.as_str()),
+            Some("> Question?\nAnswer with notes")
+        );
+        Ok(())
+    }
+
     #[test]
     fn async_questions_survive_completed_turns_and_restore_without_duplicate_answers() -> Result<()>
     {

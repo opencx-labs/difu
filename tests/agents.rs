@@ -168,6 +168,20 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
             queue: false,
         },
     )?;
+    let steered = wait(&storage, &id, |s| {
+        s.entries
+            .iter()
+            .any(|entry| entry.kind == "userMessage" && entry.text == "steer this task")
+    })?;
+    assert_eq!(
+        steered
+            .entries
+            .iter()
+            .rev()
+            .find(|e| e.kind == "userMessage")
+            .map(|e| e.text.as_str()),
+        Some("steer this task")
+    );
     control(
         &storage,
         &id,
@@ -389,6 +403,14 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
             s.pending_question_count() == remaining
         })?;
         assert_eq!(current.status, Status::Running);
+        let latest = current
+            .entries
+            .iter()
+            .rev()
+            .find(|e| e.kind == "userMessage")
+            .context("Accepted question answer")?;
+        assert!(latest.text.contains(answer));
+        assert!(!latest.text.contains("Act on this answer now"));
         let wire = fs::read_to_string(root.join("protocol.jsonl"))?;
         assert!(
             wire.lines()

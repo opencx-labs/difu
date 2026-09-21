@@ -404,13 +404,33 @@ impl Editor {
         self.chars
             .iter()
             .chain(std::iter::once(&'\0'))
-            .map(|c| {
+            .enumerate()
+            .map(|(index, c)| {
                 let w = if *c == '\t' {
                     4
                 } else {
                     c.width().unwrap_or(0)
                 };
-                if *c != '\n' && (x.saturating_add(w) > width || x >= width) {
+                let word_start = *c != '\0'
+                    && !c.is_whitespace()
+                    && (index == 0 || self.chars.get(index - 1).is_some_and(|c| c.is_whitespace()));
+                if word_start && x > 0 {
+                    let word_width = self
+                        .chars
+                        .iter()
+                        .skip(index)
+                        .take_while(|c| !c.is_whitespace())
+                        .fold(0usize, |total, ch| {
+                            total.saturating_add(ch.width().unwrap_or(0))
+                        });
+                    if word_width <= width && x.saturating_add(word_width) > width {
+                        x = 0;
+                        y += 1;
+                    }
+                }
+                // Trailing spaces belong to the preceding row. They must not create
+                // an empty row before the next word; the source remains unchanged.
+                if *c != '\n' && !c.is_whitespace() && (x.saturating_add(w) > width || x >= width) {
                     x = 0;
                     y += 1;
                 }
@@ -479,16 +499,16 @@ impl Editor {
             Vec::new()
         };
         for (index, character) in self.chars.iter().enumerate() {
-            let Some(&(_, row)) = positions.get(index) else {
+            let Some(&(column, row)) = positions.get(index) else {
                 continue;
             };
             while rows.len() <= row {
                 rows.push(Line::default());
             }
             let is_selected = range.as_ref().is_some_and(|r| r.contains(&index));
-            if *character != '\n' || is_selected {
+            if column < width.max(1) && (*character != '\n' || is_selected) {
                 let text = match character {
-                    '\t' => "    ".into(),
+                    '\t' => " ".repeat(width.max(1).saturating_sub(column).min(4)),
                     '\n' => " ".into(),
                     c => c.to_string(),
                 };
@@ -522,6 +542,28 @@ fn is_word(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn word_wrapping_keeps_cursor_selection_and_source_aligned() {
+        let mut editor = Editor::from("one two three");
+        let (rows, cursor) = editor.layout(9);
+        assert_eq!(rows, ["one two ", "three"]);
+        assert_eq!(cursor, (5, 1));
+        editor.cursor = 0;
+        editor.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        assert_eq!(editor.cursor, 8);
+        assert_eq!(editor.selected_text().as_deref(), Some("one two "));
+        assert_eq!(editor.layout(9).1, (0, 1));
+        let editor = Editor::from("abc def");
+        let (rows, cursor) = editor.layout(3);
+        assert_eq!(rows, ["abc", "def", ""]);
+        assert_eq!(cursor, (0, 2));
+        assert_eq!(editor.text(), "abc def");
+        let editor = Editor::from("hi 世界 ok");
+        assert_eq!(editor.layout(6).0, ["hi ", "世界 ", "ok"]);
+        let editor = Editor::from("abcdefghij");
+        assert_eq!(editor.layout(4).0, ["abcd", "efgh", "ij"]);
+    }
+
     #[test]
     fn terminal_control_aliases_move_delete_and_undo_logical_lines() {
         let mut e = Editor::from("before\ncurrent 世界 line\nafter");

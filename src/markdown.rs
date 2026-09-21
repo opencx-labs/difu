@@ -12,7 +12,7 @@ use ratatui::{
 use unicode_width::UnicodeWidthChar;
 
 /// Wrap styled text without losing emphasis across terminal rows.
-fn wrap(spans: Vec<Span<'static>>, width: usize) -> Vec<TextRow> {
+pub(crate) fn wrap(spans: Vec<Span<'static>>, width: usize) -> Vec<TextRow> {
     let width = width.max(1);
     let mut rows = Vec::new();
     let mut row = TextRow::default();

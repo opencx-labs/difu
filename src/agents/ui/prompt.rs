@@ -92,12 +92,10 @@ impl Ui {
                 Line::from(format!("{}{line}", if i == 0 { "› " } else { "  " })).style(style)
             })
             .collect::<Vec<_>>();
-        if let Some(line) = lines.last_mut() {
-            let hint = if self.focus == Focus::Prompt {
-                " ↵ Expand"
-            } else {
-                " · Latest prompt"
-            };
+        if self.focus == Focus::Prompt
+            && let Some(line) = lines.last_mut()
+        {
+            let hint = " ↵ Expand";
             let text = line.to_string();
             *line = Line::from(format!(
                 "{}{hint}",
