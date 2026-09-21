@@ -104,6 +104,7 @@ pub struct Review {
     pub newer: Option<PrDetail>,
     pub loading: bool,
     pub preparing: bool,
+    pub refreshing_revision: bool,
     pub preparation_failed: bool,
     pub preparation_started: Option<Instant>,
     pub preparation_progress: Option<repo::SnapshotProgress>,
@@ -163,6 +164,7 @@ pub enum Message {
     InboxStats(u64, Vec<(String, Option<PrStats>)>),
     Repositories(Result<Vec<String>, String>),
     Detail(String, Result<PrDetail, String>),
+    RefreshDetail(String, u64, Result<PrDetail, String>),
     Timeline(String, Result<Vec<TimelineItem>, String>),
     Checks(String, Result<CheckReport, String>),
     Poll(String, u64, Result<Option<PrDetail>, String>),
@@ -661,6 +663,7 @@ impl App {
         let Some(review) = self.reviews.get_mut(&id) else {
             return;
         };
+        review.refreshing_revision = false;
         review.preparing = true;
         review.preparation_started = Some(Instant::now());
         review.preparation_progress = Some(repo::SnapshotProgress {
@@ -912,7 +915,7 @@ impl App {
             self.load_inbox();
             return;
         };
-        if self.view == View::Overview {
+        if self.home || self.review().is_none_or(|r| r.snapshot.is_none()) {
             if let Some(review) = self.reviews.get_mut(&id) {
                 review
                     .failures
@@ -947,7 +950,56 @@ impl App {
                 Notice::info("Cancel the current generation before refreshing its snapshot");
             return;
         }
-        if review.preparing {
+        if review.preparing || review.refreshing_revision {
+            return;
+        }
+        let Some(pr) = review.detail.clone() else {
+            return;
+        };
+        review
+            .failures
+            .retain(|_, failures| !failures.tests.is_empty());
+        review.poll_at = None;
+        review.refreshing_revision = true;
+        let sequence = review.snapshot_id;
+        self.notice = Notice::info("Checking the latest PR revision…");
+        self.spawn(move |tx, cancel| {
+            let _ = tx.send(Message::RefreshDetail(
+                id.clone(),
+                sequence,
+                result(github::detail(&pr.key, &cancel)),
+            ));
+            let _ = tx.send(Message::Timeline(
+                id,
+                result(github::timeline(&pr.key, &cancel)),
+            ));
+        });
+    }
+    fn refreshed_revision(&mut self, id: String, sequence: u64, output: Result<PrDetail, String>) {
+        let Some(review) = self.reviews.get_mut(&id) else {
+            return;
+        };
+        if review.snapshot_id != sequence {
+            return;
+        }
+        review.refreshing_revision = false;
+        let pr = match output {
+            Ok(pr) => pr,
+            Err(error) => {
+                self.notice = Notice::error(format!("Could not refresh PR: {error}"));
+                return;
+            }
+        };
+        // An explicit refresh is authoritative even if an earlier poll saw another revision.
+        review.newer = None;
+        self.receive(Message::Detail(id.clone(), Ok(pr)));
+        if self.home || self.key().as_ref() != Some(&id) {
+            return;
+        }
+        let Some(review) = self.reviews.get(&id) else {
+            return;
+        };
+        if review.preparing || review.generation.is_some() {
             return;
         }
         if let Some(newer) = review.newer.clone() {
@@ -964,9 +1016,7 @@ impl App {
                     Notice::info("Locate this repository's local clone before refreshing");
             }
         } else {
-            self.notice = Notice::info(
-                "This snapshot is current. Remote revisions are checked every 30 seconds.",
-            );
+            self.notice = Notice::info("This snapshot matches the latest PR revision.");
         }
     }
     pub fn load_models(&mut self) {
@@ -1221,6 +1271,9 @@ impl App {
                         }
                     }
                 }
+            }
+            Message::RefreshDetail(id, sequence, output) => {
+                self.refreshed_revision(id, sequence, output);
             }
             Message::Detail(id, output) => {
                 let r = self.reviews.entry(id.clone()).or_default();
@@ -2875,6 +2928,48 @@ mod tests {
             review.newer.as_ref().context("Missing new revision")?.head,
             "new"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_refresh_ignores_stale_results_and_preserves_other_prs() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = App::new(
+            Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().into(),
+            },
+            Config::default(),
+        );
+        let pr = detail("pinned");
+        let id = pr.key.id();
+        app.reviews.insert(
+            id.clone(),
+            Review {
+                detail: Some(Arc::new(pr)),
+                snapshot_id: 2,
+                refreshing_revision: true,
+                ..Review::default()
+            },
+        );
+        app.receive(Message::RefreshDetail(
+            id.clone(),
+            1,
+            Ok(detail("obsolete")),
+        ));
+        let review = app.reviews.get(&id).context("Missing review")?;
+        assert!(review.refreshing_revision);
+        assert_eq!(review.detail.as_ref().context("Missing PR")?.head, "pinned");
+        app.receive(Message::RefreshDetail(id.clone(), 2, Err("offline".into())));
+        let review = app.reviews.get(&id).context("Missing review")?;
+        assert!(!review.refreshing_revision);
+        assert_eq!(review.detail.as_ref().context("Missing PR")?.head, "pinned");
+        // Switching to another PR while refreshing cannot start a snapshot there.
+        app.home = false;
+        app.opened = Some("example/other#2".into());
+        app.receive(Message::RefreshDetail(id.clone(), 2, Ok(detail("latest"))));
+        assert!(!app.reviews.get(&id).context("Missing review")?.preparing);
+        assert!(!app.reviews.contains_key("example/other#2"));
         Ok(())
     }
 

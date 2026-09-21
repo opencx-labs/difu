@@ -26,6 +26,10 @@ else:
     assert 'Review input JSON file:' not in prompt
     assert Path('main.rs').read_text() == 'fn main() {\n    new();\n}\n'
     hunks = [h['id'] for f in manifest['files'] for h in f['hunks']]
+    schema = json.loads(Path(args[args.index('--output-schema')+1]).read_text())
+    assert set(schema['properties']['hunk_assignments']['required']) == set(hunks)
+    assert set(schema['properties']['hunk_assignments']['properties']) == set(hunks)
+    assert schema['$defs']['placements']['minItems'] == 1
     print(json.dumps(dict(type='turn.started')), flush=True)
     if (root / 'hold-guide').exists():
         (root / 'guide-waiting').write_text('waiting')
@@ -33,8 +37,8 @@ else:
             time.sleep(0.03)
     output = Path(args[args.index('--output-last-message')+1])
     output.write_text(json.dumps(dict(chapters=[
-        dict(category='regular', title='Use the new behavior', explanation='The entry point calls `new()` to select the new behavior.', hunks=hunks + hunks),
-        dict(category='regular', title='Follow the entry point', explanation='The same entry point demonstrates how the behavior is reached.', hunks=hunks),
-    ])))
+        dict(category='regular', title='Use the new behavior', explanation='The entry point calls `new()` to select the new behavior.'),
+        dict(category='regular', title='Follow the entry point', explanation='The same entry point demonstrates how the behavior is reached.'),
+    ], hunk_assignments={h: [dict(chapter=0, order=i), dict(chapter=0, order=i), dict(chapter=1, order=i)] for i, h in enumerate(hunks)})))
     with (root / 'turns').open('a') as f:
         f.write('turn\n')

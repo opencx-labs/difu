@@ -2157,12 +2157,16 @@ impl Ui {
         };
         let requests_height =
             u16::from(!session.pending.is_empty()) + u16::from(!session.queue.is_empty());
-        let meta = format!(
-            "{} · {} · {}",
-            session.job.kind(),
-            session.model.as_deref().unwrap_or("Codex defaults"),
-            session.effort.as_deref().unwrap_or("default reasoning")
-        );
+        let (model, effort) = match &session.job {
+            Job::Guide { model, .. } | Job::Conflict { model, .. } => {
+                (model.model.as_str(), model.effort.as_str())
+            }
+            Job::Coding(_) => (
+                session.model.as_deref().unwrap_or("Codex defaults"),
+                session.effort.as_deref().unwrap_or("default reasoning"),
+            ),
+        };
+        let meta = format!("{} · {model} · {effort}", session.job.kind());
         frame.render_widget(
             Paragraph::new(meta).style(Style::default().fg(DIM)),
             Rect::new(area.x, area.y, area.width, 1),

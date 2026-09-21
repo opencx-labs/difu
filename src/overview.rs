@@ -2,7 +2,7 @@
 use crate::{
     app::{Action, Review},
     model::clean,
-    ui::{ACCENT, BG, BORDER, DIM, GREEN, PANEL, RED, TEXT, TextRow, bold, link, prose, text},
+    ui::{BG, BORDER, DIM, GREEN, PANEL, RED, TEXT, TextRow, bold, link, prose, text},
 };
 use ratatui::{
     layout::Rect,
@@ -137,7 +137,7 @@ fn date(value: &str) -> String {
 fn state_color(state: &str) -> Color {
     match state {
         "open" => GREEN,
-        "merged" => ACCENT,
+        "merged" => crate::ui::PURPLE,
         "closed" => RED,
         _ => DIM,
     }
@@ -305,7 +305,7 @@ pub(crate) fn rows_with_images(review: &Review, width: u16, images: bool) -> Vec
         let (symbol, color) = match check.state.as_str() {
             "pass" => ("✓", GREEN),
             "fail" => ("×", RED),
-            "pending" | "expected" => ("◌", ACCENT),
+            "pending" | "expected" => ("◌", crate::ui::YELLOW),
             _ => ("−", DIM),
         };
         let duration = chrono::DateTime::parse_from_rfc3339(&check.started)
@@ -456,5 +456,17 @@ mod status_tests {
         );
         assert!(text.contains("mail::reply"));
         assert!(text.contains("assertion failed"));
+    }
+}
+
+#[cfg(test)]
+mod status_color_tests {
+    use super::*;
+    #[test]
+    fn lifecycle_colors_are_independent_of_theme_accent() {
+        assert_eq!(state_color("merged"), crate::ui::PURPLE);
+        assert_eq!(state_color("open"), GREEN);
+        assert_eq!(state_color("closed"), RED);
+        assert_ne!(state_color("merged"), crate::ui::ACCENT);
     }
 }

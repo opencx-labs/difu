@@ -708,4 +708,6 @@ working-copy contents. The selected source line stays anchored.
 Guide generation supplies the complete diff directly in a compact initial Codex
 prompt. Additional repository reads are reserved for specific uncertainties.
 Progress records worktree preparation, setup, model time, tool calls, validation,
-and cleanup. Full-hunk validation remains mandatory before a guide is accepted.
+and cleanup. The response schema requires a nonempty chapter assignment for every
+hunk, including metadata-only changes. Difu reconstructs the ordered chapters and
+validates complete coverage before accepting or caching the guide.
