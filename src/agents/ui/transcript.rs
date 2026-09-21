@@ -1,4 +1,5 @@
 use super::*;
+use ratatui::style::Color;
 
 pub(super) struct Section {
     pub id: String,
@@ -112,6 +113,7 @@ fn label(entry: &Entry, running: bool) -> String {
             field(&entry.data, "query")
         ),
         "imageView" => format!("Read {}", field(&entry.data, "path")),
+        "autoApprovalReview" => "Reviewing approval request".into(),
         "contextCompaction" => "Compact conversation".into(),
         "collabAgentToolCall" => "Agent activity".into(),
         "progress" => entry
@@ -123,36 +125,113 @@ fn label(entry: &Entry, running: bool) -> String {
         _ => "Tool activity".into(),
     }
 }
-pub(super) fn activity(session: &Session) -> String {
-    let now = chrono::Utc::now().timestamp_millis();
-    let elapsed = session
-        .turn_started_at
-        .map(|at| format!(" · {}s", now.saturating_sub(at).max(0) / 1000))
-        .unwrap_or_default();
-    let spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-        .get(((now.max(0) / 100) % 10) as usize)
-        .copied()
-        .unwrap_or("·");
-    let state = if !session.pending.is_empty() {
-        "Waiting for your answer"
-    } else if session
-        .entries
-        .last()
-        .is_some_and(|e| e.kind == "contextCompaction" && e.finished_at.is_none())
+fn activity_text(session: &Session) -> (String, Option<String>, Option<i64>) {
+    if session
+        .pending
+        .iter()
+        .any(|p| p.id == "difu-missing-guidance")
     {
-        "Compacting context"
-    } else if session
+        return (
+            "Waiting for repository guidance".into(),
+            None,
+            session.turn_started_at,
+        );
+    }
+    if let Some(review) = session
         .entries
-        .last()
-        .is_some_and(|e| e.kind == "agentMessage" && e.finished_at.is_none())
+        .iter()
+        .rev()
+        .find(|e| e.kind == "autoApprovalReview" && e.finished_at.is_none())
     {
-        "Responding"
-    } else if session.status == Status::Starting {
+        let target = review.data.get("targetItemId").and_then(Value::as_str);
+        let detail = session
+            .entries
+            .iter()
+            .find(|e| Some(e.id.as_str()) == target)
+            .map(|e| label(e, true));
+        return (
+            "Reviewing approval request".into(),
+            detail,
+            review.started_at,
+        );
+    }
+    if session.pending.iter().any(|p| !p.is_async_question()) {
+        return (
+            "Waiting for your approval or answer".into(),
+            None,
+            session.turn_started_at,
+        );
+    }
+    if let Some(entry) = session.entries.iter().rev().find(|e| {
+        e.started_at.is_some()
+            && e.finished_at.is_none()
+            && !matches!(
+                e.kind.as_str(),
+                "userMessage" | "sending" | "sending_context" | "system"
+            )
+    }) {
+        let state = match entry.kind.as_str() {
+            "agentMessage" => "Responding".into(),
+            "reasoning" => "Thinking".into(),
+            "contextCompaction" => "Compacting context".into(),
+            _ => label(entry, true),
+        };
+        return (state, None, entry.started_at);
+    }
+    let state = if session.status == Status::Starting {
         "Preparing session"
+    } else if session.status == Status::Waiting {
+        "Waiting for your answer"
     } else {
         "Working"
     };
-    format!("{spinner} {state}{elapsed}")
+    (state.into(), None, session.turn_started_at)
+}
+fn shimmer(text: &str, now: i64) -> Line<'static> {
+    let length = text.chars().count();
+    let phase = (now.max(0) as usize / 60) % length.saturating_add(16).max(1);
+    Line::from(
+        text.chars()
+            .enumerate()
+            .map(|(index, ch)| {
+                let distance = index.saturating_add(8).abs_diff(phase);
+                let color = match distance {
+                    0..=1 => Color::Rgb(235, 240, 235),
+                    2..=3 => Color::Rgb(190, 200, 190),
+                    4..=5 => Color::Rgb(150, 165, 150),
+                    _ => DIM,
+                };
+                Span::styled(ch.to_string(), Style::default().fg(color))
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+pub(super) fn activity(session: &Session, width: u16, now: i64) -> Vec<Line<'static>> {
+    if !session.status.active() {
+        return Vec::new();
+    }
+    let (state, detail, started) = activity_text(session);
+    let seconds = started.map_or(0, |at| now.saturating_sub(at).max(0) / 1000);
+    let elapsed = if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    };
+    let mut lines = wrapped(&format!("• {state} ({elapsed})"), width)
+        .into_iter()
+        .map(|text| shimmer(&text, now))
+        .collect::<Vec<_>>();
+    if let Some(detail) = detail {
+        lines.extend(
+            wrapped(
+                &format!("  └ {}", detail.lines().next().unwrap_or_default()),
+                width,
+            )
+            .into_iter()
+            .map(|text| Line::from(Span::styled(text, Style::default().fg(DIM)))),
+        );
+    }
+    lines
 }
 pub(super) fn render(
     session: &Session,
@@ -240,7 +319,9 @@ pub(super) fn render(
             })),
             _ => {
                 let expanded = position.expanded.contains(&entry.id);
-                let failed = matches!(field(&entry.data, "status").as_str(), "failed" | "declined")
+                let review_status = entry.data.pointer("/review/status").and_then(Value::as_str);
+                let failed = matches!(review_status, Some("denied" | "timedOut"))
+                    || matches!(field(&entry.data, "status").as_str(), "failed" | "declined")
                     || entry
                         .data
                         .get("exitCode")
@@ -253,7 +334,9 @@ pub(super) fn render(
                     "failed"
                 } else if running {
                     "running"
-                } else if field(&entry.data, "status") == "interrupted" {
+                } else if field(&entry.data, "status") == "interrupted"
+                    || review_status == Some("aborted")
+                {
                     "interrupted"
                 } else if entry.finished_at.is_some() {
                     "done"
@@ -420,6 +503,15 @@ pub(super) fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shimmer_changes_only_color_without_moving_text_or_painting_background() {
+        let first = shimmer("Reviewing approval request", 480);
+        let next = shimmer("Reviewing approval request", 960);
+        assert_eq!(first.to_string(), next.to_string());
+        assert_eq!(first.width(), next.width());
+        assert_ne!(first, next);
+        assert!(first.spans.iter().all(|span| span.style.bg.is_none()));
+    }
     #[test]
     fn fenced_code_keeps_syntax_colors_when_wrapped() {
         let rows = prose(

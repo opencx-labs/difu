@@ -260,6 +260,15 @@ impl Editor {
                 key.modifiers = KeyModifiers::SUPER;
             }
         }
+        // Ghostty translates Option+Left/Right to ESC b/f (Alt+b/f).
+        // Keep this translation inside inputs so other panes retain their shortcuts.
+        if key.modifiers == KeyModifiers::ALT {
+            key.code = match key.code {
+                KeyCode::Char('b') => KeyCode::Left,
+                KeyCode::Char('f') => KeyCode::Right,
+                code => code,
+            };
+        }
         self.cursor = self.cursor.min(self.chars.len());
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let command = key.modifiers.contains(KeyModifiers::SUPER);
@@ -651,6 +660,26 @@ mod tests {
         e.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SUPER));
         assert_eq!(e.cursor, 24);
         assert!(e.selection().is_none());
+    }
+    #[test]
+    fn native_and_ghostty_word_navigation_match_without_editing_text() {
+        for (left, right) in [
+            (KeyCode::Left, KeyCode::Right),
+            (KeyCode::Char('b'), KeyCode::Char('f')),
+        ] {
+            let mut editor = Editor::from("hello, 世界 foo_bar");
+            for expected in [10, 7, 0, 0] {
+                editor.key(KeyEvent::new(left, KeyModifiers::ALT));
+                assert_eq!(editor.cursor, expected);
+                assert!(editor.selection().is_none());
+            }
+            for expected in [5, 9, 17, 17] {
+                editor.key(KeyEvent::new(right, KeyModifiers::ALT));
+                assert_eq!(editor.cursor, expected);
+                assert!(editor.selection().is_none());
+            }
+            assert_eq!(editor.text(), "hello, 世界 foo_bar");
+        }
     }
     #[test]
     fn word_selection_crosses_punctuation_and_preserves_unicode_anchor() {

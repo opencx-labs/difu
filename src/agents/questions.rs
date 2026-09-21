@@ -56,17 +56,19 @@ pub(super) fn prepare_answer(
 }
 
 pub(super) fn save_answer(store: &super::server::Store, id: &str, updated: Pending) -> Result<()> {
-    store.update(id, |session| {
-        if updated.is_async_question() && updated.unanswered_questions().is_empty() {
-            if let Some(id) = updated.id.as_str() {
-                session.answered_questions.insert(id.into());
-            }
-            session.pending.retain(|p| p.id != updated.id);
-        } else if let Some(pending) = session.pending.iter_mut().find(|p| p.id == updated.id) {
-            *pending = updated;
-        }
-    })?;
+    store.update(id, |session| record_answer(session, updated))?;
     store.save(id)
+}
+
+pub(super) fn record_answer(session: &mut Session, updated: Pending) {
+    if updated.is_async_question() && updated.unanswered_questions().is_empty() {
+        if let Some(id) = updated.id.as_str() {
+            session.answered_questions.insert(id.into());
+        }
+        session.pending.retain(|p| p.id != updated.id);
+    } else if let Some(pending) = session.pending.iter_mut().find(|p| p.id == updated.id) {
+        *pending = updated;
+    }
 }
 
 impl Session {

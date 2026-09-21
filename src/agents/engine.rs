@@ -253,6 +253,9 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
             session.pending.retain(Pending::is_async_question);
             session.workspace_requests.clear();
             for entry in &mut session.entries {
+                if let Some(data) = entry.data.as_object_mut() {
+                    data.remove("difuSteeringTurn");
+                }
                 if entry.started_at.is_some() && entry.finished_at.is_none() {
                     entry.finished_at = Some(chrono::Utc::now().timestamp_millis());
                     if entry.kind != "agentMessage"
@@ -287,6 +290,45 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                 for text in std::mem::take(&mut session.queue) {
                     session.unsent(text);
                 }
+            }
+        }
+        "item/autoApprovalReview/started" | "item/autoApprovalReview/completed" => {
+            let review_id = string(params, "reviewId");
+            if review_id.is_empty() {
+                return;
+            }
+            let id = format!("approval-review-{review_id}");
+            let now = chrono::Utc::now().timestamp_millis();
+            let completed = method.ends_with("/completed");
+            if let Some(entry) = session.entries.iter_mut().find(|e| e.id == id) {
+                entry.data = params.clone();
+                if completed {
+                    entry.finished_at = Some(
+                        params
+                            .get("completedAtMs")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(now),
+                    );
+                }
+            } else {
+                session.entries.push(Entry {
+                    id,
+                    kind: "autoApprovalReview".into(),
+                    data: params.clone(),
+                    started_at: Some(
+                        params
+                            .get("startedAtMs")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(now),
+                    ),
+                    finished_at: completed.then(|| {
+                        params
+                            .get("completedAtMs")
+                            .and_then(Value::as_i64)
+                            .unwrap_or(now)
+                    }),
+                    ..Entry::default()
+                });
             }
         }
         "serverRequest/resolved" => {
@@ -525,8 +567,8 @@ fn send_turn(
         );
         if let Some(entry) = s.entries.last_mut() {
             sending_id = Some(entry.id.clone());
-            entry.data =
-                json!({"wire_text":wire_text,"attachments":prompt.attachments(),"prompt":prompt});
+            entry.data = json!({"wire_text":wire_text,"attachments":prompt.attachments(),"prompt":prompt,
+                "difuSteeringTurn":if steer && !internal { session.turn_id.clone() } else { None }});
         }
     })?;
     store.save(id)?;
@@ -1060,7 +1102,8 @@ mod tests {
         );
         for text in ["first steering message", "> Question?\nAnswer with notes"] {
             session.note("userMessage", text);
-            session.entries.last_mut().context("message")?.data = json!({"wire_text":text});
+            session.entries.last_mut().context("message")?.data =
+                json!({"wire_text":text, "difuSteeringTurn":"t"});
         }
         session.note("agentMessage", "Continuing the task");
         let echo = json!({"method":"item/completed","params":{"item":{
@@ -1070,6 +1113,24 @@ mod tests {
         apply_event(&mut session, &echo);
         apply_event(&mut session, &echo);
         assert_eq!(session.entries.len(), 3);
+        assert!(
+            session
+                .entries
+                .first()
+                .context("echoed message")?
+                .data
+                .get("difuSteeringTurn")
+                .is_none()
+        );
+        assert_eq!(
+            session
+                .entries
+                .get(1)
+                .context("pending message")?
+                .data
+                .get("difuSteeringTurn"),
+            Some(&json!("t"))
+        );
         assert_eq!(
             session.entries.first().map(|e| e.id.as_str()),
             Some("first-server-id")
@@ -1083,6 +1144,18 @@ mod tests {
                 .map(|e| e.text.as_str()),
             Some("> Question?\nAnswer with notes")
         );
+        apply_event(
+            &mut session,
+            &json!({"method":"turn/completed","params":{"turn":{"id":"t","status":"completed"}}}),
+        );
+        assert_eq!(session.entries.len(), 3);
+        assert!(
+            session
+                .entries
+                .iter()
+                .all(|e| e.data.get("difuSteeringTurn").is_none())
+        );
+        assert!(session.queue.is_empty()); // Display cleanup never resubmits accepted steering.
         Ok(())
     }
 
@@ -1147,6 +1220,44 @@ mod tests {
         restored.pending.clear();
         apply_event(&mut restored, &event);
         assert!(restored.pending.is_empty());
+        Ok(())
+    }
+    #[test]
+    fn automatic_review_events_preserve_identity_and_finish_without_user_approval() -> Result<()> {
+        let mut session = Session::new(
+            "test".into(),
+            Job::Coding(super::super::Launch {
+                repository: ".".into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: "task".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.status = Status::Running;
+        session.thread_id = Some("thread".into());
+        session.turn_id = Some("turn".into());
+        let params = json!({"reviewId":"review", "threadId":"thread", "turnId":"turn", "startedAtMs":1000, "targetItemId":"tool", "review":{"status":"inProgress"}});
+        let started = json!({"method":"item/autoApprovalReview/started","params":params});
+        apply_event(&mut session, &started);
+        apply_event(&mut session, &started);
+        assert_eq!(session.entries.len(), 1);
+        assert!(session.pending.is_empty());
+        assert_eq!(session.status, Status::Running);
+        apply_event(
+            &mut session,
+            &json!({"method":"item/autoApprovalReview/completed","params":{
+                "reviewId":"review", "threadId":"thread", "turnId":"turn", "startedAtMs":1000, "completedAtMs":4000, "review":{"status":"denied"}
+            }}),
+        );
+        assert_eq!(session.entries.len(), 1);
+        assert_eq!(
+            session.entries.first().context("review")?.finished_at,
+            Some(4000)
+        );
+        assert_eq!(session.thread_id.as_deref(), Some("thread"));
+        assert_eq!(session.turn_id.as_deref(), Some("turn"));
         Ok(())
     }
     #[test]

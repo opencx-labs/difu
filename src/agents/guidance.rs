@@ -1,6 +1,6 @@
 //! Copy only explicitly approved missing local guidance into an isolated worktree.
 use super::{
-    Control, Job, Pending, Session, Status,
+    Control, Job, Pending, Prompt, Session, Status,
     server::{Command, Store},
 };
 use crate::{
@@ -192,8 +192,8 @@ pub fn confirm(
                             let _ = command.reply.send(Ok(()));
                             cancel.check()?;
                         }
-                        _ => {
-                            let _ = command.reply.send(Err(anyhow::anyhow!("Answer the repository guidance question before starting this session")));
+                        control => {
+                            let _ = command.reply.send(queue_while_waiting(store, id, control));
                         }
                     }
                 }
@@ -209,5 +209,75 @@ pub fn confirm(
         s.pending.retain(|p| p.id != json!("difu-missing-guidance"));
         s.status = Status::Starting;
     })?;
+    store.save(id)
+}
+
+// The Codex connection is paused during this transition. Persist input without
+// treating a chat message or unrelated answer as approval to copy guidance.
+fn queue_while_waiting(store: &Store, id: &str, control: Control) -> Result<()> {
+    let session = store.get(id)?;
+    match control {
+        Control::Message {
+            text,
+            skills,
+            attachments,
+            ..
+        }
+        | Control::MessageWithAttachments {
+            text,
+            skills,
+            attachments,
+            ..
+        } => {
+            ensure!(!text.trim().is_empty(), "Message cannot be empty");
+            store.update(id, |s| {
+                s.queue.push(Prompt::WithSkills {
+                    text,
+                    skills,
+                    attachments,
+                })
+            })?;
+        }
+        Control::AnswerQuestion {
+            request,
+            question,
+            answer,
+        } => {
+            let (updated, text) =
+                super::questions::prepare_answer(&session, &request, &question, answer.as_deref())?;
+            ensure!(
+                updated.is_async_question(),
+                "Answer the repository guidance question to finish switching this conversation into its worktree"
+            );
+            store.update(id, |s| {
+                if answer.is_some() {
+                    s.queue.push(Prompt::from(text));
+                }
+                super::questions::record_answer(s, updated);
+            })?;
+        }
+        Control::ReplaceQueued {
+            index,
+            expected,
+            replacement,
+        } => {
+            ensure!(
+                session.queue.get(index) == Some(&expected),
+                "That queued message changed; refresh the queue. Your draft is retained."
+            );
+            store.update(id, |s| {
+                if let Some(prompt) = replacement {
+                    if let Some(item) = s.queue.get_mut(index) {
+                        *item = prompt;
+                    }
+                } else {
+                    s.queue.remove(index);
+                }
+            })?;
+        }
+        _ => anyhow::bail!(
+            "Answer the repository guidance question to finish switching this conversation into its worktree. Messages can still be queued."
+        ),
+    }
     store.save(id)
 }

@@ -62,6 +62,10 @@ for line in sys.stdin:
         event('item/started', {'threadId':thread_id,'turnId':active,'item':{'id':'message-'+connection+'-'+str(turn),'type':'agentMessage','text':''}})
         event('item/agentMessage/delta', {'threadId':thread_id,'turnId':active,'itemId':'message-'+connection+'-'+str(turn),'delta':'Streaming fixture task'})
         if text.startswith('need edit') and sandbox == 'read-only':
+            if 'with questions' in text:
+                event('item/completed', {'threadId':thread_id,'turnId':active,'item':{
+                    'id':'workspace-question','type':'agentMessage','delivery':'async','text':'One question',
+                    'questions':[{'title':'Which detail?','options':['Brief','Full']}]}})
             emit({'id':900+turn,'method':'item/tool/call','params':{'threadId':thread_id,'turnId':active,'callId':'workspace','tool':'difu_begin_editing','arguments':{}}})
         elif text.startswith('chat only'):
             complete()
