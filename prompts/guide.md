@@ -61,17 +61,24 @@ Write a sequence of chapters that teaches a reviewer how the change works:
 - This is an explanation, not a scored review: do not give confidence scores,
   merge recommendations, reviewed checkboxes, or interactive follow-up prompts.
 
-Return only JSON matching the supplied schema. Each chapter has a category, a
-title, an explanation, and an ordered array of hunk IDs from the input. Use
-"schema" for handwritten schemas and DTOs, "migrations" for database migrations,
-"regular" for ordinary implementation or mechanical changes,
-"generated" for generated output, and
-"tests" for tests and their supporting fixtures. Difu renders section dividers;
-do not invent empty divider chapters or put divider labels in chapter titles.
-Preserve logical dependency order within each category. Every input hunk ID
-must appear at least once across the guide, including metadata-only review units.
-A hunk may appear in multiple chapters when it supports their explanations.
-List each hunk ID only once within a chapter.
-Use only those IDs as code references: difu resolves them to real files and code.
-Never invent IDs, URLs, or line references, and do not hide omitted changes.
-Read every supplied hunk before finalizing the chapter assignments.
+Return only JSON matching the supplied schema, with two fields:
+
+- `chapters`: an ordered array of chapter objects, each with `category`, `title`,
+  and `explanation`. Use "schema" for handwritten schemas and DTOs, "migrations"
+  for database migrations, "regular" for ordinary implementation or mechanical
+  changes, "generated" for generated output, and "tests" for tests and fixtures.
+  Difu renders section dividers; do not invent empty divider chapters or put
+  divider labels in chapter titles. Preserve logical order within each category.
+- `hunk_assignments`: an object with EVERY input hunk ID as a required key, including
+  metadata-only review units. Each value is a nonempty array of placements:
+  `{"chapter": 0, "order": 0}`. `chapter` is the zero-based index in your chapters
+  array; `order` is the zero-based position of that hunk within that chapter.
+  Assign a hunk to multiple chapters when it supports their explanations, using
+  one placement per chapter. Give every chapter at least one assigned hunk.
+
+For example, a hunk belonging first in chapter 0 and third in chapter 2 has
+`"f0-h0": [{"chapter": 0, "order": 0}, {"chapter": 2, "order": 2}]`.
+Those IDs and chapter indices are examples only: use the actual supplied hunks
+and the chapters you wrote. Do not put hunk arrays inside chapter objects.
+Never invent hunk IDs, URLs, or line references, and do not hide omitted changes.
+Read every supplied hunk before finalizing its assignments.

@@ -1,3 +1,5 @@
+mod guide_output;
+
 use crate::{
     diff::Snapshot,
     model::{ModelChoice, ModelInfo, PrDetail},
@@ -173,7 +175,7 @@ pub fn cache_key(pr: &PrDetail, snapshot: &Snapshot, model: &ModelChoice) -> Res
         (&snapshot.head_tree, &snapshot.base_tree, &snapshot.files),
         model,
         INSTRUCTIONS,
-        schema(),
+        schema(snapshot),
     ))?))
 }
 
@@ -199,12 +201,12 @@ pub fn legacy_cache_key(pr: &PrDetail, snapshot: &Snapshot, model: &ModelChoice)
         legacy,
         model,
         INSTRUCTIONS,
-        schema(),
+        schema(snapshot),
     ))?))
 }
 
-fn schema() -> Value {
-    json!({"type":"object","additionalProperties":false,"required":["chapters"],"properties":{"chapters":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["category","title","explanation","hunks"],"properties":{"category":{"type":"string","enum":["schema","migrations","regular","generated","tests"]},"title":{"type":"string"},"explanation":{"type":"string"},"hunks":{"type":"array","items":{"type":"string"}}}}}}})
+fn schema(snapshot: &Snapshot) -> Value {
+    guide_output::schema(snapshot)
 }
 
 // An empty table is merged with inherited MCP configuration, so it does not
@@ -363,7 +365,7 @@ pub fn generate(
         let inputs = tempfile::Builder::new().prefix("difu-guide-").tempdir()?;
         let output = inputs.path().join("guide.json");
         let schema_path = inputs.path().join("schema.json");
-        fs::write(&schema_path, serde_json::to_vec(&schema())?)?;
+        fs::write(&schema_path, serde_json::to_vec(&schema(snapshot))?)?;
         let overrides = isolation_overrides(root, &worktree.path, cancel)?;
         let input = serde_json::to_string(&guide_input(pr, snapshot))?;
         let prompt = format!(
@@ -462,11 +464,11 @@ pub fn generate(
             String::from_utf8_lossy(&response.stderr).trim()
         );
         cancel.check()?;
-        let guide: Guide =
-            serde_json::from_slice(&fs::read(output).context("Codex did not produce a guide")?)
-                .context("Codex returned a guide with an invalid structure")?;
         let validation_started = Instant::now();
-        guide.validate(snapshot)?;
+        let guide = guide_output::parse(
+            &fs::read(output).context("Codex did not produce a guide")?,
+            snapshot,
+        )?;
         storage.save_guide(&key, &guide)?;
         progress(format!(
             "Guide timings · worktree {:.1}s · setup {:.1}s · Codex {:.1}s · validate/cache {:.3}s · {} tool calls",

@@ -29,6 +29,8 @@ pub(crate) fn user_message_style() -> Style {
     Style::default().bg(background).fg(Color::White)
 }
 pub(crate) const GREEN: Color = Color::Rgb(114, 216, 163);
+pub(crate) const PURPLE: Color = Color::Rgb(171, 125, 248);
+pub(crate) const YELLOW: Color = Color::Rgb(229, 192, 100);
 pub(crate) const RED: Color = Color::Rgb(247, 137, 145);
 const ADD_BG: Color = Color::Rgb(18, 43, 32);
 const REMOVE_BG: Color = Color::Rgb(49, 25, 31);

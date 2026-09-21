@@ -252,7 +252,10 @@ fn exercise(root: &Path) -> Result<()> {
         && r.guide.is_some()
         && r.snapshot.as_ref().is_some_and(|s| s.head == original_head)));
     app.key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
-    wait(&mut app, |a| a.review().is_some_and(|r| !r.preparing))?;
+    wait(&mut app, |a| {
+        a.review()
+            .is_some_and(|r| !r.preparing && !r.refreshing_revision)
+    })?;
     assert!(app.review().is_some_and(|r| r.preparation_failed
         && r.guide.is_some()
         && r.snapshot.as_ref().is_some_and(|s| s.head == original_head)));
@@ -450,7 +453,6 @@ fn exercise(root: &Path) -> Result<()> {
         a.review().is_some_and(|r| r.guide.is_some())
     })?;
     assert_eq!(fs::read_to_string(root.join("turns"))?, "turn\n");
-    reopened.shutdown();
     let restored = storage
         .load_guide(&cache_key)?
         .context("Missing restored guide")?;
@@ -466,6 +468,31 @@ fn exercise(root: &Path) -> Result<()> {
         serde_json::from_slice(&fs::read(root.join("revisions.json"))?)?;
     *revisions.get_mut("head").context("Missing head")? = serde_json::json!(rewritten);
     fs::write(root.join("revisions.json"), serde_json::to_vec(&revisions)?)?;
+    // Refresh must adopt new code from Overview without restarting, even before a poll.
+    for view in [View::Overview, View::Guide, View::Diff] {
+        git(
+            &root.join("clone"),
+            &["commit", "--amend", "-m", &format!("refresh {view:?}")],
+        )?;
+        let latest = git(&root.join("clone"), &["rev-parse", "HEAD"])?;
+        *revisions.get_mut("head").context("Missing head")? = serde_json::json!(latest);
+        fs::write(root.join("revisions.json"), serde_json::to_vec(&revisions)?)?;
+        reopened.view = view;
+        reopened.refresh();
+        assert!(reopened.review().is_some_and(|r| r.refreshing_revision));
+        wait(&mut reopened, |a| {
+            a.review().is_some_and(|r| {
+                !r.refreshing_revision
+                    && !r.preparing
+                    && r.generation.is_none()
+                    && r.detail.as_ref().is_some_and(|p| p.head == latest)
+                    && r.snapshot.as_ref().is_some_and(|p| p.head == latest)
+            })
+        })?;
+        assert_eq!(reopened.view, view);
+        assert!(reopened.review().is_some_and(|r| r.newer.is_none()));
+    }
+    reopened.shutdown();
     let mut rewritten_app = App::new(storage.clone(), config.clone());
     rewritten_app.start(Some(PrKey::from_url(
         "https://github.com/example/project/pull/1",

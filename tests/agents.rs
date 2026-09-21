@@ -820,7 +820,7 @@ fn empty_sessions_defer_worktrees_until_editing_and_restore_permissions() -> Res
     };
     control(&storage, &direct, message("make change directly"))?;
     let direct = wait(&storage, &direct, |s| {
-        s.status == Status::Idle && s.thread_id.is_some()
+        s.status == Status::Idle && s.thread_id.is_some() && repo.join("new.txt").exists()
     })?;
     assert_eq!(direct.workspace, Some(repo.canonicalize()?));
     assert!(repo.join("new.txt").exists());

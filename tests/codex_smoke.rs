@@ -31,18 +31,27 @@ fn git(root: &Path, args: &[&str]) -> Result<String> {
 }
 
 #[test]
-#[ignore = "uses installed Codex, saved login, and one Luna High generation"]
+#[ignore = "uses installed Codex, saved login, and one Luna Low generation"]
 fn generates_a_real_guide_for_synthetic_code() -> Result<()> {
     let directory = tempfile::tempdir()?;
     let root = directory.path();
     git(root, &["init"])?;
-    fs::write(root.join("main.rs"), "fn main() { println!(\"Hello\"); }\n")?;
+    fs::write(
+        root.join("main.rs"),
+        format!(
+            "fn main() {{ println!(\"Hello\"); }}\n{}fn allowed() -> bool {{ false }}\n",
+            "// unchanged context\n".repeat(12)
+        ),
+    )?;
     git(root, &["add", "."])?;
     git(root, &["commit", "-m", "base"])?;
     let base = git(root, &["rev-parse", "HEAD"])?;
     fs::write(
         root.join("main.rs"),
-        "fn main() { println!(\"Hello, world!\"); }\n",
+        format!(
+            "fn main() {{ println!(\"Hello, world!\"); }}\n{}fn allowed() -> bool {{ true }}\n",
+            "// unchanged context\n".repeat(12)
+        ),
     )?;
     git(root, &["commit", "-am", "greet the world"])?;
     let head = git(root, &["rev-parse", "HEAD"])?;
@@ -53,19 +62,20 @@ fn generates_a_real_guide_for_synthetic_code() -> Result<()> {
             number: 1,
         },
         title: "Expand the greeting".into(),
-        body: "Say hello to the world.".into(),
+        body: "Say hello to the world and enable access.".into(),
         author: "test".into(),
         head,
         base,
         head_branch: "feature".into(),
         base_branch: "main".into(),
         state: "open".into(),
-        additions: 1,
-        deletions: 1,
+        additions: 2,
+        deletions: 2,
         changed_files: 1,
     };
     let cancel = Cancel::default();
     let snapshot = repo::snapshot(root, &pr, &cancel)?;
+    assert_eq!(snapshot.units().count(), 2);
     let storage = Storage {
         config: root.join("config.json"),
         cache: root.into(),
@@ -74,7 +84,10 @@ fn generates_a_real_guide_for_synthetic_code() -> Result<()> {
         root,
         &pr,
         &snapshot,
-        &ModelChoice::default(),
+        &ModelChoice {
+            effort: "low".into(),
+            ..ModelChoice::default()
+        },
         &storage,
         &cancel,
         |activity| eprintln!("{activity}"),

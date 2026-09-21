@@ -185,7 +185,7 @@ fn matching(key: &PrKey, head: &str, cancel: &Cancel) -> Result<()> {
     let current = github::detail(key, cancel)?;
     ensure!(
         current.head == head,
-        "PR head changed. Close this dialog, refresh the PR, then confirm again. Your draft is retained."
+        "PR head changed. Close this dialog with Esc, press r to load the latest revision, then confirm again. Your draft is retained."
     );
     Ok(())
 }
