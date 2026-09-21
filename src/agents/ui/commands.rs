@@ -3,7 +3,8 @@ use super::*;
 const COMMANDS: &[(&str, &str)] = &[
     ("voice", "Configure hold-Space dictation and API key"),
     ("compact", "Compact the current conversation"),
-    ("model", "Choose model and reasoning effort"),
+    ("model", "Choose a model"),
+    ("effort", "Choose the reasoning level"),
     ("skills", "Browse skills for this workspace"),
     ("status", "Show session, workspace and permissions"),
     ("diff", "Show current session changes"),
@@ -137,6 +138,7 @@ impl Ui {
         };
         match key.code {
             KeyCode::Esc => self.modal = None,
+            KeyCode::Backspace if query.chars.is_empty() => self.modal = None,
             KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                 *selected = selected.saturating_sub(1)
             }
@@ -208,7 +210,8 @@ impl Ui {
         match name.as_str() {
             "/voice" => self.open_voice(),
             "/compact" => self.control(Control::Compact),
-            "/model" => self.menu_action(4),
+            "/model" => self.open_model(0),
+            "/effort" => self.open_model(1),
             "/skills" => self.open_commands(true),
             "/status" => self.modal = Some(Modal::Status),
             "/diff" => {

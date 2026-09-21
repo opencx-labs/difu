@@ -37,18 +37,21 @@ fn prose(text: &str, width: u16) -> Vec<Line<'static>> {
                 )));
             }
         } else if let Some(language) = &fence {
-            let color = if language == "diff" && line.starts_with('+') {
-                GREEN
-            } else if language == "diff" && line.starts_with('-') {
-                RED
+            let content = crate::model::clean(line).replace('\t', "    ");
+            let spans = if language == "diff" && (line.starts_with('+') || line.starts_with('-')) {
+                vec![Span::styled(
+                    content,
+                    Style::default().fg(if line.starts_with('+') { GREEN } else { RED }),
+                )]
             } else {
-                TEXT
+                crate::ui::syntax_spans(&content)
             };
-            rows.extend(
-                wrapped(line, width)
-                    .into_iter()
-                    .map(|s| Line::from(Span::styled(s, Style::default().fg(color).bg(PANEL)))),
-            );
+            let highlighted = crate::markdown::wrap(spans, usize::from(width).max(1));
+            if highlighted.is_empty() {
+                rows.push(Line::default());
+            } else {
+                rows.extend(highlighted.into_iter().map(|row| Line::from(row.spans)));
+            }
         } else {
             normal.push_str(line);
             normal.push('\n');
@@ -75,9 +78,13 @@ fn tool(entry: &Entry) -> bool {
             | "reasoning"
     )
 }
-fn label(entry: &Entry) -> String {
+fn label(entry: &Entry, running: bool) -> String {
     match entry.kind.as_str() {
-        "commandExecution" => format!("Run {}", field(&entry.data, "command")),
+        "commandExecution" => format!(
+            "{} {}",
+            if running { "Running" } else { "Ran" },
+            field(&entry.data, "command")
+        ),
         "fileChange" => {
             let paths = entry
                 .data
@@ -91,7 +98,7 @@ fn label(entry: &Entry) -> String {
                         .join(", ")
                 })
                 .unwrap_or_default();
-            format!("Edit {paths}")
+            format!("{} {paths}", if running { "Editing" } else { "Edited" })
         }
         "mcpToolCall" => format!(
             "{} · {}",
@@ -99,8 +106,12 @@ fn label(entry: &Entry) -> String {
             field(&entry.data, "tool")
         ),
         "dynamicToolCall" => format!("Tool {}", field(&entry.data, "tool")),
-        "webSearch" => format!("Search {}", field(&entry.data, "query")),
-        "imageView" => format!("View {}", field(&entry.data, "path")),
+        "webSearch" => format!(
+            "{} {}",
+            if running { "Searching" } else { "Searched" },
+            field(&entry.data, "query")
+        ),
+        "imageView" => format!("Read {}", field(&entry.data, "path")),
         "contextCompaction" => "Compact conversation".into(),
         "collabAgentToolCall" => "Agent activity".into(),
         "progress" => entry
@@ -147,15 +158,11 @@ pub(super) fn render(
     session: &Session,
     position: &Position,
     width: u16,
-    pinned: Option<&str>,
     focused: bool,
 ) -> (Vec<Line<'static>>, Vec<Section>) {
     let mut lines = Vec::new();
     let mut sections = Vec::new();
     for entry in &session.entries {
-        if pinned == Some(entry.id.as_str()) {
-            continue;
-        }
         if entry.text.is_empty() && entry.kind == "reasoning" {
             continue;
         }
@@ -173,19 +180,26 @@ pub(super) fn render(
                         Style::default().fg(RED),
                     )));
                 }
+                let padding = || {
+                    Line::from(" ".repeat(usize::from(width)))
+                        .style(crate::ui::user_message_style())
+                };
+                lines.push(padding());
                 for (index, text) in wrapped(&entry.text, width.saturating_sub(2))
                     .into_iter()
                     .enumerate()
                 {
                     let style = crate::ui::user_message_style();
-                    lines.push(
-                        Line::from(vec![
-                            Span::styled(if index == 0 { "› " } else { "  " }, style),
-                            Span::styled(text, style),
-                        ])
-                        .style(style),
-                    );
+                    let mut line = Line::from(vec![
+                        Span::styled(if index == 0 { "› " } else { "  " }, style),
+                        Span::styled(text, style),
+                    ])
+                    .style(style);
+                    let padding = usize::from(width).saturating_sub(line.width());
+                    line.spans.push(Span::styled(" ".repeat(padding), style));
+                    lines.push(line);
                 }
+                lines.push(padding());
             }
             "agentMessage" | "result" => lines.extend(prose(&entry.text, width)),
             "reasoning" => {
@@ -267,50 +281,95 @@ pub(super) fn render(
                     })
                     .unwrap_or_default();
                 let focus = focused && position.focused_entry.as_ref() == Some(&entry.id);
-                lines.push(Line::from(Span::styled(
-                    format!(
-                        "{} {} {} · {state}{elapsed}",
-                        if focus { "›" } else { " " },
-                        if expanded { "▾" } else { "▸" },
-                        label(entry)
-                    ),
-                    Style::default().fg(if failed {
-                        RED
-                    } else if running || focus {
-                        ACCENT
+                let color = if failed {
+                    RED
+                } else if running || focus {
+                    ACCENT
+                } else {
+                    TEXT
+                };
+                let heading = format!(
+                    "{} {} · {state}{elapsed}",
+                    if focus {
+                        "›"
+                    } else if failed {
+                        "×"
                     } else {
-                        DIM
-                    }),
-                )));
-                if expanded {
-                    let output = if entry.kind == "fileChange" {
-                        entry
-                            .data
-                            .get("changes")
-                            .and_then(Value::as_array)
-                            .map(|a| {
-                                a.iter()
-                                    .map(|v| {
-                                        format!(
-                                            "{}\n```diff\n{}\n```",
-                                            field(v, "path"),
-                                            field(v, "diff")
-                                        )
-                                    })
-                                    .collect::<Vec<_>>()
-                                    .join("\n")
-                            })
-                            .unwrap_or_else(|| entry.text.clone())
-                    } else {
-                        entry.text.clone()
-                    };
-                    if entry.kind == "commandExecution" {
-                        lines.extend(wrapped(&output, width).into_iter().map(|s| {
-                            Line::from(Span::styled(s, Style::default().fg(TEXT).bg(PANEL)))
-                        }));
-                    } else {
-                        lines.extend(prose(&output, width));
+                        "•"
+                    },
+                    label(entry, running)
+                );
+                lines.extend(
+                    wrapped(&heading, width)
+                        .into_iter()
+                        .map(|line| Line::from(Span::styled(line, Style::default().fg(color)))),
+                );
+                let output = if entry.kind == "fileChange" {
+                    entry
+                        .data
+                        .get("changes")
+                        .and_then(Value::as_array)
+                        .map(|changes| {
+                            changes
+                                .iter()
+                                .map(|change| {
+                                    format!(
+                                        "{}\n```diff\n{}\n```",
+                                        field(change, "path"),
+                                        field(change, "diff")
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .unwrap_or_else(|| entry.text.clone())
+                } else if entry.kind == "commandExecution" {
+                    entry
+                        .text
+                        .strip_prefix(&format!("$ {}\n", field(&entry.data, "command")))
+                        .unwrap_or(&entry.text)
+                        .to_owned()
+                } else {
+                    entry.text.clone()
+                };
+                let output_lines = output.lines().count();
+                let shown = if expanded {
+                    output.clone()
+                } else {
+                    output.lines().take(3).collect::<Vec<_>>().join("\n")
+                };
+                let rows = if entry.kind == "commandExecution" {
+                    wrapped(&shown, width.saturating_sub(4))
+                        .into_iter()
+                        .map(|line| Line::from(Span::styled(line, Style::default().fg(DIM))))
+                        .collect::<Vec<_>>()
+                } else {
+                    prose(&shown, width.saturating_sub(4))
+                };
+                if !shown.is_empty() {
+                    for (index, mut row) in rows.into_iter().enumerate() {
+                        row.spans.insert(
+                            0,
+                            Span::styled(
+                                if index == 0 { "  └ " } else { "    " },
+                                Style::default().fg(DIM),
+                            ),
+                        );
+                        lines.push(row);
                     }
+                }
+                if expanded || output_lines > 3 {
+                    lines.push(Line::from(Span::styled(
+                        if expanded {
+                            "    Enter/click to collapse".into()
+                        } else {
+                            format!(
+                                "    +{} lines · Enter/click to expand",
+                                output_lines.saturating_sub(3)
+                            )
+                        },
+                        Style::default().fg(DIM),
+                    )));
                 }
             }
         }
@@ -318,7 +377,10 @@ pub(super) fn render(
             && !is_tool
             && position.focused_entry.as_ref() == Some(&entry.id)
             && let Some(section) = sections.last()
-            && let Some(line) = lines.get_mut(section.row)
+            && let Some(line) = lines.get_mut(section.row.saturating_add(usize::from(matches!(
+                entry.kind.as_str(),
+                "userMessage" | "sending"
+            ))))
         {
             if matches!(
                 entry.kind.as_str(),
@@ -353,4 +415,40 @@ pub(super) fn render(
         lines.push(Line::default());
     }
     (lines, sections)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn fenced_code_keeps_syntax_colors_when_wrapped() {
+        let rows = prose(
+            "```sql\nSELECT 'abcdefghijklmno'\n-- comment\nLIMIT 10;\n```",
+            12,
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|row| &row.spans)
+                .any(|span| span.content == "SELECT" && span.style.fg == Some(ACCENT))
+        );
+        let quoted: String = rows
+            .iter()
+            .flat_map(|row| &row.spans)
+            .filter(|span| span.style.fg == Some(ratatui::style::Color::Rgb(221, 194, 139)))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(quoted, "'abcdefghijklmno'");
+        assert!(rows.iter().all(|row| row.width() <= 12));
+        let diff = prose("```diff\n+added\n-removed\n```", 40);
+        assert!(
+            diff.iter()
+                .flat_map(|row| &row.spans)
+                .any(|span| span.content == "+added" && span.style.fg == Some(GREEN))
+        );
+        assert!(
+            diff.iter()
+                .flat_map(|row| &row.spans)
+                .any(|span| span.content == "-removed" && span.style.fg == Some(RED))
+        );
+    }
 }

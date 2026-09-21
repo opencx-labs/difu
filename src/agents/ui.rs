@@ -4,6 +4,7 @@ mod commands;
 mod defaults;
 mod inline_questions;
 mod media;
+mod models;
 mod prompt;
 mod questions;
 mod selection;
@@ -89,6 +90,8 @@ enum Action {
     QueueEditorFocus,
     ChooseRepository,
     DefaultField(usize),
+    ModelField(usize),
+    ModelOption(usize),
     DefaultToggle,
     DefaultSave,
     Approve(usize),
@@ -210,6 +213,7 @@ pub struct Ui {
     paths_loading: HashSet<String>,
     sidebar: sidebar::State,
     voice: voice::State,
+    model_completion: models::State,
     media_pending: Option<(String, mpsc::Receiver<Result<super::media::Paste, String>>)>,
 }
 impl Ui {
@@ -258,6 +262,7 @@ impl Ui {
             workspace_paths: HashMap::new(),
             paths_loading: HashSet::new(),
             voice: voice::State::new(config.voice_enabled),
+            model_completion: models::State::default(),
             media_pending: None,
         }
     }
@@ -276,6 +281,7 @@ impl Ui {
         });
     }
     pub fn tick(&mut self, visible: bool) {
+        self.tick_models();
         self.tick_media();
         self.tick_voice(visible);
         while let Ok(message) = self.receiver.try_recv() {
@@ -588,22 +594,7 @@ impl Ui {
                 }
                 self.modal = Some(Modal::Rename(editor));
             }
-            4 => {
-                let mut model = Editor::default();
-                let mut effort = Editor::default();
-                if let Some(s) = self
-                    .sessions
-                    .get(self.selected.as_deref().unwrap_or_default())
-                {
-                    model.insert(s.model.as_deref().unwrap_or_default());
-                    effort.insert(s.effort.as_deref().unwrap_or_default());
-                }
-                self.modal = Some(Modal::Model {
-                    model,
-                    effort,
-                    field: 0,
-                });
-            }
+            4 => self.open_model(0),
             5 => {
                 if let Some(id) = self.selected.clone() {
                     let archived = !self.sessions.get(&id).is_some_and(|s| s.archived);
@@ -1333,17 +1324,7 @@ impl Ui {
                 | Modal::QueuedEdit { editor: e, .. }
                 | Modal::Voice { key: e, .. },
             ) => e.insert(text),
-            Some(Modal::Model {
-                model,
-                effort,
-                field,
-            }) => {
-                if *field == 0 {
-                    model.insert(text);
-                } else {
-                    effort.insert(text);
-                }
-            }
+            Some(Modal::Model { .. }) => self.model_paste(text),
             Some(Modal::Approval {
                 answers,
                 field,
@@ -1378,6 +1359,10 @@ impl Ui {
         }
     }
     fn modal_key(&mut self, key: KeyEvent) {
+        if matches!(self.modal, Some(Modal::Model { .. })) {
+            self.model_key(key);
+            return;
+        }
         if matches!(self.modal, Some(Modal::AgentDefaults(_))) {
             self.defaults_key(key);
             return;
@@ -1448,28 +1433,6 @@ impl Ui {
                     editor.key(key);
                 }
             }
-            Some(Modal::Model {
-                model,
-                effort,
-                field,
-            }) => match key.code {
-                KeyCode::Tab | KeyCode::BackTab => *field = 1usize.saturating_sub(*field),
-                KeyCode::Enter => {
-                    let model = model.text();
-                    let effort = effort.text();
-                    self.control(Control::Model {
-                        model: (!model.is_empty()).then_some(model),
-                        effort: (!effort.is_empty()).then_some(effort),
-                    });
-                }
-                _ => {
-                    if *field == 0 {
-                        model.key(key);
-                    } else {
-                        effort.key(key);
-                    }
-                }
-            },
             Some(Modal::Cleanup) if key.code == KeyCode::Enter => {
                 if let Some(id) = self.selected.clone() {
                     self.busy = true;
@@ -1546,6 +1509,8 @@ impl Ui {
     }
     fn action(&mut self, action: Action) {
         match action {
+            Action::ModelField(index) => self.model_field(index),
+            Action::ModelOption(index) => self.model_option(index),
             Action::DefaultField(index) => {
                 if let Some(Modal::AgentDefaults(form)) = &mut self.modal {
                     form.field = index;
@@ -1944,7 +1909,7 @@ impl Ui {
                 Focus::Conversation => {
                     "Messages · Type to reply · Cmd+↑↓ Navigate · Enter Expand · Tab Sessions · Ctrl/Cmd+C Copy"
                 }
-                Focus::Prompt => "Latest prompt · Enter Expand · Cmd+↓ Messages · Tab Sessions",
+                Focus::Prompt => "Prompt · Enter Expand · Cmd+↓ Messages · Tab Sessions",
                 Focus::Changes => "Changes · ↑↓ Scroll · Shift+↑↓ Select · c Copy · Tab Sessions",
             }
         };
@@ -2194,7 +2159,6 @@ impl Ui {
             &session,
             position,
             body.width,
-            latest.map(|e| e.id.as_str()),
             self.focus == Focus::Conversation,
         );
         if lines.is_empty() {
@@ -2253,17 +2217,23 @@ impl Ui {
             .rev()
             .find(|s| s.row <= position.conversation)
             .map(|s| (s.id.clone(), position.conversation.saturating_sub(s.row)));
-        for section in &sections {
-            if section.tool
-                && section.row >= position.conversation
-                && section.row < position.conversation.saturating_add(body.height as usize)
-            {
+        for (index, section) in sections.iter().enumerate() {
+            let first = section.row.max(position.conversation);
+            let last = sections
+                .get(index + 1)
+                .map_or(lines.len(), |next| next.row)
+                .min(
+                    position
+                        .conversation
+                        .saturating_add(usize::from(body.height)),
+                );
+            if section.tool && first < last {
                 self.hits.push((
                     Rect::new(
                         body.x,
-                        body.y + section.row.saturating_sub(position.conversation) as u16,
+                        body.y + first.saturating_sub(position.conversation) as u16,
                         body.width,
-                        1,
+                        (last - first) as u16,
                     ),
                     Action::ToggleEntry(section.id.clone()),
                 ));
@@ -2501,6 +2471,10 @@ impl Ui {
             None => "",
         };
         let area = panel(frame, rect, title, true);
+        if matches!(self.modal, Some(Modal::Model { .. })) {
+            self.draw_model(frame, area);
+            return;
+        }
         if matches!(self.modal, Some(Modal::AgentDefaults(_))) {
             self.draw_defaults(frame, area);
             return;
@@ -2526,6 +2500,7 @@ impl Ui {
         }
         let mut deferred = Vec::new();
         match &mut self.modal {
+            Some(Modal::Model { .. }) => {}
             Some(Modal::Repository(value)) => {
                 let input = Rect::new(area.x, area.y, area.width, area.height.min(3));
                 editor(frame, input, "Local repository", value, true);
@@ -2569,26 +2544,6 @@ impl Ui {
                     "Name · Enter save",
                     value,
                     true,
-                );
-            }
-            Some(Modal::Model {
-                model,
-                effort,
-                field,
-            }) => {
-                editor(
-                    frame,
-                    Rect::new(area.x, area.y, area.width, 3),
-                    "Model · Tab switches · Enter applies",
-                    model,
-                    *field == 0,
-                );
-                editor(
-                    frame,
-                    Rect::new(area.x, area.y + 4, area.width, 3),
-                    "Reasoning effort",
-                    effort,
-                    *field == 1,
                 );
             }
             Some(Modal::Cleanup) => {
@@ -3081,7 +3036,7 @@ mod tests {
         );
         let session = ui.sessions.get("one").context("session")?;
         let position = ui.positions.get("one").context("position")?;
-        let (rows, sections) = transcript::render(session, position, 60, None, true);
+        let (rows, sections) = transcript::render(session, position, 60, true);
         let start = sections.last().context("last message")?.row;
         for row in rows.iter().skip(start).take(2) {
             assert_eq!(row.width(), 60);
@@ -3165,6 +3120,55 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn pinned_prompt_remains_inline_with_full_width_padding() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: tmp.path().join("config.json"),
+            cache: tmp.path().join("cache"),
+        });
+        ui.drilled = true;
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.note("userMessage", "Keep this prompt in place");
+        session.note("agentMessage", "Following response");
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert_eq!(screen.matches("Keep this prompt in place").count(), 2);
+        let session = ui.sessions.get("one").context("session")?;
+        let position = ui.positions.get("one").context("position")?;
+        let (rows, sections) = transcript::render(session, position, 60, false);
+        let id = session
+            .entries
+            .iter()
+            .find(|entry| entry.kind == "userMessage")
+            .context("prompt")?
+            .id
+            .as_str();
+        let start = sections
+            .iter()
+            .find(|section| section.id == id)
+            .context("section")?
+            .row;
+        for row in rows.iter().skip(start).take(3) {
+            assert_eq!(row.width(), 60);
+            assert_eq!(row.style, crate::ui::user_message_style());
+        }
+        assert!(
+            rows.get(start)
+                .context("top padding")?
+                .to_string()
+                .trim()
+                .is_empty()
+        );
+        assert!(
+            rows.get(start + 2)
+                .context("bottom padding")?
+                .to_string()
+                .trim()
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn newest_prompt_stays_pinned_and_composer_grows_to_ten_lines() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let mut ui = state(Storage {
@@ -3183,6 +3187,7 @@ mod tests {
         );
         let (first, _) = draw(&mut ui, 100, 40)?;
         assert!(first.contains("Newest user prompt"));
+        assert!(!first.contains("Latest prompt"));
         let short = ui.conversation_height;
         ui.paste("line\n".repeat(14).as_str());
         draw(&mut ui, 100, 40)?;
@@ -3288,6 +3293,55 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn model_and_effort_completion_uses_catalog_without_sending_on_first_enter() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        });
+        ui.model_completion.options = vec![
+            crate::model::ModelInfo {
+                id: "fixture-luna".into(),
+                name: "Luna".into(),
+                efforts: vec!["low".into(), "medium".into()],
+            },
+            crate::model::ModelInfo {
+                id: "fixture-astra".into(),
+                name: "Astra".into(),
+                efforts: vec!["high".into()],
+            },
+        ];
+        ui.open_model(0);
+        ui.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        ui.paste("LUNA");
+        let (screen, cursor) = draw(&mut ui, 100, 30)?;
+        assert!(screen.contains("fixture-luna") && !screen.contains("fixture-astra"));
+        assert!(cursor.is_some());
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.modal, Some(Modal::Model { model, .. }) if model.text() == "fixture-luna")
+        );
+        assert!(!ui.busy);
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.modal, Some(Modal::Model { effort, .. }) if effort.text() == "medium")
+        );
+        assert!(!ui.busy);
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        ui.skills.insert("one".into(), (Vec::new(), Vec::new()));
+        ui.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        ui.paste("effort");
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(ui.modal, Some(Modal::Model { field: 1, .. })));
+        Ok(())
+    }
+
+    #[test]
     fn empty_composer_opens_native_commands_and_skills_attach_without_sending() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut ui = state(Storage {
@@ -3309,6 +3363,24 @@ mod tests {
                 Vec::new(),
             ),
         );
+        for trigger in ['/', '$', '@'] {
+            ui.key(KeyEvent::new(KeyCode::Char(trigger), KeyModifiers::NONE));
+            assert!(matches!(ui.modal, Some(Modal::Commands { .. })));
+            ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+            ui.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+            assert!(matches!(ui.modal, Some(Modal::Commands { .. })));
+            ui.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+            assert!(ui.modal.is_none());
+            assert_eq!(ui.focus, Focus::Composer);
+            assert!(
+                ui.positions
+                    .get("one")
+                    .context("draft")?
+                    .draft
+                    .text()
+                    .is_empty()
+            );
+        }
         ui.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
         assert!(matches!(ui.modal, Some(Modal::Commands { .. })));
         ui.paste("fixture");
@@ -3691,7 +3763,7 @@ mod tests {
         session.entries.push(Entry {
             id: "tool".into(),
             kind: "commandExecution".into(),
-            text: "hidden tool output".into(),
+            text: "preview one\npreview two\npreview three\nhidden tool output".into(),
             data: serde_json::json!({"command":"git status","status":"completed"}),
             finished_at: Some(1),
             ..Entry::default()
@@ -3699,6 +3771,7 @@ mod tests {
         session.pending.push(Pending { id:serde_json::json!(42), method:"item/tool/requestUserInput".into(), responded:false, params:serde_json::json!({"questions":[{"id":"q","header":"Choice","question":"Choose a color","options":[{"label":"Green","description":"Matrix"}]}]}) });
         let (screen, _) = draw(&mut ui, 120, 35)?;
         assert!(!screen.contains("hidden tool output"));
+        assert!(screen.contains("preview one") && screen.contains("+1 lines"));
         assert!(!screen.contains("agentMessage"));
         ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
