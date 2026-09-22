@@ -1956,6 +1956,12 @@ impl App {
                 | KeyModifiers::HYPER
                 | KeyModifiers::META,
         );
+        if matches!(key.code, KeyCode::Up | KeyCode::Down)
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SUPER)
+            && self.step_diff_file(key.code == KeyCode::Down)
+        {
+            return;
+        }
         match key.code {
             KeyCode::Char('{' | '}') if plain => {
                 self.adjust_focused_hunk(if key.code == KeyCode::Char('}') {

@@ -991,6 +991,60 @@ impl App {
             }
         }
     }
+    pub(crate) fn step_diff_file(&mut self, forward: bool) -> bool {
+        if self.home
+            || self.view != crate::app::View::Diff
+            || self.focus != Focus::Content
+            || self.directory.is_some()
+        {
+            return false;
+        }
+        let Some(doc) = &self.document else {
+            return false;
+        };
+        let last = doc.rows.len().saturating_sub(1);
+        let cursor = self.workflow.cursor.unwrap_or(self.scroll).min(last);
+        if (forward && cursor != last) || (!forward && cursor != 0) {
+            return false;
+        }
+        let width = doc.width;
+        let files = self
+            .review()
+            .and_then(|review| review.snapshot.as_ref())
+            .map(|snapshot| crate::tree::filtered(&snapshot.files, &self.filters.files.text()))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| entry.file)
+            .collect::<Vec<_>>();
+        let Some(current) = files.iter().position(|index| *index == self.file) else {
+            return false;
+        };
+        let next = if forward {
+            current.checked_add(1)
+        } else {
+            current.checked_sub(1)
+        };
+        let Some(file) = next.and_then(|index| files.get(index)).copied() else {
+            return false;
+        };
+        self.action(crate::app::Action::SelectFile(file));
+        self.focus = Focus::Content;
+        self.preserve_diff_position = false;
+        let doc = crate::ui::build(self, width);
+        self.workflow.cursor = Some(if forward {
+            0
+        } else {
+            doc.rows.len().saturating_sub(1)
+        });
+        self.scroll = if forward {
+            0
+        } else {
+            doc.rows.len().saturating_sub(self.viewport.max(1))
+        };
+        self.document = Some(doc);
+        true
+    }
+
     pub fn move_diff(&mut self, delta: i32, select: bool) {
         let Some(doc) = &self.document else {
             return;
