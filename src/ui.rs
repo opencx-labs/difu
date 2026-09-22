@@ -746,7 +746,7 @@ fn hunk_rows(
     rows
 }
 
-fn build(app: &App, width: u16) -> Document {
+pub(crate) fn build(app: &App, width: u16) -> Document {
     let mut doc = Document {
         navigation: Vec::new(),
         epoch: app.epoch,
@@ -3213,8 +3213,22 @@ mod tests {
         assert_eq!(app.file, 1);
         assert_eq!(app.workflow.cursor, Some(10));
         app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
-        app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
         assert_eq!(app.scroll, 0);
+        assert_eq!(app.file, 1);
+        app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
+        assert_eq!(app.file, 0);
+        assert_eq!(app.focus, Focus::Content);
+        assert_eq!(
+            app.workflow.cursor,
+            Some(
+                app.document
+                    .as_ref()
+                    .context("Missing previous file")?
+                    .rows
+                    .len()
+                    - 1
+            )
+        );
         Ok(())
     }
 
@@ -3641,6 +3655,94 @@ mod tests {
         assert!(r.interaction.progress.completed.is_empty());
         Ok(())
     }
+    #[test]
+    fn diff_arrows_cross_file_edges_without_leaving_code_or_extending_selection() -> Result<()> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        for unified in [false, true] {
+            for wrap in [false, true] {
+                let mut app = guide_app(dir.path());
+                app.view = View::Diff;
+                app.focus = Focus::Content;
+                app.config.unified = unified;
+                app.config.wrap_diff = wrap;
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30))?;
+                terminal.draw(|frame| draw(frame, &mut app))?;
+                app.workflow.cursor = Some(0);
+                app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+                assert_eq!(app.file, 0);
+                let last = app.document.as_ref().context("document")?.rows.len() - 1;
+                app.workflow.cursor = Some(last - 1);
+                app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                assert_eq!(app.file, 0); // Reach the boundary before crossing it.
+                assert_eq!(app.workflow.cursor, Some(last));
+                app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+                assert_eq!(app.file, 0); // Selection never leaks to another file.
+                app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                terminal.draw(|frame| draw(frame, &mut app))?;
+                assert_eq!(app.file, 1);
+                assert_eq!(app.focus, Focus::Content);
+                assert_eq!(app.workflow.cursor, Some(0));
+                assert_eq!(app.scroll, 0);
+                assert!(app.workflow.selection.is_none());
+                app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+                terminal.draw(|frame| draw(frame, &mut app))?;
+                assert_eq!(app.file, 0);
+                assert_eq!(app.workflow.cursor, Some(last));
+                assert_eq!(app.scroll, (last + 1).saturating_sub(app.viewport));
+                app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER));
+                assert_eq!(app.file, 1);
+                assert_eq!(app.workflow.cursor, Some(0));
+                app.action(Action::SelectFile(2));
+                app.focus = Focus::Content;
+                terminal.draw(|frame| draw(frame, &mut app))?;
+                let last = app.document.as_ref().context("document")?.rows.len() - 1;
+                app.workflow.cursor = Some(last);
+                app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+                assert_eq!(app.file, 2);
+                assert_eq!(app.workflow.cursor, Some(last));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diff_file_crossing_follows_filtered_tree_order() -> Result<()> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        let snapshot = app
+            .reviews
+            .get_mut("example/repo#1")
+            .context("review")?
+            .snapshot
+            .as_mut()
+            .context("snapshot")?;
+        std::sync::Arc::make_mut(snapshot)
+            .files
+            .get_mut(1)
+            .context("file")?
+            .path = "hidden.rs".into();
+        app.filters.files = "distinctive".into();
+        app.view = View::Diff;
+        app.focus = Focus::Content;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 30))?;
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        app.workflow.cursor = app
+            .document
+            .as_ref()
+            .context("document")?
+            .rows
+            .len()
+            .checked_sub(1);
+        app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.file, 2);
+        app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.file, 0);
+        Ok(())
+    }
+
     #[test]
     fn code_cursor_tracks_the_viewport_center_and_clamps_at_document_ends() -> Result<()> {
         use crate::{review::Side, workflow::Target};
