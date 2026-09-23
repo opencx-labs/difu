@@ -212,6 +212,19 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
         .unwrap_or_default();
     let params = event.get("params").unwrap_or(&Value::Null);
     if let Some(id) = event.get("id") {
+        if session.artifact_tools
+            && method == "item/tool/call"
+            && params.get("tool").and_then(Value::as_str) == Some(super::artifacts::TOOL)
+        {
+            session.artifact_requests.push(Pending {
+                id: id.clone(),
+                method: method.into(),
+                params: params.clone(),
+                responded: false,
+            });
+            return;
+        }
+
         if session.deferred_workspace
             && method == "item/tool/call"
             && params.get("tool").and_then(Value::as_str) == Some(isolation::TOOL)
@@ -673,6 +686,32 @@ fn command(
             })?;
             store.save(id)?;
         }
+        Control::RefreshShells => {
+            let mut shells = Vec::new();
+            let mut cursor = Value::Null;
+            loop {
+                let result = rpc.call(
+                    "thread/backgroundTerminals/list",
+                    json!({"threadId":session.thread_id,"cursor":cursor,"limit":100}),
+                    cancel,
+                    |v| event(store, id, v),
+                )?;
+                shells.extend(
+                    result
+                        .get("data")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default(),
+                );
+                cursor = result.get("nextCursor").cloned().unwrap_or(Value::Null);
+                if cursor.is_null() {
+                    break;
+                }
+            }
+            if session.shells != shells {
+                store.update(id, |s| s.shells = shells)?;
+            }
+        }
         Control::Compact => {
             ensure!(
                 session.turn_id.is_none() && session.status == Status::Idle,
@@ -870,16 +909,24 @@ fn command(
     }
     Ok(())
 }
-fn instructions(session: &Session) -> &'static str {
-    if session.waiting_for_workspace() {
+fn instructions(session: &Session) -> String {
+    let base = if session.waiting_for_workspace() {
         isolation::INSTRUCTIONS
     } else if matches!(&session.job, Job::Coding(s) if s.isolated) {
         super::WORKTREE_INSTRUCTIONS
     } else {
         super::CODING_INSTRUCTIONS
+    };
+    if session.artifact_tools {
+        format!("{base}\n\n{}", super::artifacts::INSTRUCTIONS)
+    } else {
+        base.into()
     }
 }
 fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool)> {
+    if store.get(id)?.thread_id.is_none() {
+        store.update(id, |s| s.artifact_tools = true)?;
+    }
     let session = store.get(id)?;
     let cwd = session
         .workspace
@@ -918,8 +965,12 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
             json!({"model_reasoning_effort":effort}),
         )?;
     }
-    if session.deferred_workspace && launch.isolated && !resuming {
-        put(&mut params, "dynamicTools", isolation::tools())?;
+    if !resuming {
+        let mut tools = vec![super::artifacts::tool()];
+        if session.deferred_workspace && launch.isolated {
+            tools.extend(isolation::tools().as_array().cloned().unwrap_or_default());
+        }
+        put(&mut params, "dynamicTools", json!(tools))?;
     }
     if resuming {
         isolation::settings(&mut params, &session)?;
@@ -1011,14 +1062,44 @@ pub fn run(
         }
         match controls.recv_timeout(Duration::from_millis(40)) {
             Ok(command_request) => {
+                let read_only = matches!(command_request.control, Control::RefreshShells);
                 let result = command(&mut rpc, store, id, command_request.control, cancel);
-                if let Err(error) = &result {
+                if let Err(error) = &result
+                    && !read_only
+                {
                     store.update(id, |s| s.note("error", format!("{error:#}")))?;
                 }
                 let _ = command_request.reply.send(result);
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        let requests = store.get(id)?.artifact_requests;
+        if !requests.is_empty() {
+            store.update(id, |s| s.artifact_requests.clear())?;
+            for request in requests {
+                let mut session = store.get(id)?;
+                let args = request
+                    .params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                let args = if let Some(text) = args.as_str() {
+                    serde_json::from_str(text).unwrap_or(Value::Null)
+                } else {
+                    args
+                };
+                let result = super::artifacts::register(&mut session, &args);
+                if result.is_ok() {
+                    store.update(id, |s| s.artifacts = session.artifacts)?;
+                    store.save(id)?;
+                }
+                let text = match &result {
+                    Ok(()) => "Artifact registered in difu".into(),
+                    Err(e) => format!("{e:#}"),
+                };
+                rpc.write(json!({"id":request.id,"result":{"success":result.is_ok(),"contentItems":[{"type":"inputText","text":text}]}}))?;
+            }
         }
         let requests = store.get(id)?.workspace_requests;
         if !requests.is_empty() {

@@ -1553,35 +1553,48 @@ impl App {
         self.invalidate();
     }
     fn open_definition(&mut self, path: String, line: u64, column: usize, old: bool) {
-        if self.modal.is_some() || self.home || self.view == View::Overview {
-            return;
-        }
-        let Some(review) = self.review() else {
-            return;
-        };
-        let (Some(root), Some(snapshot)) = (&review.root, &review.snapshot) else {
-            return;
-        };
-        let source_path = if old {
-            snapshot
-                .files
-                .iter()
-                .find(|f| f.path == path)
-                .map(|f| f.old_path.clone())
-                .unwrap_or(path)
+        let request = if let Some(Modal::Definition(viewer)) = &self.modal {
+            let Some(Ok(definition)) = &viewer.output else {
+                return;
+            };
+            crate::navigation::Request {
+                root: viewer.request.root.clone(),
+                revision: definition.revision.clone(),
+                path,
+                line,
+                column,
+            }
         } else {
-            path
-        };
-        let request = crate::navigation::Request {
-            root: root.clone(),
-            revision: if old {
-                snapshot.merge_base.clone()
+            if self.modal.is_some() || self.home || self.view == View::Overview {
+                return;
+            }
+            let Some(review) = self.review() else {
+                return;
+            };
+            let (Some(root), Some(snapshot)) = (&review.root, &review.snapshot) else {
+                return;
+            };
+            let source_path = if old {
+                snapshot
+                    .files
+                    .iter()
+                    .find(|f| f.path == path)
+                    .map(|f| f.old_path.clone())
+                    .unwrap_or(path)
             } else {
-                snapshot.head.clone()
-            },
-            path: source_path,
-            line,
-            column,
+                path
+            };
+            crate::navigation::Request {
+                root: root.clone(),
+                revision: if old {
+                    snapshot.merge_base.clone()
+                } else {
+                    snapshot.head.clone()
+                },
+                path: source_path,
+                line,
+                column,
+            }
         };
         let id = self.next_id();
         let work = request.clone();

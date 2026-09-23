@@ -33,6 +33,8 @@ impl Default for AgentDefaults {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default = "enabled")]
+    pub last_tab_agents: bool,
     #[serde(default)]
     pub agent_defaults: AgentDefaults,
     #[serde(default)]
@@ -51,6 +53,8 @@ pub struct Config {
     pub agent_list_visible: bool,
     #[serde(default)]
     pub agent_changes_visible: bool,
+    #[serde(default = "enabled")]
+    pub agent_panel_right: bool,
     #[serde(default)]
     pub voice_enabled: bool,
 }
@@ -60,6 +64,7 @@ fn enabled() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            last_tab_agents: true,
             agent_defaults: AgentDefaults::default(),
             repositories: BTreeMap::new(),
             pinned_repositories: BTreeSet::new(),
@@ -69,6 +74,7 @@ impl Default for Config {
             wrap_diff: false,
             agent_list_visible: true,
             agent_changes_visible: false,
+            agent_panel_right: true,
             voice_enabled: false,
         }
     }

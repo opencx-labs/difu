@@ -197,6 +197,7 @@ impl Service {
         let key = match &request {
             Request::Control { id, .. }
             | Request::Cleanup { id }
+            | Request::Delete { id }
             | Request::Archive { id, .. }
             | Request::Rename { id, .. } => Some(id.clone()),
             _ => None,
@@ -421,6 +422,68 @@ impl Service {
             Request::Archive { id, archived } => {
                 self.store.update(&id, |s| s.archived = archived)?;
                 self.store.save(&id)?;
+                Ok(Reply::Ok)
+            }
+            Request::Shells { id } => {
+                let sender = self
+                    .workers
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Worker lock failed"))?
+                    .get(&id)
+                    .filter(|w| !w.handle.is_finished())
+                    .map(|w| w.sender.clone());
+                let Some(sender) = sender else {
+                    return Ok(Reply::Shells(Vec::new()));
+                };
+                let (tx, rx) = mpsc::channel();
+                sender.send(Command {
+                    control: Control::RefreshShells,
+                    reply: tx,
+                })?;
+                rx.recv_timeout(Duration::from_secs(50))
+                    .context("Shell list unavailable while Codex is busy")??;
+                Ok(Reply::Shells(self.store.get(&id)?.shells))
+            }
+            Request::Delete { id } => {
+                let session = self.store.get(&id)?;
+                ensure!(
+                    matches!(session.job, Job::Coding(_)),
+                    "Only coding chats can be deleted here"
+                );
+                // Confirmation explicitly authorizes stopping the session before cleanup.
+                if let Some(worker) = self
+                    .workers
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Worker lock failed"))?
+                    .remove(&id)
+                {
+                    worker.cancel.cancel();
+                    worker
+                        .handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("Session worker stopped unexpectedly"))?;
+                }
+                let session = self.store.get(&id)?;
+                if session.workspace_ready
+                    && !session.workspace_removed
+                    && matches!(&session.job, Job::Coding(launch) if launch.isolated)
+                {
+                    super::workspace::cleanup(&session, &self.store.home, &Cancel::default())?;
+                    self.store.update(&id, |s| s.workspace_removed = true)?;
+                    self.store.save(&id)?;
+                }
+                super::media::cleanup(&self.store.storage, &id)?;
+                let _guard = self
+                    .store
+                    .save_lock
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Persistence lock failed"))?;
+                fs::remove_file(self.store.home.join(format!("{id}.json")))?;
+                self.store
+                    .sessions
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Session lock failed"))?
+                    .remove(&id);
                 Ok(Reply::Ok)
             }
             Request::Cleanup { id } => {

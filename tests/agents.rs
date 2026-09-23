@@ -663,6 +663,89 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
     client::request(&storage, Request::Cleanup { id: second.clone() })?;
     assert!(!second_tree.exists());
     assert_eq!(git(&repo, &["rev-parse", &branch])?, committed);
+
+    // Deletion stops an active agent, removes only its clean managed worktree,
+    // and never destroys modified files when cleanup refuses.
+    let clean = launch(&storage, &repo, "wait for deletion")?;
+    let current = wait(&storage, &clean, |s| s.status == Status::Running)?;
+    let tree = current.workspace.context("Missing deletion worktree")?;
+    let Reply::Shells(shells) = client::request(&storage, Request::Shells { id: clean.clone() })?
+    else {
+        anyhow::bail!("Missing shells");
+    };
+    assert_eq!(
+        shells
+            .first()
+            .and_then(|s| s.get("processId"))
+            .and_then(|v| v.as_str()),
+        Some("123")
+    );
+    client::request(&storage, Request::Delete { id: clean.clone() })?;
+    assert!(!tree.exists());
+    assert!(session(&storage, &clean).is_err());
+    assert!(
+        !difu::agents::server::home(&storage)?
+            .join(format!("{clean}.json"))
+            .exists()
+    );
+    let dirty = launch(&storage, &repo, "wait with changes")?;
+    let current = wait(&storage, &dirty, |s| s.status == Status::Running)?;
+    let tree = current.workspace.context("Missing protected worktree")?;
+    fs::write(tree.join("precious.txt"), "preserve me")?;
+    assert!(client::request(&storage, Request::Delete { id: dirty.clone() }).is_err());
+    assert_eq!(
+        fs::read_to_string(tree.join("precious.txt"))?,
+        "preserve me"
+    );
+    assert_eq!(session(&storage, &dirty)?.status, Status::Interrupted);
+    fs::remove_file(tree.join("precious.txt"))?;
+    git(&repo, &["worktree", "lock", tree.to_str().context("path")?])?;
+    assert!(client::request(&storage, Request::Delete { id: dirty.clone() }).is_err());
+    assert!(tree.exists());
+    git(
+        &repo,
+        &["worktree", "unlock", tree.to_str().context("path")?],
+    )?;
+    client::request(&storage, Request::Delete { id: dirty })?;
+    let artifact = launch(&storage, &repo, "artifact report")?;
+    let current = wait(&storage, &artifact, |s| s.status == Status::Idle)?;
+    assert!(current.artifact_tools);
+    assert_eq!(
+        current
+            .artifacts
+            .first()
+            .context("Artifact not registered")?
+            .title,
+        "Fixture report"
+    );
+    assert!(current.pending.is_empty());
+    let durable: Session = serde_json::from_slice(&fs::read(
+        difu::agents::server::home(&storage)?.join(format!("{artifact}.json")),
+    )?)?;
+    assert_eq!(durable.artifacts.len(), 1);
+    let Reply::Launched(existing) = client::request(
+        &storage,
+        Request::Launch {
+            job: Box::new(Job::Coding(Launch {
+                repository: repo.clone(),
+                base: "HEAD".into(),
+                isolated: false,
+                prompt: "wait in existing directory".into(),
+                model: None,
+                effort: None,
+            })),
+        },
+    )?
+    else {
+        anyhow::bail!("No existing-directory session");
+    };
+    wait(&storage, &existing, |s| s.status == Status::Running)?;
+    client::request(&storage, Request::Delete { id: existing })?;
+    assert_eq!(
+        fs::read_to_string(repo.join("tracked.txt"))?,
+        "precious local edit\n"
+    );
+
     daemon.stop()?;
     Ok(())
 }

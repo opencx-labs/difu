@@ -1,4 +1,5 @@
 //! Durable, local Codex sessions. Only sessions launched by difu are registered.
+mod artifacts;
 pub mod client;
 mod engine;
 mod guidance;
@@ -205,6 +206,14 @@ pub struct Session {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub permissions: Value,
+    #[serde(default)]
+    pub artifacts: Vec<artifacts::Artifact>,
+    #[serde(default)]
+    pub artifact_tools: bool,
+    #[serde(skip)]
+    pub artifact_requests: Vec<Pending>,
+    #[serde(skip)]
+    pub shells: Vec<Value>,
     pub entries: Vec<Entry>,
     pub pending: Vec<Pending>,
     #[serde(default)]
@@ -246,6 +255,10 @@ impl Session {
             model: None,
             effort: None,
             permissions: Value::Null,
+            artifacts: Vec::new(),
+            artifact_tools: false,
+            artifact_requests: Vec::new(),
+            shells: Vec::new(),
             entries: Vec::new(),
             pending: Vec::new(),
             answered_questions: Default::default(),
@@ -396,6 +409,7 @@ pub enum Control {
     },
     Interrupt,
     Compact,
+    RefreshShells,
     ReplaceQueued {
         index: usize,
         expected: Prompt,
@@ -447,10 +461,16 @@ pub enum Request {
     Cleanup {
         id: String,
     },
+    Delete {
+        id: String,
+    },
     Changes {
         id: String,
     },
     Statistics {
+        id: String,
+    },
+    Shells {
         id: String,
     },
     WorkspacePaths {
@@ -467,6 +487,7 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
     Ok,
+    Shells(Vec<Value>),
     Sessions(Vec<Summary>),
     Session(Box<Session>),
     Unchanged,
