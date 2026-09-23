@@ -25,7 +25,7 @@ pub struct Shell {
 impl Shell {
     pub fn new(storage: Storage, config: Config, pr: Option<PrKey>) -> Self {
         let mut reviews = App::new(storage.clone(), config.clone());
-        let reviews_started = pr.is_some();
+        let reviews_started = pr.is_some() || !config.last_tab_agents;
         if reviews_started {
             reviews.start(pr);
         }
@@ -39,6 +39,14 @@ impl Shell {
     fn switch(&mut self, agents: bool) {
         self.agents.cancel_voice();
         self.agents_active = agents;
+        self.reviews.config.last_tab_agents = agents;
+        let saved = self.reviews.storage.load_config().and_then(|mut config| {
+            config.last_tab_agents = agents;
+            self.reviews.storage.save_config(&config)
+        });
+        if let Err(error) = saved {
+            self.agents.notice = Some((format!("Could not save the active tab: {error:#}"), true));
+        }
         self.reviews.hover = Default::default();
         if !agents && !self.reviews_started {
             self.reviews.start(None);
@@ -50,6 +58,7 @@ impl Shell {
         self.reviews.config.agent_defaults = self.agents.defaults.clone();
         self.reviews.config.agent_list_visible = self.agents.list_visible;
         self.reviews.config.agent_changes_visible = self.agents.changes_visible;
+        self.reviews.config.agent_panel_right = self.agents.panel_right();
         self.reviews.config.voice_enabled = self.agents.voice_enabled();
         if self.reviews_started {
             self.reviews.tick_visible(!self.agents_active);
@@ -79,6 +88,10 @@ impl Shell {
                     return;
                 }
                 KeyCode::Char('c') => {
+                    if self.agents_active && self.agents.browser_input() {
+                        self.agents.key(key);
+                        return;
+                    }
                     if self.agents_active && self.agents.copy_chat_selection() {
                         return;
                     }
@@ -146,5 +159,36 @@ impl Shell {
                 },
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn switching_tabs_persists_choice_without_overwriting_settings() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        let mut shell = Shell::new(storage.clone(), Config::default(), None);
+        assert!(shell.agents_active);
+        // Treat review loading as already started to keep this test offline.
+        shell.reviews_started = true;
+        let config = Config {
+            wrap_diff: true,
+            ..Default::default()
+        };
+        storage.save_config(&config)?;
+        shell.switch(false);
+        let saved = storage.load_config()?;
+        assert!(!saved.last_tab_agents);
+        assert!(saved.wrap_diff);
+        assert!(!shell.reviews.config.last_tab_agents);
+        shell.switch(true);
+        assert!(storage.load_config()?.last_tab_agents);
+        Ok(())
     }
 }

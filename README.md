@@ -14,7 +14,7 @@ track chapter completion, and merge or close PRs without leaving the terminal.
 - **Git** and an existing local clone of any repository whose diff you want to open.
 - **[GitHub CLI](https://cli.github.com/)** (`gh`) for GitHub authentication and PR data.
 - **[Codex CLI](https://github.com/openai/codex)** for guide generation using your
-  existing login. The integration has been tested with Codex CLI 0.154.0.
+  existing login. The integration has been tested with Codex CLI 0.155.1.
 - **[Rust 1.90 or newer](https://www.rust-lang.org/tools/install)** when building
   from source.
 
@@ -75,10 +75,37 @@ separate OpenAI API key and API billing.
 difu
 ```
 
-`difu` opens **Agents** by default. The top tabs are **Agents / Reviews**; click
-one or use **Ctrl+1 / Ctrl+2** to switch while preserving your place.
+`difu` opens **Agents** on first launch and remembers your last **Agents / Reviews**
+tab thereafter. Click a tab or use **Ctrl+1 / Ctrl+2** to switch while preserving
+your place. An explicit PR argument opens Reviews.
 
 ### Agents
+
+The session list excludes Guide-generation jobs; guides remain available in Reviews.
+The bottom **Shells** control lists Codex’s open background shells and opens their
+available streamed output. **Artifacts** lists HTML deliverables explicitly
+registered by new coding sessions. Codex is instructed to prefer self-contained
+HTML for reports and visual deliverables. Existing sessions keep their original
+tool catalog.
+
+Shells and HTML artifacts can use the right pane (replacing Changes) or the main
+conversation area. **Alt+P** switches placement and remembers the choice; **Esc**
+returns to the conversation. Artifact previews offer **Refresh** and **Open in
+browser**; edits do not automatically reload the page. Embedded HTML uses the
+optional [terminal-browser](https://github.com/zenbu-labs/terminal-browser) package
+and a terminal with Kitty graphics support, such as Ghostty. When the package is
+missing, macOS offers an explicit Homebrew installation (about 140 MB download,
+339 MB installed), external browser, or Cancel. Linux shows installation
+instructions and the external-browser option. difu launches the installed engine
+directly, without the CLI’s automatic skill installation or terminal setup. The
+browser package is never bundled with difu. Without a working embedded browser, the local HTML can still be opened in your external browser.
+
+**/actions → Delete chat and clean up worktree** confirms stopping the agent and
+permanently deleting its difu history, questions, queue, and attachment copies.
+Cleanup removes only a clean, unlocked difu-owned worktree. Modified, untracked,
+and ignored files prevent deletion and retain the chat. Existing directories,
+Git branches and commits, and Codex’s own history are retained. Archive remains
+a separate action that keeps the chat and worktree.
 
 Press **n** (or `/new`) to open an empty session immediately. Repository, model,
 reasoning, and isolation defaults live in **/actions → Default repository, model,
@@ -341,7 +368,9 @@ TypeScript diff (including JSX and TSX) to open its definition in a scrollable m
 unchanged tracked files. **Esc** closes the modal and preserves your chapter,
 focus, selection, and scroll position. Inside the modal, use the mouse wheel or
 arrow keys to scroll, **Cmd+Up/Down** to move ten lines, **PageUp/PageDown** to
-page, and **Left/Right** to pan long lines.
+page, and **Left/Right** to pan long lines. **Cmd/Ctrl+click** a symbol inside the
+modal to replace its contents with the next definition at the same pinned
+revision. Hover underlines work there too; **Esc** returns directly to the review.
 
 Navigation reads local Git objects from the clicked revision: the merge base for
 old lines, and the PR head for new lines. It does not use uncommitted files, fetch

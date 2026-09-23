@@ -37,6 +37,8 @@ for line in sys.stdin:
     if method == 'initialize': reply(request, {'userAgent':'fixture'})
     elif method == 'initialized': pass
     elif method == 'config/read': reply(request, {'config':{'model':'fixture-model','model_reasoning_effort':'high','developer_instructions':'Preserve inherited guidance.'},'origins':{}})
+    elif method == 'thread/backgroundTerminals/list':
+        reply(request, {'data':[{'command':'fixture shell','cwd':os.getcwd(),'itemId':'shell-item','processId':'123'}], 'nextCursor':None})
     elif method == 'skills/list':
         reply(request, {'data':[{'cwd':params['cwds'][0], 'skills':[{'name':'fixture-skill','description':'Fixture skill for workspace discovery','enabled':True,'path':str(pathlib.Path(params['cwds'][0])/'.agents/skills/fixture/SKILL.md')}], 'errors':[]}]})
     elif method == 'thread/compact/start':
@@ -67,6 +69,9 @@ for line in sys.stdin:
                     'id':'workspace-question','type':'agentMessage','delivery':'async','text':'One question',
                     'questions':[{'title':'Which detail?','options':['Brief','Full']}]}})
             emit({'id':900+turn,'method':'item/tool/call','params':{'threadId':thread_id,'turnId':active,'callId':'workspace','tool':'difu_begin_editing','arguments':{}}})
+        elif text.startswith('artifact'):
+            pathlib.Path('report.html').write_text('<h1>Fixture artifact</h1>')
+            emit({'id':900+turn,'method':'item/tool/call','params':{'threadId':thread_id,'turnId':active,'tool':'difu_present_artifact','arguments':{'path':'report.html','title':'Fixture report'}}})
         elif text.startswith('chat only'):
             complete()
         elif text.startswith('approval'):
@@ -99,6 +104,8 @@ for line in sys.stdin:
         event('serverRequest/resolved', {'threadId':thread_id,'requestId':request['id']})
         if request['result'].get('decision') in ('accept','acceptForSession') or 'answers' in request['result']:
             pathlib.Path('approved.txt').write_text('approved change\n')
-        if 'contentItems' not in request['result']:
+        if any(item.get('text') == 'Artifact registered in difu' for item in request['result'].get('contentItems', [])):
+            complete()
+        elif 'contentItems' not in request['result']:
             complete()
     else: emit({'id':request.get('id'),'error':{'message':'unsupported fixture method '+str(method)}})

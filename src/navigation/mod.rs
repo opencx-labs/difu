@@ -27,6 +27,8 @@ pub struct Definition {
     pub path: String,
     pub revision: String,
     pub line: usize,
+    /// UTF-8 byte offset of the snippet within its first source line.
+    pub column: usize,
     pub source: String,
 }
 pub struct Viewer {
@@ -219,6 +221,7 @@ impl<S: Sources> Resolver<'_, S> {
             path,
             revision: request.revision.clone(),
             line: before.bytes().filter(|b| *b == b'\n').count() + 1,
+            column: before.rsplit('\n').next().unwrap_or_default().len(),
             source: body.to_owned(),
         })
     }

@@ -1,10 +1,12 @@
 //! Native session UI. Network/process work is performed off the terminal thread.
 use super::*;
+mod browser;
 mod commands;
 mod defaults;
 mod inline_questions;
 mod media;
 mod models;
+mod panels;
 mod prompt;
 mod questions;
 mod selection;
@@ -69,6 +71,11 @@ enum Action {
     Open,
     Focus(Focus),
     Menu,
+    Resources(bool),
+    Resource(bool, usize),
+    RefreshArtifact,
+    ExternalArtifact,
+    BrowserChoice(usize),
     New,
     ToggleList,
     ToggleChanges,
@@ -102,6 +109,15 @@ enum Action {
     SubmitQuestion(bool),
 }
 pub enum Modal {
+    InstallBrowser {
+        path: std::path::PathBuf,
+        title: String,
+        selected: usize,
+    },
+    Resources {
+        artifacts: bool,
+        selected: usize,
+    },
     AgentDefaults(Box<defaults::Settings>),
     Prompt {
         text: String,
@@ -149,6 +165,7 @@ pub enum Modal {
         scroll: usize,
     },
     Cleanup,
+    Delete,
     Help(crate::help::State),
 }
 struct ResultMessage {
@@ -161,16 +178,21 @@ enum Task {
     Read(String),
     Changes(String),
     Statistics(String),
+    Shells(String),
+    OpenArtifact,
+    InstallBrowser(String, std::path::PathBuf, String),
     WorkspacePaths(String),
     Defaults(String),
     Skills(String),
     Launch,
     Action,
     Question,
+    Delete(String),
     Send(String, String, Vec<super::media::Attachment>),
 }
 
 pub struct Ui {
+    panels: panels::Panels,
     pub defaults: crate::storage::AgentDefaults,
     pub selected: Option<String>,
     pub summaries: Vec<Summary>,
@@ -220,6 +242,7 @@ impl Ui {
     pub fn new(storage: Storage, config: &Config) -> Self {
         let (sender, receiver) = mpsc::channel();
         Self {
+            panels: panels::Panels::new(config.agent_panel_right),
             defaults: config.agent_defaults.clone(),
             selected: None,
             summaries: Vec::new(),
@@ -281,11 +304,16 @@ impl Ui {
         });
     }
     pub fn tick(&mut self, visible: bool) {
+        self.tick_panels(visible);
         self.tick_models();
         self.tick_media();
         self.tick_voice(visible);
         while let Ok(message) = self.receiver.try_recv() {
             match &message.kind {
+                Task::Shells(_) => {
+                    self.panels.loading = false;
+                    self.panels.checked = Some(Instant::now());
+                }
                 Task::List => {
                     self.listing = false;
                     self.refreshed = Some(Instant::now());
@@ -295,8 +323,11 @@ impl Ui {
                     self.changing = false;
                     self.changes_at = Some(Instant::now());
                 }
-                Task::Launch | Task::Action | Task::Send(..) => self.busy = false,
-                Task::Defaults(_) | Task::Question => {}
+                Task::Launch | Task::Action | Task::Delete(_) | Task::Send(..) => self.busy = false,
+                Task::Defaults(_)
+                | Task::Question
+                | Task::OpenArtifact
+                | Task::InstallBrowser(..) => {}
                 Task::WorkspacePaths(id) => {
                     self.paths_loading.remove(id);
                 }
@@ -304,6 +335,42 @@ impl Ui {
                     self.sidebar.finished(id);
                 }
                 Task::Skills(_) => self.skills_loading = None,
+            }
+            if let Task::Shells(id) = &message.kind {
+                match &message.result {
+                    Ok(Reply::Shells(shells)) => {
+                        self.panels.shells.insert(id.clone(), shells.clone());
+                        self.panels.error = None;
+                    }
+                    Err(e) => self.panels.error = Some(e.clone()),
+                    _ => {}
+                }
+                continue;
+            }
+            if let Task::InstallBrowser(id, path, title) = &message.kind {
+                self.panels.installing = false;
+                match &message.result {
+                    Ok(_) => {
+                        self.notice = Some(("terminal-browser installed".into(), false));
+                        if self.selected.as_ref() == Some(id) && self.panels.view.as_ref().is_some_and(|v| matches!(v, panels::View::Artifact { path: current, .. } if current == path)) {
+                            self.open_artifact(path.clone(), title.clone());
+                        }
+                    }
+                    Err(error) => {
+                        self.notice = Some((error.clone(), true));
+                        if self.selected.as_ref() == Some(id)
+                            && let Some(panels::View::Artifact {
+                                path: current,
+                                error: shown,
+                                ..
+                            }) = &mut self.panels.view
+                            && current == path
+                        {
+                            *shown = Some(error.clone());
+                        }
+                    }
+                }
+                continue;
             }
             match message.result {
                 Err(error) => {
@@ -419,6 +486,25 @@ impl Ui {
                     (Task::Question, Reply::Ok) => {
                         self.refreshed = None;
                     }
+                    (Task::OpenArtifact, Reply::Ok) => {
+                        self.notice = Some(("Opened artifact in browser".into(), false));
+                    }
+                    (Task::Delete(id), Reply::Ok) => {
+                        self.panels.shells.remove(&id);
+                        self.sidebar.counts.remove(&id);
+                        let _ = self.sidebar.save(&self.storage);
+                        self.sessions.remove(&id);
+                        self.positions.remove(&id);
+                        self.changes.remove(&id);
+                        self.summaries.retain(|s| s.id != id);
+                        self.selected = None;
+                        self.drilled = false;
+                        self.modal = None;
+                        self.busy = false;
+                        self.refreshed = None;
+                        self.ensure_selected();
+                        self.notice = Some(("Chat deleted".into(), false));
+                    }
                     (Task::Action, Reply::Ok) => {
                         self.modal = None;
                         self.notice = Some(("Action accepted".into(), false));
@@ -478,7 +564,8 @@ impl Ui {
         self.summaries
             .iter()
             .filter(|s| {
-                s.archived == self.archived
+                s.kind != "Guide"
+                    && s.archived == self.archived
                     && format!("{} {} {}", s.title, s.kind, s.workspace.display())
                         .to_lowercase()
                         .contains(&query)
@@ -576,10 +663,21 @@ impl Ui {
             "Queued outgoing messages",
             "Pending questions · Alt+↑",
             "Default repository, model, reasoning and worktree",
+            "Delete chat and clean up worktree",
+            "Open shells",
+            "HTML artifacts",
+            "Move shell / artifact pane · Alt+P",
         ]
     }
     fn menu_action(&mut self, index: usize) {
         match index {
+            15 => self.open_resources(false),
+            16 => self.open_resources(true),
+            17 => {
+                self.modal = None;
+                self.panel_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+            }
+            14 => self.modal = Some(Modal::Delete),
             13 => self.open_defaults(),
             0 => self.launch(),
             1 => self.control(Control::Resume),
@@ -644,6 +742,8 @@ impl Ui {
         self.save_visibility();
     }
     pub fn toggle_changes(&mut self) {
+        self.panels.view = None;
+        self.panels.focused = false;
         self.changes_visible = !self.changes_visible;
         if !self.changes_visible && self.focus == Focus::Changes {
             self.focus = Focus::Conversation;
@@ -845,6 +945,9 @@ impl Ui {
         // Release events terminate hold-to-dictate, but never navigate or submit.
         if key.kind == crossterm::event::KeyEventKind::Release {
             self.voice_key(key);
+            return;
+        }
+        if self.resource_key(key) || self.panel_key(key) {
             return;
         }
         if matches!(key.code, KeyCode::Char(_))
@@ -1290,6 +1393,16 @@ impl Ui {
         }
     }
     pub fn paste(&mut self, text: &str) {
+        if self.browser_input() {
+            if let Some(panels::View::Artifact {
+                browser: Some(browser),
+                ..
+            }) = &mut self.panels.view
+            {
+                browser.paste(text);
+            }
+            return;
+        }
         self.question_reveal = true;
         self.typing_focus();
         self.cancel_voice();
@@ -1431,6 +1544,12 @@ impl Ui {
                     }
                 } else {
                     editor.key(key);
+                }
+            }
+            Some(Modal::Delete) if key.code == KeyCode::Enter => {
+                if let Some(id) = self.selected.clone() {
+                    self.busy = true;
+                    self.task(Task::Delete(id.clone()), Request::Delete { id }, false);
                 }
             }
             Some(Modal::Cleanup) if key.code == KeyCode::Enter => {
@@ -1603,6 +1722,11 @@ impl Ui {
                     *selected = 0;
                 }
             }
+            Action::Resources(artifacts) => self.open_resources(artifacts),
+            Action::Resource(artifacts, index) => self.select_resource(artifacts, index),
+            Action::RefreshArtifact => self.refresh_artifact(),
+            Action::ExternalArtifact => self.external_artifact(),
+            Action::BrowserChoice(index) => self.browser_choice(index),
             Action::MenuItem(index) => self.menu_action(index),
             Action::Command(index) => self.run_command(index),
             Action::RemoveAttachment(path) => {
@@ -1653,6 +1777,9 @@ impl Ui {
         }
     }
     pub fn mouse(&mut self, event: MouseEvent) {
+        if self.panel_mouse(event) {
+            return;
+        }
         if self.selection_mouse(event) {
             return;
         }
@@ -1843,7 +1970,7 @@ impl Ui {
             1,
             4,
             area.width.saturating_sub(2),
-            area.height.saturating_sub(7),
+            area.height.saturating_sub(9),
         );
         self.viewport = content.height.saturating_sub(2) as usize;
         let list_width = if self.list_visible {
@@ -1853,11 +1980,13 @@ impl Ui {
         } else {
             0
         };
-        let changes_width = if self.drilled && self.changes_visible {
-            (content.width.saturating_sub(list_width) / 2).max(12)
-        } else {
-            0
-        };
+        let panel = self.panels.view.is_some();
+        let changes_width =
+            if self.drilled && ((panel && self.panels.right) || (!panel && self.changes_visible)) {
+                (content.width.saturating_sub(list_width) / 2).max(12)
+            } else {
+                0
+            };
         let list = Rect::new(content.x, content.y, list_width, content.height);
         let conversation = Rect::new(
             content.x + list_width,
@@ -1874,9 +2003,55 @@ impl Ui {
         if list_width > 0 {
             self.draw_list(frame, list);
         }
-        self.draw_conversation(frame, conversation);
+        if panel && !self.panels.right {
+            self.draw_panel(frame, conversation);
+        } else {
+            self.draw_conversation(frame, conversation);
+        }
         if changes_width > 0 {
-            self.draw_changes(frame, changes);
+            if panel {
+                self.draw_panel(frame, changes);
+            } else {
+                self.draw_changes(frame, changes);
+            }
+        }
+        if self.selected.is_some() {
+            let shells = self
+                .selected
+                .as_ref()
+                .and_then(|id| self.panels.shells.get(id))
+                .map_or(0, Vec::len);
+            let artifacts = self
+                .selected
+                .as_ref()
+                .and_then(|id| self.sessions.get(id))
+                .map_or(0, |s| s.artifacts.len());
+            self.button(
+                frame,
+                Rect::new(
+                    conversation.x,
+                    content.bottom() + 1,
+                    18.min(conversation.width),
+                    1,
+                ),
+                &format!(" Shells ({shells}) "),
+                Action::Resources(false),
+                false,
+            );
+            if conversation.width > 19 {
+                self.button(
+                    frame,
+                    Rect::new(
+                        conversation.x + 19,
+                        content.bottom() + 1,
+                        (conversation.width - 19).min(24),
+                        1,
+                    ),
+                    &format!(" Artifacts ({artifacts}) "),
+                    Action::Resources(true),
+                    false,
+                );
+            }
         }
         if let Some((notice, error)) = &self.notice {
             frame.render_widget(
@@ -2509,6 +2684,7 @@ impl Ui {
         );
         let menu_entries = self.menu_entries();
         let title = match self.modal {
+            Some(Modal::InstallBrowser { .. }) => "Optional HTML preview · Esc cancels",
             Some(Modal::AgentDefaults(_)) => "New agent defaults · Tab fields · Esc cancels",
             Some(Modal::Prompt { .. }) => "Latest user prompt · Esc closes",
             Some(Modal::Voice { .. }) => "Voice settings",
@@ -2522,7 +2698,12 @@ impl Ui {
             Some(Modal::Rename(_)) => "Rename session",
             Some(Modal::Model { .. }) => "Session model",
             Some(Modal::Approval { .. }) => "Agent needs your input",
+            Some(Modal::Resources {
+                artifacts: true, ..
+            }) => "HTML artifacts · Enter open",
+            Some(Modal::Resources { .. }) => "Open shells · Enter view",
             Some(Modal::Cleanup) => "Delete worktree",
+            Some(Modal::Delete) => "Stop and delete chat",
             Some(Modal::Help(_)) => "Search agent shortcuts",
             None => "",
         };
@@ -2554,9 +2735,22 @@ impl Ui {
         if self.draw_questions_or_queue(frame, area) {
             return;
         }
+        if matches!(self.modal, Some(Modal::InstallBrowser { .. })) {
+            self.draw_browser_install(frame, area);
+            return;
+        }
         let mut deferred = Vec::new();
+        if let Some(Modal::Resources {
+            artifacts,
+            selected,
+        }) = self.modal.as_ref()
+        {
+            let (artifacts, selected) = (*artifacts, *selected);
+            self.draw_resources(frame, area, artifacts, selected);
+            return;
+        }
         match &mut self.modal {
-            Some(Modal::Model { .. }) => {}
+            Some(Modal::Model { .. } | Modal::Resources { .. } | Modal::InstallBrowser { .. }) => {}
             Some(Modal::Repository(value)) => {
                 let input = Rect::new(area.x, area.y, area.width, area.height.min(3));
                 editor(frame, input, "Local repository", value, true);
@@ -2601,6 +2795,9 @@ impl Ui {
                     value,
                     true,
                 );
+            }
+            Some(Modal::Delete) => {
+                frame.render_widget(Paragraph::new("Stop this agent and permanently delete its difu chat, saved questions, queue, and attachments? Its clean, unlocked difu-owned worktree will also be removed.\n\nModified worktrees remain protected: deletion stops with an error and retains the chat. Existing directories, named branches, commits, and Codex’s own history are not deleted.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
             }
             Some(Modal::Cleanup) => {
                 frame.render_widget(Paragraph::new("Delete this session’s clean, inactive worktree?\n\nModified, untracked, ignored, active and Git-locked worktrees are protected. Existing directories are never deleted. The named branch and its commits are retained.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
@@ -2851,6 +3048,10 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
             "Paste text or media; expand a pasted-content token at the cursor",
         ),
         ("Ctrl+B", "Show or hide agents list (saved)"),
+        (
+            "Alt+P",
+            "Move shell / artifact between side pane and main area",
+        ),
         ("Ctrl+D", "Show or hide Changes pane (saved)"),
         (
             "Enter in composer",
@@ -2951,6 +3152,123 @@ mod tests {
         ui.sessions.insert(session.id.clone(), session);
         ui.select("one".into());
         ui
+    }
+    #[test]
+    fn shell_panes_move_without_losing_chat_or_changes_and_remember_placement() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let mut ui = state(storage.clone());
+        ui.drilled = true;
+        ui.changes_visible = true;
+        ui.positions
+            .entry("one".into())
+            .or_default()
+            .draft
+            .insert("Keep this draft");
+        ui.panels.shells.insert(
+            "one".into(),
+            vec![serde_json::json!({"itemId":"shell","command":"git status","processId":"7"})],
+        );
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.entries.push(Entry {
+            id: "shell".into(),
+            kind: "commandExecution".into(),
+            text: "$ git status\nfresh streamed output".into(),
+            data: serde_json::json!({"aggregatedOutput":""}),
+            ..Entry::default()
+        });
+        ui.select_resource(false, 0);
+        let (text, _) = draw(&mut ui, 120, 40)?;
+        assert!(text.contains("Shell output"));
+        assert!(text.contains("fresh streamed output"));
+        assert!(ui.panels.right);
+        ui.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert!(!ui.panels.right);
+        assert!(!storage.load_config()?.agent_panel_right);
+        assert!(
+            !Ui::new(storage.clone(), &storage.load_config()?)
+                .panels
+                .right
+        );
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.panels.view.is_none());
+        assert_eq!(ui.focus, Focus::Composer);
+        assert!(ui.changes_visible);
+        assert_eq!(
+            ui.positions.get("one").context("position")?.draft.text(),
+            "Keep this draft"
+        );
+        let (text, _) = draw(&mut ui, 120, 40)?;
+        assert!(text.contains("Changes since session start"));
+        ui.menu_action(14);
+        let (text, _) = draw(&mut ui, 120, 40)?;
+        assert!(text.contains("Stop this agent"));
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.modal.is_none());
+        Ok(())
+    }
+    #[test]
+    fn optional_browser_prompt_does_not_install_or_change_chat_until_chosen() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        });
+        ui.positions
+            .entry("one".into())
+            .or_default()
+            .draft
+            .insert("Unsent draft");
+        ui.modal = Some(Modal::InstallBrowser {
+            path: dir.path().join("report.html"),
+            title: "Report".into(),
+            selected: 0,
+        });
+        let (text, _) = draw(&mut ui, 100, 40)?;
+        assert!(text.contains("Open in external browser"));
+        assert!(!ui.panels.installing);
+        assert!(ui.panels.view.is_none());
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.modal.is_none());
+        assert!(!ui.panels.installing);
+        assert!(ui.panels.view.is_none());
+        assert_eq!(
+            ui.positions.get("one").context("position")?.draft.text(),
+            "Unsent draft"
+        );
+        assert_eq!(ui.selected.as_deref(), Some("one"));
+        Ok(())
+    }
+    #[test]
+    fn guides_are_hidden_from_active_and_archived_session_lists() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        });
+        let mut guide = ui
+            .summaries
+            .first()
+            .context("Missing fixture summary")?
+            .clone();
+        guide.id = "guide".into();
+        guide.kind = "Guide".into();
+        ui.summaries.insert(0, guide);
+        ui.selected = None;
+        ui.ensure_selected();
+        assert_eq!(ui.selected.as_deref(), Some("one"));
+        assert_eq!(ui.filtered().len(), 1);
+        ui.archived = true;
+        for summary in &mut ui.summaries {
+            summary.archived = true;
+        }
+        assert_eq!(ui.filtered().len(), 1);
+        assert_eq!(ui.summaries.len(), 2); // Hiding never deletes review-job history.
+        Ok(())
     }
     fn draw(ui: &mut Ui, width: u16, height: u16) -> Result<(String, Option<(u16, u16)>)> {
         let mut terminal = Terminal::new(TestBackend::new(width, height))?;

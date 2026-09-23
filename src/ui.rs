@@ -2247,6 +2247,7 @@ fn draw_definition(frame: &mut Frame, app: &mut App) {
         inner.height.saturating_sub(header_height as u16 + 2),
     );
     viewer.viewport = body.height as usize;
+    let mut links = Vec::new();
     match &viewer.output {
         None => frame.render_widget(
             Paragraph::new("Resolving definition from the pinned local revision…")
@@ -2287,6 +2288,21 @@ fn draw_definition(frame: &mut Frame, app: &mut App) {
                     new: Some(definition.line.saturating_add(offset) as u64),
                     text: value.into(),
                 };
+                for mut link in code_links(
+                    &definition.path,
+                    Some(&line),
+                    false,
+                    body.width as usize,
+                    viewer.horizontal,
+                    0,
+                ) {
+                    if offset == 0
+                        && let Action::Definition { column, .. } = &mut link.action
+                    {
+                        *column += definition.column;
+                    }
+                    links.push((body.y + i as u16, link));
+                }
                 frame.render_widget(
                     Paragraph::new(Line::from(code(
                         Some(&line),
@@ -2299,11 +2315,33 @@ fn draw_definition(frame: &mut Frame, app: &mut App) {
             }
         }
     }
+    for (y, link) in links {
+        if let (Ok(column), Ok(width)) = (u16::try_from(link.column), u16::try_from(link.width))
+            && column < body.width
+        {
+            let rect = Rect::new(body.x + column, y, width.min(body.width - column), 1);
+            app.hits.push((rect, link.action));
+            if app
+                .hover
+                .position
+                .is_some_and(|position| rect.contains(position))
+            {
+                app.hover.rect = Some(rect);
+                for x in rect.x..rect.right() {
+                    if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                        cell.set_style(Style::default().add_modifier(Modifier::UNDERLINED));
+                    }
+                }
+            }
+        }
+    }
     if inner.height > 0 {
         let footer = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
         frame.render_widget(
-            Paragraph::new("Esc Close   ↑/↓ Scroll   ←/→ Pan   PgUp/PgDn Page")
-                .style(Style::default().fg(ACCENT)),
+            Paragraph::new(
+                "Esc Close   Cmd/Ctrl+click Definition   ↑/↓ Scroll   ←/→ Pan   PgUp/PgDn Page",
+            )
+            .style(Style::default().fg(ACCENT)),
             footer,
         );
         app.hits.push((

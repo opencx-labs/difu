@@ -60,7 +60,15 @@ fn modal_uses_pinned_revisions_and_restores_review_in_all_diff_layouts() -> Resu
     fs::write(root.join("a-old.ts"), original)?;
     fs::write(
         root.join("library.ts"),
-        "export function target() { return 'old'; }\n",
+        "import {leaf} from './leaf';\nexport function target() { return 'old' + leaf(); }\n",
+    )?;
+    fs::write(
+        root.join("leaf.ts"),
+        "import {finish} from './terminal';\nconst 界 = 1; export const leaf = () => finish();\n",
+    )?;
+    fs::write(
+        root.join("terminal.ts"),
+        "export function finish() { return 'base'; }\n",
     )?;
     git(root, &["add", "."])?;
     git(root, &["commit", "-m", "base"])?;
@@ -72,7 +80,9 @@ fn modal_uses_pinned_revisions_and_restores_review_in_all_diff_layouts() -> Resu
         .collect::<String>();
     fs::write(
         root.join("library.ts"),
-        format!("export function target() {{\n{body}  return 'new';\n}}\n"),
+        format!(
+            "import {{leaf}} from './leaf';\nexport function target() {{\n{body}  return 'new' + leaf();\n}}\n"
+        ),
     )?;
     git(root, &["add", "."])?;
     git(root, &["commit", "-m", "head"])?;
@@ -247,6 +257,77 @@ fn modal_uses_pinned_revisions_and_restores_review_in_all_diff_layouts() -> Resu
             app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER));
             if !old {
                 assert!(matches!(&app.modal, Some(Modal::Definition(v)) if v.scroll == 10));
+            }
+            // Follow two imported functions within the same modal, including
+            // an arrow-function snippet starting mid-line after a Unicode prefix.
+            for (symbol, expected_path) in [("leaf", "leaf.ts"), ("finish", "terminal.ts")] {
+                let Some(Modal::Definition(viewer)) = &mut app.modal else {
+                    anyhow::bail!("Definition modal missing before navigation");
+                };
+                let previous_id = viewer.id;
+                let previous_cancel = viewer.cancel.clone();
+                viewer.scroll = usize::MAX;
+                viewer.horizontal = 2;
+                terminal.draw(|f| difu::ui::draw(f, &mut app))?;
+                let nested = app
+                    .hits
+                    .iter()
+                    .find_map(|(rect, action)| {
+                        let Action::Definition {
+                            path, line, column, ..
+                        } = action
+                        else {
+                            return None;
+                        };
+                        let source = git(
+                            root,
+                            &[
+                                "show",
+                                &format!("{}:{path}", if old { &base } else { &head }),
+                            ],
+                        )
+                        .ok()?;
+                        source
+                            .lines()
+                            .nth(*line as usize - 1)?
+                            .get(*column..)?
+                            .starts_with(symbol)
+                            .then_some(*rect)
+                    })
+                    .context("Missing nested symbol hit region")?;
+                app.mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    column: nested.x,
+                    row: nested.y,
+                    modifiers: KeyModifiers::NONE,
+                });
+                terminal.draw(|f| difu::ui::draw(f, &mut app))?;
+                assert_eq!(app.hover.rect, Some(nested));
+                app.mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: nested.x,
+                    row: nested.y,
+                    modifiers: KeyModifiers::CONTROL,
+                });
+                assert!(previous_cancel.cancelled());
+                wait(&mut app)?;
+                let Some(Modal::Definition(viewer)) = &app.modal else {
+                    anyhow::bail!("Definition modal missing after navigation");
+                };
+                assert_ne!(viewer.id, previous_id);
+                assert_eq!(viewer.scroll, 0);
+                assert_eq!(viewer.horizontal, 0);
+                assert_eq!(
+                    viewer.request.revision,
+                    if old { base.clone() } else { head.clone() }
+                );
+                let next = viewer
+                    .output
+                    .as_ref()
+                    .context("Missing nested result")?
+                    .as_ref()
+                    .map_err(|e| anyhow::anyhow!(e.clone()))?;
+                assert_eq!(next.path, expected_path);
             }
             app.key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
             assert!(app.modal.is_none());
