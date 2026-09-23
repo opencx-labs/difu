@@ -708,7 +708,11 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
     )?;
     client::request(&storage, Request::Delete { id: dirty })?;
     let artifact = launch(&storage, &repo, "artifact report")?;
-    let current = wait(&storage, &artifact, |s| s.status == Status::Idle)?;
+    // Connecting briefly reports Idle before the initial turn starts. Only a
+    // completed turn proves the artifact tool has had an opportunity to run.
+    let current = wait(&storage, &artifact, |s| {
+        s.status == Status::Idle && s.completed_turn.is_some()
+    })?;
     assert!(current.artifact_tools);
     assert_eq!(
         current
