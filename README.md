@@ -250,6 +250,11 @@ accepted steering is retained in the conversation without being resent. While a
 repository-guidance permission is unanswered, messages remain queued until it is
 answered. With no waiting messages, Esc keeps its normal navigation behavior.
 
+The new-agent defaults dialog completes local directories, Codex model names, and
+the selected model’s supported reasoning levels. Type to filter, use **Up/Down**
+to select, and press **Enter** to fill a field. **Tab** changes fields and
+**Ctrl+Enter** saves. A blank model inherits Codex’s model for reasoning options.
+
 #### Messages, attachments, and session names
 
 User messages appear in the conversation with a dim green background and white
