@@ -231,8 +231,9 @@ modified shortcuts keep their existing behavior. **f** filters sessions, and **r
 refreshes/reconnects. In Changes, arrows scroll, Shift+Up/Down selects lines, and
 **c / Command+C** copies through the terminal clipboard protocol.
 
-Homebrew upgrades automatically replace an older running background service, even
-when agents are active. Opening a newer difu also checks the service version.
+After an upgrade, opening the newer difu automatically replaces an older running
+background service, even when agents are active. Installing with Homebrew leaves
+the service running until that next launch.
 Chats and worktree edits are preserved; interrupted work requires Continue and
 queued messages are not replayed. Older clients do not replace a newer service.
 
