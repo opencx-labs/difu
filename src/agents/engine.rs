@@ -1023,6 +1023,7 @@ pub fn run(
     initial: Option<Control>,
 ) -> Result<()> {
     let mut naming = super::title::Task::default();
+    let mut suggesting = super::suggestions::Task::default();
     let mut session = store.get(id)?;
     if !session.waiting_for_workspace() {
         super::workspace::prepare(&mut session, &store.home, cancel, |prepared| {
@@ -1106,6 +1107,7 @@ pub fn run(
             isolation::transition(&mut rpc, store, id, requests, &controls, cancel)?;
         }
         naming.start(store, id, cancel)?;
+        suggesting.start(store, id, cancel)?;
         let current = store.get(id)?;
         if current.status == Status::Idle && !current.queue.is_empty() {
             let mut next = None;

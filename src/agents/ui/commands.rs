@@ -77,6 +77,15 @@ impl Ui {
         let query = query.text().to_lowercase();
         let query = query.trim_start_matches('/');
         let mut result = Vec::new();
+        // Once a complete command is followed by a space, the rest is its arguments,
+        // not additional words to match against the command description.
+        if !skills_only
+            && !files_only
+            && let Some((name, _)) = query.split_once(char::is_whitespace)
+            && let Some((name, description)) = COMMANDS.iter().find(|(command, _)| *command == name)
+        {
+            return vec![(format!("/{name}"), (*description).into(), None)];
+        }
         if *files_only {
             if let Some(paths) = self
                 .selected
@@ -207,6 +216,20 @@ impl Ui {
             }
             return;
         }
+        let args = match &self.modal {
+            Some(Modal::Commands { query, .. }) => query
+                .text()
+                .trim_start_matches('/')
+                .split_once(char::is_whitespace)
+                .filter(|(command, _)| command.eq_ignore_ascii_case(name.trim_start_matches('/')))
+                .map(|(_, args)| args.trim().to_owned())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        if !args.is_empty() {
+            self.run_command_arguments(&name, &args);
+            return;
+        }
         match name.as_str() {
             "/voice" => self.open_voice(),
             "/compact" => self.control(Control::Compact),
@@ -215,10 +238,11 @@ impl Ui {
             "/skills" => self.open_commands(true),
             "/status" => self.modal = Some(Modal::Status),
             "/diff" => {
-                self.changes_visible = true;
+                if !self.changes_visible {
+                    self.toggle_changes();
+                }
                 self.drilled = true;
-                self.changes_at = None;
-                self.save_visibility();
+                self.focus = Focus::ChangeTree;
                 self.modal = None;
             }
             "/new" => self.launch(),
@@ -232,6 +256,119 @@ impl Ui {
             }
             _ => {}
         }
+    }
+    fn run_command_arguments(&mut self, name: &str, args: &str) {
+        match name {
+            "/rename" => {
+                if !self.busy
+                    && let Some(id) = self.selected.clone()
+                {
+                    self.busy = true;
+                    self.task(
+                        Task::Action,
+                        Request::Rename {
+                            id,
+                            title: args.to_owned(),
+                        },
+                        false,
+                    );
+                }
+            }
+            "/model" | "/effort" => {
+                let fields = args.split_whitespace().collect::<Vec<_>>();
+                if fields.len() > if name == "/model" { 2 } else { 1 } {
+                    self.notice = Some((
+                        format!(
+                            "Usage: {}",
+                            if name == "/model" {
+                                "/model <model> [effort]"
+                            } else {
+                                "/effort <level>"
+                            }
+                        ),
+                        true,
+                    ));
+                    return;
+                }
+                let session = self.selected.as_ref().and_then(|id| self.sessions.get(id));
+                let (model, effort) = if name == "/model" {
+                    (
+                        fields.first().map(|value| (*value).to_owned()),
+                        fields
+                            .get(1)
+                            .map(|value| (*value).to_owned())
+                            .or_else(|| session.and_then(|s| s.effort.clone())),
+                    )
+                } else {
+                    (
+                        session.and_then(|s| s.model.clone()),
+                        fields.first().map(|value| (*value).to_owned()),
+                    )
+                };
+                self.control(Control::Model { model, effort });
+            }
+            "/skills" => {
+                self.open_commands(true);
+                if let Some(Modal::Commands { query, .. }) = &mut self.modal {
+                    *query = Editor::from(args);
+                }
+            }
+            "/help" => {
+                self.modal = Some(Modal::Help(crate::help::State {
+                    query: Editor::from(args),
+                    ..Default::default()
+                }))
+            }
+            "/actions" => {
+                self.modal = Some(Modal::Menu {
+                    query: Editor::from(args),
+                    selected: 0,
+                })
+            }
+            "/voice" if matches!(args, "on" | "off") => {
+                if self.voice_enabled() != (args == "on") {
+                    self.toggle_voice();
+                }
+                self.modal = None;
+            }
+            "/voice" => self.notice = Some(("Usage: /voice on|off".into(), true)),
+            _ => {
+                self.notice = Some((
+                    format!("{name} does not accept arguments. Run {name} on its own."),
+                    true,
+                ))
+            }
+        }
+    }
+    /// Pasted commands take the same path as typed slash commands, never becoming
+    /// agent messages. Transfer the draft into the command input so errors keep it editable.
+    pub(super) fn command_draft(&mut self) -> bool {
+        let Some(id) = self.selected.clone() else {
+            return false;
+        };
+        let Some(position) = self.positions.get_mut(&id) else {
+            return false;
+        };
+        if !position.attachments.is_empty() {
+            return false;
+        }
+        let text = position.draft.text();
+        let Some(query) = text.strip_prefix('/') else {
+            return false;
+        };
+        let name = query.split_whitespace().next().unwrap_or_default();
+        if !COMMANDS.iter().any(|(command, _)| *command == name) {
+            return false;
+        }
+        position.draft.clear();
+        self.modal = Some(Modal::Commands {
+            query: Editor::from(query),
+            selected: 0,
+            skills_only: false,
+            files_only: false,
+        });
+        self.run_command(0);
+        true
     }
     pub(super) fn commands_height(&self) -> u16 {
         self.command_entries().len().clamp(1, 8) as u16 + 4
@@ -337,7 +474,7 @@ impl Ui {
                 area.width,
                 input_height,
             ),
-            "Message",
+            "",
             &input,
             true,
         );

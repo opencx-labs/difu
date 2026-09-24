@@ -115,7 +115,7 @@ impl Ui {
             self.clipboard = Some(text);
             return true;
         }
-        if self.modal.is_some() && !matches!(self.modal, Some(Modal::Prompt { .. })) {
+        if self.modal.is_some() {
             return false;
         }
         if let Some(text) = self.text_selection.text() {
@@ -126,7 +126,7 @@ impl Ui {
         }
     }
     pub(super) fn selection_mouse(&mut self, event: MouseEvent) -> bool {
-        if self.modal.is_some() && !matches!(self.modal, Some(Modal::Prompt { .. })) {
+        if self.modal.is_some() {
             return false;
         }
         let point = self.text_selection.point(event.column, event.row);

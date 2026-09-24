@@ -76,8 +76,35 @@ difu
 ```
 
 `difu` opens **Agents** on first launch and remembers your last **Agents / Reviews**
-tab thereafter. Click a tab or use **Ctrl+1 / Ctrl+2** to switch while preserving
+tab thereafter. Click a tab or use **⌥+1 / ⌥+2** to switch while preserving
 your place. An explicit PR argument opens Reviews.
+
+### Local diffs and branch PRs
+
+Run `difu pr .` from a checkout to open the PR for its current branch. If the
+branch has no PR, difu reports that and exits.
+
+The Reviews home page has **My PRs / Repositories / Diffs** tabs. Open **Diffs**
+with **3**, enter one or more base directories (one per line), and use
+**Ctrl+Enter** to scan. Select repositories with **Space**, then **Enter** to
+remember them and include their registered worktrees. The scan runs in the
+background, skips hidden/dependency/build directories and symlinks, and stops
+at each Git repository. **e** edits the directories and rescans; **r** refreshes
+the tracked worktree list.
+
+`difu diff .` opens the current checkout directly. On **main**, the diff includes
+staged, unstaged, and non-ignored untracked files against HEAD. On other branches,
+it compares **HEAD with the merge base against local main**, excluding uncommitted
+edits. A local main branch and shared history are required; difu does not fetch.
+File labels use **M** modified, **A** added/untracked, **D** deleted, **R** renamed,
+and Git's other status letters where applicable.
+
+Local diffs open directly in **Diff** and never generate a guide automatically.
+Press **g** to refresh the comparison and explicitly generate a guide. Main's
+uncommitted patch is supplied to the model; its temporary read-only worktree
+contains the committed HEAD for repository inspection. Opening or refreshing a
+local diff does not create Git refs, commits, or a temporary index. GitHub review,
+merge, and comment controls apply only to PRs.
 
 ### Agents
 
@@ -86,11 +113,12 @@ The bottom **Shells** control lists Codex’s open background shells and opens t
 available streamed output. **Artifacts** lists HTML deliverables explicitly
 registered by new coding sessions. Codex is instructed to prefer self-contained
 HTML for reports and visual deliverables. Existing sessions keep their original
-tool catalog.
+tool catalog. Empty Shells/Artifacts controls are hidden; available controls use a
+single compact row beneath the conversation.
 
-Shells and HTML artifacts can use the right pane (replacing Changes) or the main
+Shells and HTML artifacts can use the right helper canvas or the main
 conversation area. **Alt+P** switches placement and remembers the choice; **Esc**
-returns to the conversation. Artifact previews offer **Refresh** and **Open in
+closes the focused canvas. Artifact previews offer **Refresh** and **Open in
 browser**; edits do not automatically reload the page. Embedded HTML uses the
 optional [terminal-browser](https://github.com/zenbu-labs/terminal-browser) package
 and a terminal with Kitty graphics support, such as Ghostty. When the package is
@@ -126,8 +154,11 @@ After switching to the worktree, difu restores the inherited sandbox and approva
 settings. A restart never automatically replays a task or workspace transition.
 
 The searchable session list previews conversations. **Enter** opens a session;
-**Esc** returns. The conversation stays in the center, with independently toggled
-side panes: **Ctrl+B** for agents and **Ctrl+D** for Changes. Visibility is remembered.
+**Esc** returns. **Ctrl+B** toggles the agents list. **Alt+D** opens Changes in
+the main area with a file tree and a syntax-highlighted diff; **Esc** returns to
+chat. The right helper canvas is reserved for shells and artifacts. **Tab** and
+**Shift+Tab** cycle between visible panes: sessions, chat (or file tree and diff),
+and the helper canvas. **Esc** closes a focused canvas. Visibility is remembered.
 Changes compares the workspace with its session-start commit and includes later
 commits, staged/unstaged edits, and non-ignored untracked files. It never stages
 files or changes your index. Changes display is limited to 32 MiB; larger results
@@ -147,7 +178,11 @@ Recalled prompts are editable and never sent automatically.
 
 Type **/** in an empty composer for native commands: `/compact`, `/model`, `/effort`,
 `/skills`, `/status`, `/diff`, `/new`, `/rename`, `/help`, `/voice`, and `/actions`.
-Commands filter as you type. Backspace removes an empty `/`, `$`, or `@` trigger.
+Commands filter as you type. Inline arguments also work: `/rename <title>`,
+`/model <model> [effort]`, `/effort <level>`, `/skills <search>`, `/help <search>`,
+`/actions <search>`, and `/voice on|off`. With no arguments, commands retain their
+existing actions and dialogs. Unsupported arguments are reported without sending
+them to the agent. Backspace removes an empty `/`, `$`, or `@` trigger.
 A slash inside an existing message stays literal. `/model` and `/effort` suggest
 Codex’s available models and supported reasoning levels: type to filter, use
 Up/Down to select, Enter to fill, and Enter again to apply.
@@ -188,18 +223,23 @@ session, difu asks before copying any missing untracked or ignored guidance from
 the source clone. It copies only the listed guidance files after agreement.
 
  **?** opens
-searchable shortcut help. **Tab** switches directly between the session list and
-the selected session’s input (opening it if needed). **Cmd+Up/Down** focuses and navigates message blocks. The focused block has a dim
+searchable shortcut help. **Tab / Shift+Tab** cycle through the visible sessions list, chat input or
+Changes tree/diff, and helper canvas. **Cmd+Up/Down** focuses and navigates message blocks. The focused block has a dim
 background; moving down past the final block returns to the input. Typing while
 reading messages focuses the composer and inserts your text; navigation and
 modified shortcuts keep their existing behavior. **f** filters sessions, and **r**
 refreshes/reconnects. In Changes, arrows scroll, Shift+Up/Down selects lines, and
 **c / Command+C** copies through the terminal clipboard protocol.
 
+Homebrew upgrades automatically replace an older running background service, even
+when agents are active. Opening a newer difu also checks the service version.
+Chats and worktree edits are preserved; interrupted work requires Continue and
+queued messages are not replayed. Older clients do not replace a newer service.
+
 #### Messages, attachments, and session names
 
-User messages have a dim green background with white text. Your newest sent prompt
-stays pinned above the conversation; click it to read the full prompt. Drag across
+User messages appear in the conversation with a dim green background and white
+text. Drag across
 conversation text and press **Ctrl+C / Cmd+C** to copy. Ctrl+C quits only when no
 chat text is selected.
 
@@ -220,6 +260,14 @@ remain until explicit workspace cleanup.
 After the first successful coding turn, **Luna Medium** generates a short title
 from the task and response. Naming runs in the background once. Failure keeps the
 existing title, and a manual rename always wins.
+
+After each completed coding turn, Luna Medium also generates a short suggested
+follow-up from the latest exchange. It appears only in an empty input. **Tab** or
+**Right** accepts it as editable text; **Enter** then sends. Enter on an unaccepted
+suggestion sends nothing. Suggestions never replace a draft and are discarded
+when the conversation moves on. Generation runs in the background without tools;
+on failure the input shows “Ask anything…” instead. Activity shimmer moves
+back and forth without moving the text.
 
 #### Voice dictation (macOS)
 
@@ -411,13 +459,17 @@ for the selected PR and **Memory management** for temporary worktrees.
 Type in PR controls to filter commands. Use arrows and Enter to choose a match,
 Backspace to edit, or **Ctrl+U** to clear the filter.
 
-PR controls support comment/approve/request-changes reviews, merge, squash merge,
+PR controls support standalone PR comments, comment/approve/request-changes reviews, merge, squash merge,
 either merge method with the admin flag, and closing with an optional comment.
 A final confirmation shows the PR, action, and pinned revision. Difu checks the
 remote head before writing; if it changed, refresh the PR and confirm again.
 Merge requests also pass GitHub's atomic expected-head guard. GitHub permissions,
 branch protection, and merge-queue rules still apply; admin is used only when
 explicitly selected. Failed or uncertain writes are never automatically retried.
+**Add comment** posts to the PR discussion without closing it or submitting a pending review.
+**Request reviewers** loads repository users and teams into a searchable picker.
+Type to filter, use **Space** to toggle selections, and **Enter** to review and
+confirm the request. The overview shows requested users/teams and review outcomes.
 Closing with a comment performs two operations; a comment failure after closing
 is reported explicitly.
 

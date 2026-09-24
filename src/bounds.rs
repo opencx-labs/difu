@@ -103,7 +103,10 @@ pub fn load(
 }
 impl App {
     pub(crate) fn load_visible_bounds(&mut self) {
-        if self.home || self.view == View::Overview {
+        if self.home
+            || self.view == View::Overview
+            || self.review().is_some_and(|r| r.local.is_some())
+        {
             return;
         }
         let Some(id) = self.key() else { return };

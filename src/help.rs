@@ -11,7 +11,7 @@ pub struct State {
 pub fn entries(query: &str) -> Vec<(&'static str, &'static str)> {
     let query = query.to_lowercase();
     [
-        ("Ctrl+1 / Ctrl+2", "Switch Agents / Reviews"),
+        ("⌥+1 / ⌥+2", "Switch Agents / Reviews"),
         ("↑ / ↓", "Navigate repositories, PRs, files, or code"),
         ("Alt+↑ / ↓", "Previous / next guide chapter"),
         ("Tab / Shift+Tab", "Switch navigation / content focus"),

@@ -1,3 +1,5 @@
+#[path = "local_ui.rs"]
+pub mod local;
 use crate::{
     codex::{self, Guide},
     context::{Direction, Expansion, FileContext, FileState},
@@ -82,6 +84,7 @@ pub struct Generation {
 }
 #[derive(Default)]
 pub struct Review {
+    pub local: Option<crate::local_diff::Checkout>,
     pub interaction: crate::workflow::PrState,
     pub detail: Option<Arc<PrDetail>>,
     pub timeline: Vec<TimelineItem>,
@@ -145,6 +148,7 @@ impl Review {
 }
 
 pub enum Message {
+    Local(local::Event),
     Bounds(
         String,
         Arc<Snapshot>,
@@ -179,6 +183,7 @@ pub enum Message {
 
 #[derive(Clone, Debug)]
 pub enum Action {
+    Local(local::Action),
     Copy,
     Filter,
     SelectRepository(String),
@@ -248,6 +253,7 @@ pub struct App {
     pub inbox_refreshed: Option<Instant>,
     pub images: crate::images::State,
     pub workflow: crate::workflow::State,
+    pub local: local::State,
     pub storage: Storage,
     pub config: Config,
     pub inbox: Vec<PrSummary>,
@@ -314,6 +320,7 @@ impl App {
     pub fn new(storage: Storage, config: Config) -> Self {
         let (sender, receiver) = mpsc::channel();
         Self {
+            local: local::State::default(),
             storage,
             config,
             inbox: Vec::new(),
@@ -412,7 +419,10 @@ impl App {
         if !self.home {
             return self.opened.clone();
         }
-        if self.repository_directory() || !self.visible_prs().contains(&self.selected) {
+        if self.inbox_tab == InboxTab::Diffs
+            || self.repository_directory()
+            || !self.visible_prs().contains(&self.selected)
+        {
             return None;
         }
         self.inbox.get(self.selected).map(|p| p.key.id())
@@ -433,6 +443,9 @@ impl App {
         }
     }
     pub fn load_inbox(&mut self) {
+        if self.inbox_tab == InboxTab::Diffs {
+            return;
+        }
         if self.repository_directory() {
             return;
         }
@@ -523,9 +536,11 @@ impl App {
         match self.inbox_tab {
             InboxTab::MyPrs => self.my_prs_state,
             InboxTab::Repositories => self.repository_state,
+            InboxTab::Diffs => PrState::All,
         }
     }
     fn change_inbox(&mut self, tab: InboxTab) {
+        self.cancel_local_load();
         self.home = true;
         self.opened = None;
         self.pending_open = None;
@@ -540,7 +555,9 @@ impl App {
         self.horizontal = 0;
         self.focus = Focus::Navigation;
         self.notice = Notice::default();
-        if tab == InboxTab::Repositories {
+        if tab == InboxTab::Diffs {
+            self.load_local_repositories();
+        } else if tab == InboxTab::Repositories {
             self.load_repository_list();
         } else {
             self.load_inbox();
@@ -594,6 +611,9 @@ impl App {
         });
     }
     pub fn open(&mut self) {
+        if self.review().is_some_and(|r| r.local.is_some()) {
+            return;
+        }
         if self.repository_directory() {
             self.open_repository();
             return;
@@ -758,12 +778,18 @@ impl App {
         state.pending.push((hunk_id.clone(), direction, amount));
         state.error = None;
         if !loading {
+            let local = review.local.clone();
             self.spawn(move |tx, cancel| {
                 let output = (|| {
                     let (file, _) = snapshot
                         .find(&hunk_id)
                         .ok_or_else(|| anyhow::anyhow!("Hunk no longer exists"))?;
-                    FileContext::new(file, repo::file_context(&root, &snapshot, file, &cancel)?)
+                    let lines = if let Some(local) = &local {
+                        crate::local_diff::file_context(local, &snapshot, file, &cancel)?
+                    } else {
+                        repo::file_context(&root, &snapshot, file, &cancel)?
+                    };
+                    FileContext::new(file, lines)
                 })();
                 let _ = tx.send(Message::Context(id, snapshot, path, result(output)));
             });
@@ -772,6 +798,14 @@ impl App {
     }
 
     pub fn generate(&mut self, force: bool) {
+        if let Some(path) = self
+            .review()
+            .and_then(|r| r.local.as_ref())
+            .map(|c| c.root.clone())
+        {
+            self.open_local(path, true);
+            return;
+        }
         let Some(id) = self.key() else {
             return;
         };
@@ -899,6 +933,18 @@ impl App {
         }
     }
     pub fn refresh(&mut self) {
+        if self.inbox_tab == InboxTab::Diffs {
+            if let Some(path) = self
+                .review()
+                .and_then(|r| r.local.as_ref())
+                .map(|c| c.root.clone())
+            {
+                self.open_local(path, false);
+            } else {
+                self.load_local_repositories();
+            }
+            return;
+        }
         if self.repository_directory() {
             self.load_repository_list();
             return;
@@ -1122,6 +1168,9 @@ impl App {
             self.load_inbox();
         }
         self.load_visible_bounds();
+        if self.inbox_tab == InboxTab::Diffs {
+            return;
+        }
         self.poll_revisions();
         let Some(id) = self.key() else {
             return;
@@ -1181,6 +1230,10 @@ impl App {
     }
     fn receive(&mut self, message: Message) {
         match message {
+            Message::Local(event) => {
+                self.local_receive(event);
+                return;
+            }
             Message::Bounds(id, snapshot, path, output) => {
                 let visible =
                     self.key().as_ref() == Some(&id) && !self.home && self.view != View::Overview;
@@ -1283,6 +1336,11 @@ impl App {
                 match output {
                     Ok(mut pr) => {
                         r.update_state(&pr.state);
+                        if let Some(detail) = &mut r.detail {
+                            let detail = Arc::make_mut(detail);
+                            detail.requested_reviewers = pr.requested_reviewers.clone();
+                            detail.requested_teams = pr.requested_teams.clone();
+                        }
                         if r.detail.as_ref().is_some_and(|old| old.state == "merged") {
                             pr.state = "merged".into();
                         }
@@ -1621,6 +1679,7 @@ impl App {
             self.filters.focused = None;
         }
         match action {
+            Action::Local(action) => self.local_action(action),
             Action::Copy => self.copy_diff(),
             Action::Filter => {
                 if let Some(kind) = self.filter_kind() {
@@ -1695,7 +1754,11 @@ impl App {
                 self.focus = Focus::Navigation;
                 self.scroll = 0;
                 self.horizontal = 0;
-                self.load_inbox();
+                if self.inbox_tab == InboxTab::Diffs {
+                    self.load_local_repositories();
+                } else {
+                    self.load_inbox();
+                }
                 self.invalidate();
             }
             Action::SetInbox(tab) => self.change_inbox(tab),
@@ -1706,6 +1769,7 @@ impl App {
                 match self.inbox_tab {
                     InboxTab::MyPrs => self.my_prs_state = state,
                     InboxTab::Repositories => self.repository_state = state,
+                    InboxTab::Diffs => return,
                 }
                 self.inbox.clear();
                 self.selected = 0;
@@ -1922,6 +1986,9 @@ impl App {
         }
     }
     pub fn key_event(&mut self, key: KeyEvent) {
+        if self.local_key(key) {
+            return;
+        }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::SUPER) {
             let editor = match &self.modal {
                 Some(Modal::Help(state)) => Some(&state.query),
@@ -2092,7 +2159,11 @@ impl App {
             } else {
                 Action::SetView(View::Guide)
             }),
-            KeyCode::Char('3') if !self.home => self.action(Action::SetView(View::Diff)),
+            KeyCode::Char('3') => self.action(if self.home {
+                Action::SetInbox(InboxTab::Diffs)
+            } else {
+                Action::SetView(View::Diff)
+            }),
             KeyCode::Char('?') if plain => self.action(Action::Help),
             KeyCode::Char('m') if plain => self.load_models(),
             KeyCode::Char('s' | '[' | ']')
@@ -2302,6 +2373,9 @@ impl App {
         }
     }
     pub fn paste(&mut self, text: String) {
+        if self.local_paste(&text) {
+            return;
+        }
         if self.modal.is_none()
             && let Some(kind) = self.filters.focused
         {
@@ -2317,6 +2391,10 @@ impl App {
                 state.scroll = 0;
             }
             Some(Modal::Workflow(modal)) => match modal.as_mut() {
+                crate::workflow::Wizard::Reviewers(picker) => {
+                    picker.query.insert(&text.replace(['\n', '\r', '\t'], " "));
+                    picker.selected = 0;
+                }
                 crate::workflow::Wizard::Compose(draft) if draft.focus == 0 => {
                     draft.editor.insert(&text);
                 }
@@ -2846,6 +2924,8 @@ mod tests {
     }
     fn detail(head: &str) -> PrDetail {
         PrDetail {
+            requested_reviewers: Vec::new(),
+            requested_teams: Vec::new(),
             key: PrKey {
                 owner: "owner".into(),
                 repo: "repo".into(),
@@ -2933,8 +3013,26 @@ mod tests {
             Some(Arc::new(detail("pinned")));
         let mut merged = detail("new");
         merged.state = "merged".into();
+        merged.requested_reviewers = vec!["reviewer".into()];
+        merged.requested_teams = vec!["team".into()];
         app.receive(Message::Detail(id.clone(), Ok(merged)));
         let review = app.reviews.get(&id).context("Missing review")?;
+        assert_eq!(
+            review
+                .detail
+                .as_ref()
+                .context("Missing detail")?
+                .requested_reviewers,
+            ["reviewer"]
+        );
+        assert_eq!(
+            review
+                .detail
+                .as_ref()
+                .context("Missing detail")?
+                .requested_teams,
+            ["team"]
+        );
         assert_eq!(
             review.detail.as_ref().context("Missing detail")?.state,
             "merged"

@@ -33,6 +33,13 @@ pub struct Anchor {
 }
 #[derive(Clone, Debug)]
 pub enum Operation {
+    RequestReviewers {
+        users: Vec<String>,
+        teams: Vec<String>,
+    },
+    PrComment {
+        body: String,
+    },
     Review {
         event: String,
         body: String,
@@ -70,6 +77,8 @@ impl Operation {
                 if *admin { " with admin override" } else { "" }
             ),
             Self::Close { .. } => "Close PR".into(),
+            Self::PrComment { .. } => "Post PR comment".into(),
+            Self::RequestReviewers { .. } => "Request reviewers".into(),
             Self::Viewed { viewed, .. } => if *viewed {
                 "Mark file Viewed"
             } else {
@@ -212,6 +221,30 @@ pub fn execute(key: &PrKey, head: &str, operation: &Operation, cancel: &Cancel) 
             let current = github::detail(key, cancel)?;
             return Ok(format!("{} · {}", current.state, output.trim()));
         }
+        Operation::RequestReviewers { users, teams } => {
+            ensure!(
+                !users.is_empty() || !teams.is_empty(),
+                "Select at least one reviewer"
+            );
+            api(
+                &format!("{endpoint}/requested_reviewers"),
+                "POST",
+                Some(json!({"reviewers": users, "team_reviewers": teams})),
+                cancel,
+            )?;
+        }
+        Operation::PrComment { body } => {
+            ensure!(!body.trim().is_empty(), "Comment cannot be empty");
+            api(
+                &format!(
+                    "repos/{}/{}/issues/{}/comments",
+                    key.owner, key.repo, key.number
+                ),
+                "POST",
+                Some(json!({"body": body})),
+                cancel,
+            )?;
+        }
         Operation::Close { body } => {
             // Closing and commenting are separate API operations; report partial success explicitly.
             api(&endpoint, "PATCH", Some(json!({"state":"closed"})), cancel)?;
@@ -341,6 +374,57 @@ pub fn execute(key: &PrKey, head: &str, operation: &Operation, cancel: &Cancel) 
 pub struct Mentions {
     pub fetched: i64,
     pub users: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Reviewer {
+    pub team: bool,
+    pub name: String,
+}
+impl Reviewer {
+    pub fn label(&self, owner: &str) -> String {
+        if self.team {
+            format!("@{owner}/{} · team", self.name)
+        } else {
+            format!("@{}", self.name)
+        }
+    }
+}
+
+pub fn reviewers(key: &PrKey, cancel: &Cancel) -> Result<Vec<Reviewer>> {
+    key.validate()?;
+    let mut options = BTreeSet::new();
+    let owner = api(&format!("users/{}", key.owner), "GET", None, cancel)?;
+    for (endpoint, field, team) in [("collaborators", "login", false), ("teams", "slug", true)] {
+        if team && owner.get("type").and_then(Value::as_str) != Some("Organization") {
+            continue;
+        }
+        for page in 1.. {
+            let value = api(
+                &format!(
+                    "repos/{}/{endpoint}?per_page=100&page={page}",
+                    key.repository()
+                ),
+                "GET",
+                None,
+                cancel,
+            )?;
+            let values = value
+                .as_array()
+                .context("Missing GitHub reviewer options")?;
+            for item in values {
+                let name = self::field(item, field)?;
+                options.insert(Reviewer {
+                    team,
+                    name: name.into(),
+                });
+            }
+            if values.len() < 100 {
+                break;
+            }
+        }
+    }
+    Ok(options.into_iter().collect())
 }
 fn paged_users(endpoint: &str, cancel: &Cancel) -> Result<BTreeSet<String>> {
     let mut users = BTreeSet::new();

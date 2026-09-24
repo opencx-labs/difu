@@ -139,6 +139,7 @@ fn exercise(root: &Path) -> Result<()> {
     exercise_checks(root)?;
     exercise_mention_shortcut(root)?;
     exercise_writes(root)?;
+    exercise_reviewer_picker_and_branch_lookup(root)?;
     let storage = Storage {
         config: root.join("config.json"),
         cache: root.to_owned(),
@@ -625,6 +626,7 @@ fn exercise(root: &Path) -> Result<()> {
         std::thread::sleep(Duration::from_millis(30));
     }
     assert_eq!(fs::read_to_string(root.join("turns"))?, "turn\nturn\n");
+    exercise_manual_local_guide(root, &storage)?;
     Ok(())
 }
 
@@ -678,6 +680,45 @@ fn exercise_writes(root: &Path) -> Result<()> {
             Some("RIGHT")
         );
     }
+    // A general PR comment must not close the PR or submit the pending review.
+    let before = fs::read_to_string(root.join("writes.jsonl"))?;
+    assert!(
+        review::execute(
+            &key,
+            head,
+            &Operation::PrComment { body: "  ".into() },
+            &cancel
+        )
+        .is_err()
+    );
+    assert_eq!(before, fs::read_to_string(root.join("writes.jsonl"))?);
+    review::execute(
+        &key,
+        head,
+        &Operation::PrComment {
+            body: "Standalone discussion".into(),
+        },
+        &cancel,
+    )?;
+    let after = fs::read_to_string(root.join("writes.jsonl"))?;
+    let additions = after
+        .strip_prefix(&before)
+        .context("writes preserved")?
+        .lines()
+        .collect::<Vec<_>>();
+    assert_eq!(additions.len(), 1);
+    let posted: serde_json::Value =
+        serde_json::from_str(additions.first().context("posted comment")?)?;
+    assert_eq!(
+        posted.get("endpoint").context("endpoint")?,
+        "repos/example/project/issues/1/comments"
+    );
+    assert_eq!(posted.get("method").context("method")?, "POST");
+    assert_eq!(
+        posted.pointer("/body/body").context("comment body")?,
+        "Standalone discussion"
+    );
+    assert!(review::state(&key, &cancel)?.pending.is_some());
     review::execute(
         &key,
         head,
@@ -688,6 +729,32 @@ fn exercise_writes(root: &Path) -> Result<()> {
         &cancel,
     )?;
     assert!(review::state(&key, &cancel)?.pending.is_none());
+    let before = fs::read_to_string(root.join("writes.jsonl"))?;
+    let reviewers = Operation::RequestReviewers {
+        users: vec!["alice".into()],
+        teams: vec!["platform".into()],
+    };
+    assert!(review::execute(&key, "outdated", &reviewers, &cancel).is_err());
+    assert_eq!(before, fs::read_to_string(root.join("writes.jsonl"))?);
+    review::execute(&key, head, &reviewers, &cancel)?;
+    let after = fs::read_to_string(root.join("writes.jsonl"))?;
+    let added = after
+        .strip_prefix(&before)
+        .context("writes preserved")?
+        .lines()
+        .collect::<Vec<_>>();
+    assert_eq!(added.len(), 1);
+    let request: serde_json::Value =
+        serde_json::from_str(added.first().context("reviewer request")?)?;
+    assert_eq!(request.get("method").context("method")?, "POST");
+    assert_eq!(
+        request.get("endpoint").context("endpoint")?,
+        "repos/example/project/pulls/1/requested_reviewers"
+    );
+    assert_eq!(
+        request.get("body").context("reviewers body")?,
+        &serde_json::json!({"reviewers":["alice"],"team_reviewers":["platform"]})
+    );
     let old = Anchor {
         side: Side::Left,
         ..anchor
@@ -843,5 +910,136 @@ fn exercise_mention_shortcut(root: &Path) -> Result<()> {
     assert!(
         matches!(&app.modal,Some(difu::app::Modal::Workflow(w)) if matches!(w.as_ref(),Wizard::Compose(draft) if draft.editor.text()=="r"))
     );
+    Ok(())
+}
+
+fn exercise_reviewer_picker_and_branch_lookup(root: &Path) -> Result<()> {
+    use difu::{
+        app::{Modal, Review},
+        review::Operation,
+        workflow::{WAction, Wizard},
+    };
+    let cancel = Cancel::default();
+    let key = difu::github::current_branch_pr(&cancel)?;
+    assert_eq!(key.id(), "example/project#1");
+    fs::write(root.join("no-branch-pr"), "yes")?;
+    let failure = difu::github::current_branch_pr(&cancel)
+        .err()
+        .context("missing PR should fail")?;
+    assert!(format!("{failure:#}").contains("no pull requests found"));
+    fs::remove_file(root.join("no-branch-pr"))?;
+    let detail = difu::github::detail(&key, &cancel)?;
+    let mut app = App::new(
+        Storage {
+            config: root.join("reviewers-config.json"),
+            cache: root.join("reviewers-cache"),
+        },
+        Config::default(),
+    );
+    app.inbox = vec![difu::model::PrSummary {
+        key: key.clone(),
+        title: detail.title.clone(),
+        author: detail.author.clone(),
+        updated: String::new(),
+        created: String::new(),
+        stats: None,
+        stats_error: false,
+        draft: false,
+    }];
+    app.reviews.insert(
+        key.id(),
+        Review {
+            detail: Some(std::sync::Arc::new(detail)),
+            ..Default::default()
+        },
+    );
+    app.workflow_action(WAction::Controls);
+    app.workflow_action(WAction::Choose(8));
+    wait(
+        &mut app,
+        |app| matches!(&app.modal, Some(Modal::Workflow(w)) if matches!(w.as_ref(), Wizard::Reviewers(p) if !p.loading)),
+    )?;
+    let screen = render(&mut app, 120)?;
+    assert!(screen.contains("@example/platform"));
+    assert!(!screen.contains("@author"));
+    let before = fs::read_to_string(root.join("writes.jsonl"))?;
+    app.paste("ali".into());
+    app.key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    app.key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+    app.paste("platform".into());
+    app.key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+    app.key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(
+        matches!(&app.modal, Some(Modal::Workflow(w)) if matches!(w.as_ref(), Wizard::Confirm { operation: Operation::RequestReviewers { users, teams }, .. } if users == &["alice"] && teams == &["platform"]))
+    );
+    assert_eq!(fs::read_to_string(root.join("writes.jsonl"))?, before);
+    app.key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait(&mut app, |app| !app.workflow.busy)?;
+    let writes = fs::read_to_string(root.join("writes.jsonl"))?;
+    let write: serde_json::Value =
+        serde_json::from_str(writes.strip_prefix(&before).context("new writes")?.trim())?;
+    assert_eq!(
+        write.get("endpoint").context("endpoint")?,
+        "repos/example/project/pulls/1/requested_reviewers"
+    );
+    assert_eq!(
+        write.get("body").context("body")?,
+        &serde_json::json!({"reviewers":["alice"],"team_reviewers":["platform"]})
+    );
+    app.shutdown();
+    Ok(())
+}
+
+fn exercise_manual_local_guide(root: &Path, storage: &Storage) -> Result<()> {
+    let repo = root.join("local-review");
+    fs::create_dir(&repo)?;
+    git(&repo, &["init", "-b", "main"])?;
+    fs::write(repo.join("main.rs"), "fn main() {\n    new();\n}\n")?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-m", "base"])?;
+    fs::write(repo.join("main.rs"), "fn main() {\n    uncommitted();\n}\n")?;
+    fs::write(repo.join("new.txt"), "new local file\n")?;
+    let index = fs::read(repo.join(".git/index"))?;
+    let refs = git(&repo, &["show-ref"])?;
+    let turns = fs::read_to_string(root.join("turns"))?;
+    let mut app = App::new(storage.clone(), Config::default());
+    app.open_local(repo.clone(), false);
+    wait(&mut app, |a| !a.local.loading)?;
+    assert!(app.review().context("local review")?.guide.is_none());
+    app.action(Action::SetView(View::Guide));
+    app.tick();
+    assert_eq!(fs::read_to_string(root.join("turns"))?, turns);
+    app.action(Action::Regenerate);
+    wait(&mut app, |a| {
+        a.review()
+            .is_some_and(|r| r.guide.is_some() || r.guide_error.is_some())
+    })?;
+    let review = app.review().context("local review")?;
+    let guide = review
+        .guide
+        .as_ref()
+        .with_context(|| format!("Local guide failed: {:?}", review.guide_error))?;
+    guide.validate(review.snapshot.as_ref().context("snapshot")?)?;
+    assert_eq!(
+        fs::read_to_string(repo.join("main.rs"))?,
+        "fn main() {\n    uncommitted();\n}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("new.txt"))?,
+        "new local file\n"
+    );
+    assert_eq!(fs::read(repo.join(".git/index"))?, index);
+    assert_eq!(git(&repo, &["show-ref"])?, refs);
+    assert_eq!(
+        git(&repo, &["worktree", "list", "--porcelain"])?
+            .matches("worktree ")
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("turns"))?,
+        format!("{turns}turn\n")
+    );
+    app.shutdown();
     Ok(())
 }

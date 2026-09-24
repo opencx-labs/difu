@@ -5,6 +5,11 @@ root = Path(os.environ['DIFU_TEST_FIXTURE'])
 revs = json.loads((root / 'revisions.json').read_text())
 args = sys.argv[1:]
 url = 'https://github.com/example/project/pull/1'
+if args[:2] == ['pr', 'view']:
+    assert args == ['pr', 'view', '--json=url']
+    if (root / 'no-branch-pr').exists():
+        print('no pull requests found for branch', file=sys.stderr);sys.exit(1)
+    print(json.dumps(dict(url=url)));sys.exit(0)
 if args[:2] == ['pr', 'merge']:
     assert '--match-head-commit' in args
     assert args[args.index('--match-head-commit')+1] == revs['head']
@@ -36,6 +41,8 @@ if args[:2] == ['api', '--method']:
     elif method != 'GET':
         with (root / 'writes.jsonl').open('a') as log: log.write(json.dumps(dict(endpoint=endpoint,method=method,body=body))+'\n')
         value = dict(id=100)
+    elif '/collaborators?' in endpoint: value = [dict(login='alice'),dict(login='author'),dict(login='reviewer')]
+    elif '/teams?' in endpoint: value = [dict(slug='platform')]
     elif endpoint == 'user': value = dict(login='reviewer')
     elif endpoint.startswith('users/'): value = dict(type='Organization')
     elif endpoint.startswith('orgs/'): value = [dict(login='alice'),dict(login='reviewer')]

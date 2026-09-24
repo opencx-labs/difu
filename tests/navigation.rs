@@ -93,6 +93,8 @@ fn modal_uses_pinned_revisions_and_restores_review_in_all_diff_layouts() -> Resu
         number: 1,
     };
     let pr = PrDetail {
+        requested_reviewers: Vec::new(),
+        requested_teams: Vec::new(),
         key: key.clone(),
         title: "Navigation".into(),
         body: String::new(),

@@ -709,6 +709,8 @@ mod tests {
     use std::{sync::Arc, time::Instant};
     fn pr() -> PrDetail {
         PrDetail {
+            requested_reviewers: Vec::new(),
+            requested_teams: Vec::new(),
             key: PrKey {
                 owner: "example".into(),
                 repo: "repo".into(),

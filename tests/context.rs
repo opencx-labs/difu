@@ -59,6 +59,8 @@ fn fixture(root: &Path) -> Result<(App, PrDetail)> {
         number: 1,
     };
     let pr = PrDetail {
+        requested_reviewers: Vec::new(),
+        requested_teams: Vec::new(),
         key: key.clone(),
         title: "Context".into(),
         body: String::new(),

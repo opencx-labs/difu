@@ -32,8 +32,8 @@ pub(crate) const GREEN: Color = Color::Rgb(114, 216, 163);
 pub(crate) const PURPLE: Color = Color::Rgb(171, 125, 248);
 pub(crate) const YELLOW: Color = Color::Rgb(229, 192, 100);
 pub(crate) const RED: Color = Color::Rgb(247, 137, 145);
-const ADD_BG: Color = Color::Rgb(18, 43, 32);
-const REMOVE_BG: Color = Color::Rgb(49, 25, 31);
+pub(crate) const ADD_BG: Color = Color::Rgb(18, 43, 32);
+pub(crate) const REMOVE_BG: Color = Color::Rgb(49, 25, 31);
 
 #[derive(Clone, Default)]
 pub struct TextRow {
@@ -124,6 +124,7 @@ fn file_header(
         {
             "Enter: mark unviewed"
         }
+        None if review.local.is_some() => "Local diff",
         None => "Enter: mark viewed",
     };
     wrapped_text(
@@ -291,6 +292,19 @@ pub(crate) fn syntax_spans(content: &str) -> Vec<Span<'static>> {
             Color::Rgb(221, 194, 139)
         } else if [
             "fn",
+            "for",
+            "in",
+            "use",
+            "mut",
+            "while",
+            "loop",
+            "break",
+            "continue",
+            "try",
+            "except",
+            "raise",
+            "some",
+            "none",
             "pub",
             "let",
             "const",
@@ -789,6 +803,27 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
         return doc;
     };
     if app.view == View::Overview {
+        if let Some(local) = &review.local {
+            for row in prose(
+                &format!(
+                    "{}\nBranch: {}\n{}\n\nGuide generation is manual: press g.",
+                    local.root.display(),
+                    local.branch,
+                    if matches!(
+                        local.comparison,
+                        crate::local_diff::Comparison::WorkingTree { .. }
+                    ) {
+                        "Uncommitted changes against HEAD"
+                    } else {
+                        "HEAD against the merge base with main"
+                    }
+                ),
+                width as usize,
+            ) {
+                append(&mut doc.rows, row);
+            }
+            return doc;
+        }
         for row in crate::overview::rows_with_images(review, width, app.images.supported()) {
             append(&mut doc.rows, row);
         }
@@ -1283,6 +1318,10 @@ fn relocated_row(old: &Document, new: &Document, position: usize) -> Option<usiz
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    if app.home && app.inbox_tab == InboxTab::Diffs {
+        crate::app::local::draw(frame, app);
+        return;
+    }
     let area = frame.area();
     app.hits.clear();
     app.hover.rect = None;
@@ -1295,7 +1334,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
     let title = Rect::new(2, 1, area.width.saturating_sub(4), 1);
-    let identity = app.key().unwrap_or_else(|| app.inbox_tab.label().into());
+    let identity = app
+        .review()
+        .and_then(|r| r.local.as_ref())
+        .map(|c| format!("{} · {}", c.root.display(), c.branch))
+        .unwrap_or_else(|| app.key().unwrap_or_else(|| app.inbox_tab.label().into()));
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(
@@ -1318,6 +1361,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 "2 Repositories",
                 app.inbox_tab == InboxTab::Repositories,
                 Action::SetInbox(InboxTab::Repositories),
+            ),
+            (
+                "3 Diffs",
+                app.inbox_tab == InboxTab::Diffs,
+                Action::SetInbox(InboxTab::Diffs),
             ),
         ]
     } else {
@@ -1718,6 +1766,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 total
             );
         } else if app.view == View::Diff
+            && review.local.is_none()
             && let Some(snapshot) = &review.snapshot
         {
             status = format!(
@@ -2188,7 +2237,19 @@ fn draw_files(frame: &mut Frame, app: &mut App, rect: Rect) {
             format!(
                 "{} {}",
                 if active { "▸" } else { " " },
-                crop(&entry.label(), app.tree_horizontal, width)
+                crop(
+                    &format!(
+                        "{}{}",
+                        entry
+                            .file
+                            .and_then(|i| snapshot.files.get(i))
+                            .map(|f| format!("{} ", crate::local_diff::status_letter(&f.status)))
+                            .unwrap_or_default(),
+                        entry.label()
+                    ),
+                    app.tree_horizontal,
+                    width
+                )
             ),
             color,
         );

@@ -1,12 +1,14 @@
 //! Native session UI. Network/process work is performed off the terminal thread.
 use super::*;
 mod browser;
+mod changes;
 mod commands;
 mod defaults;
 mod inline_questions;
 mod media;
 mod models;
 mod panels;
+mod patch;
 mod prompt;
 mod questions;
 mod selection;
@@ -38,15 +40,18 @@ pub enum Focus {
     List,
     Filter,
     Conversation,
-    Prompt,
     Composer,
     Changes,
+    ChangeTree,
+    Resources(bool),
 }
 #[derive(Default)]
 pub struct Position {
     pub conversation: usize,
     pub follow: bool,
     pub changes: usize,
+    pub change_file: usize,
+    pub change_tree: usize,
     pub horizontal: usize,
     pub selection: Option<usize>,
     pub draft: Editor,
@@ -79,11 +84,11 @@ enum Action {
     New,
     ToggleList,
     ToggleChanges,
+    ChangeFile(usize),
     Approval(usize),
     MenuItem(usize),
     Command(usize),
     ToggleEntry(String),
-    ShowPrompt(String),
     RemoveAttachment(std::path::PathBuf),
     Pending,
     Queue,
@@ -107,6 +112,7 @@ enum Action {
     QuestionChoice(usize),
     QuestionNote(usize),
     SubmitQuestion(bool),
+    DismissNotice,
 }
 pub enum Modal {
     InstallBrowser {
@@ -119,10 +125,6 @@ pub enum Modal {
         selected: usize,
     },
     AgentDefaults(Box<defaults::Settings>),
-    Prompt {
-        text: String,
-        scroll: usize,
-    },
     Voice {
         key: Editor,
         field: usize,
@@ -198,7 +200,7 @@ pub struct Ui {
     pub summaries: Vec<Summary>,
     pub sessions: HashMap<String, Session>,
     pub positions: HashMap<String, Position>,
-    pub changes: HashMap<String, String>,
+    pub changes: HashMap<String, changes::Document>,
     pub focus: Focus,
     pub drilled: bool,
     pub list_visible: bool,
@@ -229,6 +231,7 @@ pub struct Ui {
     conversation_height: usize,
     text_selection: selection::Selection,
     change_lines: usize,
+    change_rows: Vec<patch::SourceRow>,
     skills: HashMap<String, (Vec<Skill>, Vec<String>)>,
     skills_loading: Option<String>,
     workspace_paths: HashMap<String, Vec<String>>,
@@ -236,6 +239,7 @@ pub struct Ui {
     sidebar: sidebar::State,
     voice: voice::State,
     model_completion: models::State,
+    toast_rect: Rect,
     media_pending: Option<(String, mpsc::Receiver<Result<super::media::Paste, String>>)>,
 }
 impl Ui {
@@ -280,12 +284,14 @@ impl Ui {
             conversation_height: 0,
             text_selection: selection::Selection::default(),
             change_lines: 0,
+            change_rows: Vec::new(),
             skills: HashMap::new(),
             skills_loading: None,
             workspace_paths: HashMap::new(),
             paths_loading: HashSet::new(),
             voice: voice::State::new(config.voice_enabled),
             model_completion: models::State::default(),
+            toast_rect: Rect::default(),
             media_pending: None,
         }
     }
@@ -423,7 +429,7 @@ impl Ui {
                         self.question_received(&id);
                     }
                     (Task::Changes(id), Reply::Changes(patch)) => {
-                        self.changes.insert(id, patch);
+                        self.receive_changes(id, patch.into());
                     }
                     (
                         Task::Defaults(id),
@@ -450,6 +456,7 @@ impl Ui {
                     }
                     (Task::Launch, Reply::Launched(id)) => {
                         self.selected = Some(id.clone());
+                        self.changes_visible = false;
                         self.positions.entry(id).or_default().follow = true;
                         self.drilled = true;
                         self.focus = Focus::Composer;
@@ -584,6 +591,7 @@ impl Ui {
         self.positions.entry(id.clone()).or_default();
         self.restore_media(&id);
         self.conversation_sections.clear();
+        self.change_rows.clear();
         self.text_selection.clear();
         self.changes_at = None;
     }
@@ -657,7 +665,7 @@ impl Ui {
             },
             "Show active / archived sessions",
             "Toggle agents list · Ctrl+B",
-            "Toggle Changes · Ctrl+D",
+            "Toggle Changes · Alt+D",
             "Delete clean inactive worktree",
             "Open Reviews",
             "Queued outgoing messages",
@@ -737,22 +745,47 @@ impl Ui {
     pub fn toggle_list(&mut self) {
         self.list_visible = !self.list_visible;
         if !self.list_visible && matches!(self.focus, Focus::List | Focus::Filter) {
-            self.focus = Focus::Conversation;
+            self.focus = if self.changes_visible && self.drilled {
+                Focus::ChangeTree
+            } else {
+                Focus::Conversation
+            };
         }
         self.save_visibility();
     }
     pub fn toggle_changes(&mut self) {
-        self.panels.view = None;
         self.panels.focused = false;
         self.changes_visible = !self.changes_visible;
-        if !self.changes_visible && self.focus == Focus::Changes {
-            self.focus = Focus::Conversation;
+        if self.changes_visible && self.panels.view.is_some() {
+            self.panels.right = true;
         }
+        self.drilled = true;
+        self.focus = if self.changes_visible {
+            Focus::ChangeTree
+        } else {
+            Focus::Composer
+        };
         self.changes_at = None;
         self.save_visibility();
     }
+    fn composer_suggestion(&self) -> Option<&str> {
+        let id = self.selected.as_ref()?;
+        let position = self.positions.get(id)?;
+        if !position.draft.chars.is_empty() || !position.attachments.is_empty() {
+            return None;
+        }
+        let session = self.sessions.get(id)?;
+        session
+            .suggestion
+            .as_ref()
+            .filter(|suggestion| suggestion.current(session))
+            .map(|suggestion| suggestion.text.as_str())
+    }
     fn send(&mut self, queue: bool) {
         if self.busy || self.media_pending.is_some() {
+            return;
+        }
+        if self.command_draft() {
             return;
         }
         if let Some(id) = self.selected.clone() {
@@ -930,7 +963,7 @@ impl Ui {
     fn typing_focus(&mut self) {
         if self.modal.is_none()
             && self.drilled
-            && matches!(self.focus, Focus::Conversation | Focus::Prompt)
+            && matches!(self.focus, Focus::Conversation)
             && self
                 .selected
                 .as_ref()
@@ -988,7 +1021,7 @@ impl Ui {
             self.toggle_list();
             return;
         }
-        if ctrl && key.code == KeyCode::Char('d') {
+        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('d') {
             self.toggle_changes();
             return;
         }
@@ -997,9 +1030,6 @@ impl Ui {
             return;
         }
         if self.modal.is_some() {
-            if self.prompt_key(key) {
-                return;
-            }
             self.modal_key(key);
             self.remember_answers();
             return;
@@ -1007,20 +1037,11 @@ impl Ui {
         if self.drilled
             && key.modifiers == KeyModifiers::SUPER
             && matches!(key.code, KeyCode::Up | KeyCode::Down)
-            && matches!(
-                self.focus,
-                Focus::Composer | Focus::Conversation | Focus::Prompt
-            )
+            && matches!(self.focus, Focus::Composer | Focus::Conversation)
         {
             if self.focus == Focus::Composer {
                 if key.code == KeyCode::Up {
-                    self.focus = if self.conversation_sections.is_empty()
-                        && self.latest_prompt().is_some()
-                    {
-                        Focus::Prompt
-                    } else {
-                        Focus::Conversation
-                    };
+                    self.focus = Focus::Conversation;
                     if let Some(p) = self
                         .selected
                         .as_ref()
@@ -1037,18 +1058,31 @@ impl Ui {
                         }
                     }
                 }
-            } else if self.focus == Focus::Prompt {
-                if key.code == KeyCode::Down {
-                    self.focus = if self.conversation_sections.is_empty() {
-                        Focus::Composer
-                    } else {
-                        Focus::Conversation
-                    };
-                }
             } else {
                 self.move_transcript(key.code == KeyCode::Down);
             }
             return;
+        }
+        if self.changes_visible && self.drilled && key.code == KeyCode::Esc {
+            self.toggle_changes();
+            return;
+        }
+        if self.focus == Focus::ChangeTree && self.changes_visible {
+            match key.code {
+                KeyCode::Up => {
+                    self.move_change_tree(-1);
+                    return;
+                }
+                KeyCode::Down => {
+                    self.move_change_tree(1);
+                    return;
+                }
+                KeyCode::Enter | KeyCode::Right => {
+                    self.focus = Focus::Changes;
+                    return;
+                }
+                _ => {}
+            }
         }
         if self.focus == Focus::Filter {
             match key.code {
@@ -1060,6 +1094,18 @@ impl Ui {
             return;
         }
         if self.focus == Focus::Composer && self.drilled {
+            if key.modifiers.is_empty()
+                && matches!(key.code, KeyCode::Tab | KeyCode::Right)
+                && let Some(suggestion) = self.composer_suggestion().map(str::to_owned)
+                && let Some(id) = self.selected.clone()
+            {
+                self.positions
+                    .entry(id)
+                    .or_default()
+                    .draft
+                    .insert(&suggestion);
+                return;
+            }
             if self.history_key(key) {
                 return;
             }
@@ -1128,19 +1174,6 @@ impl Ui {
             return;
         }
         match key.code {
-            KeyCode::Enter if self.focus == Focus::Prompt => {
-                if let Some(text) = self.latest_prompt() {
-                    self.action(Action::ShowPrompt(text));
-                }
-            }
-            KeyCode::Down if self.focus == Focus::Prompt => {
-                self.focus = if self.conversation_sections.is_empty() {
-                    Focus::Composer
-                } else {
-                    Focus::Conversation
-                };
-            }
-            KeyCode::Up if self.focus == Focus::Prompt => {}
             KeyCode::Char('n') => self.launch(),
             KeyCode::Char('/') if self.drilled && self.focus != Focus::List => {
                 self.open_commands(false)
@@ -1173,6 +1206,13 @@ impl Ui {
                     .and_then(|p| p.focused_entry.clone())
                 {
                     self.action(Action::ToggleEntry(entry));
+                }
+            }
+            KeyCode::Enter if self.changes_visible && self.focus == Focus::List => {
+                if self.selected.is_some() {
+                    self.drilled = true;
+                    self.focus = Focus::ChangeTree;
+                    self.changes_at = None;
                 }
             }
             KeyCode::Char('i') | KeyCode::Enter if self.drilled => {
@@ -1260,29 +1300,79 @@ impl Ui {
             _ => {}
         }
     }
-    fn cycle_focus(&mut self, _backwards: bool) {
-        if self.focus == Focus::List {
-            if self
-                .selected
-                .as_ref()
-                .and_then(|id| self.sessions.get(id))
-                .is_some_and(|s| matches!(s.job, Job::Coding(_)))
-            {
-                self.drilled = true;
-                self.focus = Focus::Composer;
-                self.changes_at = None;
+    fn cycle_focus(&mut self, backwards: bool) {
+        let helper = self.drilled && self.panels.right && self.panels.view.is_some();
+        // Visible panes cycle in screen order: sessions, composer, helper canvas.
+        let mut targets = Vec::new();
+        if self.list_visible {
+            targets.push(0);
+        }
+        if self.changes_visible && self.drilled {
+            targets.extend([3, 4]);
+        } else {
+            targets.push(1);
+        }
+        if helper {
+            targets.push(2);
+        }
+        let current = if self.panels.focused && helper {
+            2
+        } else if matches!(self.focus, Focus::List | Focus::Filter) {
+            0
+        } else if self.changes_visible && self.drilled {
+            if self.focus == Focus::Changes { 4 } else { 3 }
+        } else {
+            1
+        };
+        let index = targets
+            .iter()
+            .position(|target| *target == current)
+            .unwrap_or(0);
+        let next = if backwards {
+            (index + targets.len() - 1) % targets.len()
+        } else {
+            (index + 1) % targets.len()
+        };
+        match targets.get(next) {
+            Some(3) => {
+                self.panels.focused = false;
+                self.focus = Focus::ChangeTree;
             }
-        } else if self.list_visible {
-            self.focus = Focus::List;
-        } else if self.drilled {
-            self.focus = Focus::Composer;
+            Some(4) => {
+                self.panels.focused = false;
+                self.focus = Focus::Changes;
+            }
+            Some(0) => {
+                self.panels.focused = false;
+                self.focus = Focus::List;
+            }
+            Some(2) => {
+                self.panels.focused = true;
+                self.focus = Focus::Composer;
+            }
+            _ => {
+                if self
+                    .selected
+                    .as_ref()
+                    .and_then(|id| self.sessions.get(id))
+                    .is_some_and(|s| matches!(s.job, Job::Coding(_)))
+                {
+                    self.drilled = true;
+                    self.panels.focused = false;
+                    self.focus = if self.changes_visible {
+                        Focus::ChangeTree
+                    } else {
+                        Focus::Composer
+                    };
+                    self.changes_at = None;
+                }
+            }
         }
     }
     fn move_transcript(&mut self, down: bool) {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        let has_prompt = self.latest_prompt().is_some();
         let position = self.positions.entry(id.clone()).or_default();
         let current = self
             .conversation_sections
@@ -1298,10 +1388,6 @@ impl Ui {
                 .is_some_and(|s| matches!(s.job, Job::Coding(_)))
         {
             self.focus = Focus::Composer;
-            return;
-        }
-        if !down && current == Some(0) && has_prompt {
-            self.focus = Focus::Prompt;
             return;
         }
         let index = current
@@ -1339,6 +1425,10 @@ impl Ui {
         }
     }
     fn scroll(&mut self, delta: i32, select: bool) {
+        if self.focus == Focus::ChangeTree {
+            self.move_change_tree(delta);
+            return;
+        }
         if self.focus == Focus::List {
             self.move_list(delta);
             return;
@@ -1368,28 +1458,27 @@ impl Ui {
         }
     }
     fn copy_change(&mut self) {
-        if let Some(id) = self.selected.as_ref()
-            && let (Some(p), Some(patch)) = (self.positions.get(id), self.changes.get(id))
-        {
+        if let Some(p) = self.selected.as_ref().and_then(|id| self.positions.get(id)) {
             let start = p.selection.unwrap_or(p.changes).min(p.changes);
             let end = p.selection.unwrap_or(p.changes).max(p.changes);
-            let text = patch
-                .lines()
+            let mut previous = None;
+            let mut text = Vec::new();
+            for row in self
+                .change_rows
+                .iter()
                 .skip(start)
                 .take(end.saturating_sub(start) + 1)
-                .map(|line| {
-                    if !line.starts_with("+++")
-                        && !line.starts_with("---")
-                        && matches!(line.as_bytes().first(), Some(b'+' | b'-' | b' '))
-                    {
-                        line.get(1..).unwrap_or(line)
-                    } else {
-                        line
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            self.clipboard = Some(text);
+            {
+                if let Some((index, source)) = &row.source
+                    && previous != Some(*index)
+                {
+                    text.push(source.clone());
+                    previous = Some(*index);
+                }
+            }
+            if !text.is_empty() {
+                self.clipboard = Some(text.join("\n"));
+            }
         }
     }
     pub fn paste(&mut self, text: &str) {
@@ -1628,6 +1717,7 @@ impl Ui {
     }
     fn action(&mut self, action: Action) {
         match action {
+            Action::DismissNotice => self.notice = None,
             Action::ModelField(index) => self.model_field(index),
             Action::ModelOption(index) => self.model_option(index),
             Action::DefaultField(index) => {
@@ -1660,6 +1750,7 @@ impl Ui {
             Action::New => self.launch(),
             Action::ToggleList => self.toggle_list(),
             Action::ToggleChanges => self.toggle_changes(),
+            Action::ChangeFile(index) => self.select_change(index),
             Action::Approval(index) => self.pending(index),
             Action::Pending => self.open_questions(),
             Action::InlineQuestion(index) => self.open_question(index),
@@ -1741,7 +1832,6 @@ impl Ui {
                     }
                 }
             }
-            Action::ShowPrompt(text) => self.modal = Some(Modal::Prompt { text, scroll: 0 }),
             Action::ToggleEntry(entry) => {
                 if let Some(id) = self.selected.clone() {
                     let p = self.positions.entry(id).or_default();
@@ -1777,6 +1867,12 @@ impl Ui {
         }
     }
     pub fn mouse(&mut self, event: MouseEvent) {
+        if self.notice.is_some() && self.toast_rect.contains((event.column, event.row).into()) {
+            if event.kind == MouseEventKind::Down(MouseButton::Left) {
+                self.action(Action::DismissNotice);
+            }
+            return;
+        }
         if self.panel_mouse(event) {
             return;
         }
@@ -1807,9 +1903,7 @@ impl Ui {
                             -3
                         },
                     );
-                } else if let Some(Modal::Approval { scroll, .. } | Modal::Prompt { scroll, .. }) =
-                    &mut self.modal
-                {
+                } else if let Some(Modal::Approval { scroll, .. }) = &mut self.modal {
                     *scroll =
                         scroll.saturating_add_signed(if event.kind == MouseEventKind::ScrollDown {
                             3
@@ -1849,10 +1943,12 @@ fn inner(rect: Rect) -> Rect {
     )
 }
 fn panel(frame: &mut Frame, rect: Rect, title: &str, focused: bool) -> Rect {
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" {title} "))
         .border_style(Style::default().fg(if focused { ACCENT } else { BORDER }));
+    if !title.is_empty() {
+        block = block.title(format!(" {title} "));
+    }
     frame.render_widget(block, rect);
     inner(rect)
 }
@@ -1961,16 +2057,18 @@ impl Ui {
             self.button(
                 frame,
                 Rect::new(toolbar.x + 46, toolbar.y, 18, 1),
-                " Ctrl+D Changes ",
+                " Alt+D Changes ",
                 Action::ToggleChanges,
                 self.changes_visible,
             );
         }
+        let resources = self.visible_resources();
+        let resource_height = u16::from(!resources.is_empty());
         let content = Rect::new(
             1,
             4,
             area.width.saturating_sub(2),
-            area.height.saturating_sub(9),
+            area.height.saturating_sub(4 + resource_height),
         );
         self.viewport = content.height.saturating_sub(2) as usize;
         let list_width = if self.list_visible {
@@ -1981,12 +2079,11 @@ impl Ui {
             0
         };
         let panel = self.panels.view.is_some();
-        let changes_width =
-            if self.drilled && ((panel && self.panels.right) || (!panel && self.changes_visible)) {
-                (content.width.saturating_sub(list_width) / 2).max(12)
-            } else {
-                0
-            };
+        let changes_width = if self.drilled && panel && self.panels.right {
+            (content.width.saturating_sub(list_width) / 2).max(12)
+        } else {
+            0
+        };
         let list = Rect::new(content.x, content.y, list_width, content.height);
         let conversation = Rect::new(
             content.x + list_width,
@@ -2005,100 +2102,71 @@ impl Ui {
         }
         if panel && !self.panels.right {
             self.draw_panel(frame, conversation);
+        } else if self.drilled && self.changes_visible {
+            self.draw_changes(frame, conversation);
         } else {
             self.draw_conversation(frame, conversation);
         }
         if changes_width > 0 {
-            if panel {
-                self.draw_panel(frame, changes);
-            } else {
-                self.draw_changes(frame, changes);
-            }
+            self.draw_panel(frame, changes);
         }
-        if self.selected.is_some() {
-            let shells = self
-                .selected
-                .as_ref()
-                .and_then(|id| self.panels.shells.get(id))
-                .map_or(0, Vec::len);
-            let artifacts = self
-                .selected
-                .as_ref()
-                .and_then(|id| self.sessions.get(id))
-                .map_or(0, |s| s.artifacts.len());
+        let mut x = conversation.x;
+        for (artifacts, count) in resources {
+            let label = format!(
+                " {} ({count}) ",
+                if artifacts { "Artifacts" } else { "Shells" }
+            );
+            let width = (label.len() as u16).min(conversation.right().saturating_sub(x));
             self.button(
                 frame,
-                Rect::new(
-                    conversation.x,
-                    content.bottom() + 1,
-                    18.min(conversation.width),
-                    1,
-                ),
-                &format!(" Shells ({shells}) "),
-                Action::Resources(false),
-                false,
+                Rect::new(x, content.bottom(), width, 1),
+                &label,
+                Action::Resources(artifacts),
+                self.focus == Focus::Resources(artifacts),
             );
-            if conversation.width > 19 {
-                self.button(
-                    frame,
-                    Rect::new(
-                        conversation.x + 19,
-                        content.bottom() + 1,
-                        (conversation.width - 19).min(24),
-                        1,
-                    ),
-                    &format!(" Artifacts ({artifacts}) "),
-                    Action::Resources(true),
-                    false,
-                );
-            }
+            x = x.saturating_add(width + 1);
         }
-        if let Some((notice, error)) = &self.notice {
-            frame.render_widget(
-                Paragraph::new(crate::model::clean(notice)).style(Style::default().fg(if *error {
-                    RED
-                } else {
-                    GREEN
-                })),
-                Rect::new(
-                    1,
-                    area.height.saturating_sub(2),
-                    area.width.saturating_sub(2),
-                    1,
-                ),
-            );
-        }
-        let footer = if self.inline_question() {
-            "Questions · ↑↓ Choose · n Note · Enter Submit · Ctrl+] Skip · Alt+↑↓ Navigate · Esc Input"
-        } else if matches!(self.modal, Some(Modal::Commands { .. })) {
-            "Suggestions · Type to filter · ↑↓ Choose · Enter Select · Esc Input"
-        } else {
-            match self.focus {
-                Focus::List => {
-                    "Sessions · Tab Input · ↑↓ Select · Enter Open · f Filter · n New · / Actions · ? Help"
-                }
-                Focus::Filter => "Session filter · Enter/Esc List · Ctrl+U Clear",
-                Focus::Composer => {
-                    "Input · Tab Sessions · Cmd+↑ Messages · ↑ History · Enter Send · / Commands"
-                }
-                Focus::Conversation => {
-                    "Messages · Type to reply · Cmd+↑↓ Navigate · Enter Expand · Tab Sessions · Ctrl/Cmd+C Copy"
-                }
-                Focus::Prompt => "Prompt · Enter Expand · Cmd+↓ Messages · Tab Sessions",
-                Focus::Changes => "Changes · ↑↓ Scroll · Shift+↑↓ Select · c Copy · Tab Sessions",
-            }
-        };
-        frame.render_widget(
-            Paragraph::new(footer).style(Style::default().fg(DIM)),
-            Rect::new(
-                1,
-                area.height.saturating_sub(1),
-                area.width.saturating_sub(2),
-                1,
-            ),
-        );
         self.text_selection.highlight(frame);
         self.draw_modal(frame);
+        self.draw_toast(frame);
+    }
+    fn draw_toast(&mut self, frame: &mut Frame) {
+        self.toast_rect = Rect::default();
+        let Some((notice, error)) = &self.notice else {
+            return;
+        };
+        let area = frame.area();
+        let width = area.width.saturating_sub(2).min(64);
+        if width < 4 {
+            return;
+        }
+        let text = crate::model::clean(notice);
+        let rows = wrapped(&text, width.saturating_sub(2));
+        let height = (rows.len() as u16)
+            .saturating_add(2)
+            .min(area.height.saturating_sub(2));
+        if height < 3 {
+            return;
+        }
+        let rect = Rect::new(
+            area.right().saturating_sub(width + 1),
+            area.bottom().saturating_sub(height + 1),
+            width,
+            height,
+        );
+        let color = if *error { RED } else { GREEN };
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(rows.into_iter().map(Line::from).collect::<Vec<_>>())
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(color)),
+                )
+                .style(Style::default().fg(color).bg(BG)),
+            rect,
+        );
+        self.toast_rect = rect;
     }
     fn draw_list(&mut self, frame: &mut Frame, rect: Rect) {
         let area = panel(
@@ -2109,7 +2177,7 @@ impl Ui {
             } else {
                 "Agents"
             },
-            matches!(self.focus, Focus::List | Focus::Filter),
+            !self.panels.focused && matches!(self.focus, Focus::List | Focus::Filter),
         );
         self.hits.push((rect, Action::Focus(Focus::List)));
         let filter = Rect::new(
@@ -2255,10 +2323,7 @@ impl Ui {
             frame,
             rect,
             &crate::model::clean(&title),
-            matches!(
-                self.focus,
-                Focus::Conversation | Focus::Prompt | Focus::Composer
-            ),
+            !self.panels.focused && matches!(self.focus, Focus::Conversation | Focus::Composer),
         );
         self.hits.push((rect, Action::Focus(Focus::Conversation)));
         let Some(id) = self.selected.clone() else {
@@ -2380,16 +2445,6 @@ impl Ui {
             area.height
                 .saturating_sub(composer_height + requests_height + 1),
         );
-        let latest = session
-            .entries
-            .iter()
-            .rev()
-            .find(|e| e.kind == "userMessage");
-        let body = if let Some(entry) = latest {
-            self.prompt_header(frame, body, &entry.text)
-        } else {
-            body
-        };
         self.conversation_height = usize::from(body.height);
         let position = self.positions.entry(id.clone()).or_default();
         let (mut lines, sections) = transcript::render(
@@ -2553,22 +2608,24 @@ impl Ui {
             } else {
                 composer
             };
+            let placeholder = self
+                .composer_suggestion()
+                .unwrap_or("Ask anything…")
+                .to_owned();
             let position = self.positions.entry(id.clone()).or_default();
             editor(
                 frame,
                 composer,
-                if let Some(status) = &voice_status {
-                    status
-                } else if self.busy {
-                    "Sending… draft retained until acknowledged"
-                } else if session.status.active() {
-                    "Message · Enter steer · Ctrl+Enter queue"
-                } else {
-                    "Message · Enter send"
-                },
+                "",
                 &position.draft,
-                self.focus == Focus::Composer && self.modal.is_none(),
+                self.focus == Focus::Composer && !self.panels.focused && self.modal.is_none(),
             );
+            if position.draft.chars.is_empty() {
+                frame.render_widget(
+                    Paragraph::new(placeholder).style(Style::default().fg(DIM)),
+                    inner(composer),
+                );
+            }
             self.hits.push((composer, Action::Focus(Focus::Composer)));
         } else if !self.drilled {
             self.button(
@@ -2580,82 +2637,6 @@ impl Ui {
             );
         }
     }
-    fn draw_changes(&mut self, frame: &mut Frame, rect: Rect) {
-        let area = panel(
-            frame,
-            rect,
-            "Changes since session start",
-            self.focus == Focus::Changes,
-        );
-        self.hits.push((rect, Action::Focus(Focus::Changes)));
-        let Some(id) = self.selected.clone() else {
-            return;
-        };
-        let Some(patch) = self.changes.get(&id) else {
-            frame.render_widget(
-                Paragraph::new(if self.changing {
-                    "Reading local changes…"
-                } else {
-                    "Changes are available for coding sessions."
-                })
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(DIM)),
-                area,
-            );
-            return;
-        };
-        let lines: Vec<_> = patch.lines().collect();
-        self.change_lines = lines.len();
-        let p = self.positions.entry(id).or_default();
-        p.changes = p.changes.min(lines.len().saturating_sub(1));
-        let top = p
-            .changes
-            .saturating_sub(area.height as usize / 2)
-            .min(lines.len().saturating_sub(area.height as usize));
-        let rows = lines
-            .iter()
-            .enumerate()
-            .skip(top)
-            .take(area.height as usize)
-            .map(|(index, line)| {
-                let selected = p.selection.is_some_and(|anchor| {
-                    (anchor.min(p.changes)..=anchor.max(p.changes)).contains(&index)
-                });
-                let color = if line.starts_with('+') {
-                    GREEN
-                } else if line.starts_with('-') {
-                    RED
-                } else if line.starts_with("@@") || line.starts_with("diff --git") {
-                    ACCENT
-                } else {
-                    TEXT
-                };
-                Line::from(vec![
-                    Span::styled(
-                        if index == p.changes { "> " } else { "  " },
-                        Style::default().fg(ACCENT),
-                    ),
-                    Span::styled(
-                        crate::model::clean(line)
-                            .chars()
-                            .skip(p.horizontal)
-                            .collect::<String>(),
-                        Style::default()
-                            .fg(color)
-                            .bg(if selected { PANEL } else { BG }),
-                    ),
-                ])
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            Paragraph::new(if rows.is_empty() {
-                vec![Line::from("No changes since session start")]
-            } else {
-                rows
-            }),
-            area,
-        );
-    }
     fn draw_modal(&mut self, frame: &mut Frame) {
         if self.modal.is_none()
             || self.inline_question()
@@ -2663,9 +2644,7 @@ impl Ui {
         {
             return;
         }
-        if !matches!(self.modal, Some(Modal::Prompt { .. })) {
-            self.text_selection.clear();
-        }
+        self.text_selection.clear();
         // Underlying panes must not receive modal mouse events.
         self.hits.clear();
         let full = frame.area();
@@ -2686,7 +2665,6 @@ impl Ui {
         let title = match self.modal {
             Some(Modal::InstallBrowser { .. }) => "Optional HTML preview · Esc cancels",
             Some(Modal::AgentDefaults(_)) => "New agent defaults · Tab fields · Esc cancels",
-            Some(Modal::Prompt { .. }) => "Latest user prompt · Esc closes",
             Some(Modal::Voice { .. }) => "Voice settings",
             Some(Modal::Repository(_)) => "Choose and remember your default repository",
             Some(Modal::Menu { .. }) => "Agent actions",
@@ -2714,10 +2692,6 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::AgentDefaults(_))) {
             self.draw_defaults(frame, area);
-            return;
-        }
-        if matches!(self.modal, Some(Modal::Prompt { .. })) {
-            self.draw_prompt(frame, area);
             return;
         }
         if matches!(self.modal, Some(Modal::Commands { .. })) {
@@ -2995,7 +2969,6 @@ impl Ui {
             }
             Some(
                 Modal::AgentDefaults(_)
-                | Modal::Prompt { .. }
                 | Modal::Voice { .. }
                 | Modal::Commands { .. }
                 | Modal::Status
@@ -3028,7 +3001,7 @@ impl Ui {
 fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
     let query = query.to_lowercase();
     [
-        ("Ctrl+1 / Ctrl+2", "Switch Agents / Reviews"),
+        ("⌥+1 / ⌥+2", "Switch Agents / Reviews"),
         ("n", "Launch a new coding agent"),
         (
             "↑ / ↓",
@@ -3041,7 +3014,10 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
         ),
         ("Enter / Esc", "Open session / go back"),
         ("f / Ctrl+U", "Focus session filter / clear filter"),
-        ("Tab / Shift+Tab", "Switch sessions list and message input"),
+        (
+            "Tab / Shift+Tab",
+            "Cycle sessions, chat or tree/diff, and helper canvas",
+        ),
         ("Drag · Ctrl+C / Cmd+C", "Select and copy conversation text"),
         (
             "Ctrl+V / Cmd+V",
@@ -3052,7 +3028,7 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
             "Alt+P",
             "Move shell / artifact between side pane and main area",
         ),
-        ("Ctrl+D", "Show or hide Changes pane (saved)"),
+        ("Alt+D", "Open or close Changes with file tree"),
         (
             "Enter in composer",
             "Send message; steer active turn immediately",
@@ -3154,6 +3130,528 @@ mod tests {
         ui
     }
     #[test]
+    fn submitted_messages_keep_the_same_rendering_through_delivery_states() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.note(
+            "awaiting connection",
+            "A submitted message that wraps across multiple lines",
+        );
+        let entry_id = session.entries.last().context("message")?.id.clone();
+        let position = Position {
+            focused_entry: Some(entry_id.clone()),
+            ..Position::default()
+        };
+        for focused in [false, true] {
+            let mut previous = None;
+            for kind in ["awaiting connection", "sending", "userMessage"] {
+                session.entries.last_mut().context("message")?.kind = kind.into();
+                let (rows, sections) = transcript::render(session, &position, 32, focused);
+                let rendered = rows
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(!rendered.contains("Tool activity"));
+                assert!(!rendered.contains("awaiting connection"));
+                assert!(!rendered.contains("sending"));
+                assert_eq!(rendered.matches("A submitted message").count(), 1);
+                assert!(!sections.last().context("message section")?.tool);
+                assert_eq!(sections.last().context("message section")?.id, entry_id);
+                if let Some(previous) = &previous {
+                    assert_eq!(&rows, previous);
+                }
+                previous = Some(rows);
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn resource_controls_are_compact_and_notices_overlay_without_reserving_footer_rows()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        let (empty, _) = draw(&mut ui, 120, 40)?;
+        let height = ui.conversation_height;
+        assert!(!empty.contains("Shells (0)") && !empty.contains("Artifacts (0)"));
+        assert!(!empty.contains("Input · Tab Sessions"));
+        ui.panels.shells.insert(
+            "one".into(),
+            vec![serde_json::json!({"itemId":"shell", "command":"sleep 30"})],
+        );
+        let (with_shell, _) = draw(&mut ui, 120, 40)?;
+        assert!(with_shell.contains("Shells (1)"));
+        assert!(!with_shell.contains("Artifacts (0)"));
+        assert_eq!(ui.conversation_height + 1, height);
+        ui.notice = Some(("Action accepted".into(), false));
+        let (with_notice, _) = draw(&mut ui, 120, 40)?;
+        assert_eq!(with_notice.matches("Action accepted").count(), 1);
+        assert_eq!(ui.conversation_height + 1, height);
+        assert!(ui.toast_rect.x > 40 && ui.toast_rect.y > 25);
+        let rect = ui.toast_rect;
+        ui.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(ui.notice.is_none());
+        assert_eq!(ui.focus, Focus::Composer);
+        Ok(())
+    }
+    #[test]
+    fn keyboard_reaches_only_visible_resource_controls_and_preserves_draft() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        draw(&mut ui, 120, 40)?;
+        ui.positions.get_mut("one").context("position")?.draft = Editor::from("Keep this draft");
+        ui.panels.shells.insert(
+            "one".into(),
+            vec![serde_json::json!({"itemId":"shell", "command":"sleep 30"})],
+        );
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(ui.focus, Focus::Resources(false));
+        ui.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(ui.focus, Focus::Resources(false));
+        ui.sessions
+            .get_mut("one")
+            .context("session")?
+            .artifacts
+            .push(super::super::artifacts::Artifact {
+                path: "report.html".into(),
+                title: "Report".into(),
+            });
+        ui.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(ui.focus, Focus::Resources(true));
+        ui.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(ui.focus, Focus::Resources(false));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            ui.modal,
+            Some(Modal::Resources {
+                artifacts: false,
+                ..
+            })
+        ));
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(ui.focus, Focus::Composer);
+        assert_eq!(
+            ui.positions.get("one").context("position")?.draft.text(),
+            "Keep this draft"
+        );
+        Ok(())
+    }
+    #[test]
+    fn suggestions_require_acceptance_and_never_replace_a_draft_or_cross_turns() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.note("userMessage", "Plan the change");
+        let prompt = session.entries.last().context("prompt")?.id.clone();
+        session.completed_turn = Some("completed".into());
+        session.suggestion = Some(super::super::suggestions::Suggestion {
+            turn: "completed".into(),
+            prompt,
+            text: "Okay, implement the plan.".into(),
+        });
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert!(screen.contains("Okay, implement the plan."));
+        assert!(!screen.contains("Message · Enter"));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!ui.busy);
+        assert!(
+            ui.positions
+                .get("one")
+                .context("position")?
+                .draft
+                .chars
+                .is_empty()
+        );
+        for key in [KeyCode::Tab, KeyCode::Right] {
+            ui.positions
+                .get_mut("one")
+                .context("position")?
+                .draft
+                .clear();
+            ui.key(KeyEvent::new(key, KeyModifiers::NONE));
+            assert_eq!(
+                ui.positions.get("one").context("position")?.draft.text(),
+                "Okay, implement the plan."
+            );
+            assert_eq!(ui.focus, Focus::Composer);
+            assert!(!ui.busy);
+        }
+        ui.positions.get_mut("one").context("position")?.draft = Editor::from("My own text");
+        ui.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            ui.positions.get("one").context("position")?.draft.text(),
+            "My own text"
+        );
+        ui.positions
+            .get_mut("one")
+            .context("position")?
+            .draft
+            .clear();
+        ui.sessions
+            .get_mut("one")
+            .context("session")?
+            .note("userMessage", "Different task");
+        assert!(ui.composer_suggestion().is_none());
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert!(screen.contains("Ask anything…"));
+        assert!(!screen.contains("Okay, implement the plan."));
+        Ok(())
+    }
+    #[test]
+    fn inline_commands_accept_search_arguments_and_reject_unsupported_arguments() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        ui.skills.insert("one".into(), (Vec::new(), Vec::new()));
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        for (command, query) in [
+            ("help copy", "copy"),
+            ("actions rename", "rename"),
+            ("skills rust", "rust"),
+        ] {
+            ui.modal = None;
+            ui.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+            ui.paste(command);
+            ui.key(enter);
+            let actual = match &ui.modal {
+                Some(Modal::Help(state)) => state.query.text(),
+                Some(
+                    Modal::Menu { query, .. }
+                    | Modal::Commands {
+                        query,
+                        skills_only: true,
+                        ..
+                    },
+                ) => query.text(),
+                _ => anyhow::bail!("Wrong result for {command}"),
+            };
+            assert_eq!(actual, query);
+            assert!(!ui.busy);
+        }
+        for command in [
+            "compact unexpected",
+            "status unexpected",
+            "diff unexpected",
+            "new unexpected",
+            "voice maybe",
+            "model one high extra",
+            "effort high extra",
+        ] {
+            ui.open_commands(false);
+            ui.paste(command);
+            ui.key(enter);
+            assert!(ui.notice.as_ref().is_some_and(|(_, error)| *error));
+            assert!(
+                matches!(&ui.modal, Some(Modal::Commands { query, .. }) if query.text() == command)
+            );
+            assert!(!ui.busy);
+        }
+        ui.open_commands(false);
+        ui.paste("rename");
+        ui.key(enter);
+        assert!(matches!(ui.modal, Some(Modal::Rename(_))));
+        // A pasted slash command uses the same dispatcher, never the message transport.
+        ui.modal = None;
+        ui.paste("/help keyboard");
+        ui.key(enter);
+        assert!(matches!(&ui.modal, Some(Modal::Help(state)) if state.query.text() == "keyboard"));
+        assert!(
+            ui.positions
+                .get("one")
+                .context("position")?
+                .draft
+                .chars
+                .is_empty()
+        );
+        assert!(!ui.busy);
+        Ok(())
+    }
+    #[test]
+    fn inline_rename_model_and_effort_send_their_arguments_to_the_service() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let socket = super::super::server::socket(&storage)?;
+        let listener = UnixListener::bind(socket)?;
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || -> Result<()> {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept()?;
+                let mut line = String::new();
+                BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+                let request: Request = serde_json::from_str(&line)?;
+                serde_json::to_writer(&mut stream, &Reply::Ok)?;
+                stream.write_all(b"\n")?;
+                tx.send(request)?;
+            }
+            Ok(())
+        });
+        let mut ui = state(storage);
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        ui.skills.insert("one".into(), (Vec::new(), Vec::new()));
+        ui.sessions.get_mut("one").context("session")?.model = Some("fixture-current".into());
+        for (i, command) in [
+            "rename Lorem / Hello 🦀",
+            "model fixture-luna medium",
+            "effort high",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            ui.open_commands(false);
+            ui.paste(command);
+            ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            let request = rx.recv_timeout(Duration::from_secs(5))?;
+            match (i, request) {
+                (0, Request::Rename { id, title }) => {
+                    assert_eq!(id, "one");
+                    assert_eq!(title, "Lorem / Hello 🦀");
+                }
+                (
+                    1,
+                    Request::Control {
+                        id,
+                        control: Control::Model { model, effort },
+                    },
+                ) => {
+                    assert_eq!(id, "one");
+                    assert_eq!(model.as_deref(), Some("fixture-luna"));
+                    assert_eq!(effort.as_deref(), Some("medium"));
+                }
+                (
+                    2,
+                    Request::Control {
+                        id,
+                        control: Control::Model { model, effort },
+                    },
+                ) => {
+                    assert_eq!(id, "one");
+                    assert_eq!(model.as_deref(), Some("fixture-current"));
+                    assert_eq!(effort.as_deref(), Some("high"));
+                }
+                (_, other) => anyhow::bail!("Unexpected request: {other:?}"),
+            }
+            ui.busy = false;
+        }
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
+        Ok(())
+    }
+    #[test]
+    fn main_changes_tree_diff_and_canvas_share_tab_navigation_without_losing_chat() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        ui.paste("Keep my draft");
+        let patch = "diff --git a/src/first.rs b/src/first.rs\n--- a/src/first.rs\n+++ b/src/first.rs\n@@ -1 +1 @@\n-old\n+let first = 1;\ndiff --git a/src/second.rs b/src/second.rs\n--- a/src/second.rs\n+++ b/src/second.rs\n@@ -1 +1 @@\n-old\n+let second = 2;\n";
+        ui.receive_changes("one".into(), patch.into());
+        ui.panels.right = true;
+        ui.panels.view = Some(panels::View::Shell {
+            id: "shell".into(),
+            command: "shell output".into(),
+        });
+        ui.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
+        assert!(ui.changes_visible && ui.panels.view.is_some());
+        assert_eq!(ui.focus, Focus::ChangeTree);
+        let (screen, _) = draw(&mut ui, 160, 40)?;
+        assert!(screen.contains("Files"));
+        assert!(screen.contains("first.rs") && screen.contains("second.rs"));
+        assert!(screen.contains("let first = 1;"));
+        assert!(!screen.contains("diff --git"));
+        assert!(!screen.contains("Keep my draft"));
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let (screen, _) = draw(&mut ui, 160, 40)?;
+        assert!(screen.contains("let second = 2;"));
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        ui.key(tab);
+        assert_eq!(ui.focus, Focus::Changes);
+        ui.key(tab);
+        assert!(ui.panels.focused);
+        ui.key(tab);
+        assert_eq!(ui.focus, Focus::List);
+        assert!(!ui.panels.focused);
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(ui.focus, Focus::ChangeTree);
+        ui.focus = Focus::List;
+        ui.toggle_list();
+        assert_eq!(ui.focus, Focus::ChangeTree);
+        ui.toggle_list();
+        ui.focus = Focus::List;
+        ui.key(tab);
+        assert_eq!(ui.focus, Focus::ChangeTree);
+        ui.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(ui.focus, Focus::List);
+        ui.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(ui.panels.focused);
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.panels.view.is_none() && ui.changes_visible);
+        assert_eq!(ui.focus, Focus::Changes);
+        // Refreshing reordered files keeps the selected path rather than its old index.
+        let second = patch
+            .split("diff --git a/src/second.rs")
+            .nth(1)
+            .context("second patch")?;
+        ui.receive_changes(
+            "one".into(),
+            format!("diff --git a/src/second.rs{second}{patch}").into(),
+        );
+        let p = ui.positions.get("one").context("position")?;
+        assert_eq!(
+            ui.changes
+                .get("one")
+                .context("changes")?
+                .files
+                .get(p.change_file)
+                .context("file")?
+                .path,
+            "src/second.rs"
+        );
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!ui.changes_visible);
+        assert_eq!(ui.focus, Focus::Composer);
+        assert_eq!(
+            ui.positions.get("one").context("draft")?.draft.text(),
+            "Keep my draft"
+        );
+        Ok(())
+    }
+    #[test]
+    fn tab_cycles_sessions_composer_and_helper_and_escape_closes_only_focused_helper() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::List;
+        ui.panels.right = true;
+        ui.panels.view = Some(panels::View::Shell {
+            id: "shell".into(),
+            command: "sleep".into(),
+        });
+        ui.positions
+            .entry("one".into())
+            .or_default()
+            .draft
+            .insert("Unsent draft");
+        let tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        let back = KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT);
+        ui.key(tab);
+        assert_eq!(ui.focus, Focus::Composer);
+        assert!(!ui.panels.focused);
+        ui.key(tab);
+        assert!(ui.panels.focused);
+        let (_, cursor) = draw(&mut ui, 120, 40)?;
+        assert_eq!(cursor, Some((0, 0)));
+        ui.key(tab);
+        assert_eq!(ui.focus, Focus::List);
+        assert!(!ui.panels.focused);
+        ui.key(back);
+        assert!(ui.panels.focused);
+        ui.key(back);
+        assert_eq!(ui.focus, Focus::Composer);
+        assert!(!ui.panels.focused);
+        ui.list_visible = false;
+        ui.key(tab);
+        assert!(ui.panels.focused);
+        ui.key(tab);
+        assert_eq!(ui.focus, Focus::Composer);
+        assert!(!ui.panels.focused);
+        ui.key(tab);
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.panels.view.is_none());
+        assert!(!ui.panels.focused);
+        assert_eq!(ui.focus, Focus::Composer);
+        assert_eq!(
+            ui.positions.get("one").context("draft")?.draft.text(),
+            "Unsent draft"
+        );
+        Ok(())
+    }
+    #[test]
+    fn tool_commands_outputs_and_edited_files_have_syntax_colors() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.entries.clear();
+        session.entries.push(Entry { id: "command".into(), kind: "commandExecution".into(), text: "const output = 42;\nsecond\nthird\nfourth".into(), data: serde_json::json!({"command":"python3 - <<'PY'\nfrom pathlib import Path\nPY","exitCode":0}), ..Entry::default() });
+        session.entries.push(Entry { id: "edit".into(), kind: "fileChange".into(), data: serde_json::json!({"changes":[{"path":"src/example.rs","diff":"@@ -9 +9,2 @@\n-old\n+let answer = 42;\n+return answer;"}]}), ..Entry::default() });
+        let mut position = Position::default();
+        position.expanded.insert("edit".into());
+        let (rows, sections) = transcript::render(session, &position, 72, false);
+        let text = rows
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Edited src/example.rs +2 -1"));
+        assert!(text.contains("9 - old"));
+        assert!(text.contains("10 + return answer;"));
+        assert!(text.contains("+1 lines · Enter/click to expand"));
+        for keyword in ["from", "import", "const", "let", "return"] {
+            assert!(
+                rows.iter()
+                    .flat_map(|row| &row.spans)
+                    .any(|span| span.content.contains(keyword) && span.style.fg == Some(ACCENT)),
+                "Missing syntax color for {keyword}"
+            );
+        }
+        assert_eq!(sections.len(), 2);
+        assert!(sections.iter().all(|section| section.tool));
+        assert!(
+            rows.iter()
+                .any(|row| row.style.bg == Some(crate::ui::ADD_BG))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.style.bg == Some(crate::ui::REMOVE_BG))
+        );
+        Ok(())
+    }
+    #[test]
     fn shell_panes_move_without_losing_chat_or_changes_and_remember_placement() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let storage = Storage {
@@ -3195,7 +3693,7 @@ mod tests {
         );
         ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(ui.panels.view.is_none());
-        assert_eq!(ui.focus, Focus::Composer);
+        assert_eq!(ui.focus, Focus::Changes);
         assert!(ui.changes_visible);
         assert_eq!(
             ui.positions.get("one").context("position")?.draft.text(),
@@ -3494,7 +3992,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn pinned_prompt_remains_inline_with_full_width_padding() -> Result<()> {
+    fn user_prompt_remains_inline_with_full_width_padding() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let mut ui = state(Storage {
             config: tmp.path().join("config.json"),
@@ -3505,7 +4003,7 @@ mod tests {
         session.note("userMessage", "Keep this prompt in place");
         session.note("agentMessage", "Following response");
         let (screen, _) = draw(&mut ui, 120, 40)?;
-        assert_eq!(screen.matches("Keep this prompt in place").count(), 2);
+        assert_eq!(screen.matches("Keep this prompt in place").count(), 1);
         let session = ui.sessions.get("one").context("session")?;
         let position = ui.positions.get("one").context("position")?;
         let (rows, sections) = transcript::render(session, position, 60, false);
@@ -3543,7 +4041,7 @@ mod tests {
     }
 
     #[test]
-    fn newest_prompt_stays_pinned_and_composer_grows_to_ten_lines() -> Result<()> {
+    fn user_prompt_scrolls_away_and_composer_grows_to_ten_lines() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let mut ui = state(Storage {
             config: tmp.path().join("config.json"),
@@ -3556,11 +4054,25 @@ mod tests {
         s.note(
             "agentMessage",
             (0..80)
-                .map(|i| format!("Response line {i}\n"))
+                .map(|i| format!("Response line {i}\n\n"))
                 .collect::<String>(),
         );
+        ui.positions.entry("one".into()).or_default().follow = true;
         let (first, _) = draw(&mut ui, 100, 40)?;
-        assert!(first.contains("Newest user prompt"));
+        assert!(!first.contains("Newest user prompt"));
+        let height = ui.conversation_height;
+        {
+            let position = ui.positions.get_mut("one").context("position")?;
+            position.follow = false;
+            position.conversation = 0;
+            position.scroll_anchor = None;
+        }
+        let (at_start, _) = draw(&mut ui, 100, 40)?;
+        assert_eq!(at_start.matches("Newest user prompt").count(), 1);
+        assert_eq!(ui.positions.get("one").context("position")?.conversation, 0);
+        assert_eq!(ui.conversation_height, height);
+        ui.positions.get_mut("one").context("position")?.follow = true;
+        draw(&mut ui, 100, 40)?;
         assert!(!first.contains("Latest prompt"));
         let short = ui.conversation_height;
         ui.paste("line\n".repeat(14).as_str());
@@ -3569,7 +4081,7 @@ mod tests {
         ui.focus = Focus::Conversation;
         ui.scroll(30, false);
         let (scrolled, _) = draw(&mut ui, 100, 40)?;
-        assert!(scrolled.contains("Newest user prompt"));
+        assert!(!scrolled.contains("Newest user prompt"));
         assert_eq!(
             crate::ui::user_message_style().fg,
             Some(ratatui::style::Color::White)
@@ -3829,7 +4341,7 @@ mod tests {
         let queued = screen
             .find("Messages queued for the next turn")
             .context("queued")?;
-        let composer = screen.find("Message · Enter steer").context("composer")?;
+        let composer = screen.find("Ask anything…").context("composer")?;
         assert!(activity < steering && steering < queued && queued < composer);
         assert!(screen.contains("git diff --stat"));
         assert!(screen.contains("Explain the result next"));
@@ -4267,7 +4779,7 @@ mod tests {
             .context("position")?
             .conversation = 7;
         ui.key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL));
-        ui.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        ui.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::ALT));
         assert!(!ui.list_visible && ui.changes_visible);
         assert_eq!(ui.selected.as_deref(), Some("one"));
         let p = ui.positions.get("one").context("position")?;
@@ -4277,12 +4789,16 @@ mod tests {
         assert!(!restored.list_visible && restored.changes_visible);
         ui.focus = Focus::Composer;
         ui.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
-        assert!(ui.focus == Focus::Composer);
+        assert!(ui.focus == Focus::Changes);
         ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        assert!(ui.focus == Focus::Composer);
+        assert!(ui.focus == Focus::ChangeTree);
         let (screen, cursor) = draw(&mut ui, 140, 35)?;
-        assert!(screen.contains("draft text") && screen.contains("Changes since session start"));
-        assert!(cursor.is_some());
+        assert!(!screen.contains("draft text") && screen.contains("Changes since session start"));
+        assert_eq!(cursor, Some((0, 0)));
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let (screen, _) = draw(&mut ui, 140, 35)?;
+        assert!(screen.contains("draft text"));
+        assert!(!ui.changes_visible);
         Ok(())
     }
     #[test]
@@ -4304,15 +4820,16 @@ mod tests {
         ui.focus = Focus::Changes;
         ui.changes_visible = true;
         ui.changes
-            .insert("one".into(), "+    first\n+    second\n".into());
+            .insert("one".into(), "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -0,0 +1,2 @@\n+    first\n+    second\n".into());
+        draw(&mut ui, 120, 35)?;
         ui.change_lines = 2;
         ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
         ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
         assert_eq!(ui.clipboard.as_deref(), Some("    first\n    second"));
         ui.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
-        ui.paste("Ctrl+D");
+        ui.paste("Alt+D");
         let (screen, _) = draw(&mut ui, 100, 30)?;
-        assert!(screen.contains("Show or hide Changes"));
+        assert!(screen.contains("Open or close Changes"));
         assert!(!screen.contains("Launch a new coding agent"));
         ui.modal = Some(Modal::Repository(Editor::from("/tmp/repo")));
         for (width, height) in [(40, 12), (80, 24), (180, 50)] {

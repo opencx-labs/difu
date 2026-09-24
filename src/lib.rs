@@ -11,6 +11,7 @@ pub mod github;
 pub mod help;
 pub mod hover;
 pub mod images;
+pub mod local_diff;
 pub mod model;
 pub mod navigation;
 mod overview;

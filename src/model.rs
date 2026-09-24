@@ -5,12 +5,14 @@ pub enum InboxTab {
     #[default]
     MyPrs,
     Repositories,
+    Diffs,
 }
 impl InboxTab {
     pub fn label(self) -> &'static str {
         match self {
             Self::MyPrs => "My PRs",
             Self::Repositories => "Repositories",
+            Self::Diffs => "Diffs",
         }
     }
 }
@@ -125,6 +127,10 @@ pub struct PrStats {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrDetail {
+    #[serde(default)]
+    pub requested_reviewers: Vec<String>,
+    #[serde(default)]
+    pub requested_teams: Vec<String>,
     pub key: PrKey,
     pub title: String,
     pub body: String,
