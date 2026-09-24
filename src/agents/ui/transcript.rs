@@ -63,22 +63,12 @@ fn prose(text: &str, width: u16) -> Vec<Line<'static>> {
 }
 
 pub(super) fn tool(entry: &Entry) -> bool {
-    !matches!(
-        entry.kind.as_str(),
-        "agentMessage"
-            | "userMessage"
-            | "sending"
-            | "sending_context"
-            | "awaiting connection"
-            | "result"
-            | "plan"
-            | "error"
-            | "system"
-            | "unsent"
-            | "unsent or unacknowledged"
-            | "reasoning"
-    )
+    entry.is_tool()
 }
+pub(super) fn visible(session: &Session, entry: &Entry) -> bool {
+    !(entry.text.is_empty() && entry.kind == "reasoning") && !session.is_pending_steering(entry)
+}
+
 fn label(entry: &Entry, running: bool) -> String {
     match entry.kind.as_str() {
         "commandExecution" => format!(
@@ -189,9 +179,7 @@ fn activity_text(session: &Session) -> (String, Option<String>, Option<i64>) {
 }
 fn shimmer(text: &str, now: i64) -> Line<'static> {
     let length = text.chars().count();
-    let travel = length.saturating_sub(1).max(1);
-    let step = (now.max(0) as usize / 60) % (travel * 2);
-    let phase = travel.abs_diff(step);
+    let phase = (now.max(0) as usize / 80) % length.max(1);
     Line::from(
         text.chars()
             .enumerate()
@@ -235,6 +223,85 @@ pub(super) fn activity(session: &Session, width: u16, now: i64) -> Vec<Line<'sta
     }
     lines
 }
+pub(super) fn waiting_messages(
+    session: &Session,
+    width: u16,
+    outgoing: &[PendingSend],
+) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    let mut group = |heading: &str, messages: Vec<&str>| {
+        if messages.is_empty() {
+            return;
+        }
+        rows.push(Line::default());
+        let mut spans = vec![Span::styled(
+            format!("• {heading}"),
+            Style::default().fg(TEXT),
+        )];
+        if session.can_send_waiting() {
+            spans.push(Span::styled(
+                " (press esc to interrupt and send immediately)",
+                Style::default().fg(DIM),
+            ));
+        }
+        rows.extend(
+            crate::markdown::wrap(spans, usize::from(width.max(1)))
+                .into_iter()
+                .map(|row| Line::from(row.spans)),
+        );
+        for text in messages {
+            use unicode_width::UnicodeWidthStr;
+            let available = usize::from(width.saturating_sub(4));
+            let mut chars = text.chars();
+            let prefix = chars
+                .by_ref()
+                .take(available + 1)
+                .map(|ch| if ch.is_whitespace() { ' ' } else { ch })
+                .collect::<String>();
+            let prefix = crate::model::clean(&prefix);
+            let shortened = chars.next().is_some() || prefix.width() > available;
+            let preview = if shortened && available > 0 {
+                format!("{}…", crate::ui::crop(&prefix, 0, available - 1))
+            } else {
+                crate::ui::crop(&prefix, 0, available)
+            };
+            rows.push(Line::from(Span::styled(
+                crate::ui::crop(&format!("  ↳ {preview}"), 0, usize::from(width)),
+                Style::default().fg(DIM),
+            )));
+        }
+    };
+    let mut steering = session
+        .pending_steering()
+        .map(|entry| entry.text.as_str())
+        .collect::<Vec<_>>();
+    let mut queue = session.queue.iter().map(Prompt::text).collect::<Vec<_>>();
+    for outgoing in outgoing {
+        if outgoing.queued {
+            queue.push(&outgoing.text);
+        } else {
+            steering.push(&outgoing.text);
+        }
+    }
+    group(
+        "Messages to be submitted after the next tool call",
+        steering,
+    );
+    group(
+        if session
+            .pending
+            .iter()
+            .any(|p| p.id == "difu-missing-guidance")
+        {
+            "Messages queued until repository guidance is answered"
+        } else {
+            "Messages queued for the next turn"
+        },
+        queue,
+    );
+    rows
+}
+
 // Bound input before markdown/syntax parsing, then cap terminal rows after wrapping.
 fn prefix(text: &str, budget: usize) -> String {
     text.chars().take(budget).collect()
@@ -321,7 +388,7 @@ pub(super) fn render_entries(
     let mut lines = Vec::new();
     let mut sections = Vec::new();
     for entry in entries {
-        if entry.text.is_empty() && entry.kind == "reasoning" {
+        if !visible(session, entry) {
             continue;
         }
         let is_tool = tool(entry);
@@ -664,10 +731,11 @@ mod tests {
         assert_ne!(first, next);
         assert!(first.spans.iter().all(|span| span.style.bg.is_none()));
         let text = "0123456789abcdefghijk";
-        let turn = (text.chars().count() as i64 - 1) * 60;
-        assert_eq!(shimmer(text, turn - 180), shimmer(text, turn + 180));
-        assert_eq!(shimmer(text, 0), shimmer(text, turn * 2));
-        assert_ne!(shimmer(text, 0), shimmer(text, turn));
+        let cycle = text.chars().count() as i64 * 80;
+        assert_eq!(shimmer(text, 0), shimmer(text, 79));
+        assert_ne!(shimmer(text, 0), shimmer(text, 80));
+        assert_eq!(shimmer(text, 0), shimmer(text, cycle));
+        assert_ne!(shimmer(text, cycle - 240), shimmer(text, cycle + 240));
     }
     #[test]
     fn fenced_code_keeps_syntax_colors_when_wrapped() {

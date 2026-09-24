@@ -147,6 +147,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             }
         }
         Wizard::Controls {
+            draft,
             key,
             selected,
             query,
@@ -175,7 +176,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 ));
             }
             rows.push(ui::text("", DIM));
-            let commands = crate::workflow::control_commands(&query.text());
+            let commands = crate::workflow::control_commands(&query.text(), *draft);
             let available = inner.height.saturating_sub(5) as usize;
             let start = selected.saturating_sub(available.saturating_sub(1));
             if commands.is_empty() {

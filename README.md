@@ -241,6 +241,15 @@ the service running until that next launch.
 Chats and worktree edits are preserved; interrupted work requires Continue and
 queued messages are not replayed. Older clients do not replace a newer service.
 
+Waiting messages appear below the activity line, with a bright heading and indented
+previews. Messages sent during a tool call appear there immediately, before the
+service replies, and stay out of the transcript until Codex echoes them or accepts
+them and the running tools finish. Each message appears in only one place.
+**Esc** in the chat interrupts and sends waiting messages immediately;
+accepted steering is retained in the conversation without being resent. While a
+repository-guidance permission is unanswered, messages remain queued until it is
+answered. With no waiting messages, Esc keeps its normal navigation behavior.
+
 #### Messages, attachments, and session names
 
 User messages appear in the conversation with a dim green background and white
@@ -268,12 +277,12 @@ from the task and response. Naming runs in the background once. Failure keeps th
 existing title, and a manual rename always wins.
 
 After each completed coding turn, Luna Medium also generates a short suggested
-follow-up from the latest exchange. It appears only in an empty input. **Tab** or
-**Right** accepts it as editable text; **Enter** then sends. Enter on an unaccepted
+follow-up from the latest exchange. It appears only in an empty input. **Right Arrow**
+accepts it as editable text; **Tab** keeps its normal focus navigation; **Enter** then sends. Enter on an unaccepted
 suggestion sends nothing. Suggestions never replace a draft and are discarded
 when the conversation moves on. Generation runs in the background without tools;
 on failure the input shows “Ask anything…” instead. Activity shimmer moves
-back and forth without moving the text.
+in a slightly slower, repeating one-way sweep without moving the text.
 
 #### Voice dictation (macOS)
 
@@ -464,6 +473,9 @@ Press **/** inside a PR for its action wizard. At home, **/** offers **PR contro
 for the selected PR and **Memory management** for temporary worktrees.
 Type in PR controls to filter commands. Use arrows and Enter to choose a match,
 Backspace to edit, or **Ctrl+U** to clear the filter.
+
+PR controls include **Convert to draft** for ready PRs and **Mark ready for review**
+for draft PRs. Both require confirmation and apply only to open PRs.
 
 PR controls support standalone PR comments, comment/approve/request-changes reviews, merge, squash merge,
 either merge method with the admin flag, and closing with an optional comment.

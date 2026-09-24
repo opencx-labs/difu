@@ -128,6 +128,8 @@ pub struct PrStats {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PrDetail {
     #[serde(default)]
+    pub draft: bool,
+    #[serde(default)]
     pub requested_reviewers: Vec<String>,
     #[serde(default)]
     pub requested_teams: Vec<String>,

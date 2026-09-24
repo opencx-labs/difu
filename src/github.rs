@@ -232,6 +232,7 @@ pub(crate) fn parse_detail(key: &PrKey, v: &Value) -> Result<PrDetail> {
             .collect()
     };
     Ok(PrDetail {
+        draft: v.get("draft").and_then(Value::as_bool).unwrap_or(false),
         requested_reviewers: names("requested_reviewers", "login"),
         requested_teams: names("requested_teams", "slug"),
         key: key.clone(),

@@ -789,6 +789,28 @@ fn exercise_writes(root: &Path) -> Result<()> {
         &cancel,
     )?;
     assert!(review::state(&key, &cancel)?.viewed.is_empty());
+    let before_readiness = fs::read_to_string(root.join("writes.jsonl"))?;
+    assert!(review::execute(&key, "outdated", &Operation::Draft { draft: true }, &cancel).is_err());
+    assert_eq!(
+        before_readiness,
+        fs::read_to_string(root.join("writes.jsonl"))?
+    );
+    for draft in [true, false] {
+        review::execute(&key, head, &Operation::Draft { draft }, &cancel)?;
+        assert_eq!(difu::github::detail(&key, &cancel)?.draft, draft);
+        let writes = fs::read_to_string(root.join("writes.jsonl"))?;
+        review::execute(&key, head, &Operation::Draft { draft }, &cancel)?;
+        assert_eq!(
+            writes,
+            fs::read_to_string(root.join("writes.jsonl"))?,
+            "already in desired state is a no-op"
+        );
+    }
+    fs::write(root.join("closed-pr"), "")?;
+    let writes = fs::read_to_string(root.join("writes.jsonl"))?;
+    assert!(review::execute(&key, head, &Operation::Draft { draft: true }, &cancel).is_err());
+    assert_eq!(writes, fs::read_to_string(root.join("writes.jsonl"))?);
+    fs::remove_file(root.join("closed-pr"))?;
     for squash in [false, true] {
         for admin in [false, true] {
             review::execute(&key, head, &Operation::Merge { squash, admin }, &cancel)?;

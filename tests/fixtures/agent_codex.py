@@ -79,7 +79,7 @@ for line in sys.stdin:
         elif text.startswith('approval'):
             emit({'id':900+turn,'method':'item/commandExecution/requestApproval','params':{'threadId':thread_id,'turnId':active,'itemId':'command','command':'git diff --check','reason':'Inspect diff only'}})
         elif text.startswith('wait'):
-            pass
+            event('item/started', {'threadId':thread_id,'turnId':active,'item':{'id':'waiting-'+active,'type':'commandExecution','command':'fixture long-running tool','status':'inProgress'}})
         elif text.startswith('async questions'):
             event('item/completed', {'threadId':thread_id,'turnId':active,'item':{
                 'id':'questions-'+connection+'-'+str(turn),'type':'agentMessage','delivery':'async','text':'Three questions',

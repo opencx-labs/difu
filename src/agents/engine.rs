@@ -441,6 +441,12 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
         }
         _ => {}
     }
+    if matches!(
+        method,
+        "item/started" | "item/completed" | "item/autoApprovalReview/completed"
+    ) {
+        session.finish_steering_wait();
+    }
     if matches!(method, "item/started" | "item/completed") {
         session.restore_async_questions();
     }
@@ -599,6 +605,7 @@ fn send_turn(
                     entry.kind = "userMessage".into();
                 }
 
+                s.finish_steering_wait();
                 if session.waiting_for_workspace() && !steer {
                     s.permissions = json!({"sandbox":isolation::read_only_policy(&session),"approvalPolicy":"never",
                         "approvalsReviewer":session.inherited_permissions.get("approvalsReviewer")});
@@ -735,6 +742,84 @@ fn command(
                 store.update(id, |s| s.status = Status::Idle)?;
                 return Err(error);
             }
+        }
+        Control::InterruptAndSend => {
+            // UI snapshots can lag behind consumption. Never interrupt an unrelated turn.
+            if !session.can_send_waiting() {
+                return Ok(());
+            }
+            let accepted = session.pending_steering().next().is_some();
+            if let (Some(thread), Some(turn)) = (&session.thread_id, &session.turn_id) {
+                let preserve_queue = |value: Value| {
+                    store.update(id, |s| {
+                        let queue = std::mem::take(&mut s.queue);
+                        apply_event(s, &value);
+                        s.queue = queue;
+                    })
+                };
+                rpc.call(
+                    "turn/interrupt",
+                    json!({"threadId":thread,"turnId":turn}),
+                    cancel,
+                    &preserve_queue,
+                )?;
+                // The interrupt acknowledgement may precede turn/completed.
+                let started = Instant::now();
+                while store.get(id)?.turn_id.as_deref() == Some(turn) {
+                    cancel.check()?;
+                    ensure!(
+                        started.elapsed() < Duration::from_secs(45),
+                        "Codex has not finished interrupting; waiting messages were retained"
+                    );
+                    match rpc.output.recv_timeout(Duration::from_millis(50)) {
+                        Ok(Ok(value)) => preserve_queue(value)?,
+                        Ok(Err(error)) => anyhow::bail!("{error}"),
+                        Err(mpsc::RecvTimeoutError::Disconnected) => {
+                            anyhow::bail!("Codex disconnected; waiting messages were retained")
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                }
+            }
+            let mut delivered = false;
+            loop {
+                let current = store.get(id)?;
+                if current.queue.is_empty() {
+                    break;
+                }
+                let mut next = None;
+                store.update(id, |s| {
+                    if !s.queue.is_empty() {
+                        next = Some(s.queue.remove(0));
+                    }
+                })?;
+                if let Some(prompt) = next {
+                    // send_turn records durable intent before the RPC, and never retries it.
+                    if let Err(error) =
+                        start_turn(rpc, store, id, &prompt, current.turn_id.is_some(), cancel)
+                    {
+                        let value = serde_json::to_value(&prompt)?;
+                        store.update(id, |s| {
+                            let recorded = s
+                                .entries
+                                .iter()
+                                .skip(current.entries.len())
+                                .any(|entry| entry.data.get("prompt") == Some(&value));
+                            if !recorded {
+                                s.unsent(prompt);
+                            }
+                        })?;
+                        store.save(id)?;
+                        return Err(error);
+                    }
+                    delivered = true;
+                }
+            }
+            if accepted && !delivered {
+                // Continue the existing conversation; accepted steering is already in it.
+                command(rpc, store, id, Control::Resume, cancel)?;
+            }
+            store.save(id)?;
         }
         Control::Interrupt => {
             if let (Some(thread), Some(turn)) = (&session.thread_id, &session.turn_id) {
@@ -1189,13 +1274,20 @@ mod tests {
                 json!({"wire_text":text, "difuSteeringTurn":"t"});
         }
         session.note("agentMessage", "Continuing the task");
+        session.turn_id = Some("t".into());
+        session.entries.push(Entry {
+            id: "tool".into(),
+            kind: "commandExecution".into(),
+            started_at: Some(1),
+            ..Entry::default()
+        });
         let echo = json!({"method":"item/completed","params":{"item":{
             "id":"first-server-id","type":"userMessage",
             "content":[{"type":"text","text":"first steering message"}]
         }}});
         apply_event(&mut session, &echo);
         apply_event(&mut session, &echo);
-        assert_eq!(session.entries.len(), 3);
+        assert_eq!(session.entries.len(), 4);
         assert!(
             session
                 .entries
@@ -1231,7 +1323,7 @@ mod tests {
             &mut session,
             &json!({"method":"turn/completed","params":{"turn":{"id":"t","status":"completed"}}}),
         );
-        assert_eq!(session.entries.len(), 3);
+        assert_eq!(session.entries.len(), 4);
         assert!(
             session
                 .entries
@@ -1239,6 +1331,75 @@ mod tests {
                 .all(|e| e.data.get("difuSteeringTurn").is_none())
         );
         assert!(session.queue.is_empty()); // Display cleanup never resubmits accepted steering.
+        Ok(())
+    }
+
+    #[test]
+    fn steering_waits_for_acceptance_and_all_running_tools() -> Result<()> {
+        let mut session = Session::new(
+            "test".into(),
+            Job::Coding(super::super::Launch {
+                repository: ".".into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: "task".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        apply_event(
+            &mut session,
+            &json!({"method":"turn/started","params":{"turn":{"id":"t"}}}),
+        );
+        for id in ["tool-a", "tool-b"] {
+            apply_event(
+                &mut session,
+                &json!({"method":"item/started","params":{"item":{
+                    "id":id,"type":"commandExecution","command":"test"
+                }}}),
+            );
+        }
+        session.note("sending", "follow up");
+        session.entries.last_mut().context("message")?.data = json!({"difuSteeringTurn":"t"});
+        assert!(session.tool_running());
+        assert_eq!(session.pending_steering().count(), 1);
+        session.entries.last_mut().context("message")?.kind = "userMessage".into();
+        session.finish_steering_wait();
+        assert_eq!(session.pending_steering().count(), 1); // RPC acknowledgement alone is insufficient.
+        apply_event(
+            &mut session,
+            &json!({"method":"item/completed","params":{"item":{
+                "id":"tool-a","type":"commandExecution"
+            }}}),
+        );
+        assert_eq!(session.pending_steering().count(), 1); // The parallel tool is still running.
+        apply_event(
+            &mut session,
+            &json!({"method":"item/completed","params":{"item":{
+                "id":"tool-b","type":"commandExecution"
+            }}}),
+        );
+        assert!(!session.tool_running());
+        assert_eq!(session.pending_steering().count(), 0);
+        apply_event(
+            &mut session,
+            &json!({"method":"item/started","params":{"item":{
+                "id":"tool-c","type":"commandExecution"
+            }}}),
+        );
+        assert_eq!(session.pending_steering().count(), 0); // A later tool cannot queue the message again.
+        session.note("sending", "delayed acknowledgement");
+        session.entries.last_mut().context("message")?.data = json!({"difuSteeringTurn":"t"});
+        apply_event(
+            &mut session,
+            &json!({"method":"item/completed","params":{"item":{
+                "id":"tool-c","type":"commandExecution"
+            }}}),
+        );
+        assert_eq!(session.pending_steering().count(), 1); // Tool completion cannot accept a send.
+        session.entries.last_mut().context("message")?.kind = "userMessage".into();
+        session.finish_steering_wait();
+        assert_eq!(session.pending_steering().count(), 0);
         Ok(())
     }
 

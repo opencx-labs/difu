@@ -142,6 +142,84 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
         assert!(matches!(reply, Reply::Ok));
     }
 
+    // Escape's interrupt-and-send action waits for completion, sends the local queue,
+    // and never replays steering that Codex already accepted.
+    let escape_id = launch(&storage, &repo, "wait for escape")?;
+    wait(&storage, &escape_id, |s| s.status == Status::Running)?;
+    let message = |text: &str, queue| Control::Message {
+        text: text.into(),
+        queue,
+        skills: Vec::new(),
+        attachments: Vec::new(),
+    };
+    control(
+        &storage,
+        &escape_id,
+        message("accepted steering before escape", false),
+    )?;
+    control(
+        &storage,
+        &escape_id,
+        message("wait first escape message", true),
+    )?;
+    control(&storage, &escape_id, message("second escape message", true))?;
+    control(&storage, &escape_id, Control::InterruptAndSend)?;
+    let sent = wait(&storage, &escape_id, |s| {
+        s.queue.is_empty()
+            && s.entries
+                .iter()
+                .any(|e| e.kind == "userMessage" && e.text == "second escape message")
+    })?;
+    for text in [
+        "accepted steering before escape",
+        "wait first escape message",
+        "second escape message",
+    ] {
+        assert_eq!(
+            sent.entries
+                .iter()
+                .filter(|e| e.kind == "userMessage" && e.text == text)
+                .count(),
+            1
+        );
+        assert!(
+            !sent
+                .entries
+                .iter()
+                .any(|e| e.kind == "unsent" && e.text == text)
+        );
+    }
+    control(&storage, &escape_id, Control::InterruptAndSend)?;
+    wait(&storage, &escape_id, |s| s.status == Status::Idle)?;
+    let wire = fs::read_to_string(root.join("protocol.jsonl"))?;
+    for text in [
+        "accepted steering before escape",
+        "wait first escape message",
+        "second escape message",
+    ] {
+        assert_eq!(
+            wire.lines()
+                .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+                .filter(
+                    |v| v.pointer("/params/input/0/text").and_then(|t| t.as_str()) == Some(text)
+                )
+                .count(),
+            1
+        );
+    }
+    // A repeated Escape after delivery must not interrupt a new, unrelated turn.
+    control(&storage, &escape_id, Control::InterruptAndSend)?;
+    let interrupts = |log: &str| {
+        log.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v.get("method").and_then(|m| m.as_str()) == Some("turn/interrupt"))
+            .count()
+    };
+    assert_eq!(
+        interrupts(&wire),
+        interrupts(&fs::read_to_string(root.join("protocol.jsonl"))?)
+    );
+
     let id = launch(&storage, &repo, "approval please")?;
     let waiting = wait(&storage, &id, |s| s.status == Status::Waiting)?;
     assert_eq!(waiting.baseline.as_deref(), Some(base.as_str()));

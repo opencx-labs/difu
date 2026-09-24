@@ -125,7 +125,7 @@ impl Compose {
     }
 }
 /// Keep stable command IDs shared by filtering, keyboard selection, and mouse hits.
-pub fn control_commands(query: &str) -> Vec<(usize, &'static str)> {
+pub fn control_commands(query: &str, draft: Option<bool>) -> Vec<(usize, &'static str)> {
     let query = query.to_lowercase();
     let terms = query.split_whitespace().collect::<Vec<_>>();
     [
@@ -138,9 +138,16 @@ pub fn control_commands(query: &str) -> Vec<(usize, &'static str)> {
         "Resolve conflicts",
         "Add comment",
         "Request reviewers",
+        "Convert to draft",
+        "Mark ready for review",
     ]
     .into_iter()
     .enumerate()
+    .filter(|(id, _)| match id {
+        9 => draft == Some(false),
+        10 => draft == Some(true),
+        _ => true,
+    })
     .filter(|(_, label)| {
         let label = label.to_lowercase();
         terms.iter().all(|term| label.contains(term))
@@ -161,6 +168,7 @@ pub enum Wizard {
     },
     Home(usize),
     Controls {
+        draft: Option<bool>,
         key: PrKey,
         head: String,
         selected: usize,
@@ -338,6 +346,7 @@ impl App {
                 }
                 if let Some(pr) = self.review().and_then(|r| r.detail.clone()) {
                     self.wizard(Wizard::Controls {
+                        draft: (pr.state == "open").then_some(pr.draft),
                         key: pr.key.clone(),
                         head: pr.head.clone(),
                         selected: 0,
@@ -369,6 +378,12 @@ impl App {
                                 squash: index == 2 || index == 4,
                                 admin: index >= 3,
                             },
+                            draft: None,
+                        }),
+                        9 | 10 => self.wizard(Wizard::Confirm {
+                            key,
+                            head,
+                            operation: Operation::Draft { draft: index == 9 },
                             draft: None,
                         }),
                         5 => self.compose(key, head, Kind::Close),
@@ -890,9 +905,12 @@ impl App {
                 _ => {}
             },
             Wizard::Controls {
-                selected, query, ..
+                selected,
+                query,
+                draft,
+                ..
             } => {
-                let commands = control_commands(&query.text());
+                let commands = control_commands(&query.text(), *draft);
                 match key.code {
                     KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
                         *selected = selected.saturating_sub(1)

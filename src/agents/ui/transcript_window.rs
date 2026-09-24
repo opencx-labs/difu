@@ -25,7 +25,7 @@ impl Window {
         let sections = session
             .entries
             .iter()
-            .filter(|e| !(e.kind == "reasoning" && e.text.is_empty()))
+            .filter(|e| transcript::visible(session, e))
             .map(|entry| {
                 let section = transcript::Section {
                     id: entry.id.clone(),
