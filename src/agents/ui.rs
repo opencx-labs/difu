@@ -46,6 +46,34 @@ pub enum Focus {
     ChangeTree,
     Resources(bool),
 }
+pub(super) struct PendingSend {
+    text: String,
+    queued: bool,
+    observed_before: usize,
+}
+impl PendingSend {
+    fn matching(session: &Session, text: &str) -> usize {
+        session
+            .entries
+            .iter()
+            .filter(|e| {
+                e.text == text
+                    && matches!(
+                        e.kind.as_str(),
+                        "sending"
+                            | "userMessage"
+                            | "awaiting connection"
+                            | "unsent"
+                            | "unsent or unacknowledged"
+                    )
+            })
+            .count()
+            + session.queue.iter().filter(|p| p.text() == text).count()
+    }
+    fn observed(&self, session: &Session) -> bool {
+        Self::matching(session, &self.text) > self.observed_before
+    }
+}
 #[derive(Default)]
 pub struct Position {
     pub conversation: usize,
@@ -56,6 +84,7 @@ pub struct Position {
     pub horizontal: usize,
     pub selection: Option<usize>,
     pub draft: Editor,
+    outgoing: Vec<PendingSend>,
     history: Option<prompt::History>,
     pub skills: Vec<super::Skill>,
     pub attachments: Vec<super::media::Attachment>,
@@ -392,6 +421,12 @@ impl Ui {
             }
             match message.result {
                 Err(error) => {
+                    if let Task::Send(id, text, ..) = &message.kind
+                        && let Some(position) = self.positions.get_mut(id)
+                        && let Some(index) = position.outgoing.iter().rposition(|p| &p.text == text)
+                    {
+                        position.outgoing.remove(index);
+                    }
                     if matches!(message.kind, Task::Question) {
                         self.busy = false;
                         self.question_send = None;
@@ -418,6 +453,11 @@ impl Ui {
                         self.ensure_selected();
                     }
                     (Task::Read(id), Reply::Session(session)) => {
+                        if let Some(position) = self.positions.get_mut(&id) {
+                            position
+                                .outgoing
+                                .retain(|pending| !pending.observed(&session));
+                        }
                         if !self.sessions.contains_key(&id) && session.thread_id.is_none() {
                             self.task(
                                 Task::Defaults(id.clone()),
@@ -810,6 +850,26 @@ impl Ui {
                 .unwrap_or_default();
             let text = draft.clone();
             if !text.trim().is_empty() {
+                if let Some(session) = self.sessions.get(&id)
+                    && (session.tool_running()
+                        || queue && session.turn_id.is_some()
+                        || session
+                            .pending
+                            .iter()
+                            .any(|p| p.id == "difu-missing-guidance"))
+                {
+                    let position = self.positions.entry(id.clone()).or_default();
+                    let earlier = position.outgoing.iter().filter(|p| p.text == text).count();
+                    position.outgoing.push(PendingSend {
+                        text: text.clone(),
+                        queued: queue
+                            || session
+                                .pending
+                                .iter()
+                                .any(|p| p.id == "difu-missing-guidance"),
+                        observed_before: PendingSend::matching(session, &text) + earlier,
+                    });
+                }
                 self.busy = true;
                 self.task(
                     Task::Send(id.clone(), draft, attachments.clone()),
@@ -1073,6 +1133,18 @@ impl Ui {
             self.toggle_changes();
             return;
         }
+        if key.code == KeyCode::Esc
+            && self.drilled
+            && matches!(self.focus, Focus::Composer | Focus::Conversation)
+            && self
+                .selected
+                .as_ref()
+                .and_then(|id| self.sessions.get(id))
+                .is_some_and(Session::can_send_waiting)
+        {
+            self.control(Control::InterruptAndSend);
+            return;
+        }
         if self.focus == Focus::ChangeTree && self.changes_visible {
             match key.code {
                 KeyCode::Up => {
@@ -1101,7 +1173,7 @@ impl Ui {
         }
         if self.focus == Focus::Composer && self.drilled {
             if key.modifiers.is_empty()
-                && matches!(key.code, KeyCode::Tab | KeyCode::Right)
+                && key.code == KeyCode::Right
                 && let Some(suggestion) = self.composer_suggestion().map(str::to_owned)
                 && let Some(id) = self.selected.clone()
             {
@@ -2406,66 +2478,14 @@ impl Ui {
         };
         let mut activity_rows =
             transcript::activity(session, area.width, chrono::Utc::now().timestamp_millis());
-        let steering = session
-            .entries
-            .iter()
-            .filter(|entry| {
-                entry.kind == "userMessage"
-                    && session.turn_id.as_deref().is_some_and(|turn| {
-                        entry.data.get("difuSteeringTurn").and_then(Value::as_str) == Some(turn)
-                    })
-            })
-            .collect::<Vec<_>>();
-        if !steering.is_empty() {
-            activity_rows.push(Line::default());
-            activity_rows.extend(
-                wrapped(
-                    "Messages to be submitted after the next tool call",
-                    area.width,
-                )
-                .into_iter()
-                .map(|text| Line::from(Span::styled(text, Style::default().fg(DIM)))),
-            );
-            for entry in steering {
-                activity_rows.extend(
-                    wrapped(
-                        &format!("  ↳ {}", crate::model::clean(&entry.text)),
-                        area.width,
-                    )
-                    .into_iter()
-                    .map(|text| Line::from(Span::styled(text, Style::default().fg(DIM)))),
-                );
-            }
-        }
-        if !session.queue.is_empty() {
-            activity_rows.push(Line::default());
-            activity_rows.extend(
-                wrapped(
-                    if session
-                        .pending
-                        .iter()
-                        .any(|p| p.id == "difu-missing-guidance")
-                    {
-                        "Messages queued until repository guidance is answered · click to edit"
-                    } else {
-                        "Messages queued for the next turn · click to edit"
-                    },
-                    area.width,
-                )
-                .into_iter()
-                .map(|text| Line::from(Span::styled(text, Style::default().fg(DIM)))),
-            );
-            for prompt in &session.queue {
-                activity_rows.extend(
-                    wrapped(
-                        &format!("  ↳ {}", crate::model::clean(prompt.text())),
-                        area.width,
-                    )
-                    .into_iter()
-                    .map(|text| Line::from(Span::styled(text, Style::default().fg(DIM)))),
-                );
-            }
-        }
+        activity_rows.extend(transcript::waiting_messages(
+            session,
+            area.width,
+            self.positions
+                .get(&id)
+                .map(|p| p.outgoing.as_slice())
+                .unwrap_or_default(),
+        ));
         let activity_height = (activity_rows.len().min(usize::from(area.height / 3))) as u16;
         let requests_height = u16::from(!session.pending.is_empty()) + activity_height;
         let (model, effort) = match &session.job {
@@ -3088,7 +3108,10 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
             "PageUp / PageDown / wheel",
             "Scroll transcript freely; End returns to live output",
         ),
-        ("Enter / Esc", "Open session / go back"),
+        (
+            "Enter / Esc",
+            "Open session / send waiting messages now, otherwise go back",
+        ),
         ("f / Ctrl+U", "Focus session filter / clear filter"),
         (
             "Tab / Shift+Tab",
@@ -3205,6 +3228,246 @@ mod tests {
         ui.select("one".into());
         ui
     }
+    #[test]
+    fn message_is_queued_before_reply_and_only_enters_chat_after_tool_completion() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let listener = UnixListener::bind(super::super::server::socket(&storage)?)?;
+        let (release, hold) = mpsc::channel();
+        let worker = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut line = String::new();
+            BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+            let request: Request = serde_json::from_str(&line)?;
+            assert!(matches!(
+                request,
+                Request::Control {
+                    control: Control::Message { queue: false, .. },
+                    ..
+                }
+            ));
+            hold.recv_timeout(Duration::from_secs(5))?;
+            serde_json::to_writer(&mut stream, &Reply::Ok)?;
+            stream.write_all(b"\n")?;
+            Ok(())
+        });
+        let mut ui = state(storage);
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.turn_id = Some("t".into());
+        session.status = Status::Running;
+        session.entries.push(Entry {
+            id: "running-tool".into(),
+            kind: "commandExecution".into(),
+            started_at: Some(1),
+            ..Entry::default()
+        });
+        ui.positions.get_mut("one").context("position")?.draft =
+            Editor::from("follow up immediately");
+        ui.send(false);
+        // No service reply has been permitted yet.
+        let position = ui.positions.get("one").context("position")?;
+        assert!(!position.outgoing.is_empty());
+        let session = ui.sessions.get("one").context("session")?;
+        let rows = transcript::waiting_messages(session, 150, &position.outgoing);
+        assert_eq!(
+            rows.iter()
+                .filter(|l| l.to_string().contains("follow up immediately"))
+                .count(),
+            1
+        );
+        assert!(
+            !session
+                .entries
+                .iter()
+                .any(|e| e.text == "follow up immediately")
+        );
+        // A canonical snapshot can arrive before the request acknowledgement.
+        let mut canonical = session.clone();
+        canonical.note("sending", "follow up immediately");
+        canonical.entries.last_mut().context("message")?.data =
+            serde_json::json!({"difuSteeringTurn":"t"});
+        ui.sender.send(ResultMessage {
+            kind: Task::Read("one".into()),
+            result: Ok(Reply::Session(Box::new(canonical.clone()))),
+        })?;
+        ui.tick(false);
+        assert!(
+            ui.positions
+                .get("one")
+                .context("position")?
+                .outgoing
+                .is_empty()
+        );
+        release.send(())?;
+        let response = ui.receiver.recv_timeout(Duration::from_secs(5))?;
+        ui.sender.send(response)?;
+        ui.tick(false);
+        assert!(
+            ui.positions
+                .get("one")
+                .context("position")?
+                .draft
+                .text()
+                .is_empty()
+        );
+        canonical.entries.last_mut().context("message")?.kind = "userMessage".into();
+        canonical.finish_steering_wait();
+        canonical.touch();
+        ui.sender.send(ResultMessage {
+            kind: Task::Read("one".into()),
+            result: Ok(Reply::Session(Box::new(canonical.clone()))),
+        })?;
+        ui.tick(false);
+        let (screen, _) = draw(&mut ui, 150, 40)?;
+        assert_eq!(screen.matches("follow up immediately").count(), 1);
+        assert!(screen.contains("Messages to be submitted after the next tool call"));
+        let message_id = &canonical.entries.last().context("message")?.id;
+        assert!(!ui.conversation_sections.iter().any(|s| &s.id == message_id));
+        super::super::engine::apply_event(
+            &mut canonical,
+            &serde_json::json!({"method":"item/completed","params":{"item":{
+                "id":"running-tool","type":"commandExecution"
+            }}}),
+        );
+        canonical.touch();
+        ui.sender.send(ResultMessage {
+            kind: Task::Read("one".into()),
+            result: Ok(Reply::Session(Box::new(canonical))),
+        })?;
+        ui.tick(false);
+        let (screen, _) = draw(&mut ui, 150, 40)?;
+        assert_eq!(screen.matches("follow up immediately").count(), 1);
+        assert!(!screen.contains("Messages to be submitted after the next tool call"));
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn queue_snapshots_reconcile_repeated_messages_and_failed_sends_keep_the_draft() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        let p = ui.positions.get_mut("one").context("position")?;
+        p.outgoing = vec![
+            PendingSend {
+                text: "again".into(),
+                queued: true,
+                observed_before: 0,
+            },
+            PendingSend {
+                text: "again".into(),
+                queued: false,
+                observed_before: 1,
+            },
+        ];
+        let mut snapshot = ui.sessions.get("one").context("session")?.clone();
+        snapshot.queue.push("again".into());
+        ui.sender.send(ResultMessage {
+            kind: Task::Read("one".into()),
+            result: Ok(Reply::Session(Box::new(snapshot.clone()))),
+        })?;
+        ui.tick(false);
+        assert_eq!(
+            ui.positions.get("one").context("position")?.outgoing.len(),
+            1
+        );
+        snapshot.note("userMessage", "again");
+        ui.sender.send(ResultMessage {
+            kind: Task::Read("one".into()),
+            result: Ok(Reply::Session(Box::new(snapshot))),
+        })?;
+        ui.tick(false);
+        assert!(
+            ui.positions
+                .get("one")
+                .context("position")?
+                .outgoing
+                .is_empty()
+        );
+        let p = ui.positions.get_mut("one").context("position")?;
+        p.draft = Editor::from("retry this");
+        p.outgoing.push(PendingSend {
+            text: "retry this".into(),
+            queued: false,
+            observed_before: 0,
+        });
+        ui.busy = true;
+        ui.sender.send(ResultMessage {
+            kind: Task::Send("one".into(), "retry this".into(), vec![]),
+            result: Err("Disconnected".into()),
+        })?;
+        ui.tick(false);
+        let p = ui.positions.get("one").context("position")?;
+        assert!(p.outgoing.is_empty());
+        assert_eq!(p.draft.text(), "retry this");
+        assert!(!ui.busy);
+        assert!(
+            ui.notice
+                .as_ref()
+                .is_some_and(|(text, error)| *error && text == "Disconnected")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn escape_sends_waiting_messages_without_leaving_chat() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let listener = UnixListener::bind(super::super::server::socket(&storage)?)?;
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut line = String::new();
+            BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+            let request: Request = serde_json::from_str(&line)?;
+            serde_json::to_writer(&mut stream, &Reply::Ok)?;
+            stream.write_all(b"\n")?;
+            tx.send(request)?;
+            Ok(())
+        });
+        let mut ui = state(storage);
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        ui.sessions
+            .get_mut("one")
+            .context("session")?
+            .queue
+            .push("Next task".into());
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5))?,
+            Request::Control {
+                control: Control::InterruptAndSend,
+                ..
+            }
+        ));
+        assert!(ui.drilled);
+        assert_eq!(ui.focus, Focus::Composer);
+        ui.sessions.get_mut("one").context("session")?.queue.clear();
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!ui.drilled);
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
+        Ok(())
+    }
+
     #[test]
     fn inline_attachment_send_preserves_text_order_without_appending_duplicate_labels() -> Result<()>
     {
@@ -3698,20 +3961,25 @@ mod tests {
                 .chars
                 .is_empty()
         );
-        for key in [KeyCode::Tab, KeyCode::Right] {
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(
             ui.positions
-                .get_mut("one")
+                .get("one")
                 .context("position")?
                 .draft
-                .clear();
-            ui.key(KeyEvent::new(key, KeyModifiers::NONE));
-            assert_eq!(
-                ui.positions.get("one").context("position")?.draft.text(),
-                "Okay, implement the plan."
-            );
-            assert_eq!(ui.focus, Focus::Composer);
-            assert!(!ui.busy);
-        }
+                .text()
+                .is_empty()
+        );
+        assert_ne!(ui.focus, Focus::Composer);
+        assert!(!ui.busy);
+        ui.focus = Focus::Composer;
+        ui.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(
+            ui.positions.get("one").context("position")?.draft.text(),
+            "Okay, implement the plan."
+        );
+        assert_eq!(ui.focus, Focus::Composer);
+        assert!(!ui.busy);
         ui.positions.get_mut("one").context("position")?.draft = Editor::from("My own text");
         ui.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(
@@ -4756,6 +5024,37 @@ mod tests {
         assert!(activity < steering && steering < queued && queued < composer);
         assert!(screen.contains("git diff --stat"));
         assert!(screen.contains("Explain the result next"));
+        assert!(screen.contains("press esc to interrupt and send immediately"));
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.queue = vec!["long ".repeat(10000).into(), "Another message".into()];
+        let rows = transcript::waiting_messages(session, 120, &[]);
+        assert!(rows.len() < 12);
+        assert!(
+            rows.iter()
+                .any(|row| row.to_string().starts_with("• Messages")
+                    && row.spans.first().is_some_and(|s| s.style.fg == Some(TEXT)))
+        );
+        assert!(
+            rows.iter().any(
+                |row| row.to_string().starts_with("  ↳ long") && row.to_string().ends_with('…')
+            )
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.to_string() == "  ↳ Another message")
+        );
+        session.pending.push(Pending {
+            id: serde_json::json!("difu-missing-guidance"),
+            method: "item/tool/requestUserInput".into(),
+            params: Value::Null,
+            responded: false,
+        });
+        assert!(!session.can_send_waiting());
+        assert!(
+            !transcript::waiting_messages(session, 120, &[])
+                .iter()
+                .any(|row| row.to_string().contains("press esc"))
+        );
         assert_eq!(ui.positions.get("one").context("position")?.conversation, 0);
         Ok(())
     }

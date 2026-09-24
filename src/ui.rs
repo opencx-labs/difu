@@ -2783,6 +2783,7 @@ mod tests {
         app.workflow.mentions_loading.insert(key.id());
         let open_menu = |app: &mut App| {
             app.wizard(Wizard::Controls {
+                draft: Some(false),
                 key: key.clone(),
                 head: "head".into(),
                 selected: 0,
@@ -2794,7 +2795,7 @@ mod tests {
             app.key_event(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
         assert_eq!(
-            crate::workflow::control_commands("ADMIN merge")
+            crate::workflow::control_commands("ADMIN merge", Some(false))
                 .iter()
                 .map(|(id, _)| *id)
                 .collect::<Vec<_>>(),
@@ -2857,6 +2858,26 @@ mod tests {
         assert!(
             matches!(&app.modal,Some(Modal::Workflow(w)) if matches!(w.as_ref(),Wizard::Compose(draft) if matches!(draft.kind, Kind::Close)))
         );
+        for (draft, label) in [(false, "Convert to draft"), (true, "Mark ready for review")] {
+            assert_eq!(
+                crate::workflow::control_commands(label, Some(draft)).len(),
+                1
+            );
+            assert!(crate::workflow::control_commands(label, Some(!draft)).is_empty());
+            assert!(crate::workflow::control_commands(label, None).is_empty());
+            app.wizard(Wizard::Controls {
+                key: key.clone(),
+                head: "head".into(),
+                draft: Some(draft),
+                selected: 0,
+                query: Editor::from(label),
+            });
+            app.key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            assert!(
+                matches!(&app.modal, Some(Modal::Workflow(w)) if matches!(w.as_ref(), Wizard::Confirm { operation: Operation::Draft { draft: next }, .. } if *next != draft))
+            );
+            assert!(!app.workflow.busy);
+        }
         open_menu(&mut app);
         app.key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.modal.is_none());

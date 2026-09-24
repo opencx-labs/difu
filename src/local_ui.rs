@@ -237,6 +237,7 @@ impl App {
                     let key = id(&checkout.root);
                     let working = matches!(checkout.comparison, Comparison::WorkingTree { .. });
                     let pr = PrDetail {
+                        draft: false,
                         requested_reviewers: Vec::new(), requested_teams: Vec::new(),
                         key: PrKey { owner: "local".into(), repo: crate::storage::hash(checkout.root.to_string_lossy().as_bytes()), number: 1 },
                         title: format!("{} · {}", checkout.root.display(), checkout.branch),

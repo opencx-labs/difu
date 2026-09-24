@@ -33,6 +33,9 @@ pub struct Anchor {
 }
 #[derive(Clone, Debug)]
 pub enum Operation {
+    Draft {
+        draft: bool,
+    },
     RequestReviewers {
         users: Vec<String>,
         teams: Vec<String>,
@@ -64,6 +67,12 @@ pub enum Operation {
 impl Operation {
     pub fn label(&self) -> String {
         match self {
+            Self::Draft { draft } => if *draft {
+                "Convert to draft"
+            } else {
+                "Mark ready for review"
+            }
+            .into(),
             Self::Review { event, .. } => format!("Submit review: {event}"),
             Self::Comment { pending, .. } => if *pending {
                 "Add to pending review"
@@ -190,20 +199,40 @@ pub fn state(key: &PrKey, cancel: &Cancel) -> Result<State> {
     }
     Ok(result)
 }
-fn matching(key: &PrKey, head: &str, cancel: &Cancel) -> Result<()> {
+fn matching(key: &PrKey, head: &str, cancel: &Cancel) -> Result<crate::model::PrDetail> {
     let current = github::detail(key, cancel)?;
     ensure!(
         current.head == head,
         "PR head changed. Close this dialog with Esc, press r to load the latest revision, then confirm again. Your draft is retained."
     );
-    Ok(())
+    Ok(current)
 }
 /// The UI supplies the pinned revision; merge also uses GitHub's atomic head guard.
 pub fn execute(key: &PrKey, head: &str, operation: &Operation, cancel: &Cancel) -> Result<String> {
     key.validate()?;
-    matching(key, head, cancel)?;
+    let current = matching(key, head, cancel)?;
     let endpoint = format!("repos/{}/{}/pulls/{}", key.owner, key.repo, key.number);
     match operation {
+        Operation::Draft { draft } => {
+            ensure!(
+                current.state == "open",
+                "Only open pull requests can change review readiness"
+            );
+            if current.draft == *draft {
+                return Ok(if *draft {
+                    "PR is already a draft"
+                } else {
+                    "PR is already ready for review"
+                }
+                .into());
+            }
+            let mut command = github::command();
+            command.args(["pr", "ready", &key.url()]);
+            if *draft {
+                command.arg("--undo");
+            }
+            process::checked(&mut command, cancel)?;
+        }
         Operation::Merge { squash, admin } => {
             let mut command = github::command();
             command.args([

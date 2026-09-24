@@ -10,6 +10,14 @@ if args[:2] == ['pr', 'view']:
     if (root / 'no-branch-pr').exists():
         print('no pull requests found for branch', file=sys.stderr);sys.exit(1)
     print(json.dumps(dict(url=url)));sys.exit(0)
+if args[:2] == ['pr', 'ready']:
+    assert args[2] == url
+    if (root / 'fail-write').exists():
+        print('Fixture write rejected', file=sys.stderr);sys.exit(1)
+    with (root / 'writes.jsonl').open('a') as log: log.write(json.dumps(dict(ready=args))+'\n')
+    if '--undo' in args: (root / 'draft-pr').write_text('draft')
+    else: (root / 'draft-pr').unlink(missing_ok=True)
+    print('Readiness changed');sys.exit(0)
 if args[:2] == ['pr', 'merge']:
     assert '--match-head-commit' in args
     assert args[args.index('--match-head-commit')+1] == revs['head']
@@ -103,7 +111,7 @@ elif 'timeline?' in args[-1]:
 elif '/comments?' in args[-1]:
     value = [[]]
 else:
-    value = dict(title='Describe the behavior', body='PR description with `code`.', user=dict(login='author'), head=dict(sha=revs['head'], ref='feature'), base=dict(sha=revs['base'], ref='main'), state='open', merged=False, additions=1, deletions=1, changed_files=1)
+    value = dict(title='Describe the behavior', body='PR description with `code`.', user=dict(login='author'), head=dict(sha=revs['head'], ref='feature'), base=dict(sha=revs['base'], ref='main'), state='closed' if (root / 'closed-pr').exists() else 'open', draft=(root / 'draft-pr').exists(), merged=False, additions=1, deletions=1, changed_files=1)
 if (root / 'updated-title').exists():
     if isinstance(value, list) and value and isinstance(value[0], dict) and 'title' in value[0]:
         value[0]['title'] = 'Fresh title from GitHub'

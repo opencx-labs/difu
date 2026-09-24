@@ -1338,6 +1338,7 @@ impl App {
                         r.update_state(&pr.state);
                         if let Some(detail) = &mut r.detail {
                             let detail = Arc::make_mut(detail);
+                            detail.draft = pr.draft;
                             detail.requested_reviewers = pr.requested_reviewers.clone();
                             detail.requested_teams = pr.requested_teams.clone();
                         }
@@ -1345,6 +1346,7 @@ impl App {
                             pr.state = "merged".into();
                         }
                         if let Some(summary) = self.inbox.iter_mut().find(|p| p.key.id() == id) {
+                            summary.draft = pr.draft;
                             summary.title = pr.title.clone();
                             summary.author = pr.author.clone();
                             summary.stats = Some(PrStats {
@@ -2924,6 +2926,7 @@ mod tests {
     }
     fn detail(head: &str) -> PrDetail {
         PrDetail {
+            draft: false,
             requested_reviewers: Vec::new(),
             requested_teams: Vec::new(),
             key: PrKey {

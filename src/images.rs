@@ -709,6 +709,7 @@ mod tests {
     use std::{sync::Arc, time::Instant};
     fn pr() -> PrDetail {
         PrDetail {
+            draft: false,
             requested_reviewers: Vec::new(),
             requested_teams: Vec::new(),
             key: PrKey {

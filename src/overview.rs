@@ -483,6 +483,7 @@ mod status_tests {
     fn conflicts_and_empty_checks_are_not_parsing_errors_and_failures_follow_checks() {
         let mut review = Review {
             detail: Some(Arc::new(PrDetail {
+                draft: false,
                 requested_reviewers: Vec::new(),
                 requested_teams: Vec::new(),
                 key: PrKey {

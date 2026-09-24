@@ -128,6 +128,25 @@ pub struct Entry {
     #[serde(default)]
     pub finished_at: Option<i64>,
 }
+impl Entry {
+    pub fn is_tool(&self) -> bool {
+        !matches!(
+            self.kind.as_str(),
+            "agentMessage"
+                | "userMessage"
+                | "sending"
+                | "sending_context"
+                | "awaiting connection"
+                | "result"
+                | "plan"
+                | "error"
+                | "system"
+                | "unsent"
+                | "unsent or unacknowledged"
+                | "reasoning"
+        )
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Pending {
     pub id: Value,
@@ -299,6 +318,40 @@ impl Session {
             entry.data = serde_json::json!({"prompt":prompt});
         }
     }
+    pub fn tool_running(&self) -> bool {
+        self.turn_id.is_some()
+            && self.entries.iter().any(|entry| {
+                entry.is_tool() && entry.started_at.is_some() && entry.finished_at.is_none()
+            })
+    }
+    pub fn is_pending_steering(&self, entry: &Entry) -> bool {
+        matches!(entry.kind.as_str(), "userMessage" | "sending")
+            && self.turn_id.as_deref().is_some_and(|turn| {
+                entry.data.get("difuSteeringTurn").and_then(Value::as_str) == Some(turn)
+            })
+    }
+    pub fn pending_steering(&self) -> impl Iterator<Item = &Entry> {
+        self.entries
+            .iter()
+            .filter(|entry| self.is_pending_steering(entry))
+    }
+    pub fn finish_steering_wait(&mut self) {
+        if !self.tool_running() {
+            for entry in &mut self.entries {
+                if entry.kind == "userMessage"
+                    && let Some(data) = entry.data.as_object_mut()
+                {
+                    data.remove("difuSteeringTurn");
+                }
+            }
+        }
+    }
+    pub fn can_send_waiting(&self) -> bool {
+        matches!(self.job, Job::Coding(_))
+            && !self.archived
+            && !self.pending.iter().any(|p| p.id == "difu-missing-guidance")
+            && (!self.queue.is_empty() || self.pending_steering().next().is_some())
+    }
     pub fn summary(&self) -> Summary {
         Summary {
             id: self.id.clone(),
@@ -415,6 +468,7 @@ pub enum Control {
         attachments: Vec<media::Attachment>,
     },
     Interrupt,
+    InterruptAndSend,
     Compact,
     RefreshShells,
     ReplaceQueued {
