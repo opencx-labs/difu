@@ -18,6 +18,7 @@ use std::io::Write;
 use unicode_width::UnicodeWidthStr;
 
 const TAB_LABELS: [&str; 2] = [" Agents (⌥+1) ", " Reviews (⌥+2) "];
+const TAB_MARGIN: u16 = 1;
 
 pub struct Shell {
     pub reviews: App,
@@ -122,13 +123,14 @@ impl Shell {
     }
     pub fn mouse(&mut self, mouse: MouseEvent) {
         if mouse.row == 0 && mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-            let mut x = 0;
+            let mut x = TAB_MARGIN;
             for (index, label) in TAB_LABELS.iter().enumerate() {
-                x += label.width() as u16;
-                if mouse.column < x {
+                let end = x + label.width() as u16;
+                if (x..end).contains(&mouse.column) {
                     self.switch(index == 0);
                     break;
                 }
+                x = end;
             }
             return;
         }
@@ -151,7 +153,7 @@ impl Shell {
         } else {
             crate::ui::draw(frame, &mut self.reviews);
         }
-        let mut x = 0;
+        let mut x = TAB_MARGIN;
         for (index, label) in TAB_LABELS.iter().enumerate() {
             let width = label.width() as u16;
             let active = self.agents_active == (index == 0);
@@ -206,6 +208,29 @@ mod tests {
         assert!(!shell.reviews.config.last_tab_agents);
         shell.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT));
         assert!(storage.load_config()?.last_tab_agents);
+        let reviews_start =
+            TAB_MARGIN + TAB_LABELS.first().copied().unwrap_or_default().width() as u16;
+        shell.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: reviews_start,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!shell.agents_active);
+        shell.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!shell.agents_active);
+        shell.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: TAB_MARGIN,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(shell.agents_active);
         Ok(())
     }
 }

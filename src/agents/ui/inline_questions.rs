@@ -119,7 +119,7 @@ impl Ui {
             })
             .unwrap_or_default()
     }
-    fn question_index(&self) -> Option<usize> {
+    pub(super) fn question_index(&self) -> Option<usize> {
         let Some(Modal::Approval { pending, field, .. }) = &self.modal else {
             return None;
         };
@@ -355,7 +355,7 @@ impl Ui {
     }
     pub(super) fn question_height(&self, width: u16) -> u16 {
         self.question_lines(width)
-            .map(|(lines, _, _)| u16::try_from(lines.len().saturating_add(4)).unwrap_or(u16::MAX))
+            .map(|(lines, _, _)| u16::try_from(lines.len().saturating_add(3)).unwrap_or(u16::MAX))
             .unwrap_or(0)
     }
     fn question_lines(&self, width: u16) -> Option<QuestionLines> {
@@ -540,18 +540,16 @@ impl Ui {
         ));
         Some((lines, cursor, hits))
     }
-    pub(super) fn draw_inline_question(&mut self, frame: &mut Frame, area: Rect) {
-        let Some((lines, cursor, hits)) = self.question_lines(area.width) else {
+    pub(super) fn draw_question_tabs(&mut self, frame: &mut Frame, area: Rect) {
+        if !self.inline_question() {
             return;
-        };
+        }
         let slots = self.question_slots();
+        if slots.len() <= 1 {
+            return;
+        }
         let index = self.question_index().unwrap_or(0);
-        frame.render_widget(
-            Paragraph::new(format!("{} of {}", index + 1, slots.len()))
-                .style(Style::default().fg(DIM)),
-            Rect::new(area.x, area.y, area.width, 1),
-        );
-        let mut x = area.x.saturating_add(10);
+        let mut x = area.x;
         for tab in 0..slots.len() {
             let label = format!(" {} ", tab + 1);
             let width = u16::try_from(label.len()).unwrap_or(0);
@@ -567,7 +565,12 @@ impl Ui {
             );
             x = x.saturating_add(width);
         }
-        let available = area.height.saturating_sub(3) as usize;
+    }
+    pub(super) fn draw_inline_question(&mut self, frame: &mut Frame, area: Rect) {
+        let Some((lines, cursor, hits)) = self.question_lines(area.width) else {
+            return;
+        };
+        let available = area.height.saturating_sub(2) as usize;
         let scroll = match &mut self.modal {
             Some(Modal::Approval {
                 scroll, selected, ..
@@ -600,7 +603,7 @@ impl Ui {
                     .take(available)
                     .collect::<Vec<_>>(),
             ),
-            Rect::new(area.x, area.y + 1, area.width, available as u16),
+            Rect::new(area.x, area.y, area.width, available as u16),
         );
         for (start, height, action) in hits {
             let top = start.max(scroll);
@@ -609,7 +612,7 @@ impl Ui {
                 self.hits.push((
                     Rect::new(
                         area.x,
-                        area.y + 1 + (top - scroll) as u16,
+                        area.y + (top - scroll) as u16,
                         area.width,
                         (bottom - top) as u16,
                     ),
@@ -622,7 +625,7 @@ impl Ui {
             && y < scroll + available
             && x < usize::from(area.width)
         {
-            frame.set_cursor_position((area.x + x as u16, area.y + 1 + (y - scroll) as u16));
+            frame.set_cursor_position((area.x + x as u16, area.y + (y - scroll) as u16));
         }
         self.button(
             frame,

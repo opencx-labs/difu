@@ -373,6 +373,11 @@ impl Session {
                     .count(),
             queued: self.queue.len(),
             turn_started_at: self.turn_started_at,
+            branch: self.branch.clone(),
+            repository: Some(self.job.root().clone()),
+            worktree: self.workspace_ready
+                && !self.workspace_removed
+                && matches!(&self.job, Job::Coding(launch) if launch.isolated),
             can_read_changes: self.workspace.is_some()
                 && self.baseline.is_some()
                 && !self.workspace_removed
@@ -393,6 +398,12 @@ pub struct Summary {
     pub turn_started_at: Option<i64>,
     pub workspace: PathBuf,
     #[serde(default)]
+    pub repository: Option<PathBuf>,
+    #[serde(default)]
+    pub worktree: bool,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
     pub can_read_changes: bool,
     pub pending: usize,
     pub queued: usize,
@@ -410,6 +421,11 @@ pub struct Skill {
 #[serde(untagged)]
 pub enum Prompt {
     Text(String),
+    QuestionAnswer {
+        text: String,
+        question_request: Value,
+        question_id: Option<String>,
+    },
     WithSkills {
         text: String,
         skills: Vec<Skill>,
@@ -420,18 +436,20 @@ pub enum Prompt {
 impl Prompt {
     pub fn text(&self) -> &str {
         match self {
-            Self::Text(s) | Self::WithSkills { text: s, .. } => s,
+            Self::Text(s)
+            | Self::WithSkills { text: s, .. }
+            | Self::QuestionAnswer { text: s, .. } => s,
         }
     }
     pub fn attachments(&self) -> &[media::Attachment] {
         match self {
-            Self::Text(_) => &[],
+            Self::Text(_) | Self::QuestionAnswer { .. } => &[],
             Self::WithSkills { attachments, .. } => attachments,
         }
     }
     pub fn skills(&self) -> &[Skill] {
         match self {
-            Self::Text(_) => &[],
+            Self::Text(_) | Self::QuestionAnswer { .. } => &[],
             Self::WithSkills { skills, .. } => skills,
         }
     }

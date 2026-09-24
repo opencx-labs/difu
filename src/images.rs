@@ -659,7 +659,7 @@ pub(crate) fn draw_modal(frame: &mut Frame, app: &mut App) {
         return;
     };
     let request = request.clone();
-    let area = frame.area();
+    let area = app.render_area.unwrap_or_else(|| frame.area());
     let rect = Rect::new(
         area.x + 1,
         area.y + 1,

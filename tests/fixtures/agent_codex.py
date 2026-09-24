@@ -76,6 +76,9 @@ for line in sys.stdin:
             emit({'id':900+turn,'method':'item/tool/call','params':{'threadId':thread_id,'turnId':active,'tool':'difu_present_artifact','arguments':{'path':'report.html','title':'Fixture report'}}})
         elif text.startswith('chat only'):
             complete()
+        elif text == 'fixture fail turn':
+            event('turn/completed', {'threadId':thread_id,'turn':{'id':active,'status':'failed','error':{'message':'Fixture failure'}}})
+            active = None
         elif text.startswith('approval'):
             emit({'id':900+turn,'method':'item/commandExecution/requestApproval','params':{'threadId':thread_id,'turnId':active,'itemId':'command','command':'git diff --check','reason':'Inspect diff only'}})
         elif text.startswith('wait'):

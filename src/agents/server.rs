@@ -324,10 +324,16 @@ impl Service {
                     super::questions::save_answer(&self.store, &id, updated)?;
                     return Ok(Reply::Ok);
                 }
+                let async_response = matches!(&control, Control::Respond { request, .. } | Control::AnswerQuestion { request, .. }
+                    if session.pending.iter().any(|p| p.id == *request && p.is_async_question() && !p.responded));
+                let sends_message = matches!(
+                    control,
+                    Control::Message { .. } | Control::MessageWithAttachments { .. }
+                ) || async_response;
                 if matches!(session.status, Status::Interrupted | Status::Failed) {
                     ensure!(
-                        matches!(control, Control::Resume | Control::Model { .. }),
-                        "This session was interrupted; explicitly Continue before sending another message"
+                        sends_message || matches!(control, Control::Resume | Control::Model { .. }),
+                        "This session was interrupted; send a message or choose Continue to resume"
                     );
                 }
                 let connected = self
@@ -369,8 +375,6 @@ impl Service {
                     session.thread_id.is_some() || !matches!(control, Control::Compact),
                     "Send the first message to start this session"
                 );
-                let async_response = matches!(&control, Control::Respond { request, .. } | Control::AnswerQuestion { request, .. }
-                    if session.pending.iter().any(|p| p.id == *request && p.is_async_question() && !p.responded));
                 let (reply, result) = mpsc::channel();
                 let command = Command {
                     control: control.clone(),
@@ -383,6 +387,11 @@ impl Service {
                     _ => {
                         ensure!(
                             matches!(control, Control::Resume)
+                                || (sends_message
+                                    && matches!(
+                                        session.status,
+                                        Status::Interrupted | Status::Failed
+                                    ))
                                 || (session.status == Status::Idle
                                     && (async_response
                                         || matches!(
@@ -392,7 +401,7 @@ impl Service {
                                                 | Control::Model { .. }
                                                 | Control::Compact
                                         ))),
-                            "Session is disconnected; choose Continue to reconnect"
+                            "Session is disconnected; send a message or choose Continue to reconnect"
                         );
                         self.store.update(&id, |s| {
                             s.status = Status::Starting;
@@ -630,7 +639,7 @@ pub fn run(storage: Storage) -> Result<()> {
             session.status = Status::Interrupted;
             session.turn_id = None;
             session.pending.retain(Pending::is_async_question);
-            session.note("system", "Service restarted. Work was interrupted; Continue explicitly. No prompt or publication action was replayed.");
+            session.note("system", "Service restarted. Work was interrupted; send a message or choose Continue to resume. No prompt or publication action was replayed.");
         }
         // Queued messages remain visible, but never replay after a service restart.
         if !session.queue.is_empty() {

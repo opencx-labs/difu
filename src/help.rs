@@ -44,9 +44,10 @@ pub fn entries(query: &str) -> Vec<(&'static str, &'static str)> {
         ),
         ("1 / 2", "Home: My PRs / Repositories"),
         ("1 / 2 / 3", "Inside PR: Overview / Guide / Diff"),
+        ("[ / ]", "Inside PR: previous / next view"),
         (
             "[ / ] / s",
-            "Previous / next / next PR state: Open / Merged / Closed / All",
+            "Home: previous / next / next PR state: Open / Merged / Closed / All",
         ),
         ("f", "Focus sidebar filter; Enter/Esc returns to the list"),
         ("Ctrl+U", "Clear the focused filter or search input"),

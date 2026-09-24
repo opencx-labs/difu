@@ -289,6 +289,7 @@ pub struct App {
     pub chapter_target: Option<usize>,
     pub hits: Vec<(ratatui::layout::Rect, Action)>,
     pub viewport: usize,
+    pub render_area: Option<ratatui::layout::Rect>,
     pub content_rect: ratatui::layout::Rect,
     sender: Sender<Message>,
     receiver: Receiver<Message>,
@@ -366,6 +367,7 @@ impl App {
             chapter_target: None,
             hits: Vec::new(),
             viewport: 20,
+            render_area: None,
             content_rect: Default::default(),
             sender,
             receiver,
@@ -395,6 +397,14 @@ impl App {
         } else {
             self.load_inbox();
         }
+    }
+    pub(crate) fn start_embedded(&mut self, key: PrKey) {
+        let id = key.id();
+        self.start(Some(key));
+        self.opened = Some(id);
+        self.home = false;
+        self.view = View::Overview;
+        self.focus = Focus::Content;
     }
     pub(crate) fn spawn(
         &mut self,
@@ -1952,16 +1962,8 @@ impl App {
                 .and_then(|r| r.snapshot.as_ref())
                 .map(|s| crate::tree::filtered(&s.files, &self.filters.files.text()))
                 .unwrap_or_default();
-            let current = entries
-                .iter()
-                .position(|entry| match &self.directory {
-                    Some(path) => entry.file.is_none() && &entry.path == path,
-                    None => entry.file == Some(self.file),
-                })
-                .unwrap_or(0);
-            let next = current
-                .saturating_add_signed(delta as isize)
-                .min(entries.len().saturating_sub(1));
+            let current = crate::tree::selected(&entries, self.file, self.directory.as_deref());
+            let next = crate::tree::step(&entries, current, delta);
             if let Some(entry) = entries.get(next) {
                 self.action(match entry.file {
                     Some(index) => Action::SelectFile(index),
@@ -2166,6 +2168,14 @@ impl App {
             } else {
                 Action::SetView(View::Diff)
             }),
+            KeyCode::Char('[' | ']') if plain && !self.home => {
+                let next = match (self.view, key.code == KeyCode::Char(']')) {
+                    (View::Overview, true) | (View::Diff, false) => View::Guide,
+                    (View::Guide, true) | (View::Overview, false) => View::Diff,
+                    (View::Diff, true) | (View::Guide, false) => View::Overview,
+                };
+                self.action(Action::SetView(next));
+            }
             KeyCode::Char('?') if plain => self.action(Action::Help),
             KeyCode::Char('m') if plain => self.load_models(),
             KeyCode::Char('s' | '[' | ']')

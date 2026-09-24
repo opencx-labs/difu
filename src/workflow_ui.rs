@@ -17,12 +17,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     };
     let wizard = *modal;
-    let area = frame.area();
+    let area = app.render_area.unwrap_or_else(|| frame.area());
     let width = area.width.saturating_sub(4).min(100);
     let height = area.height.saturating_sub(4).min(32);
     let rect = Rect::new(
-        (area.width - width) / 2,
-        (area.height - height) / 2,
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
         width,
         height,
     );

@@ -1172,23 +1172,12 @@ impl App {
             return false;
         }
         let width = doc.width;
-        let files = self
+        let entries = self
             .review()
             .and_then(|review| review.snapshot.as_ref())
             .map(|snapshot| crate::tree::filtered(&snapshot.files, &self.filters.files.text()))
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|entry| entry.file)
-            .collect::<Vec<_>>();
-        let Some(current) = files.iter().position(|index| *index == self.file) else {
-            return false;
-        };
-        let next = if forward {
-            current.checked_add(1)
-        } else {
-            current.checked_sub(1)
-        };
-        let Some(file) = next.and_then(|index| files.get(index)).copied() else {
+            .unwrap_or_default();
+        let Some(file) = crate::tree::next_file(&entries, self.file, forward) else {
             return false;
         };
         self.action(crate::app::Action::SelectFile(file));
