@@ -9,7 +9,7 @@ struct Point {
 }
 #[derive(Default)]
 pub(super) struct Selection {
-    documents: HashMap<usize, Vec<Line<'static>>>,
+    documents: HashMap<usize, std::collections::BTreeMap<usize, Line<'static>>>,
     visible: Vec<(Rect, usize, usize)>,
     anchor: Option<Point>,
     end: Option<Point>,
@@ -21,14 +21,54 @@ impl Selection {
         self.visible.clear();
     }
     pub fn clear(&mut self) {
+        self.documents.clear();
         self.anchor = None;
         self.end = None;
         self.dragging = false;
         self.click = None;
     }
+    #[cfg(test)]
     pub fn register(&mut self, region: usize, area: Rect, offset: usize, lines: &[Line<'static>]) {
         self.visible.push((area, region, offset));
-        self.documents.insert(region, lines.to_vec());
+        self.documents
+            .insert(region, lines.iter().cloned().enumerate().collect());
+    }
+    pub fn rebase(&mut self, region: usize, delta: isize) {
+        if delta == 0 {
+            return;
+        }
+        for point in [&mut self.anchor, &mut self.end].into_iter().flatten() {
+            if point.region == region {
+                point.row = point.row.saturating_add_signed(delta);
+            }
+        }
+        if let Some(rows) = self.documents.get_mut(&region) {
+            *rows = std::mem::take(rows)
+                .into_iter()
+                .map(|(row, line)| (row.saturating_add_signed(delta), line))
+                .collect();
+        }
+    }
+    pub fn register_window(
+        &mut self,
+        region: usize,
+        area: Rect,
+        offset: usize,
+        start: usize,
+        lines: &[Line<'static>],
+    ) {
+        self.visible.push((area, region, offset));
+        let rows = self.documents.entry(region).or_default();
+        if self.anchor.is_none() {
+            rows.clear();
+        }
+        rows.extend(
+            lines
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(i, line)| (start + i, line)),
+        );
     }
     fn point(&self, x: u16, y: u16) -> Option<Point> {
         self.visible
@@ -53,7 +93,7 @@ impl Selection {
             let Some(lines) = self.documents.get(&region) else {
                 continue;
             };
-            for (row, line) in lines.iter().enumerate() {
+            for (&row, line) in lines {
                 if (region, row) < (start.region, start.row)
                     || (region, row) > (end.region, end.row)
                 {
@@ -115,7 +155,7 @@ impl Ui {
             self.clipboard = Some(text);
             return true;
         }
-        if self.modal.is_some() {
+        if self.modal.is_some() && !matches!(self.modal, Some(Modal::Transcript { .. })) {
             return false;
         }
         if let Some(text) = self.text_selection.text() {
@@ -126,7 +166,7 @@ impl Ui {
         }
     }
     pub(super) fn selection_mouse(&mut self, event: MouseEvent) -> bool {
-        if self.modal.is_some() {
+        if self.modal.is_some() && !matches!(self.modal, Some(Modal::Transcript { .. })) {
             return false;
         }
         let point = self.text_selection.point(event.column, event.row);
@@ -206,6 +246,34 @@ impl Ui {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selection_survives_loading_and_rebasing_virtual_rows() {
+        let mut s = Selection::default();
+        let area = Rect::new(0, 0, 20, 2);
+        s.register_window(
+            1,
+            area,
+            100,
+            100,
+            &[Line::from("alpha"), Line::from("beta")],
+        );
+        s.anchor = s.point(0, 0);
+        s.end = s.point(4, 1);
+        assert_eq!(s.text().as_deref(), Some("alpha\nbeta"));
+        s.rebase(1, 5);
+        s.frame();
+        s.register_window(
+            1,
+            area,
+            106,
+            106,
+            &[Line::from("beta"), Line::from("gamma")],
+        );
+        s.end = s.point(5, 1);
+        assert_eq!(s.text().as_deref(), Some("alpha\nbeta\ngamma"));
+        s.clear();
+        assert!(s.documents.is_empty());
+    }
     #[test]
     fn copies_portions_across_messages_with_wide_characters() {
         let mut s = Selection::default();

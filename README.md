@@ -200,10 +200,14 @@ every ten seconds while working and after a turn finishes. Archived sessions
 remain available through the actions menu.
 
 
-Conversation tools show their action, target, state, and duration; click or press
-Enter to expand details. Up/Down focuses transcript entries, PageUp/PageDown and
-the wheel scroll, and End returns to live output. Reading earlier output keeps
-your place. **Alt+Up** opens pending questions in place of the composer. Answer one question
+Conversation tools show a compact preview capped at four terminal rows, including
+wrapped commands and output. Click a tool or press Enter on a focused message to
+open its full contents in a modal. Up/Down, PageUp/PageDown, and the wheel scroll
+inside it; Esc returns to the same conversation position. Chat rendering keeps a
+window of about ten nearby messages (more when needed to fill the viewport),
+loading older messages as you scroll without discarding history. Up/Down focuses
+transcript entries, PageUp/PageDown and the wheel scroll, and End returns to live
+output. Reading earlier output keeps your place. Toasts dismiss after five seconds. **Alt+Up** opens pending questions in place of the composer. Answer one question
 at a time with **Enter**, or skip it without answering with **Ctrl+]**.
 On a suggested choice, **n** opens a note beneath it. **Enter** submits the choice
 and its note together; **Esc** returns to the choices while keeping the note.
@@ -251,7 +255,8 @@ syntax highlighting. Pastes of **500 characters or more** appear as
 keys paste normally (Command shortcuts depend on terminal forwarding).
 
 Paste/drop local image or video paths, or use **Ctrl+V / Cmd+V** for clipboard
-images. Removable `[image 1]` and `[video 1]` tokens appear above the input. Difu
+images. `[image 1]` and `[video 1]` tokens appear inline at the cursor, alongside
+your text. Backspace/Delete removes a token; Cmd+Z restores it. Difu
 keeps private session copies, including unsent attachment drafts, so original
 files can move or change. Nothing is sent to Codex before you send the message.
 Images use Codex’s image input; videos are supplied as local paths, without frame
