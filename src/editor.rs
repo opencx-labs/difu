@@ -22,6 +22,7 @@ pub struct Editor {
 struct Fold {
     range: Range<usize>,
     text: String,
+    attachment: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -81,6 +82,26 @@ impl Editor {
     }
     pub fn paste(&mut self, text: &str) {
         self.edit(|editor| editor.paste_raw(text));
+    }
+    /// Insert an atomic attachment label without treating typed lookalikes as media.
+    pub fn insert_attachment(&mut self, label: &str) {
+        self.edit(|editor| {
+            editor.insert_raw(label);
+            editor.folds.push(Fold {
+                range: editor.cursor.saturating_sub(label.chars().count())..editor.cursor,
+                text: label.into(),
+                attachment: true,
+            });
+        });
+    }
+    pub fn attachment_tokens(&self) -> Vec<&str> {
+        let mut tokens = self
+            .folds
+            .iter()
+            .filter(|fold| fold.attachment)
+            .collect::<Vec<_>>();
+        tokens.sort_by_key(|fold| fold.range.start);
+        tokens.into_iter().map(|fold| fold.text.as_str()).collect()
     }
     pub fn expand_paste(&mut self) -> bool {
         self.edit(Self::expand_paste_raw)
@@ -187,7 +208,15 @@ impl Editor {
                 .iter()
                 .any(|f| f.range.start < self.cursor && self.cursor < f.range.end)
         {
-            self.expand_paste_raw();
+            if let Some(fold) = self
+                .folds
+                .iter()
+                .find(|f| f.attachment && f.range.contains(&self.cursor))
+            {
+                self.cursor = fold.range.end;
+            } else {
+                self.expand_paste_raw();
+            }
         }
         let range = self.selection().unwrap_or(self.cursor..self.cursor);
         self.replace(range, text);
@@ -231,14 +260,13 @@ impl Editor {
         self.folds.push(Fold {
             range: self.cursor.saturating_sub(label.chars().count())..self.cursor,
             text: text.into(),
+            attachment: false,
         });
     }
     fn expand_paste_raw(&mut self) -> bool {
-        let Some(index) = self
-            .folds
-            .iter()
-            .position(|f| f.range.start <= self.cursor && self.cursor <= f.range.end)
-        else {
+        let Some(index) = self.folds.iter().position(|f| {
+            !f.attachment && f.range.start <= self.cursor && self.cursor <= f.range.end
+        }) else {
             return false;
         };
         let fold = self.folds.remove(index);
@@ -362,6 +390,17 @@ impl Editor {
                     }
                 }
                 _ => {}
+            }
+            if let Some(fold) = self
+                .folds
+                .iter()
+                .find(|f| f.attachment && f.range.start < self.cursor && self.cursor < f.range.end)
+            {
+                self.cursor = if self.cursor < old {
+                    fold.range.start
+                } else {
+                    fold.range.end
+                };
             }
             if !matches!(key.code, KeyCode::Up | KeyCode::Down) {
                 self.preferred_column = None;
@@ -526,6 +565,12 @@ impl Editor {
                         text,
                         if is_selected {
                             selected
+                        } else if self
+                            .folds
+                            .iter()
+                            .any(|fold| fold.attachment && fold.range.contains(&index))
+                        {
+                            Style::default().fg(crate::ui::ACCENT)
                         } else {
                             colors.get(index).copied().unwrap_or_default()
                         },
@@ -551,6 +596,35 @@ fn is_word(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn attachments_stay_inline_atomic_and_distinct_from_large_pastes() {
+        let mut editor = Editor::from("before  after");
+        editor.cursor = 7;
+        editor.insert_attachment("[image 1]");
+        assert_eq!(editor.text(), "before [image 1] after");
+        assert!(!editor.expand_paste());
+        editor.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(editor.cursor, 7);
+        editor.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(editor.cursor, 16);
+        editor.key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(editor.text(), "before  after");
+        assert!(editor.attachment_tokens().is_empty());
+        editor.undo();
+        assert_eq!(editor.attachment_tokens(), ["[image 1]"]);
+        let content = "hello ".repeat(100);
+        editor.paste(&content);
+        assert_eq!(editor.text(), format!("before [image 1]{content} after"));
+        assert!(editor.expand_paste());
+        assert_eq!(editor.attachment_tokens(), ["[image 1]"]);
+        editor.cursor = 8; // A mouse selection starting inside the token still deletes it whole.
+        editor.anchor = Some(9);
+        editor.key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        assert!(editor.attachment_tokens().is_empty());
+        editor.undo();
+        assert_eq!(editor.attachment_tokens(), ["[image 1]"]);
+    }
+
     #[test]
     fn word_wrapping_keeps_cursor_selection_and_source_aligned() {
         let mut editor = Editor::from("one two three");

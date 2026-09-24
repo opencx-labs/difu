@@ -349,7 +349,7 @@ impl Ui {
         let Some(position) = self.positions.get_mut(&id) else {
             return false;
         };
-        if !position.attachments.is_empty() {
+        if !position.active_attachments().is_empty() {
             return false;
         }
         let text = position.draft.text();

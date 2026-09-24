@@ -14,6 +14,7 @@ mod questions;
 mod selection;
 mod sidebar;
 mod transcript;
+mod transcript_window;
 mod voice;
 use crate::{
     editor::Editor,
@@ -61,6 +62,7 @@ pub struct Position {
     pub image_count: usize,
     pub video_count: usize,
     media_loaded: bool,
+    saved_attachments: Vec<super::media::Attachment>,
     pub expanded: HashSet<String>,
     pub focused_entry: Option<String>,
     pub scroll_anchor: Option<(String, usize)>,
@@ -89,7 +91,6 @@ enum Action {
     MenuItem(usize),
     Command(usize),
     ToggleEntry(String),
-    RemoveAttachment(std::path::PathBuf),
     Pending,
     Queue,
     EditQueued(usize),
@@ -115,6 +116,13 @@ enum Action {
     DismissNotice,
 }
 pub enum Modal {
+    Transcript {
+        entry: String,
+        scroll: usize,
+        rows: Vec<Line<'static>>,
+        layout: Option<(u16, u64)>,
+        height: usize,
+    },
     InstallBrowser {
         path: std::path::PathBuf,
         title: String,
@@ -229,6 +237,8 @@ pub struct Ui {
     conversation_lines: usize,
     conversation_sections: Vec<transcript::Section>,
     conversation_height: usize,
+    transcript_window: transcript_window::Window,
+    toast_started: Option<(String, bool, Instant)>,
     text_selection: selection::Selection,
     change_lines: usize,
     change_rows: Vec<patch::SourceRow>,
@@ -282,6 +292,8 @@ impl Ui {
             conversation_lines: 0,
             conversation_sections: Vec::new(),
             conversation_height: 0,
+            transcript_window: Default::default(),
+            toast_started: None,
             text_selection: selection::Selection::default(),
             change_lines: 0,
             change_rows: Vec::new(),
@@ -466,13 +478,14 @@ impl Ui {
                             self.defaults = config.agent_defaults;
                         }
                     }
-                    (Task::Send(id, text, attachments), Reply::Ok) => {
+                    (Task::Send(id, text, _attachments), Reply::Ok) => {
                         if let Some(position) = self.positions.get_mut(&id) {
                             if position.draft.text() == text {
                                 position.draft = Editor::default();
                                 position.history = None;
                                 position.skills.clear();
-                                position.attachments.retain(|a| !attachments.contains(a));
+                                position.attachments.clear();
+                                position.saved_attachments.clear();
                                 if let Err(error) = super::media::save_draft(
                                     &self.storage,
                                     &id,
@@ -771,7 +784,7 @@ impl Ui {
     fn composer_suggestion(&self) -> Option<&str> {
         let id = self.selected.as_ref()?;
         let position = self.positions.get(id)?;
-        if !position.draft.chars.is_empty() || !position.attachments.is_empty() {
+        if !position.draft.chars.is_empty() || !position.active_attachments().is_empty() {
             return None;
         }
         let session = self.sessions.get(id)?;
@@ -793,16 +806,9 @@ impl Ui {
             let attachments = self
                 .positions
                 .get(&id)
-                .map(|p| p.attachments.clone())
+                .map(Position::active_attachments)
                 .unwrap_or_default();
-            let text = format!(
-                "{}{}",
-                draft,
-                attachments
-                    .iter()
-                    .map(|a| format!("\n{}", a.token()))
-                    .collect::<String>()
-            );
+            let text = draft.clone();
             if !text.trim().is_empty() {
                 self.busy = true;
                 self.task(
@@ -1413,6 +1419,7 @@ impl Ui {
             position.transcript_viewport = None;
             if section.row < position.conversation {
                 position.conversation = section.row;
+                position.scroll_anchor = Some((section.id.clone(), 0));
             } else if section.row
                 >= position
                     .conversation
@@ -1582,6 +1589,7 @@ impl Ui {
             return;
         }
         if key.code == KeyCode::Esc {
+            self.text_selection.clear();
             self.modal = None;
             return;
         }
@@ -1589,6 +1597,23 @@ impl Ui {
         let menu = self.menu_entries();
         let mut action = None;
         match &mut self.modal {
+            Some(Modal::Transcript {
+                scroll,
+                rows,
+                height,
+                ..
+            }) => {
+                let maximum = rows.len().saturating_sub(*height);
+                *scroll = match key.code {
+                    KeyCode::Up => scroll.saturating_sub(1),
+                    KeyCode::Down => scroll.saturating_add(1).min(maximum),
+                    KeyCode::PageUp => scroll.saturating_sub(*height),
+                    KeyCode::PageDown => scroll.saturating_add(*height).min(maximum),
+                    KeyCode::Home => 0,
+                    KeyCode::End => maximum,
+                    _ => *scroll,
+                };
+            }
             Some(Modal::Repository(editor)) => match key.code {
                 KeyCode::Enter => action = Some(Action::ChooseRepository),
                 KeyCode::Char('u') if ctrl => editor.clear(),
@@ -1820,27 +1845,15 @@ impl Ui {
             Action::BrowserChoice(index) => self.browser_choice(index),
             Action::MenuItem(index) => self.menu_action(index),
             Action::Command(index) => self.run_command(index),
-            Action::RemoveAttachment(path) => {
-                if let Some(id) = self.selected.clone()
-                    && let Some(p) = self.positions.get_mut(&id)
-                {
-                    p.attachments.retain(|a| a.path != path);
-                    if let Err(error) = super::media::save_draft(&self.storage, &id, &p.attachments)
-                    {
-                        self.notice =
-                            Some((format!("Cannot save attachment draft: {error:#}"), true));
-                    }
-                }
-            }
             Action::ToggleEntry(entry) => {
-                if let Some(id) = self.selected.clone() {
-                    let p = self.positions.entry(id).or_default();
-                    p.focused_entry = Some(entry.clone());
-                    if !p.expanded.remove(&entry) {
-                        p.expanded.insert(entry);
-                    }
-                    self.focus = Focus::Conversation;
-                }
+                self.text_selection.clear();
+                self.modal = Some(Modal::Transcript {
+                    entry,
+                    scroll: 0,
+                    rows: Vec::new(),
+                    layout: None,
+                    height: 0,
+                });
             }
             Action::ChooseRepository => {
                 if let Some(Modal::Repository(editor)) = &self.modal {
@@ -1903,6 +1916,20 @@ impl Ui {
                             -3
                         },
                     );
+                } else if let Some(Modal::Transcript {
+                    scroll,
+                    rows,
+                    height,
+                    ..
+                }) = &mut self.modal
+                {
+                    *scroll = scroll
+                        .saturating_add_signed(if event.kind == MouseEventKind::ScrollDown {
+                            3
+                        } else {
+                            -3
+                        })
+                        .min(rows.len().saturating_sub(*height));
                 } else if let Some(Modal::Approval { scroll, .. }) = &mut self.modal {
                     *scroll =
                         scroll.saturating_add_signed(if event.kind == MouseEventKind::ScrollDown {
@@ -2130,7 +2157,22 @@ impl Ui {
         self.draw_modal(frame);
         self.draw_toast(frame);
     }
+    fn expire_toast(&mut self, now: Instant) {
+        match (&self.notice, &self.toast_started) {
+            (Some((text, error)), Some((previous, was_error, started)))
+                if text == previous && error == was_error =>
+            {
+                if now.saturating_duration_since(*started) >= Duration::from_secs(5) {
+                    self.notice = None;
+                    self.toast_started = None;
+                }
+            }
+            (Some((text, error)), _) => self.toast_started = Some((text.clone(), *error, now)),
+            (None, _) => self.toast_started = None,
+        }
+    }
     fn draw_toast(&mut self, frame: &mut Frame) {
+        self.expire_toast(Instant::now());
         self.toast_rect = Rect::default();
         let Some((notice, error)) = &self.notice else {
             return;
@@ -2330,7 +2372,7 @@ impl Ui {
             frame.render_widget(Paragraph::new("Launch a coding agent with n.\n\nSessions and review jobs keep running when difu closes.").wrap(Wrap { trim:false }).style(Style::default().fg(DIM)), area);
             return;
         };
-        let Some(session) = self.sessions.get(&id).cloned() else {
+        let Some(session) = self.sessions.get(&id) else {
             frame.render_widget(Paragraph::new("Loading session…"), area);
             return;
         };
@@ -2339,7 +2381,6 @@ impl Ui {
             self.restore_media(&id);
         }
         let voice_status = self.voice_status();
-        let media_height = self.media_rows(area.width).min(area.height / 4);
         let composer_height = if self.inline_question() {
             self.question_height(area.width)
                 .min(area.height.saturating_sub(5))
@@ -2355,13 +2396,16 @@ impl Ui {
                 .0
                 .len()
                 .clamp(1, 10) as u16;
-            (lines + 2 + media_height + if voice_status.is_some() { 2 } else { 0 })
+            (lines + 2 + if voice_status.is_some() { 2 } else { 0 })
                 .min(area.height.saturating_sub(3))
         } else {
             0
         };
+        let Some(session) = self.sessions.get(&id) else {
+            return;
+        };
         let mut activity_rows =
-            transcript::activity(&session, area.width, chrono::Utc::now().timestamp_millis());
+            transcript::activity(session, area.width, chrono::Utc::now().timestamp_millis());
         let steering = session
             .entries
             .iter()
@@ -2447,66 +2491,56 @@ impl Ui {
         );
         self.conversation_height = usize::from(body.height);
         let position = self.positions.entry(id.clone()).or_default();
-        let (mut lines, sections) = transcript::render(
-            &session,
+        if let Some((old_width, old_height, version)) = position.transcript_viewport {
+            if old_width != body.width || version != session.version {
+                position.keep_transcript_position = false;
+            } else if old_height != body.height {
+                position.keep_transcript_position = true;
+            }
+        }
+        position.transcript_viewport = Some((body.width, body.height, session.version));
+        let before_measure = position.conversation;
+        let view = self.transcript_window.render(
+            session,
             position,
             body.width,
+            body.height,
             self.focus == Focus::Conversation,
         );
-        if lines.is_empty() {
+        self.text_selection
+            .rebase(1, position.conversation as isize - before_measure as isize);
+        let transcript_window::View {
+            mut lines,
+            start,
+            mut total,
+            sections,
+        } = view;
+        if session.entries.is_empty() {
             lines.push(Line::from("Preparing session…"));
+            total = 1;
         }
         if let Some(error) = &session.error
             && !session
                 .entries
                 .iter()
                 .any(|e| e.kind == "error" && &e.text == error)
+            && start + lines.len() == total
         {
-            lines.extend(
-                wrapped(error, body.width)
-                    .into_iter()
-                    .map(|text| Line::from(Span::styled(text, Style::default().fg(RED)))),
-            );
+            let extra = wrapped(error, body.width)
+                .into_iter()
+                .map(|text| Line::from(Span::styled(text, Style::default().fg(RED))))
+                .collect::<Vec<_>>();
+            total += extra.len();
+            lines.extend(extra);
         }
-        self.conversation_lines = lines.len();
-        let position = self.positions.entry(id.clone()).or_default();
-        if let Some((width, height, version)) = position.transcript_viewport {
-            if width != body.width || version != session.version {
-                position.keep_transcript_position = false;
-            } else if height != body.height {
-                // Changing composer/question height must not move existing chat rows.
-                position.keep_transcript_position = true;
-            }
-        }
-        position.transcript_viewport = Some((body.width, body.height, session.version));
-        if position.follow && !position.keep_transcript_position {
-            position.conversation = lines.len().saturating_sub(body.height as usize);
-        } else if let Some((id, offset)) = &position.scroll_anchor
-            && let Some(section) = sections.iter().find(|section| &section.id == id)
-        {
-            position.conversation = section.row.saturating_add(*offset);
-        }
-        let maximum = if position.keep_transcript_position {
-            lines.len().saturating_sub(1)
-        } else {
-            lines.len().saturating_sub(body.height as usize)
-        };
-        position.conversation = position.conversation.min(maximum);
-        position.scroll_anchor = sections
-            .iter()
-            .rev()
-            .find(|s| s.row <= position.conversation)
-            .map(|s| (s.id.clone(), position.conversation.saturating_sub(s.row)));
+        self.conversation_lines = total;
         for (index, section) in sections.iter().enumerate() {
             let first = section.row.max(position.conversation);
-            let last = sections
-                .get(index + 1)
-                .map_or(lines.len(), |next| next.row)
-                .min(
-                    position
-                        .conversation
-                        .saturating_add(usize::from(body.height)),
-                );
+            let last = sections.get(index + 1).map_or(total, |next| next.row).min(
+                position
+                    .conversation
+                    .saturating_add(usize::from(body.height)),
+            );
             if section.tool && first < last {
                 self.hits.push((
                     Rect::new(
@@ -2521,29 +2555,32 @@ impl Ui {
         }
         self.conversation_sections = sections;
         self.text_selection
-            .register(1, body, position.conversation, &lines);
+            .register_window(1, body, position.conversation, start, &lines);
         frame.render_widget(
             Paragraph::new(
                 lines
                     .into_iter()
-                    .skip(position.conversation)
+                    .skip(position.conversation.saturating_sub(start))
                     .take(body.height as usize)
                     .collect::<Vec<_>>(),
             ),
             body,
         );
-        if !session.pending.is_empty() {
+        let pending = !session.pending.is_empty();
+        let queued = !session.queue.is_empty();
+        let question_count = session.pending_question_count();
+        let approval_count = session
+            .pending
+            .iter()
+            .filter(|p| p.method != "item/tool/requestUserInput")
+            .count();
+        if pending {
             self.button(
                 frame,
                 Rect::new(area.x, body.bottom(), area.width, 1),
                 &format!(
                     "{} question(s) · {} approval(s) · Alt+↑ Questions",
-                    session.pending_question_count(),
-                    session
-                        .pending
-                        .iter()
-                        .filter(|p| p.method != "item/tool/requestUserInput")
-                        .count()
+                    question_count, approval_count
                 ),
                 Action::Pending,
                 true,
@@ -2552,7 +2589,7 @@ impl Ui {
         if activity_height > 0 {
             let activity_area = Rect::new(
                 area.x,
-                body.bottom() + u16::from(!session.pending.is_empty()),
+                body.bottom() + u16::from(pending),
                 area.width,
                 activity_height,
             );
@@ -2565,7 +2602,7 @@ impl Ui {
                 ),
                 activity_area,
             );
-            if !session.queue.is_empty() {
+            if queued {
                 self.hits.push((activity_area, Action::Queue));
             }
         }
@@ -2584,16 +2621,6 @@ impl Ui {
                 self.draw_commands(frame, composer);
                 return;
             }
-            self.draw_media(
-                frame,
-                Rect::new(composer.x, composer.y, composer.width, media_height),
-            );
-            let composer = Rect::new(
-                composer.x,
-                composer.y.saturating_add(media_height),
-                composer.width,
-                composer.height.saturating_sub(media_height),
-            );
             let composer = if voice_status.is_some() {
                 self.draw_voice_preview(
                     frame,
@@ -2644,7 +2671,10 @@ impl Ui {
         {
             return;
         }
-        self.text_selection.clear();
+        if !matches!(self.modal, Some(Modal::Transcript { .. })) {
+            self.text_selection.clear();
+        }
+        self.text_selection.frame();
         // Underlying panes must not receive modal mouse events.
         self.hits.clear();
         let full = frame.area();
@@ -2663,6 +2693,7 @@ impl Ui {
         );
         let menu_entries = self.menu_entries();
         let title = match self.modal {
+            Some(Modal::Transcript { .. }) => "Message · ↑/↓ Scroll · PgUp/PgDn Page · Esc Close",
             Some(Modal::InstallBrowser { .. }) => "Optional HTML preview · Esc cancels",
             Some(Modal::AgentDefaults(_)) => "New agent defaults · Tab fields · Esc cancels",
             Some(Modal::Voice { .. }) => "Voice settings",
@@ -2686,6 +2717,46 @@ impl Ui {
             None => "",
         };
         let area = panel(frame, rect, title, true);
+        if let Some(Modal::Transcript {
+            entry,
+            scroll,
+            rows,
+            layout,
+            height,
+        }) = &mut self.modal
+        {
+            if let Some(session) = self.selected.as_ref().and_then(|id| self.sessions.get(id)) {
+                let key = (area.width, session.version);
+                if *layout != Some(key) {
+                    if let Some(source) = session.entries.iter().find(|e| e.id == *entry) {
+                        let mut position = Position::default();
+                        position.expanded.insert(entry.clone());
+                        *rows = transcript::render_entries(
+                            session,
+                            std::slice::from_ref(source),
+                            &position,
+                            area.width,
+                            false,
+                        )
+                        .0;
+                    }
+                    *layout = Some(key);
+                }
+            }
+            *height = usize::from(area.height);
+            *scroll = (*scroll).min(rows.len().saturating_sub(*height));
+            let visible = rows
+                .iter()
+                .skip(*scroll)
+                .take(*height)
+                .cloned()
+                .collect::<Vec<_>>();
+            self.text_selection
+                .register_window(3, area, *scroll, *scroll, &visible);
+            frame.render_widget(Paragraph::new(visible), area);
+            self.text_selection.highlight(frame);
+            return;
+        }
         if matches!(self.modal, Some(Modal::Model { .. })) {
             self.draw_model(frame, area);
             return;
@@ -2724,7 +2795,12 @@ impl Ui {
             return;
         }
         match &mut self.modal {
-            Some(Modal::Model { .. } | Modal::Resources { .. } | Modal::InstallBrowser { .. }) => {}
+            Some(
+                Modal::Transcript { .. }
+                | Modal::Model { .. }
+                | Modal::Resources { .. }
+                | Modal::InstallBrowser { .. },
+            ) => {}
             Some(Modal::Repository(value)) => {
                 let input = Rect::new(area.x, area.y, area.width, area.height.min(3));
                 editor(frame, input, "Local repository", value, true);
@@ -3130,6 +3206,115 @@ mod tests {
         ui
     }
     #[test]
+    fn inline_attachment_send_preserves_text_order_without_appending_duplicate_labels() -> Result<()>
+    {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let listener = UnixListener::bind(super::super::server::socket(&storage)?)?;
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                let mut line = String::new();
+                BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+                let request: Request = serde_json::from_str(&line)?;
+                serde_json::to_writer(&mut stream, &Reply::Ok)?;
+                stream.write_all(b"\n")?;
+                tx.send(request)?;
+            }
+            Ok(())
+        });
+        let mut ui = state(storage);
+        for queue in [false, true] {
+            let p = ui.positions.get_mut("one").context("position")?;
+            p.draft = Editor::from("compare  please");
+            p.draft.cursor = 8;
+            p.draft.insert_attachment("[image 1]");
+            let attachment = super::super::media::Attachment {
+                label: "image 1".into(),
+                path: "image.png".into(),
+                kind: super::super::media::Kind::Image,
+                hash: "image".into(),
+            };
+            p.attachments = vec![attachment.clone()];
+            ui.busy = false;
+            ui.send(queue);
+            let request = rx.recv_timeout(Duration::from_secs(5))?;
+            let Request::Control {
+                control:
+                    Control::MessageWithAttachments {
+                        text,
+                        attachments,
+                        queue: actual_queue,
+                        ..
+                    },
+                ..
+            } = request
+            else {
+                anyhow::bail!("Expected attachment message");
+            };
+            assert_eq!(text, "compare [image 1] please");
+            assert_eq!(attachments, [attachment]);
+            assert_eq!(actual_queue, queue);
+        }
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn attachment_tokens_use_composer_rows_and_persist_only_undeleted_media() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let attachment = super::super::media::Attachment {
+            label: "image 1".into(),
+            path: "image.png".into(),
+            kind: super::super::media::Kind::Image,
+            hash: "image".into(),
+        };
+        super::super::media::save_draft(&storage, "one", std::slice::from_ref(&attachment))?;
+        let mut ui = state(storage.clone());
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert_eq!(screen.matches("[image 1]").count(), 1);
+        assert!(!screen.contains("[image 1] ×"));
+        let height = ui.conversation_height;
+        let position = ui.positions.get_mut("one").context("position")?;
+        assert_eq!(position.draft.text(), "[image 1]");
+        position
+            .draft
+            .key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        ui.tick_media();
+        assert!(super::super::media::load_draft(&storage, "one")?.is_empty());
+        draw(&mut ui, 120, 40)?;
+        assert_eq!(
+            ui.conversation_height, height,
+            "attachments have no separate row"
+        );
+        ui.positions
+            .get_mut("one")
+            .context("position")?
+            .draft
+            .undo();
+        ui.tick_media();
+        assert_eq!(
+            super::super::media::load_draft(&storage, "one")?,
+            [attachment]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn submitted_messages_keep_the_same_rendering_through_delivery_states() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut ui = state(Storage {
@@ -3168,6 +3353,232 @@ mod tests {
                 previous = Some(rows);
             }
         }
+        Ok(())
+    }
+    #[test]
+    fn tool_previews_are_bounded_and_open_a_scrollable_modal() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::Conversation;
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.entries.clear();
+        for (id, kind, text, data) in [
+            (
+                "json",
+                "mcpToolCall",
+                format!("{{\"output\":\"{}\"}}", "escaped\\ntext ".repeat(20000)),
+                serde_json::json!({"server":"docs","tool":"read"}),
+            ),
+            (
+                "command",
+                "commandExecution",
+                (0..100).map(|i| format!("output {i}\n")).collect(),
+                serde_json::json!({"command":"echo hello\n".repeat(10000)}),
+            ),
+            (
+                "patch",
+                "fileChange",
+                String::new(),
+                serde_json::json!({"changes":[{"path":"a.rs","diff":format!("@@ -1 +1,10000 @@\n{}","+let value = 1;\n".repeat(10000))}]}),
+            ),
+        ] {
+            session.entries.push(Entry {
+                id: id.into(),
+                kind: kind.into(),
+                text,
+                data,
+                ..Entry::default()
+            });
+        }
+        session.touch();
+        let (lines, sections) = transcript::render(session, &Position::default(), 60, false);
+        assert_eq!(sections.len(), 3);
+        assert!(
+            lines.len() <= 18,
+            "preview must cap visual rows across JSON, commands and patches"
+        );
+        ui.positions.entry("one".into()).or_default().focused_entry = Some("command".into());
+        draw(&mut ui, 100, 40)?;
+        let before = ui.positions.get("one").context("position")?.conversation;
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        draw(&mut ui, 100, 40)?;
+        assert!(
+            matches!(ui.modal,Some(Modal::Transcript {ref rows, scroll:0,..}) if rows.len()>100)
+        );
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(matches!(
+            ui.modal,
+            Some(Modal::Transcript { scroll: 1, .. })
+        ));
+        ui.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+        assert!(
+            matches!(ui.modal,Some(Modal::Transcript {scroll,ref rows,height,..}) if scroll==rows.len()-height)
+        );
+        ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        draw(&mut ui, 100, 40)?;
+        assert!(ui.modal.is_none());
+        assert_eq!(
+            ui.positions.get("one").context("position")?.conversation,
+            before
+        );
+        Ok(())
+    }
+    #[test]
+    fn transcript_virtualization_formats_only_nearby_messages_and_keeps_history() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.entries.clear();
+        session.status = Status::Idle;
+        for i in 0..10000 {
+            session.note(
+                "agentMessage",
+                format!("Message {i}\n\nSecond paragraph {i}"),
+            );
+        }
+        let mut position = Position {
+            follow: true,
+            ..Position::default()
+        };
+        let mut window = transcript_window::Window::default();
+        let tail = window.render(session, &mut position, 80, 25, false);
+        assert_eq!(session.entries.len(), 10000);
+        assert!(
+            window.formatted <= 20,
+            "cold draw must not format all history"
+        );
+        assert!(
+            tail.lines
+                .iter()
+                .any(|l| l.to_string().contains("Message 9999"))
+        );
+        let measured = window.formatted;
+        window.render(session, &mut position, 80, 25, false);
+        assert_eq!(
+            window.formatted, measured,
+            "stationary repaint must reuse formatted rows"
+        );
+        let reference = transcript::render(session, &Position::default(), 80, false).0;
+        let mut expected = reference.len().saturating_sub(25);
+        position.follow = false;
+        for distance in [1, 3, 25, 25, 25, 3, 25] {
+            position.conversation = position.conversation.saturating_sub(distance);
+            position.scroll_anchor = None;
+            expected = expected.saturating_sub(distance);
+            let view = window.render(session, &mut position, 80, 25, false);
+            let actual = view
+                .lines
+                .iter()
+                .skip(position.conversation.saturating_sub(view.start))
+                .take(25)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            let expected_rows = reference
+                .iter()
+                .skip(expected)
+                .take(25)
+                .map(ToString::to_string)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual, expected_rows,
+                "paging across an unmeasured boundary must preserve exact rows"
+            );
+        }
+        let measured = window.formatted;
+        position.follow = false;
+        position.scroll_anchor = Some((session.entries.get(4999).context("entry")?.id.clone(), 1));
+        let middle = window.render(session, &mut position, 80, 25, false);
+        assert!(window.formatted - measured <= 20);
+        let reference_sections = transcript::render(session, &Position::default(), 80, false).1;
+        let source_id = session.entries.get(4999).context("entry")?.id.clone();
+        let mut expected = reference_sections
+            .iter()
+            .find(|s| s.id == source_id)
+            .context("reference")?
+            .row
+            + 1;
+        for distance in [3, 25, 25, 25, 25, 25] {
+            position.conversation += distance;
+            position.scroll_anchor = None;
+            expected += distance;
+            let view = window.render(session, &mut position, 80, 25, false);
+            assert_eq!(
+                view.lines
+                    .iter()
+                    .skip(position.conversation.saturating_sub(view.start))
+                    .take(25)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                reference
+                    .iter()
+                    .skip(expected)
+                    .take(25)
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                "paging forward must measure relative to the preceding known boundary"
+            );
+        }
+        let anchor = position.scroll_anchor.clone();
+        window.render(session, &mut position, 40, 25, false);
+        assert_eq!(
+            position.scroll_anchor, anchor,
+            "resize must retain source message and row"
+        );
+        assert!(
+            !middle
+                .lines
+                .iter()
+                .any(|l| l.to_string().contains("Message 9999"))
+        );
+        position.scroll_anchor = None;
+        position.conversation = 0;
+        let first = window.render(session, &mut position, 80, 25, false);
+        assert!(
+            first
+                .lines
+                .iter()
+                .any(|l| l.to_string().contains("Message 0"))
+        );
+        position.follow = true;
+        session.note("agentMessage", "New streamed response");
+        let tail = window.render(session, &mut position, 80, 25, false);
+        assert!(
+            tail.lines
+                .iter()
+                .any(|l| l.to_string().contains("New streamed response"))
+        );
+        Ok(())
+    }
+    #[test]
+    fn toasts_expire_after_five_seconds_and_new_notices_restart_timer() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        let now = Instant::now();
+        ui.notice = Some(("Success".into(), false));
+        ui.expire_toast(now);
+        ui.expire_toast(now + Duration::from_millis(4999));
+        assert!(ui.notice.is_some());
+        ui.expire_toast(now + Duration::from_secs(5));
+        assert!(ui.notice.is_none());
+        ui.notice = Some(("Error".into(), true));
+        ui.expire_toast(now + Duration::from_secs(6));
+        ui.notice = Some(("Another error".into(), true));
+        ui.expire_toast(now + Duration::from_secs(9));
+        ui.expire_toast(now + Duration::from_secs(13));
+        assert!(ui.notice.is_some());
+        ui.expire_toast(now + Duration::from_secs(14));
+        assert!(ui.notice.is_none());
         Ok(())
     }
     #[test]
@@ -3630,8 +4041,8 @@ mod tests {
         assert!(text.contains("Edited src/example.rs +2 -1"));
         assert!(text.contains("9 - old"));
         assert!(text.contains("10 + return answer;"));
-        assert!(text.contains("+1 lines · Enter/click to expand"));
-        for keyword in ["from", "import", "const", "let", "return"] {
+        assert!(text.contains("Enter/click to expand"));
+        for keyword in ["from", "import", "let", "return"] {
             assert!(
                 rows.iter()
                     .flat_map(|row| &row.spans)
@@ -4740,13 +5151,14 @@ mod tests {
         session.pending.push(Pending { id:serde_json::json!(42), method:"item/tool/requestUserInput".into(), responded:false, params:serde_json::json!({"questions":[{"id":"q","header":"Choice","question":"Choose a color","options":[{"label":"Green","description":"Matrix"}]}]}) });
         let (screen, _) = draw(&mut ui, 120, 35)?;
         assert!(!screen.contains("hidden tool output"));
-        assert!(screen.contains("preview one") && screen.contains("+1 lines"));
+        assert!(screen.contains("preview one") && screen.contains("Enter/click to expand"));
         assert!(!screen.contains("agentMessage"));
         ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let (screen, _) = draw(&mut ui, 120, 35)?;
         assert!(screen.contains("hidden tool output"));
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
         ui.paste("Green");
         assert!(!ui.busy);

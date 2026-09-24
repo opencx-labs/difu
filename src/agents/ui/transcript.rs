@@ -62,7 +62,7 @@ fn prose(text: &str, width: u16) -> Vec<Line<'static>> {
     rows
 }
 
-fn tool(entry: &Entry) -> bool {
+pub(super) fn tool(entry: &Entry) -> bool {
     !matches!(
         entry.kind.as_str(),
         "agentMessage"
@@ -235,15 +235,92 @@ pub(super) fn activity(session: &Session, width: u16, now: i64) -> Vec<Line<'sta
     }
     lines
 }
+// Bound input before markdown/syntax parsing, then cap terminal rows after wrapping.
+fn prefix(text: &str, budget: usize) -> String {
+    text.chars().take(budget).collect()
+}
+fn preview(session: &Session, entry: &Entry, width: u16, focused: bool) -> Vec<Line<'static>> {
+    let budget = usize::from(width.max(1)).saturating_mul(16);
+    let mut data = serde_json::Map::new();
+    for key in [
+        "command", "server", "tool", "query", "path", "status", "exitCode", "review",
+    ] {
+        if let Some(value) = entry.data.get(key) {
+            if let Some(text) = value.as_str() {
+                data.insert(key.into(), Value::String(prefix(text, budget)));
+            } else if key == "exitCode" && value.is_i64() {
+                data.insert(key.into(), value.clone());
+            }
+        }
+    }
+    if let Some(status) = entry.data.pointer("/review/status").and_then(Value::as_str) {
+        data.insert(
+            "review".into(),
+            serde_json::json!({"status":prefix(status,64)}),
+        );
+    }
+    if let Some(changes) = entry.data.get("changes").and_then(Value::as_array) {
+        let changes = changes.iter().take(1).map(|change| {
+            let diff = change.get("diff").and_then(Value::as_str).unwrap_or_default();
+            let (added,removed) = super::patch::counts(diff);
+            serde_json::json!({
+                "path":prefix(change.get("path").and_then(Value::as_str).unwrap_or_default(),budget),
+                "diff":prefix(diff,budget),
+                "previewAdded":added,
+                "previewRemoved":removed,
+            })
+        }).collect();
+        data.insert("changes".into(), Value::Array(changes));
+    }
+    let bounded = Entry {
+        id: entry.id.clone(),
+        kind: entry.kind.clone(),
+        text: prefix(&entry.text, budget),
+        data: Value::Object(data),
+        started_at: entry.started_at,
+        finished_at: entry.finished_at,
+    };
+    let mut position = Position::default();
+    position.expanded.insert(entry.id.clone());
+    if focused {
+        position.focused_entry = Some(entry.id.clone());
+    }
+    let (mut rows, _) = render_entries(
+        session,
+        std::slice::from_ref(&bounded),
+        &position,
+        width,
+        focused,
+    );
+    // A multiline command or very long JSON response shares the same preview budget.
+    rows.truncate(4);
+    rows.push(Line::from(Span::styled(
+        "    Enter/click to expand",
+        Style::default().fg(DIM),
+    )));
+    rows.push(Line::default());
+    rows
+}
+
+#[cfg(test)]
 pub(super) fn render(
     session: &Session,
     position: &Position,
     width: u16,
     focused: bool,
 ) -> (Vec<Line<'static>>, Vec<Section>) {
+    render_entries(session, &session.entries, position, width, focused)
+}
+pub(super) fn render_entries(
+    session: &Session,
+    entries: &[Entry],
+    position: &Position,
+    width: u16,
+    focused: bool,
+) -> (Vec<Line<'static>>, Vec<Section>) {
     let mut lines = Vec::new();
     let mut sections = Vec::new();
-    for entry in &session.entries {
+    for entry in entries {
         if entry.text.is_empty() && entry.kind == "reasoning" {
             continue;
         }
@@ -253,6 +330,15 @@ pub(super) fn render(
             row: lines.len(),
             tool: is_tool,
         });
+        if is_tool && !position.expanded.contains(&entry.id) {
+            lines.extend(preview(
+                session,
+                entry,
+                width,
+                focused && position.focused_entry.as_ref() == Some(&entry.id),
+            ));
+            continue;
+        }
         match entry.kind.as_str() {
             "userMessage"
             | "awaiting connection"
@@ -324,7 +410,6 @@ pub(super) fn render(
                 ))
             })),
             _ => {
-                let expanded = position.expanded.contains(&entry.id);
                 let review_status = entry.data.pointer("/review/status").and_then(Value::as_str);
                 let failed = matches!(review_status, Some("denied" | "timedOut"))
                     || matches!(field(&entry.data, "status").as_str(), "failed" | "declined")
@@ -426,6 +511,14 @@ pub(super) fn render(
                         for change in changes {
                             let (patch, added, removed) =
                                 super::patch::render(&field(change, "diff"), width);
+                            let added = change
+                                .get("previewAdded")
+                                .and_then(Value::as_u64)
+                                .map_or(added, |n| n as usize);
+                            let removed = change
+                                .get("previewRemoved")
+                                .and_then(Value::as_u64)
+                                .map_or(removed, |n| n as usize);
                             let title = vec![
                                 Span::styled(
                                     format!(
@@ -455,21 +548,7 @@ pub(super) fn render(
                                     .into_iter()
                                     .map(|row| Line::from(row.spans)),
                             );
-                            let count = patch.len();
-                            lines.extend(patch.into_iter().take(if expanded { count } else { 3 }));
-                            if expanded || count > 3 {
-                                lines.push(Line::from(Span::styled(
-                                    if expanded {
-                                        "    Enter/click to collapse".into()
-                                    } else {
-                                        format!(
-                                            "    +{} lines · Enter/click to expand",
-                                            count.saturating_sub(3)
-                                        )
-                                    },
-                                    Style::default().fg(DIM),
-                                )));
-                            }
+                            lines.extend(patch);
                         }
                         lines.push(Line::default());
                         continue;
@@ -490,12 +569,7 @@ pub(super) fn render(
                 } else {
                     entry.text.clone()
                 };
-                let output_lines = output.lines().count();
-                let shown = if expanded {
-                    output.clone()
-                } else {
-                    output.lines().take(3).collect::<Vec<_>>().join("\n")
-                };
+                let shown = output;
                 let rows = if entry.kind == "commandExecution" {
                     shown
                         .lines()
@@ -527,19 +601,6 @@ pub(super) fn render(
                         );
                         lines.push(row);
                     }
-                }
-                if expanded || output_lines > 3 {
-                    lines.push(Line::from(Span::styled(
-                        if expanded {
-                            "    Enter/click to collapse".into()
-                        } else {
-                            format!(
-                                "    +{} lines · Enter/click to expand",
-                                output_lines.saturating_sub(3)
-                            )
-                        },
-                        Style::default().fg(DIM),
-                    )));
                 }
             }
         }

@@ -1,4 +1,18 @@
 use super::*;
+impl Position {
+    pub(super) fn active_attachments(&self) -> Vec<super::super::media::Attachment> {
+        self.draft
+            .attachment_tokens()
+            .into_iter()
+            .filter_map(|token| {
+                self.attachments
+                    .iter()
+                    .find(|attachment| attachment.token() == token)
+                    .cloned()
+            })
+            .collect()
+    }
+}
 impl Ui {
     pub(super) fn restore_media(&mut self, id: &str) {
         let p = self.positions.entry(id.to_owned()).or_default();
@@ -24,6 +38,10 @@ impl Ui {
                         }
                     }
                 }
+                for attachment in &attachments {
+                    p.draft.insert_attachment(&attachment.token());
+                }
+                p.saved_attachments = attachments.clone();
                 p.attachments = attachments;
             }
             Err(error) => {
@@ -39,6 +57,7 @@ impl Ui {
         let Some(id) = self.selected.clone() else {
             return;
         };
+        self.restore_media(&id);
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
@@ -60,6 +79,19 @@ impl Ui {
         });
     }
     pub(super) fn tick_media(&mut self) {
+        // Keep metadata for undo in memory, but persist/send only tokens still in the draft.
+        for (id, position) in &mut self.positions {
+            let active = position.active_attachments();
+            if position.media_loaded && active != position.saved_attachments {
+                match super::super::media::save_draft(&self.storage, id, &active) {
+                    Ok(()) => position.saved_attachments = active,
+                    Err(error) => {
+                        self.notice =
+                            Some((format!("Cannot save attachment draft: {error:#}"), true))
+                    }
+                }
+            }
+        }
         let Some(result) = self
             .media_pending
             .as_ref()
@@ -84,69 +116,59 @@ impl Ui {
                     };
                     *counter = counter.saturating_add(1);
                     attachment.label = format!("{kind} {counter}");
+                    p.draft.insert_attachment(&attachment.token());
                     p.attachments.push(attachment);
                 }
-                if let Err(error) =
-                    super::super::media::save_draft(&self.storage, &id, &p.attachments)
-                {
+                let active = p.active_attachments();
+                if let Err(error) = super::super::media::save_draft(&self.storage, &id, &active) {
                     self.notice = Some((format!("Cannot save attachment draft: {error:#}"), true));
                     return;
                 }
-                self.notice = Some((
-                    "Attached locally · click × to remove · Enter sends".into(),
-                    false,
-                ));
+                p.saved_attachments = active;
+                self.notice = None;
             }
             Err(error) => self.notice = Some((error, true)),
         }
     }
-    pub(super) fn media_rows(&self, width: u16) -> u16 {
-        let Some(p) = self.selected.as_ref().and_then(|id| self.positions.get(id)) else {
-            return 0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn inline_tokens_select_media_in_text_order_and_undo_restores_deletions() {
+        let image = super::super::super::media::Attachment {
+            label: "image 1".into(),
+            path: "image.png".into(),
+            kind: super::super::super::media::Kind::Image,
+            hash: "image".into(),
         };
-        let mut rows = 0;
-        let mut used = 0;
-        for attachment in &p.attachments {
-            let size = attachment
-                .token()
-                .len()
-                .saturating_add(3)
-                .min(usize::from(width.max(1)));
-            if rows == 0 || used + size > usize::from(width) {
-                rows += 1;
-                used = 0;
-            }
-            used += size;
-        }
-        rows
-    }
-    pub(super) fn draw_media(&mut self, frame: &mut Frame, area: Rect) {
-        let attachments = self
-            .selected
-            .as_ref()
-            .and_then(|id| self.positions.get(id))
-            .map(|p| p.attachments.clone())
-            .unwrap_or_default();
-        let mut x = area.x;
-        let mut y = area.y;
-        for attachment in attachments {
-            let label = format!("{} ×", attachment.token());
-            let width = (label.len().saturating_add(1) as u16).min(area.width);
-            if x + width > area.right() {
-                x = area.x;
-                y = y.saturating_add(1);
-            }
-            if y >= area.bottom() {
-                break;
-            }
-            let rect = Rect::new(x, y, width, 1);
-            frame.render_widget(
-                Paragraph::new(label).style(Style::default().fg(ACCENT)),
-                rect,
-            );
-            self.hits
-                .push((rect, Action::RemoveAttachment(attachment.path)));
-            x = x.saturating_add(width);
-        }
+        let video = super::super::super::media::Attachment {
+            label: "video 1".into(),
+            path: "video.mp4".into(),
+            kind: super::super::super::media::Kind::Video,
+            hash: "video".into(),
+        };
+        let mut position = Position {
+            attachments: vec![video.clone(), image.clone()],
+            ..Default::default()
+        };
+        position.draft.insert("compare ");
+        position.draft.insert_attachment(&image.token());
+        position.draft.insert(" with ");
+        position.draft.insert_attachment(&video.token());
+        assert_eq!(position.draft.text(), "compare [image 1] with [video 1]");
+        assert_eq!(
+            position.active_attachments(),
+            [image.clone(), video.clone()]
+        );
+        position
+            .draft
+            .key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(position.active_attachments(), std::slice::from_ref(&image));
+        position.draft.undo();
+        assert_eq!(position.active_attachments(), [image, video]);
+        position.draft = Editor::from("typed [image 1] and [video 1]");
+        assert!(position.active_attachments().is_empty());
     }
 }

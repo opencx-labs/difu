@@ -24,6 +24,24 @@ fn starts(header: &str) -> Option<(u64, u64)> {
     (parts.next()? == "@@").then_some((old, new))
 }
 
+pub(super) fn counts(diff: &str) -> (usize, usize) {
+    let (mut added, mut removed) = (0, 0);
+    let mut hunk = false;
+    for line in diff.lines() {
+        if line.starts_with("@@") {
+            hunk = starts(line).is_some();
+        } else if hunk {
+            if line.starts_with('+') {
+                added += 1;
+            }
+            if line.starts_with('-') {
+                removed += 1;
+            }
+        }
+    }
+    (added, removed)
+}
+
 pub(super) struct SourceRow {
     pub line: Line<'static>,
     pub source: Option<(usize, String)>,
