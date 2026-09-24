@@ -18,7 +18,7 @@ impl Drop for State {
     }
 }
 impl State {
-    fn load(&mut self) {
+    pub(super) fn load(&mut self) {
         self.selected = 0;
         self.filled = false;
         if !self.options.is_empty() || self.receiver.is_some() {
@@ -32,6 +32,37 @@ impl State {
         thread::spawn(move || {
             let _ = tx.send(crate::codex::models(&cancel).map_err(|error| format!("{error:#}")));
         });
+    }
+    pub(super) fn choices(&self, model: &str, effort: &str, choosing_model: bool) -> Vec<String> {
+        let query = if choosing_model { model } else { effort }.to_lowercase();
+        if choosing_model {
+            self.options
+                .iter()
+                .filter(|m| {
+                    m.id.to_lowercase().contains(&query) || m.name.to_lowercase().contains(&query)
+                })
+                .map(|m| m.id.clone())
+                .collect()
+        } else {
+            self.options
+                .iter()
+                .find(|m| m.id == model)
+                .map(|m| {
+                    m.efforts
+                        .iter()
+                        .filter(|e| e.to_lowercase().contains(&query))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default()
+        }
+    }
+    pub(super) fn empty_label(&self) -> &str {
+        if self.receiver.is_some() {
+            "Loading Codex options…"
+        } else {
+            self.error.as_deref().unwrap_or("No matching options")
+        }
     }
     fn changed(&mut self) {
         self.selected = 0;
@@ -82,35 +113,8 @@ impl Ui {
         else {
             return Vec::new();
         };
-        let query = if *field == 0 {
-            model.text()
-        } else {
-            effort.text()
-        }
-        .to_lowercase();
-        if *field == 0 {
-            self.model_completion
-                .options
-                .iter()
-                .filter(|m| {
-                    m.id.to_lowercase().contains(&query) || m.name.to_lowercase().contains(&query)
-                })
-                .map(|m| m.id.clone())
-                .collect()
-        } else {
-            self.model_completion
-                .options
-                .iter()
-                .find(|m| m.id == model.text())
-                .map(|m| {
-                    m.efforts
-                        .iter()
-                        .filter(|e| e.to_lowercase().contains(&query))
-                        .cloned()
-                        .collect()
-                })
-                .unwrap_or_default()
-        }
+        self.model_completion
+            .choices(&model.text(), &effort.text(), *field == 0)
     }
     pub(super) fn model_paste(&mut self, text: &str) {
         if let Some(Modal::Model {

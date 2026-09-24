@@ -132,6 +132,7 @@ enum Action {
     QueueEditorFocus,
     ChooseRepository,
     DefaultField(usize),
+    DefaultOption(usize),
     ModelField(usize),
     ModelOption(usize),
     DefaultToggle,
@@ -353,6 +354,7 @@ impl Ui {
     pub fn tick(&mut self, visible: bool) {
         self.tick_panels(visible);
         self.tick_models();
+        self.tick_defaults();
         self.tick_media();
         self.tick_voice(visible);
         while let Ok(message) = self.receiver.try_recv() {
@@ -1597,6 +1599,7 @@ impl Ui {
             Some(Modal::AgentDefaults(form)) => {
                 if let Some(editor) = form.fields.get_mut(form.field) {
                     editor.insert(text);
+                    form.changed();
                 }
             }
             Some(Modal::Repository(editor)) => editor.insert(text),
@@ -1817,9 +1820,11 @@ impl Ui {
             Action::DismissNotice => self.notice = None,
             Action::ModelField(index) => self.model_field(index),
             Action::ModelOption(index) => self.model_option(index),
+            Action::DefaultOption(index) => self.default_option(index),
             Action::DefaultField(index) => {
                 if let Some(Modal::AgentDefaults(form)) = &mut self.modal {
                     form.field = index;
+                    form.changed();
                 }
             }
             Action::DefaultToggle => {
@@ -4479,6 +4484,11 @@ mod tests {
         storage.save_config(&config)?;
         let mut ui = state(storage.clone());
         let before = ui.sessions.get("one").context("session")?.model.clone();
+        ui.model_completion.options = vec![crate::model::ModelInfo {
+            id: "fixture-model".into(),
+            name: "Fixture".into(),
+            efforts: vec!["medium".into()],
+        }];
         ui.open_defaults();
         let Some(Modal::AgentDefaults(form)) = &mut ui.modal else {
             anyhow::bail!("defaults");
