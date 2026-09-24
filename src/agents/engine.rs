@@ -511,6 +511,9 @@ fn send_turn(
         .as_ref()
         .context("Codex session is not connected")?;
     let mut input = vec![json!({"type":"text","text":text})];
+    if let Some(context) = super::questions::pending_context(&session, prompt) {
+        input.push(json!({"type":"text","text":context}));
+    }
     for skill in prompt.skills() {
         ensure!(
             skill.enabled && skill.path.is_absolute(),
@@ -639,6 +642,26 @@ fn send_turn(
     }
 }
 
+fn resume_thread(
+    rpc: &mut Connection,
+    store: &Store,
+    id: &str,
+    session: &Session,
+    cancel: &Cancel,
+) -> Result<()> {
+    ensure!(
+        session.turn_id.is_none(),
+        "The turn is still active; wait for interruption to complete"
+    );
+    let mut params = json!({"threadId":session.thread_id,"cwd":session.workspace,"developerInstructions":format!("{}\n\n{}", rpc.inherited, instructions(session))});
+    if let Some(model) = &session.model {
+        put(&mut params, "model", json!(model))?;
+    }
+    isolation::settings(&mut params, session)?;
+    rpc.call("thread/resume", params, cancel, |v| event(store, id, v))?;
+    Ok(())
+}
+
 fn command(
     rpc: &mut Connection,
     store: &Store,
@@ -661,6 +684,9 @@ fn command(
             attachments,
         } => {
             ensure!(!text.trim().is_empty(), "Message cannot be empty");
+            if matches!(session.status, Status::Interrupted | Status::Failed) {
+                resume_thread(rpc, store, id, &session, cancel)?;
+            }
             let prompt = Prompt::WithSkills {
                 text,
                 skills,
@@ -838,17 +864,7 @@ fn command(
             })?;
         }
         Control::Resume => {
-            ensure!(
-                session.turn_id.is_none(),
-                "The turn is still active; wait for interruption to complete"
-            );
-            // Reapply policy on every explicit continuation, as well as reconnection.
-            let mut params = json!({"threadId":session.thread_id,"cwd":session.workspace,"developerInstructions":format!("{}\n\n{}", rpc.inherited, instructions(&session))});
-            if let Some(model) = &session.model {
-                put(&mut params, "model", json!(model))?;
-            }
-            isolation::settings(&mut params, &session)?;
-            rpc.call("thread/resume", params, cancel, |v| event(store, id, v))?;
+            resume_thread(rpc, store, id, &session, cancel)?;
             start_turn(
                 rpc,
                 store,
@@ -869,6 +885,9 @@ fn command(
                 super::questions::prepare_answer(&session, &request, &question, answer.as_deref())?;
             if updated.is_async_question() {
                 if answer.is_some() {
+                    if matches!(session.status, Status::Interrupted | Status::Failed) {
+                        resume_thread(rpc, store, id, &session, cancel)?;
+                    }
                     store.update(id, |s| {
                         if let Some(pending) = s.pending.iter_mut().find(|p| p.id == request) {
                             pending.responded = true;
@@ -879,7 +898,11 @@ fn command(
                         rpc,
                         store,
                         id,
-                        &Prompt::from(text),
+                        &Prompt::QuestionAnswer {
+                            text,
+                            question_request: request.clone(),
+                            question_id: Some(question.clone()),
+                        },
                         session.turn_id.is_some(),
                         cancel,
                     )?;
@@ -928,6 +951,9 @@ fn command(
             validate_response(pending, &response)?;
             if pending.is_async_question() {
                 let text = super::questions::answer_text(pending, &response)?;
+                if matches!(session.status, Status::Interrupted | Status::Failed) {
+                    resume_thread(rpc, store, id, &session, cancel)?;
+                }
                 // Persist intent before sending; never replay answers after an uncertain reply.
                 store.update(id, |s| {
                     if let Some(pending) = s.pending.iter_mut().find(|p| p.id == request) {
@@ -939,7 +965,11 @@ fn command(
                     rpc,
                     store,
                     id,
-                    &Prompt::from(text),
+                    &Prompt::QuestionAnswer {
+                        text,
+                        question_request: request.clone(),
+                        question_id: None,
+                    },
                     session.turn_id.is_some(),
                     cancel,
                 )?;

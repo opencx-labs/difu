@@ -946,6 +946,23 @@ fn exercise_reviewer_picker_and_branch_lookup(root: &Path) -> Result<()> {
         workflow::{WAction, Wizard},
     };
     let cancel = Cancel::default();
+    let discovered =
+        difu::github::session_pr(&root.join("clone"), Some("session-branch"), None, &cancel)?;
+    assert_eq!(discovered.label(), "Has conflicts");
+    fs::write(root.join("session-pr-state"), "MERGED")?;
+    let merged = difu::github::session_pr(
+        &root.join("removed-worktree"),
+        None,
+        Some(&discovered.key),
+        &cancel,
+    )?;
+    assert_eq!(merged.label(), "Merged");
+    fs::write(root.join("session-pr-error"), "offline")?;
+    assert!(
+        difu::github::session_pr(&root.join("clone"), None, Some(&discovered.key), &cancel)
+            .is_err()
+    );
+    fs::remove_file(root.join("session-pr-error"))?;
     let key = difu::github::current_branch_pr(&cancel)?;
     assert_eq!(key.id(), "example/project#1");
     fs::write(root.join("no-branch-pr"), "yes")?;

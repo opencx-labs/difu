@@ -569,7 +569,7 @@ fn code_offsets(
     offsets
 }
 
-fn code_rows(
+pub(crate) fn code_rows(
     path: &str,
     lines: &[DiffLine],
     width: usize,
@@ -1081,9 +1081,7 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
             app.directory
                 .as_ref()
                 .map_or(*index == app.file, |directory| {
-                    file.path
-                        .strip_prefix(directory)
-                        .is_some_and(|rest| rest.starts_with('/'))
+                    crate::tree::contains(directory, &file.path)
                 })
         }) {
             let start = doc.rows.len();
@@ -1322,7 +1320,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         crate::app::local::draw(frame, app);
         return;
     }
-    let area = frame.area();
+    let area = app.render_area.unwrap_or_else(|| frame.area());
     app.hits.clear();
     app.hover.rect = None;
     frame.render_widget(
@@ -1333,7 +1331,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         frame.render_widget(Paragraph::new("difu · resize to at least 24 × 8"), area);
         return;
     }
-    let title = Rect::new(2, 1, area.width.saturating_sub(4), 1);
+    let title = Rect::new(area.x + 2, area.y + 1, area.width.saturating_sub(4), 1);
     let identity = app
         .review()
         .and_then(|r| r.local.as_ref())
@@ -1349,7 +1347,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])),
         title,
     );
-    let mut x = 2;
+    let mut x = area.x + 2;
     let tabs = if app.home {
         vec![
             (
@@ -1371,7 +1369,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         vec![
             (
-                "1 Overview",
+                if app.render_area.is_some() {
+                    "1 Preview"
+                } else {
+                    "1 Overview"
+                },
                 app.view == View::Overview,
                 Action::SetView(View::Overview),
             ),
@@ -1385,24 +1387,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 app.view == View::Diff,
                 Action::SetView(View::Diff),
             ),
-            ("Esc Home", false, Action::Back),
         ]
     };
     for (label, selected, action) in tabs {
-        if x + label.len() as u16 + 4 < area.width {
-            x = button(frame, app, x, 3, label, selected, action);
+        if app.render_area.is_some() && matches!(action, Action::Back) {
+            continue;
+        }
+        if x + label.len() as u16 + 4 < area.right() {
+            x = button(frame, app, x, area.y + 3, label, selected, action);
         }
     }
     let filters = app.home && !app.repository_directory() && area.height >= 14;
     if filters {
-        let mut x = 2;
+        let mut x = area.x + 2;
         for state in PrState::ALL {
-            if x + state.label().len() as u16 + 4 < area.width {
+            if x + state.label().len() as u16 + 4 < area.right() {
                 x = button(
                     frame,
                     app,
                     x,
-                    5,
+                    area.y + 5,
                     state.label(),
                     app.state() == state,
                     Action::SetState(state),
@@ -1412,8 +1416,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     let content_y = if filters { 7 } else { 5 };
     let content = Rect::new(
-        2,
-        content_y,
+        area.x + 2,
+        area.y + content_y,
         area.width.saturating_sub(4),
         area.height.saturating_sub(content_y + 4),
     );
@@ -1785,9 +1789,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 DIM
             }),
         ),
-        Rect::new(2, area.height - 3, area.width - 4, 1),
+        Rect::new(area.x + 2, area.bottom() - 3, area.width - 4, 1),
     );
-    let mut footer_x = 2;
+    let mut footer_x = area.x + 2;
     let footer = if app.home {
         vec![
             (
@@ -1839,10 +1843,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ("g Generate", Action::Regenerate),
             ("x Cancel", Action::Cancel),
             ("Ctrl+B Split", Action::ToggleLayout),
-            ("Esc Home", Action::Back),
         ]
     };
     for (label, action) in footer {
+        if app.render_area.is_some() && matches!(action, Action::Back) {
+            continue;
+        }
         if matches!(label, "c / Cmd+C Copy" | "Cmd/Ctrl+click Definition")
             && app.view == View::Overview
         {
@@ -1860,10 +1866,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             continue;
         }
         let width = label.width() as u16;
-        if footer_x + width > area.width.saturating_sub(2) {
+        if footer_x + width > area.right().saturating_sub(2) {
             break;
         }
-        let rect = Rect::new(footer_x, area.height - 2, width, 1);
+        let rect = Rect::new(footer_x, area.bottom() - 2, width, 1);
         frame.render_widget(Paragraph::new(label).style(Style::default().fg(DIM)), rect);
         app.hits.push((rect, action));
         footer_x += width + 2;
@@ -1891,7 +1897,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     frame.render_widget(
         Paragraph::new(Line::from(focus_line)),
-        Rect::new(2, area.height - 1, area.width - 4, 1),
+        Rect::new(area.x + 2, area.bottom() - 1, area.width - 4, 1),
     );
     if app.modal.is_some() {
         draw_modal(frame, app);
@@ -2209,69 +2215,53 @@ fn draw_files(frame: &mut Frame, app: &mut App, rect: Rect) {
             app,
         );
     }
-    let selected = |entry: &crate::tree::Entry| match &app.directory {
-        Some(path) => entry.file.is_none() && &entry.path == path,
-        None => entry.file == Some(app.file),
-    };
-    let selected_row = entries.iter().position(selected).unwrap_or(0);
-    let width = rect.width.saturating_sub(2) as usize;
+    let selected = crate::tree::selected(&entries, app.file, app.directory.as_deref());
+    let statuses = snapshot
+        .files
+        .iter()
+        .map(|file| file.status.clone())
+        .collect::<Vec<_>>();
+    let width = usize::from(rect.width.saturating_sub(2));
     app.tree_max_horizontal = entries
         .iter()
-        .map(|entry| entry.label().width().saturating_sub(width))
+        .map(|entry| {
+            (entry.label().width() + if entry.file.is_some() { 2 } else { 0 }).saturating_sub(width)
+        })
         .max()
         .unwrap_or(0);
-    app.tree_horizontal = app.tree_horizontal.min(app.tree_max_horizontal);
-    let height = rect.height.saturating_sub(4) as usize;
-    let start = selected_row.saturating_sub(height.saturating_sub(1));
-    for (offset, entry) in entries.iter().enumerate().skip(start).take(height) {
-        let y = rect.y + 4 + (offset - start) as u16;
-        let active = offset == selected_row;
-        let color = if active {
-            ACCENT
-        } else if entry.file.is_some() {
-            TEXT
-        } else {
-            DIM
-        };
-        let row = text(
-            format!(
-                "{} {}",
-                if active { "▸" } else { " " },
-                crop(
-                    &format!(
-                        "{}{}",
-                        entry
-                            .file
-                            .and_then(|i| snapshot.files.get(i))
-                            .map(|f| format!("{} ", crate::local_diff::status_letter(&f.status)))
-                            .unwrap_or_default(),
-                        entry.label()
-                    ),
-                    app.tree_horizontal,
-                    width
-                )
-            ),
-            color,
-        );
-        let hit = Rect::new(rect.x, y, rect.width, 1);
-        paint(frame, hit, &row, app);
-        app.hits.push((
-            hit,
-            match entry.file {
-                Some(index) => Action::SelectFile(index),
-                None => Action::SelectDirectory(entry.path.clone()),
-            },
-        ));
+    let body = Rect::new(
+        rect.x,
+        rect.y.saturating_add(4),
+        rect.width,
+        rect.height.saturating_sub(4),
+    );
+    for (hit, index) in crate::tree::draw(
+        frame,
+        body,
+        &entries,
+        &statuses,
+        selected,
+        &mut app.tree_horizontal,
+    ) {
+        if let Some(entry) = entries.get(index) {
+            app.hits.push((
+                hit,
+                match entry.file {
+                    Some(index) => Action::SelectFile(index),
+                    None => Action::SelectDirectory(entry.path.clone()),
+                },
+            ));
+        }
     }
 }
 
 fn draw_definition(frame: &mut Frame, app: &mut App) {
-    let area = frame.area();
+    let area = app.render_area.unwrap_or_else(|| frame.area());
     let width = area.width.saturating_sub(4).min(120);
     let height = area.height.saturating_sub(4).min(40);
     let rect = Rect::new(
-        (area.width - width) / 2,
-        (area.height - height) / 2,
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
         width,
         height,
     );
@@ -2413,12 +2403,12 @@ fn draw_definition(frame: &mut Frame, app: &mut App) {
 }
 
 fn draw_help(frame: &mut Frame, app: &mut App) {
-    let area = frame.area();
+    let area = app.render_area.unwrap_or_else(|| frame.area());
     let width = area.width.saturating_sub(4).min(100);
     let height = area.height.saturating_sub(4).min(38);
     let rect = Rect::new(
-        (area.width - width) / 2,
-        (area.height - height) / 2,
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
         width,
         height,
     );
@@ -2502,12 +2492,12 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
         crate::workflow_ui::draw(frame, app);
         return;
     }
-    let area = frame.area();
+    let area = app.render_area.unwrap_or_else(|| frame.area());
     let width = area.width.saturating_sub(4).min(88);
     let height = area.height.saturating_sub(4).min(26);
     let rect = Rect::new(
-        (area.width - width) / 2,
-        (area.height - height) / 2,
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
         width,
         height,
     );

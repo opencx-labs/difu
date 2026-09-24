@@ -153,16 +153,34 @@ read-only investigation, filesystem writes and permission escalation are disable
 After switching to the worktree, difu restores the inherited sandbox and approval
 settings. A restart never automatically replays a task or workspace transition.
 
-The searchable session list previews conversations. **Enter** opens a session;
-**Esc** returns. **Ctrl+B** toggles the agents list. **Alt+D** opens Changes in
+The searchable session list previews conversations. Selecting or entering a
+session scrolls to its latest messages; scrolling up afterward keeps your reading
+position through background updates. **Enter** opens a session;
+**Esc** interrupts the active agent and keeps the chat open, or returns to the
+list when idle. **Alt+[** toggles the agents list. **Alt+]** hides or reopens the
+selected helper canvas, preserving its contents. **Alt+D** opens Changes in
 the main area with a file tree and a syntax-highlighted diff; **Esc** returns to
-chat. The right helper canvas is reserved for shells and artifacts. **Tab** and
+chat. The right helper canvas hosts shells, artifacts, and session PRs. **Tab** and
 **Shift+Tab** cycle between visible panes: sessions, chat (or file tree and diff),
 and the helper canvas. **Esc** closes a focused canvas. Visibility is remembered.
 Changes compares the workspace with its session-start commit and includes later
 commits, staged/unstaged edits, and non-ignored untracked files. It never stages
 files or changes your index. Changes display is limited to 32 MiB; larger results
 produce an explicit error.
+
+Difu discovers each coding session's PR from its Git branch and remembers the PR
+across restarts. Status refreshes in the background every 30 seconds for the
+selected session and sessions visible in the sidebar; cached status remains
+available between refreshes and during network failures. Badges show **Open**,
+**Draft**, **Merged**, **Closed**, or **Has conflicts**. In the sidebar, **Needs
+input** appears below the diff counts, followed by the PR badge.
+
+Select the bottom PR badge to open the existing PR viewer in the helper canvas,
+starting on **Preview**. **1 / 2 / 3** selects Preview / Guide / Diff while that
+canvas is focused. **Alt+P** switches between the right pane and the main area,
+remembering the last placement. **Esc** closes a PR dialog first, then the canvas.
+From the composer, **Down** focuses the bottom resources; **Left/Right** moves
+between Shells, Artifacts, and the PR badge, and **Enter** opens the selection.
 
 In the composer, **Enter** sends a message and steers an active turn immediately.
 **Ctrl+Enter** explicitly queues it for the next turn; **Shift+Enter** inserts a
@@ -195,7 +213,8 @@ In Agents, `/` commands, `$` workspace skills, and `@` workspace files and folde
 appear above the message input. Choose a suggestion with arrows and Enter;
 selecting a skill or path inserts it without sending the message.
 The session list puts active agents first and shows turn time beside the title,
-with cached green additions and red deletions below. Local Git counts refresh
+with the original repository name and cached green additions and red deletions
+below. A tree icon marks sessions using an isolated worktree. Local Git counts refresh
 every ten seconds while working and after a turn finishes. Archived sessions
 remain available through the actions menu.
 
@@ -215,8 +234,10 @@ and its note together; **Esc** returns to the choices while keeping the note.
 from the first question. Question drafts survive dismissal and session switching.
 Asynchronous question cards remain available after the agent finishes its turn
 and across service restarts. Answers steer a running turn or start a follow-up
-when idle, using the normal chat delivery path. Only the question, chosen answer,
-and any additional note are sent.
+when idle, using the normal chat delivery path. The chat shows the question,
+chosen answer, and any additional note. Each answer also sends the agent the
+remaining pending questions as application context, instructing it not to repeat
+or rephrase questions already awaiting answers. Answers still send individually.
 Outgoing queued messages have a separate editable queue. Down from the final
 transcript entry focuses the composer. Up in an empty composer recalls this
 session’s previous prompts; Down walks forward and restores your draft.
@@ -225,6 +246,8 @@ Codex keeps its normal global configuration and memory settings and reads
 AGENTS.md and skills from the session workspace. Before launching an isolated
 session, difu asks before copying any missing untracked or ignored guidance from
 the source clone. It copies only the listed guidance files after agreement.
+Installed dependencies inside `node_modules` are excluded at every directory
+depth, including nested package-manager stores and skill dependencies.
 
  **?** opens
 searchable shortcut help. **Tab / Shift+Tab** cycle through the visible sessions list, chat input or
@@ -232,14 +255,18 @@ Changes tree/diff, and helper canvas. **Cmd+Up/Down** focuses and navigates mess
 background; moving down past the final block returns to the input. Typing while
 reading messages focuses the composer and inserts your text; navigation and
 modified shortcuts keep their existing behavior. **f** filters sessions, and **r**
-refreshes/reconnects. In Changes, arrows scroll, Shift+Up/Down selects lines, and
-**c / Command+C** copies through the terminal clipboard protocol.
+refreshes/reconnects. Changes shares the PR viewer's file-tree navigation and code
+renderer. Selecting a folder shows its descendant changes; background refreshes
+preserve the selected folder or file. **Left/Right** pans the focused tree or diff,
+and **Enter** moves from the tree into the diff. **Up/Down** crosses to the previous
+or next file at a file boundary; **Shift+Up/Down** selects lines within the current
+file. **c / Command+C** copies through the terminal clipboard protocol.
 
 After an upgrade, opening the newer difu automatically replaces an older running
 background service, even when agents are active. Installing with Homebrew leaves
 the service running until that next launch.
-Chats and worktree edits are preserved; interrupted work requires Continue and
-queued messages are not replayed. Older clients do not replace a newer service.
+Chats and worktree edits are preserved; send a new message or choose Continue to
+resume interrupted work. Queued messages are not replayed. Older clients do not replace a newer service.
 
 Waiting messages appear below the activity line, with a bright heading and indented
 previews. Messages sent during a tool call appear there immediately, before the
@@ -248,7 +275,8 @@ them and the running tools finish. Each message appears in only one place.
 **Esc** in the chat interrupts and sends waiting messages immediately;
 accepted steering is retained in the conversation without being resent. While a
 repository-guidance permission is unanswered, messages remain queued until it is
-answered. With no waiting messages, Esc keeps its normal navigation behavior.
+answered. With no waiting messages, Esc interrupts an active agent; when idle,
+it returns to the session list.
 
 The new-agent defaults dialog completes local directories, Codex model names, and
 the selected model’s supported reasoning levels. Type to filter, use **Up/Down**
@@ -310,7 +338,7 @@ existing external Codex conversations are not imported. Guide and conflict jobs
 appear with distinct labels and keep their existing workflow restrictions.
 
 After a service crash or machine restart, history is restored and interrupted work
-requires explicit continuation. Pending queued prompts are retained as unsent text,
+resumes when you send a new message or choose Continue. Pending queued prompts are retained as unsent text,
 not replayed. Completed publication actions are never automatically retried.
 Interrupting preserves edits; archiving hides the session and keeps its workspace.
 Cleanup is separate and refuses active, modified, untracked, ignored, or Git-locked
@@ -347,7 +375,7 @@ or press **r**. Failed refreshes keep cached data available.
 Select a PR to preview its description, chronological activity, inline review
 comments, and checks. **Enter** drills into that PR and selects **Overview** (the
 preview), while its guide is prepared or retrieved in the background. Inside the
-PR, the tabs are **Overview / Guide / Diff**;
+PR, the tabs are **Overview / Guide / Diff**; **[ / ]** switches to the previous/next tab.
 **Esc** returns home. Guide starts with code focused; Diff starts with files focused. The
 border highlights the focused pane, the footer names it, and **Tab** switches focus. You can also launch directly:
 

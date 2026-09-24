@@ -5,6 +5,16 @@ root = Path(os.environ['DIFU_TEST_FIXTURE'])
 revs = json.loads((root / 'revisions.json').read_text())
 args = sys.argv[1:]
 url = 'https://github.com/example/project/pull/1'
+if args[:2] == ['pr', 'view'] and '--json=url,state,isDraft,mergeable' in args:
+    if (root / 'session-pr-error').exists():
+        print('GitHub unavailable', file=sys.stderr);sys.exit(1)
+    if len(args) == 4 and not args[2].startswith('https://'):
+        assert args[2] == 'session-branch'
+        assert Path.cwd() == (root / 'clone').resolve()
+    if len(args) == 4 and args[2].startswith('https://'):
+        assert args[2] == url
+    state = (root / 'session-pr-state').read_text() if (root / 'session-pr-state').exists() else 'OPEN'
+    print(json.dumps(dict(url=url, state=state, isDraft=state=='OPEN', mergeable='CONFLICTING')));sys.exit(0)
 if args[:2] == ['pr', 'view']:
     assert args == ['pr', 'view', '--json=url']
     if (root / 'no-branch-pr').exists():

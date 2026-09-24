@@ -3,6 +3,9 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 pub(super) enum View {
+    PullRequest {
+        app: Box<crate::app::App>,
+    },
     Shell {
         id: String,
         command: String,
@@ -17,6 +20,7 @@ pub(super) enum View {
 pub(super) struct Panels {
     pub session: Option<String>,
     pub view: Option<View>,
+    pub hidden: bool,
     pub right: bool,
     pub focused: bool,
     pub rect: Rect,
@@ -32,6 +36,7 @@ impl Panels {
         Self {
             session: None,
             view: None,
+            hidden: false,
             right,
             focused: false,
             rect: Rect::default(),
@@ -42,6 +47,9 @@ impl Panels {
             checked: None,
             error: None,
         }
+    }
+    pub fn visible(&self) -> bool {
+        self.view.is_some() && !self.hidden
     }
 }
 impl Ui {
@@ -73,17 +81,24 @@ impl Ui {
     pub(super) fn tick_panels(&mut self, visible: bool) {
         if self.panels.session != self.selected {
             self.panels.view = None;
+            self.panels.hidden = false;
             self.panels.focused = false;
             self.panels.session = self.selected.clone();
             self.panels.checked = None;
             self.panels.error = None;
+        }
+        if let Some(View::PullRequest { app }) = &mut self.panels.view {
+            app.tick_visible(visible && !self.panels.hidden);
+            if let Some(text) = app.clipboard.take() {
+                self.clipboard = Some(text);
+            }
         }
         if let Some(View::Artifact {
             browser: Some(browser),
             ..
         }) = &mut self.panels.view
         {
-            browser.visible(visible && self.modal.is_none());
+            browser.visible(visible && !self.panels.hidden && self.modal.is_none());
             browser.focus(visible && self.panels.focused && self.modal.is_none());
             browser.tick();
         }
@@ -193,6 +208,7 @@ impl Ui {
             });
         }
         self.panels.session = self.selected.clone();
+        self.panels.hidden = false;
         self.panels.focused = true;
         self.panels.scroll = 0;
         self.drilled = true;
@@ -217,6 +233,7 @@ impl Ui {
             error,
         });
         self.panels.session = self.selected.clone();
+        self.panels.hidden = false;
         self.panels.focused = true;
         self.drilled = true;
     }
@@ -239,6 +256,7 @@ impl Ui {
                 ),
             });
             self.panels.session = self.selected.clone();
+            self.panels.hidden = false;
             self.external_artifact();
             return;
         }
@@ -333,9 +351,16 @@ impl Ui {
         if self.modal.is_some() {
             return false;
         }
+        if self.panels.focused
+            && let Some(View::PullRequest { app }) = &mut self.panels.view
+            && (app.modal.is_some() || app.filters.focused.is_some())
+        {
+            app.key_event(key);
+            return true;
+        }
         if key.code == KeyCode::Char('p')
             && key.modifiers == KeyModifiers::ALT
-            && self.panels.view.is_some()
+            && self.panels.visible()
         {
             self.panels.right = !self.panels.right;
             let result = self.storage.load_config().and_then(|mut c| {
@@ -347,10 +372,35 @@ impl Ui {
             }
             return true;
         }
-        if !self.panels.focused || self.panels.view.is_none() {
+        if key.code == KeyCode::Char(']') && key.modifiers == KeyModifiers::ALT {
+            if self.panels.view.is_some() {
+                self.panels.hidden = !self.panels.hidden;
+                self.panels.focused = !self.panels.hidden;
+                if self.panels.hidden {
+                    self.focus = if self.changes_visible {
+                        Focus::Changes
+                    } else {
+                        Focus::Composer
+                    };
+                }
+            }
+            return true;
+        }
+        if !self.panels.focused || !self.panels.visible() {
             return false;
         }
         if self.panels.right && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            // Keep the PR's file/chapter pane reachable before leaving the helper.
+            let backwards =
+                key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
+            if let Some(View::PullRequest { app }) = &mut self.panels.view
+                && app.view != crate::app::View::Overview
+                && ((!backwards && app.focus == crate::app::Focus::Navigation)
+                    || (backwards && app.focus == crate::app::Focus::Content))
+            {
+                app.key_event(key);
+                return true;
+            }
             self.cycle_focus(
                 key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT),
             );
@@ -366,9 +416,7 @@ impl Ui {
             };
             return true;
         }
-        if (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('b'))
-            || (key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('d'))
-        {
+        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('[' | 'd')) {
             self.panels.focused = false;
             return false;
         }
@@ -378,6 +426,10 @@ impl Ui {
         }) = &mut self.panels.view
         {
             browser.key(key);
+            return true;
+        }
+        if let Some(View::PullRequest { app }) = &mut self.panels.view {
+            app.key_event(key);
             return true;
         }
         match key.code {
@@ -406,10 +458,17 @@ impl Ui {
         true
     }
     pub(super) fn panel_mouse(&mut self, event: MouseEvent) -> bool {
-        if self.modal.is_some() || self.panels.view.is_none() {
+        if self.modal.is_some() || !self.panels.visible() {
             return false;
         }
         let inside = self.panels.rect.contains((event.column, event.row).into());
+        if let Some(View::PullRequest { app }) = &mut self.panels.view
+            && (inside || app.modal.is_some())
+        {
+            self.panels.focused = true;
+            app.mouse(event);
+            return true;
+        }
         if matches!(event.kind, MouseEventKind::Down(_)) {
             self.panels.focused = inside;
         }
@@ -518,16 +577,28 @@ impl Ui {
     }
     pub(super) fn resource_key(&mut self, key: KeyEvent) -> bool {
         if self.modal.is_none() && !self.panels.focused && self.drilled {
-            let visible = self.visible_resources();
+            let mut visible = self
+                .visible_resources()
+                .into_iter()
+                .map(|(a, _)| Focus::Resources(a))
+                .collect::<Vec<_>>();
+            if self
+                .selected
+                .as_ref()
+                .and_then(|id| self.prs.get(id))
+                .is_some()
+            {
+                visible.push(Focus::PullRequest);
+            }
             if self.focus == Focus::Composer
                 && key.code == KeyCode::Down
                 && key.modifiers.is_empty()
-                && let Some((artifacts, _)) = visible.first()
+                && let Some(first) = visible.first()
             {
-                self.focus = Focus::Resources(*artifacts);
+                self.focus = *first;
                 return true;
             }
-            if let Focus::Resources(artifacts) = self.focus {
+            if matches!(self.focus, Focus::Resources(_) | Focus::PullRequest) {
                 if visible.is_empty() {
                     self.focus = Focus::Composer;
                     return false;
@@ -535,20 +606,21 @@ impl Ui {
                 match key.code {
                     KeyCode::Up | KeyCode::Esc => self.focus = Focus::Composer,
                     KeyCode::Left | KeyCode::Right => {
-                        let current = visible
-                            .iter()
-                            .position(|(a, _)| *a == artifacts)
-                            .unwrap_or(0);
+                        let current = visible.iter().position(|f| *f == self.focus).unwrap_or(0);
                         let next = if key.code == KeyCode::Right {
                             (current + 1) % visible.len()
                         } else {
                             (current + visible.len() - 1) % visible.len()
                         };
-                        if let Some((next, _)) = visible.get(next) {
-                            self.focus = Focus::Resources(*next);
+                        if let Some(next) = visible.get(next) {
+                            self.focus = *next;
                         }
                     }
-                    KeyCode::Enter => self.open_resources(artifacts),
+                    KeyCode::Enter => match self.focus {
+                        Focus::PullRequest => self.open_pr_panel(),
+                        Focus::Resources(a) => self.open_resources(a),
+                        _ => {}
+                    },
                     KeyCode::Tab | KeyCode::BackTab => {
                         self.cycle_focus(key.code == KeyCode::BackTab)
                     }
@@ -601,6 +673,7 @@ impl Ui {
     }
     pub(super) fn draw_panel(&mut self, frame: &mut Frame, area: Rect) {
         let title = match &self.panels.view {
+            Some(View::PullRequest { .. }) => "Pull request",
             Some(View::Shell { .. }) => "Shell output",
             Some(View::Artifact { title, .. }) => title,
             _ => return,
@@ -640,6 +713,10 @@ impl Ui {
             self.panels.rect = inner;
         }
         match &mut self.panels.view {
+            Some(View::PullRequest { app }) => {
+                app.render_area = Some(inner);
+                crate::ui::draw(frame, app);
+            }
             Some(View::Artifact { browser, error, .. }) => {
                 if let Some(browser) = browser {
                     if let Some(error) = &browser.error {

@@ -44,11 +44,12 @@ fn regular_path(root: &Path, relative: &Path, missing: bool) -> Result<PathBuf> 
     Ok(result)
 }
 fn discover(source: &Path, destination: &Path, cancel: &Cancel) -> Result<Vec<File>> {
-    // Omitting --exclude-standard includes ignored guidance, without scanning dependency trees.
+    // Include ignored repository guidance, but prune installed dependencies at every depth.
     let result = process::run(
         repo::git(source).args([
             "ls-files",
             "--others",
+            "--exclude=node_modules/",
             "-z",
             "--",
             "AGENTS.md",
@@ -68,6 +69,10 @@ fn discover(source: &Path, destination: &Path, cancel: &Cancel) -> Result<Vec<Fi
         .split('\0')
         .filter(|p| !p.is_empty())
         .map(PathBuf::from)
+        .filter(|p| {
+            !p.components()
+                .any(|part| part.as_os_str() == "node_modules")
+        })
     {
         let target = regular_path(destination, &relative, true)?;
         if target.exists() {
@@ -251,7 +256,11 @@ fn queue_while_waiting(store: &Store, id: &str, control: Control) -> Result<()> 
             );
             store.update(id, |s| {
                 if answer.is_some() {
-                    s.queue.push(Prompt::from(text));
+                    s.queue.push(Prompt::QuestionAnswer {
+                        text,
+                        question_request: request,
+                        question_id: Some(question),
+                    });
                 }
                 super::questions::record_answer(s, updated);
             })?;
@@ -280,4 +289,64 @@ fn queue_while_waiting(store: &Store, id: &str, control: Control) -> Result<()> 
         ),
     }
     store.save(id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discovers_repo_guidance_without_dependency_instructions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("repo");
+        let destination = temp.path().join("worktree");
+        fs::create_dir(&source)?;
+        fs::create_dir(&destination)?;
+        let cancel = Cancel::default();
+        process::checked(repo::git(&source).arg("init"), &cancel)?;
+        for relative in [
+            "node_modules/package/AGENTS.md",
+            "backend/node_modules/.pnpm/just-bash@2.14.5/node_modules/just-bash/dist/AGENTS.md",
+            "frontend/node_modules/package/AGENTS.override.md",
+            ".agents/skills/example/node_modules/package/AGENTS.md",
+            ".codex/skills/example/node_modules/package/SKILL.md",
+        ] {
+            let path = source.join(relative);
+            fs::create_dir_all(path.parent().context("parent")?)?;
+            fs::write(path, "Dependency instructions must not be copied")?;
+        }
+        assert!(discover(&source, &destination, &cancel)?.is_empty());
+        fs::write(
+            source.join(".gitignore"),
+            "AGENTS.md\nAGENTS.override.md\n.agents/\n.codex/\nnode_modules/\n",
+        )?;
+        let expected = [
+            ".agents/skills/example/SKILL.md",
+            ".codex/skills/example/SKILL.md",
+            "AGENTS.md",
+            "backend/AGENTS.md",
+            "frontend/AGENTS.override.md",
+            "node_modules_notes/AGENTS.md",
+        ];
+        for relative in expected {
+            let path = source.join(relative);
+            fs::create_dir_all(path.parent().context("parent")?)?;
+            fs::write(path, "Repository instructions")?;
+        }
+        let files = discover(&source, &destination, &cancel)?;
+        assert_eq!(
+            files.iter().map(|f| f.relative.clone()).collect::<Vec<_>>(),
+            expected.map(PathBuf::from)
+        );
+        copy(&source, &destination, &files)?;
+        assert!(discover(&source, &destination, &cancel)?.is_empty());
+        assert!(!destination.join("node_modules").exists());
+        assert!(!destination.join("backend/node_modules").exists());
+        assert!(
+            !destination
+                .join(".agents/skills/example/node_modules")
+                .exists()
+        );
+        Ok(())
+    }
 }

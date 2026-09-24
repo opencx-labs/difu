@@ -87,6 +87,105 @@ pub fn filtered(files: &[DiffFile], query: &str) -> Vec<Entry> {
         .collect()
 }
 
+/// Resolve focus by identity, so refreshes and reordered files do not move it.
+pub(crate) fn selected(entries: &[Entry], file: usize, directory: Option<&str>) -> usize {
+    entries
+        .iter()
+        .position(|entry| match directory {
+            Some(path) => entry.file.is_none() && entry.path == path,
+            None => entry.file == Some(file),
+        })
+        .unwrap_or(0)
+}
+pub(crate) fn step(entries: &[Entry], current: usize, delta: i32) -> usize {
+    current
+        .saturating_add_signed(delta as isize)
+        .min(entries.len().saturating_sub(1))
+}
+pub(crate) fn next_file(entries: &[Entry], file: usize, forward: bool) -> Option<usize> {
+    let files = entries
+        .iter()
+        .filter_map(|entry| entry.file)
+        .collect::<Vec<_>>();
+    let current = files.iter().position(|index| *index == file)?;
+    let next = if forward {
+        current.checked_add(1)?
+    } else {
+        current.checked_sub(1)?
+    };
+    files.get(next).copied()
+}
+pub(crate) fn contains(directory: &str, path: &str) -> bool {
+    path.strip_prefix(directory)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
+
+/// Shared changed-files tree used by PR reviews and live agent changes.
+pub(crate) fn draw(
+    frame: &mut ratatui::Frame,
+    rect: ratatui::layout::Rect,
+    entries: &[Entry],
+    statuses: &[String],
+    selected: usize,
+    horizontal: &mut usize,
+) -> Vec<(ratatui::layout::Rect, usize)> {
+    use crate::ui::{ACCENT, DIM, TEXT};
+    use ratatui::{style::Style, widgets::Paragraph};
+    use unicode_width::UnicodeWidthStr;
+    let width = usize::from(rect.width.saturating_sub(2));
+    let labels = entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{}{}",
+                entry
+                    .file
+                    .and_then(|i| statuses.get(i))
+                    .map(|s| format!("{} ", crate::local_diff::status_letter(s)))
+                    .unwrap_or_default(),
+                entry.label()
+            )
+        })
+        .collect::<Vec<_>>();
+    let max = labels
+        .iter()
+        .map(|label| label.width().saturating_sub(width))
+        .max()
+        .unwrap_or(0);
+    *horizontal = (*horizontal).min(max);
+    let height = usize::from(rect.height);
+    let start = selected.saturating_sub(height.saturating_sub(1));
+    let mut hits = Vec::new();
+    for (index, (entry, label)) in entries
+        .iter()
+        .zip(labels)
+        .enumerate()
+        .skip(start)
+        .take(height)
+    {
+        let active = index == selected;
+        let row =
+            ratatui::layout::Rect::new(rect.x, rect.y + (index - start) as u16, rect.width, 1);
+        let text = format!(
+            "{} {}",
+            if active { "▸" } else { " " },
+            crate::ui::crop(&crate::model::clean(&label), *horizontal, width)
+        );
+        frame.render_widget(
+            Paragraph::new(text).style(Style::default().fg(if active {
+                ACCENT
+            } else if entry.file.is_some() {
+                TEXT
+            } else {
+                DIM
+            })),
+            row,
+        );
+        hits.push((row, index));
+    }
+    hits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

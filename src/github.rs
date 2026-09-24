@@ -171,6 +171,70 @@ pub fn current_branch_pr(cancel: &Cancel) -> Result<PrKey> {
     PrKey::from_url(url)
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct SessionPr {
+    pub key: PrKey,
+    pub state: String,
+    pub draft: bool,
+    pub conflicts: bool,
+}
+impl SessionPr {
+    pub fn label(&self) -> &'static str {
+        match self.state.as_str() {
+            "MERGED" => "Merged",
+            "CLOSED" => "Closed",
+            "OPEN" if self.conflicts => "Has conflicts",
+            "OPEN" if self.draft => "Draft",
+            "OPEN" => "Open",
+            _ => "Unknown",
+        }
+    }
+}
+
+/// Discover using gh's branch/upstream resolution, then follow the remembered PR
+/// by URL even after its branch or worktree has been removed.
+pub fn session_pr(
+    workspace: &std::path::Path,
+    branch: Option<&str>,
+    known: Option<&PrKey>,
+    cancel: &Cancel,
+) -> Result<SessionPr> {
+    let mut cmd = command();
+    cmd.args(["pr", "view"]);
+    if let Some(key) = known {
+        key.validate()?;
+        cmd.arg(key.url());
+    } else {
+        cmd.current_dir(workspace);
+        if let Some(branch) = branch.filter(|b| !b.is_empty() && *b != "HEAD") {
+            anyhow::ensure!(!branch.starts_with('-'), "Invalid Git branch");
+            cmd.arg(branch);
+        }
+    }
+    cmd.arg("--json=url,state,isDraft,mergeable");
+    let output = process::run(&mut cmd, None, cancel)?;
+    anyhow::ensure!(
+        output.code == 0,
+        "GitHub: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let value: Value = serde_json::from_slice(&output.stdout)?;
+    let state = text(&value, "state");
+    anyhow::ensure!(
+        matches!(state.as_str(), "OPEN" | "CLOSED" | "MERGED"),
+        "Invalid PR state"
+    );
+    Ok(SessionPr {
+        key: PrKey::from_url(&text(&value, "url"))?,
+        state,
+        draft: value
+            .get("isDraft")
+            .and_then(Value::as_bool)
+            .context("Missing PR draft status")?,
+        conflicts: text(&value, "mergeable") == "CONFLICTING",
+    })
+}
+
 pub fn current_repository(cancel: &Cancel) -> Result<String> {
     let v = json(&["repo", "view", "--json=nameWithOwner"], cancel)?;
     v.get("nameWithOwner")

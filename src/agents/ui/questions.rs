@@ -66,15 +66,30 @@ impl Ui {
             self.notice = Some(("Enter a message, or choose Remove".into(), true));
             return;
         }
-        let replacement = (!delete).then(|| Prompt::WithSkills {
-            text: editor.text(),
-            skills: expected.skills().to_vec(),
-            attachments: expected
-                .attachments()
-                .iter()
-                .filter(|a| editor.text().contains(&a.token()))
-                .cloned()
-                .collect(),
+        let replacement = (!delete).then(|| {
+            if let Prompt::QuestionAnswer {
+                question_request,
+                question_id,
+                ..
+            } = expected
+            {
+                Prompt::QuestionAnswer {
+                    text: editor.text(),
+                    question_request: question_request.clone(),
+                    question_id: question_id.clone(),
+                }
+            } else {
+                Prompt::WithSkills {
+                    text: editor.text(),
+                    skills: expected.skills().to_vec(),
+                    attachments: expected
+                        .attachments()
+                        .iter()
+                        .filter(|a| editor.text().contains(&a.token()))
+                        .cloned()
+                        .collect(),
+                }
+            }
         });
         self.control(Control::ReplaceQueued {
             index: *index,

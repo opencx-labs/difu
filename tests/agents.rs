@@ -502,6 +502,7 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
             .context("Accepted question answer")?;
         assert!(latest.text.contains(answer));
         assert!(!latest.text.contains("Act on this answer now"));
+        assert!(!latest.text.contains("Difu question state"));
         let wire = fs::read_to_string(root.join("protocol.jsonl"))?;
         assert!(
             wire.lines()
@@ -512,6 +513,13 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
                             .and_then(|v| v.as_str())
                             .is_some_and(|text| text.contains(answer)
                                 && !text.contains("Act on this answer now"))
+                        && v.pointer("/params/input/1/text")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|text| text
+                                .contains(&format!("Remaining pending questions ({remaining})"))
+                                && text.contains(
+                                    "Do not ask them again, including reworded versions"
+                                ))
                 )
         );
     }
@@ -519,8 +527,51 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
     assert_eq!(answered.status, Status::Running);
     control(&storage, &questions, Control::Interrupt)?;
     wait(&storage, &questions, |s| s.status == Status::Interrupted)?;
-    control(&storage, &questions, Control::Resume)?;
-    wait(&storage, &questions, |s| s.status == Status::Idle)?;
+    control(
+        &storage,
+        &questions,
+        Control::Message {
+            text: "chat only: continue with this new message".into(),
+            queue: false,
+            skills: Vec::new(),
+            attachments: Vec::new(),
+        },
+    )?;
+    let resumed = wait(&storage, &questions, |s| s.status == Status::Idle)?;
+    assert_eq!(resumed.thread_id, answered.thread_id);
+    assert_eq!(
+        resumed
+            .entries
+            .iter()
+            .filter(|e| e.kind == "userMessage"
+                && e.text == "chat only: continue with this new message")
+            .count(),
+        1
+    );
+    control(
+        &storage,
+        &questions,
+        Control::Message {
+            text: "fixture fail turn".into(),
+            queue: false,
+            skills: Vec::new(),
+            attachments: Vec::new(),
+        },
+    )?;
+    wait(&storage, &questions, |s| s.status == Status::Failed)?;
+    control(
+        &storage,
+        &questions,
+        Control::Message {
+            text: "chat only: recover failed turn".into(),
+            queue: false,
+            skills: Vec::new(),
+            attachments: Vec::new(),
+        },
+    )?;
+    let recovered = wait(&storage, &questions, |s| s.status == Status::Idle)?;
+    assert_eq!(recovered.thread_id, answered.thread_id);
+    assert!(recovered.error.is_none());
     control(
         &storage,
         &questions,
@@ -678,8 +729,36 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
         )
         .is_err()
     );
-    control(&storage, &second, Control::Resume)?;
-    wait(&storage, &second, |s| s.status == Status::Idle)?;
+    control(
+        &storage,
+        &second,
+        Control::MessageWithAttachments {
+            text: "continue after service restart".into(),
+            queue: false,
+            skills: Vec::new(),
+            attachments: Vec::new(),
+        },
+    )?;
+    let resumed = wait(&storage, &second, |s| s.status == Status::Idle)?;
+    assert_eq!(resumed.thread_id, recovered.thread_id);
+    assert_eq!(
+        resumed
+            .entries
+            .iter()
+            .filter(|e| e.kind == "userMessage" && e.text == "continue after service restart")
+            .count(),
+        1
+    );
+    let protocol = fs::read_to_string(root.join("protocol.jsonl"))?;
+    assert!(
+        !protocol
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(
+                |v| v.pointer("/params/input/0/text").and_then(|v| v.as_str())
+                    == Some("must not replay")
+            )
+    );
     control(
         &storage,
         &id,
@@ -1144,7 +1223,16 @@ fn guidance_wait_survives_frontend_reconnect_and_service_restart_without_permiss
     assert_eq!(session(&storage, &id)?.status, Status::Interrupted);
     assert!(!workspace.join("AGENTS.md").exists());
     assert!(!root.join("protocol.jsonl").exists());
-    control(&storage, &id, Control::Resume)?;
+    control(
+        &storage,
+        &id,
+        Control::Message {
+            text: "finish guided task from this new message".into(),
+            queue: false,
+            skills: Vec::new(),
+            attachments: Vec::new(),
+        },
+    )?;
     let resumed = wait(&storage, &id, |s| s.status == Status::Waiting)?;
     assert_eq!(resumed.pending_question_count(), 1);
     assert_eq!(resumed.workspace.as_ref(), Some(&workspace));
