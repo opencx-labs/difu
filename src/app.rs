@@ -642,7 +642,7 @@ impl App {
         }
         self.opened = Some(id.clone());
         self.home = false;
-        self.view = View::Guide;
+        self.view = View::Overview;
         self.focus = Focus::Content;
         self.scroll = 0;
         self.horizontal = 0;

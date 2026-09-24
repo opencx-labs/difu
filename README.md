@@ -345,8 +345,9 @@ visible. Repository names are also cached, refreshing when you enter Repositorie
 or press **r**. Failed refreshes keep cached data available.
 
 Select a PR to preview its description, chronological activity, inline review
-comments, and checks. **Enter** drills into that PR and selects **Guide**, starting
-or retrieving its guide. Inside the PR, the tabs are **Overview / Guide / Diff**;
+comments, and checks. **Enter** drills into that PR and selects **Overview** (the
+preview), while its guide is prepared or retrieved in the background. Inside the
+PR, the tabs are **Overview / Guide / Diff**;
 **Esc** returns home. Guide starts with code focused; Diff starts with files focused. The
 border highlights the focused pane, the footer names it, and **Tab** switches focus. You can also launch directly:
 

@@ -201,7 +201,11 @@ fn exercise(root: &Path) -> Result<()> {
     );
     app.action(Action::OpenPr);
     assert_eq!(app.focus, difu::app::Focus::Content);
+    assert_eq!(app.view, View::Overview);
     wait(&mut app, |a| a.review().is_some_and(|r| r.guide.is_some()))?;
+    assert_eq!(app.view, View::Overview); // Background guide completion must not steal focus.
+    assert!(render(&mut app, 180)?.contains("1 Overview"));
+    app.action(Action::SetView(View::Guide));
     let guide = app
         .review()
         .and_then(|r| r.guide.as_ref())
