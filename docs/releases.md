@@ -22,3 +22,7 @@ and Codex remain user-installed runtime prerequisites.
 Users then install with `brew install opencx-labs/tap/difu` or upgrade with
 `brew update` followed by `brew upgrade difu`. Each release needs its matching
 formula update; publishing a GitHub release alone does not update the tap.
+
+Do not add a Homebrew post-install service hook: Homebrew isolates that hook from
+the user's home directory. The upgraded difu checks and refreshes an older
+background service automatically on its next launch.
