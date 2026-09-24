@@ -189,12 +189,14 @@ fn activity_text(session: &Session) -> (String, Option<String>, Option<i64>) {
 }
 fn shimmer(text: &str, now: i64) -> Line<'static> {
     let length = text.chars().count();
-    let phase = (now.max(0) as usize / 60) % length.saturating_add(16).max(1);
+    let travel = length.saturating_sub(1).max(1);
+    let step = (now.max(0) as usize / 60) % (travel * 2);
+    let phase = travel.abs_diff(step);
     Line::from(
         text.chars()
             .enumerate()
             .map(|(index, ch)| {
-                let distance = index.saturating_add(8).abs_diff(phase);
+                let distance = index.abs_diff(phase);
                 let color = match distance {
                     0..=1 => Color::Rgb(235, 240, 235),
                     2..=3 => Color::Rgb(190, 200, 190),
@@ -252,7 +254,11 @@ pub(super) fn render(
             tool: is_tool,
         });
         match entry.kind.as_str() {
-            "userMessage" | "sending" | "unsent" | "unsent or unacknowledged" => {
+            "userMessage"
+            | "awaiting connection"
+            | "sending"
+            | "unsent"
+            | "unsent or unacknowledged" => {
                 if entry.kind.starts_with("unsent") {
                     lines.push(Line::from(Span::styled(
                         "Not sent",
@@ -382,31 +388,100 @@ pub(super) fn render(
                     },
                     label(entry, running)
                 );
-                lines.extend(
-                    wrapped(&heading, width)
-                        .into_iter()
-                        .map(|line| Line::from(Span::styled(line, Style::default().fg(color)))),
-                );
-                let output = if entry.kind == "fileChange" {
-                    entry
-                        .data
-                        .get("changes")
-                        .and_then(Value::as_array)
-                        .map(|changes| {
-                            changes
-                                .iter()
-                                .map(|change| {
+                if entry.kind == "commandExecution" {
+                    for (index, source) in field(&entry.data, "command").lines().enumerate() {
+                        let mut spans = if index == 0 {
+                            vec![Span::styled(
+                                format!(
+                                    "{} {} ",
+                                    if focus {
+                                        "›"
+                                    } else if failed {
+                                        "×"
+                                    } else {
+                                        "•"
+                                    },
+                                    if running { "Running" } else { "Ran" }
+                                ),
+                                Style::default().fg(color),
+                            )]
+                        } else {
+                            vec![Span::raw("  │ ")]
+                        };
+                        spans.extend(crate::ui::syntax_spans(&source.replace('\t', "    ")));
+                        if index == 0 {
+                            spans.push(Span::styled(
+                                format!(" · {state}{elapsed}"),
+                                Style::default().fg(DIM),
+                            ));
+                        }
+                        lines.extend(
+                            crate::markdown::wrap(spans, usize::from(width).max(1))
+                                .into_iter()
+                                .map(|row| Line::from(row.spans)),
+                        );
+                    }
+                } else if entry.kind == "fileChange" {
+                    if let Some(changes) = entry.data.get("changes").and_then(Value::as_array) {
+                        for change in changes {
+                            let (patch, added, removed) =
+                                super::patch::render(&field(change, "diff"), width);
+                            let title = vec![
+                                Span::styled(
                                     format!(
-                                        "{}\n```diff\n{}\n```",
-                                        field(change, "path"),
-                                        field(change, "diff")
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n")
-                        })
-                        .unwrap_or_else(|| entry.text.clone())
-                } else if entry.kind == "commandExecution" {
+                                        "{} {} {} ",
+                                        if focus {
+                                            "›"
+                                        } else if failed {
+                                            "×"
+                                        } else {
+                                            "•"
+                                        },
+                                        if running { "Editing" } else { "Edited" },
+                                        field(change, "path")
+                                    ),
+                                    Style::default().fg(color),
+                                ),
+                                Span::styled(format!("+{added}"), Style::default().fg(GREEN)),
+                                Span::raw(" "),
+                                Span::styled(format!("-{removed}"), Style::default().fg(RED)),
+                                Span::styled(
+                                    format!(" · {state}{elapsed}"),
+                                    Style::default().fg(DIM),
+                                ),
+                            ];
+                            lines.extend(
+                                crate::markdown::wrap(title, usize::from(width).max(1))
+                                    .into_iter()
+                                    .map(|row| Line::from(row.spans)),
+                            );
+                            let count = patch.len();
+                            lines.extend(patch.into_iter().take(if expanded { count } else { 3 }));
+                            if expanded || count > 3 {
+                                lines.push(Line::from(Span::styled(
+                                    if expanded {
+                                        "    Enter/click to collapse".into()
+                                    } else {
+                                        format!(
+                                            "    +{} lines · Enter/click to expand",
+                                            count.saturating_sub(3)
+                                        )
+                                    },
+                                    Style::default().fg(DIM),
+                                )));
+                            }
+                        }
+                        lines.push(Line::default());
+                        continue;
+                    }
+                } else {
+                    lines.extend(
+                        wrapped(&heading, width)
+                            .into_iter()
+                            .map(|line| Line::from(Span::styled(line, Style::default().fg(color)))),
+                    );
+                }
+                let output = if entry.kind == "commandExecution" {
                     entry
                         .text
                         .strip_prefix(&format!("$ {}\n", field(&entry.data, "command")))
@@ -422,9 +497,21 @@ pub(super) fn render(
                     output.lines().take(3).collect::<Vec<_>>().join("\n")
                 };
                 let rows = if entry.kind == "commandExecution" {
-                    wrapped(&shown, width.saturating_sub(4))
-                        .into_iter()
-                        .map(|line| Line::from(Span::styled(line, Style::default().fg(DIM))))
+                    shown
+                        .lines()
+                        .flat_map(|line| {
+                            let rows = crate::markdown::wrap(
+                                crate::ui::syntax_spans(
+                                    &crate::model::clean(line).replace('\t', "    "),
+                                ),
+                                usize::from(width.saturating_sub(4)).max(1),
+                            );
+                            if rows.is_empty() {
+                                vec![Line::default()]
+                            } else {
+                                rows.into_iter().map(|row| Line::from(row.spans)).collect()
+                            }
+                        })
                         .collect::<Vec<_>>()
                 } else {
                     prose(&shown, width.saturating_sub(4))
@@ -462,12 +549,16 @@ pub(super) fn render(
             && let Some(section) = sections.last()
             && let Some(line) = lines.get_mut(section.row.saturating_add(usize::from(matches!(
                 entry.kind.as_str(),
-                "userMessage" | "sending"
+                "userMessage" | "awaiting connection" | "sending"
             ))))
         {
             if matches!(
                 entry.kind.as_str(),
-                "userMessage" | "sending" | "unsent" | "unsent or unacknowledged"
+                "userMessage"
+                    | "awaiting connection"
+                    | "sending"
+                    | "unsent"
+                    | "unsent or unacknowledged"
             ) {
                 if let Some(marker) = line.spans.first_mut() {
                     marker.content = "▸ ".into();
@@ -511,6 +602,11 @@ mod tests {
         assert_eq!(first.width(), next.width());
         assert_ne!(first, next);
         assert!(first.spans.iter().all(|span| span.style.bg.is_none()));
+        let text = "0123456789abcdefghijk";
+        let turn = (text.chars().count() as i64 - 1) * 60;
+        assert_eq!(shimmer(text, turn - 180), shimmer(text, turn + 180));
+        assert_eq!(shimmer(text, 0), shimmer(text, turn * 2));
+        assert_ne!(shimmer(text, 0), shimmer(text, turn));
     }
     #[test]
     fn fenced_code_keeps_syntax_colors_when_wrapped() {

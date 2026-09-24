@@ -45,6 +45,17 @@ impl Panels {
     }
 }
 impl Ui {
+    pub(super) fn visible_resources(&self) -> Vec<(bool, usize)> {
+        let Some(id) = &self.selected else {
+            return Vec::new();
+        };
+        let shells = self.panels.shells.get(id).map_or(0, Vec::len);
+        let artifacts = self.sessions.get(id).map_or(0, |s| s.artifacts.len());
+        [(false, shells), (true, artifacts)]
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .collect()
+    }
     pub fn panel_right(&self) -> bool {
         self.panels.right
     }
@@ -339,14 +350,24 @@ impl Ui {
         if !self.panels.focused || self.panels.view.is_none() {
             return false;
         }
+        if self.panels.right && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            self.cycle_focus(
+                key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT),
+            );
+            return true;
+        }
         if key.code == KeyCode::Esc {
             self.panels.view = None;
             self.panels.focused = false;
-            self.focus = Focus::Composer;
+            self.focus = if self.changes_visible {
+                Focus::Changes
+            } else {
+                Focus::Composer
+            };
             return true;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('b' | 'd'))
+        if (key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('b'))
+            || (key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('d'))
         {
             self.panels.focused = false;
             return false;
@@ -496,6 +517,46 @@ impl Ui {
         }
     }
     pub(super) fn resource_key(&mut self, key: KeyEvent) -> bool {
+        if self.modal.is_none() && !self.panels.focused && self.drilled {
+            let visible = self.visible_resources();
+            if self.focus == Focus::Composer
+                && key.code == KeyCode::Down
+                && key.modifiers.is_empty()
+                && let Some((artifacts, _)) = visible.first()
+            {
+                self.focus = Focus::Resources(*artifacts);
+                return true;
+            }
+            if let Focus::Resources(artifacts) = self.focus {
+                if visible.is_empty() {
+                    self.focus = Focus::Composer;
+                    return false;
+                }
+                match key.code {
+                    KeyCode::Up | KeyCode::Esc => self.focus = Focus::Composer,
+                    KeyCode::Left | KeyCode::Right => {
+                        let current = visible
+                            .iter()
+                            .position(|(a, _)| *a == artifacts)
+                            .unwrap_or(0);
+                        let next = if key.code == KeyCode::Right {
+                            (current + 1) % visible.len()
+                        } else {
+                            (current + visible.len() - 1) % visible.len()
+                        };
+                        if let Some((next, _)) = visible.get(next) {
+                            self.focus = Focus::Resources(*next);
+                        }
+                    }
+                    KeyCode::Enter => self.open_resources(artifacts),
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        self.cycle_focus(key.code == KeyCode::BackTab)
+                    }
+                    _ => return false,
+                }
+                return true;
+            }
+        }
         if let Some(Modal::InstallBrowser { selected, .. }) = &mut self.modal {
             match key.code {
                 KeyCode::Esc => self.modal = None,

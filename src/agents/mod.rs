@@ -6,6 +6,7 @@ mod guidance;
 pub mod media;
 mod questions;
 pub mod server;
+mod suggestions;
 mod title;
 pub mod ui;
 mod workspace;
@@ -173,6 +174,10 @@ pub struct Session {
     pub title_attempted: bool,
     #[serde(default)]
     pub title_manual: bool,
+    #[serde(default)]
+    pub suggestion: Option<suggestions::Suggestion>,
+    #[serde(default)]
+    pub suggestion_attempted: Option<String>,
     pub job: Job,
     pub status: Status,
     pub archived: bool,
@@ -231,6 +236,8 @@ impl Session {
             title_response: String::new(),
             title_attempted: false,
             title_manual: false,
+            suggestion: None,
+            suggestion_attempted: None,
             id,
             job,
             status: Status::Starting,
@@ -433,6 +440,7 @@ pub enum Control {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
     Ping,
+    ServiceVersion,
     List,
     Read {
         id: String,
@@ -487,6 +495,9 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
     Ok,
+    ServiceVersion {
+        version: String,
+    },
     Shells(Vec<Value>),
     Sessions(Vec<Summary>),
     Session(Box<Session>),

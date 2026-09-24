@@ -211,6 +211,41 @@ pub(crate) fn rows_with_images(review: &Review, width: u16, images: bool) -> Vec
         width,
     ));
     rows.push(TextRow::default());
+    let mut reviewers = std::collections::BTreeMap::new();
+    for item in &review.timeline {
+        if let Some(state) = item.kind.strip_prefix("review · ") {
+            reviewers.insert(item.author.clone(), state.replace('_', " "));
+        }
+    }
+    for login in &pr.requested_reviewers {
+        reviewers.insert(login.clone(), "requested".into());
+    }
+    for team in &pr.requested_teams {
+        reviewers.insert(
+            format!("{}/{} (team)", pr.key.owner, team),
+            "requested".into(),
+        );
+    }
+    let reviewer_rows = if reviewers.is_empty() {
+        vec![text("No reviewers requested.", DIM)]
+    } else {
+        reviewers
+            .into_iter()
+            .flat_map(|(name, state)| {
+                let color = match state.as_str() {
+                    "approved" => GREEN,
+                    "changes requested" => RED,
+                    _ => DIM,
+                };
+                flow(
+                    text(format!("{} · {}", clean(&name), clean(&state)), color),
+                    inner,
+                )
+            })
+            .collect()
+    };
+    rows.extend(card(width, vec![bold("REVIEWERS", TEXT)], reviewer_rows));
+    rows.push(TextRow::default());
     let body = if pr.body.trim().is_empty() {
         vec![text("No description provided.", DIM)]
     } else {
@@ -381,9 +416,75 @@ mod status_tests {
     use crate::model::{Check, CheckReport, PrDetail, PrKey};
     use std::sync::Arc;
     #[test]
+    fn reviewers_show_users_teams_and_latest_review_outcomes() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let key = PrKey {
+            owner: "example".into(),
+            repo: "repo".into(),
+            number: 1,
+        };
+        let pr = crate::github::parse_detail(
+            &key,
+            &serde_json::json!({
+                "requested_reviewers": [{"login": "alice"}],
+                "requested_teams": [{"slug": "platform", "name": "Platform team"}]
+            }),
+        )?;
+        let review = Review {
+            detail: Some(Arc::new(pr)),
+            timeline: vec![
+                crate::model::TimelineItem {
+                    author: "bob".into(),
+                    kind: "review · changes_requested".into(),
+                    ..Default::default()
+                },
+                crate::model::TimelineItem {
+                    author: "bob".into(),
+                    kind: "review · approved".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let output = rows(&review, 110)
+            .into_iter()
+            .map(|row| {
+                row.spans
+                    .into_iter()
+                    .map(|s| s.content.into_owned())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let card = output
+            .split("description")
+            .next()
+            .context("reviewer card")?;
+        assert!(card.contains("alice · requested"));
+        assert!(card.contains("example/platform (team) · requested"));
+        assert!(card.contains("bob · approved"));
+        assert!(!card.contains("bob · changes requested"));
+        // Old cached PR details remain readable after adding reviewer metadata.
+        let mut cached = serde_json::to_value(review.detail.as_ref().context("detail")?.as_ref())?;
+        cached
+            .as_object_mut()
+            .context("object")?
+            .remove("requested_reviewers");
+        cached
+            .as_object_mut()
+            .context("object")?
+            .remove("requested_teams");
+        let old: PrDetail = serde_json::from_value(cached)?;
+        assert!(old.requested_reviewers.is_empty());
+        assert!(old.requested_teams.is_empty());
+        Ok(())
+    }
+    #[test]
     fn conflicts_and_empty_checks_are_not_parsing_errors_and_failures_follow_checks() {
         let mut review = Review {
             detail: Some(Arc::new(PrDetail {
+                requested_reviewers: Vec::new(),
+                requested_teams: Vec::new(),
                 key: PrKey {
                     owner: "example".into(),
                     repo: "repo".into(),

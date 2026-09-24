@@ -55,6 +55,9 @@ pub fn inbox(
     repositories: &[String],
     cancel: &Cancel,
 ) -> Result<Vec<PrSummary>> {
+    if tab == InboxTab::Diffs {
+        return Ok(Vec::new());
+    }
     // Empty selections must never fall through to a global GitHub search.
     if tab == InboxTab::Repositories {
         let mut combined = Vec::new();
@@ -157,6 +160,17 @@ pub fn repositories(cancel: &Cancel) -> Result<Vec<String>> {
     Ok(repositories)
 }
 
+/// Let gh resolve the current branch, including its configured fork/upstream.
+pub fn current_branch_pr(cancel: &Cancel) -> Result<PrKey> {
+    let value = json(&["pr", "view", "--json=url"], cancel)
+        .context("Could not find a pull request for the current branch")?;
+    let url = value
+        .get("url")
+        .and_then(Value::as_str)
+        .context("GitHub did not return a pull request URL for the current branch")?;
+    PrKey::from_url(url)
+}
+
 pub fn current_repository(cancel: &Cancel) -> Result<String> {
     let v = json(&["repo", "view", "--json=nameWithOwner"], cancel)?;
     v.get("nameWithOwner")
@@ -207,7 +221,19 @@ pub fn detail(key: &PrKey, cancel: &Cancel) -> Result<PrDetail> {
 }
 
 pub(crate) fn parse_detail(key: &PrKey, v: &Value) -> Result<PrDetail> {
+    let names = |field: &str, name: &str| {
+        v.get(field)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get(name).and_then(Value::as_str))
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
     Ok(PrDetail {
+        requested_reviewers: names("requested_reviewers", "login"),
+        requested_teams: names("requested_teams", "slug"),
         key: key.clone(),
         title: text(v, "title"),
         body: text(v, "body"),

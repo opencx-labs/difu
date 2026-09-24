@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::{
     cursor::SetCursorStyle,
     event::{
@@ -18,34 +18,66 @@ use std::{
 #[derive(Parser)]
 #[command(
     version,
+    args_conflicts_with_subcommands = true,
     about = "Your diff shifu · Codex agents and guided PR reviews"
 )]
 struct Args {
     /// Optional GitHub PR URL or number (numbers use the current repository).
     pr: Option<String>,
+    #[command(subcommand)]
+    command: Option<Commands>,
     #[arg(long, hide = true)]
     agent_service: bool,
+    #[arg(long, hide = true, conflicts_with = "agent_service")]
+    refresh_agent_service: bool,
     #[arg(long, hide = true)]
     agent_config: Option<std::path::PathBuf>,
     #[arg(long, hide = true)]
     agent_cache: Option<std::path::PathBuf>,
 }
 
+#[derive(Subcommand)]
+enum Commands {
+    /// Open the pull request associated with the current Git branch.
+    Pr {
+        /// Use the repository and branch in the current directory.
+        #[arg(value_parser = ["."])]
+        target: String,
+    },
+    /// Open the local diff for the current repository or worktree.
+    Diff {
+        /// Use the checkout in the current directory.
+        #[arg(value_parser = ["."])]
+        target: String,
+    },
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    if args.agent_service {
-        nix::unistd::setsid().context("Could not detach the background agent service")?;
+    if args.agent_service || args.refresh_agent_service {
+        if args.agent_service {
+            nix::unistd::setsid().context("Could not detach the background agent service")?;
+        }
         let storage = match (args.agent_config, args.agent_cache) {
             (Some(config), Some(cache)) => Storage { config, cache },
             _ => Storage::discover()?,
         };
-        return difu::agents::server::run(storage);
+        return if args.refresh_agent_service {
+            difu::agents::client::refresh_running(&storage)
+        } else {
+            difu::agents::server::run(storage)
+        };
     }
     anyhow::ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "difu needs an interactive terminal. Run `difu` directly in your terminal."
     );
-    let pr = match args.pr {
+    let local_diff = matches!(args.command, Some(Commands::Diff { .. }));
+    let requested_pr = match args.command {
+        Some(Commands::Pr { .. }) => Some(github::current_branch_pr(&Cancel::default())?.url()),
+        _ => args.pr,
+    };
+    let pr = match requested_pr {
         Some(value) if value.chars().all(|c| c.is_ascii_digit()) => {
             let repository = github::current_repository(&Cancel::default())?;
             let (owner, repo) = repository
@@ -64,7 +96,11 @@ fn main() -> Result<()> {
     };
     let storage = Storage::discover()?;
     let config = storage.load_config()?;
-    let mut app = Shell::new(storage, config, pr);
+    let mut app = if local_diff {
+        Shell::local(storage, config, std::env::current_dir()?)
+    } else {
+        Shell::new(storage, config, pr)
+    };
     let terminated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     for signal in [
         signal_hook::consts::SIGTERM,
@@ -142,4 +178,32 @@ fn main() -> Result<()> {
     ratatui::restore();
     app.reviews.shutdown();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_current_branch_command_and_preserves_existing_launch_forms() -> Result<()> {
+        let args = Args::try_parse_from(["difu", "pr", "."])?;
+        assert!(matches!(args.command, Some(Commands::Pr { target }) if target == "."));
+        assert!(args.pr.is_none());
+        let args = Args::try_parse_from(["difu", "diff", "."])?;
+        assert!(matches!(args.command, Some(Commands::Diff { target }) if target == "."));
+        assert!(args.pr.is_none());
+        assert!(Args::try_parse_from(["difu", "123", "diff", "."]).is_err());
+        assert!(Args::try_parse_from(["difu", "diff"]).is_err());
+        assert!(Args::try_parse_from(["difu", "diff", "elsewhere"]).is_err());
+        for value in ["123", "https://github.com/owner/repo/pull/123"] {
+            let args = Args::try_parse_from(["difu", value])?;
+            assert_eq!(args.pr.as_deref(), Some(value));
+            assert!(args.command.is_none());
+        }
+        assert!(Args::try_parse_from(["difu"])?.command.is_none());
+        assert!(Args::try_parse_from(["difu", "--agent-service"])?.agent_service);
+        assert!(Args::try_parse_from(["difu", "pr"]).is_err());
+        assert!(Args::try_parse_from(["difu", "pr", "elsewhere"]).is_err());
+        Ok(())
+    }
 }

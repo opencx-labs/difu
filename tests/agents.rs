@@ -257,6 +257,19 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
     })?;
     let named = wait(&storage, &id, |s| s.title == "Fixture coding session")?;
     assert!(named.title_attempted);
+    let suggested = wait(&storage, &id, |s| s.suggestion.is_some())?;
+    assert_eq!(
+        suggested.suggestion.as_ref().context("suggestion")?.text,
+        "Okay, implement the plan."
+    );
+    let suggestions = fs::read_to_string(root.join("suggestions.jsonl"))?;
+    assert!(suggestions.contains("gpt-5.6-luna") && suggestions.contains("medium"));
+    assert!(
+        !suggested
+            .entries
+            .iter()
+            .any(|e| e.kind == "userMessage" && e.text == "Okay, implement the plan.")
+    );
     let title_log = fs::read_to_string(root.join("titles.jsonl"))?;
     assert!(title_log.contains("gpt-5.6-luna") && title_log.contains("medium"));
     let image_path = root.join("attachment.png");

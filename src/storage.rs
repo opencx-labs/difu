@@ -33,6 +33,10 @@ impl Default for AgentDefaults {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub local_diff_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub local_diff_repositories: BTreeSet<PathBuf>,
     #[serde(default = "enabled")]
     pub last_tab_agents: bool,
     #[serde(default)]
@@ -64,6 +68,8 @@ fn enabled() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            local_diff_roots: Vec::new(),
+            local_diff_repositories: BTreeSet::new(),
             last_tab_agents: true,
             agent_defaults: AgentDefaults::default(),
             repositories: BTreeMap::new(),

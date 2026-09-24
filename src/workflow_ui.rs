@@ -43,6 +43,76 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     );
     let mut rows = Vec::new();
     match &wizard {
+        Wizard::Reviewers(picker) => {
+            rows.push(ui::bold(
+                format!("Request reviewers · {}", picker.key.id()),
+                ACCENT,
+            ));
+            rows.push(ui::text(
+                "Type to filter · ↑↓ select · Space toggle · Enter confirm · Esc cancel",
+                DIM,
+            ));
+            let (lines, (x, y)) = picker.query.styled_layout(
+                inner.width.saturating_sub(8) as usize,
+                Style::default().bg(ACCENT).fg(crate::ui::INK),
+            );
+            let mut spans = vec![ratatui::text::Span::raw("Filter: ")];
+            if let Some(line) = lines.get(y) {
+                spans.extend(line.spans.clone());
+            }
+            rows.push(ui::TextRow {
+                spans,
+                ..Default::default()
+            });
+            if inner.width > 8 && inner.height > 2 {
+                frame.set_cursor_position((
+                    inner.x + 8 + (x as u16).min(inner.width - 9),
+                    inner.y + 2,
+                ));
+            }
+            rows.push(ui::text(format!("{} selected", picker.chosen.len()), DIM));
+            if picker.loading {
+                rows.push(ui::text("Loading users and teams…", DIM));
+            }
+            if let Some(error) = &picker.error {
+                rows.extend(ui::prose(error, inner.width as usize));
+            }
+            let available = inner.height.saturating_sub(6) as usize;
+            let visible = picker.visible();
+            if visible.is_empty() && !picker.loading && picker.error.is_none() {
+                rows.push(ui::text("No matching users or teams.", DIM));
+            }
+            for (position, index) in visible
+                .iter()
+                .enumerate()
+                .skip(picker.selected.saturating_sub(available.saturating_sub(1)))
+                .take(available)
+            {
+                if let Some(option) = picker.options.get(*index) {
+                    rows.push(action(
+                        format!(
+                            "{} [{}] {}",
+                            if position == picker.selected {
+                                ">"
+                            } else {
+                                " "
+                            },
+                            if picker.chosen.contains(option) {
+                                "x"
+                            } else {
+                                " "
+                            },
+                            option.label(&picker.key.owner)
+                        ),
+                        WAction::ToggleReviewer(*index),
+                    ));
+                }
+            }
+            rows.push(action(
+                "[ Next: confirm selected reviewers ]",
+                WAction::Next,
+            ));
+        }
         Wizard::Resolve { key, head, model } => {
             rows.push(ui::bold("Resolve conflicts and push", ACCENT));
             rows.extend(ui::prose(&format!("{}\nRevision: {head}\nModel: {model}\n\nCodex edits only conflicted text files in an isolated worktree. Difu validates, commits and pushes to the PR branch without force. Project checks run in CI.\n\nFailures discard the isolated attempt and report the error; no automatic retry.", key.id()), inner.width as usize));
@@ -134,6 +204,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     "{} · {}",
                     match draft.kind {
                         Kind::Review => "Review PR",
+                        Kind::PrComment => "Add comment",
                         Kind::Comment(_) => "Line comment",
                         Kind::Close => "Close PR",
                     },
@@ -258,9 +329,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 inner.width as usize,
             ));
             match operation {
+                crate::review::Operation::RequestReviewers { users, teams } => {
+                    rows.extend(ui::prose(
+                        &format!("Users: {}\nTeams: {}", users.join(", "), teams.join(", ")),
+                        inner.width as usize,
+                    ));
+                }
                 crate::review::Operation::Review { body, .. }
                 | crate::review::Operation::Comment { body, .. }
-                | crate::review::Operation::Close { body } => {
+                | crate::review::Operation::Close { body }
+                | crate::review::Operation::PrComment { body } => {
                     rows.extend(ui::prose(body, inner.width as usize));
                 }
                 _ => {}

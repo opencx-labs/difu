@@ -7,10 +7,12 @@ if sys.argv[1:3] == ['mcp', 'list']:
     sys.exit(0)
 if sys.argv[1:2] == ['exec']:
     prompt = sys.stdin.read()
-    with (root/'titles.jsonl').open('a') as log:
+    schema = json.loads(pathlib.Path(sys.argv[sys.argv.index('--output-schema')+1]).read_text())
+    suggestion = 'suggestion' in schema['properties']
+    with (root/('suggestions.jsonl' if suggestion else 'titles.jsonl')).open('a') as log:
         log.write(json.dumps({'args':sys.argv[1:], 'input':json.loads(prompt)})+'\n')
     output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message')+1])
-    output.write_text(json.dumps({'title':'Fixture coding session'}))
+    output.write_text(json.dumps({'suggestion':'Okay, implement the plan.'} if suggestion else {'title':'Fixture coding session'}))
     sys.exit(0)
 turn = 0
 connection = uuid.uuid4().hex[:8]

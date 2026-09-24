@@ -15,6 +15,9 @@ use crossterm::{
 };
 use ratatui::{Frame, layout::Rect, style::Style, widgets::Paragraph};
 use std::io::Write;
+use unicode_width::UnicodeWidthStr;
+
+const TAB_LABELS: [&str; 2] = [" Agents (⌥+1) ", " Reviews (⌥+2) "];
 
 pub struct Shell {
     pub reviews: App,
@@ -35,6 +38,16 @@ impl Shell {
             agents_active: !reviews_started,
             reviews_started,
         }
+    }
+    pub fn local(storage: Storage, config: Config, path: std::path::PathBuf) -> Self {
+        let mut initial = config.clone();
+        initial.last_tab_agents = true;
+        let mut shell = Self::new(storage, initial, None);
+        shell.reviews.config = config;
+        shell.agents_active = false;
+        shell.reviews_started = true;
+        shell.reviews.open_local(path, false);
+        shell
     }
     fn switch(&mut self, agents: bool) {
         self.agents.cancel_voice();
@@ -77,7 +90,7 @@ impl Shell {
             }
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.modifiers == KeyModifiers::ALT {
             match key.code {
                 KeyCode::Char('1') => {
                     self.switch(true);
@@ -87,19 +100,19 @@ impl Shell {
                     self.switch(false);
                     return;
                 }
-                KeyCode::Char('c') => {
-                    if self.agents_active && self.agents.browser_input() {
-                        self.agents.key(key);
-                        return;
-                    }
-                    if self.agents_active && self.agents.copy_chat_selection() {
-                        return;
-                    }
-                    self.reviews.quit = true;
-                    return;
-                }
                 _ => {}
             }
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            if self.agents_active && self.agents.browser_input() {
+                self.agents.key(key);
+                return;
+            }
+            if self.agents_active && self.agents.copy_chat_selection() {
+                return;
+            }
+            self.reviews.quit = true;
+            return;
         }
         if self.agents_active {
             self.agents.key(key);
@@ -109,10 +122,13 @@ impl Shell {
     }
     pub fn mouse(&mut self, mouse: MouseEvent) {
         if mouse.row == 0 && mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-            if mouse.column < 21 {
-                self.switch(true);
-            } else if mouse.column < 45 {
-                self.switch(false);
+            let mut x = 0;
+            for (index, label) in TAB_LABELS.iter().enumerate() {
+                x += label.width() as u16;
+                if mouse.column < x {
+                    self.switch(index == 0);
+                    break;
+                }
             }
             return;
         }
@@ -135,18 +151,19 @@ impl Shell {
         } else {
             crate::ui::draw(frame, &mut self.reviews);
         }
-        for (x, width, label, active) in [
-            (0, 21, " 1 Agents · Ctrl+1 ", self.agents_active),
-            (21, 24, " 2 Reviews · Ctrl+2 ", !self.agents_active),
-        ] {
+        let mut x = 0;
+        for (index, label) in TAB_LABELS.iter().enumerate() {
+            let width = label.width() as u16;
+            let active = self.agents_active == (index == 0);
             frame.render_widget(
-                Paragraph::new(label).style(if active {
+                Paragraph::new(*label).style(if active {
                     Style::default().bg(ACCENT).fg(crate::ui::INK)
                 } else {
                     Style::default().fg(DIM).bg(BG)
                 }),
                 Rect::new(x, 0, width.min(frame.area().width.saturating_sub(x)), 1),
             );
+            x += width;
         }
     }
     pub fn clipboard(&mut self, output: &mut impl Write) {
@@ -182,12 +199,12 @@ mod tests {
             ..Default::default()
         };
         storage.save_config(&config)?;
-        shell.switch(false);
+        shell.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT));
         let saved = storage.load_config()?;
         assert!(!saved.last_tab_agents);
         assert!(saved.wrap_diff);
         assert!(!shell.reviews.config.last_tab_agents);
-        shell.switch(true);
+        shell.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT));
         assert!(storage.load_config()?.last_tab_agents);
         Ok(())
     }

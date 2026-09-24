@@ -56,6 +56,8 @@ fn generates_a_real_guide_for_synthetic_code() -> Result<()> {
     git(root, &["commit", "-am", "greet the world"])?;
     let head = git(root, &["rev-parse", "HEAD"])?;
     let pr = PrDetail {
+        requested_reviewers: Vec::new(),
+        requested_teams: Vec::new(),
         key: PrKey {
             owner: "difu-test".into(),
             repo: "synthetic".into(),

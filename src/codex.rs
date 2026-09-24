@@ -962,6 +962,8 @@ mod tests {
     fn cache_identity_changes_with_code_description_and_model_settings() -> Result<()> {
         let mut snapshot = snapshot()?;
         let mut pr = PrDetail {
+            requested_reviewers: Vec::new(),
+            requested_teams: Vec::new(),
             key: crate::model::PrKey {
                 owner: "owner".into(),
                 repo: "repo".into(),

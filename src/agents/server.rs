@@ -223,6 +223,9 @@ impl Service {
             .transpose()?;
         match request {
             Request::Ping => Ok(Reply::Ok),
+            Request::ServiceVersion => Ok(Reply::ServiceVersion {
+                version: env!("CARGO_PKG_VERSION").into(),
+            }),
             Request::List => Ok(Reply::Sessions(self.store.list()?)),
             Request::Read { id, version } => {
                 let session = self.store.get(&id)?;

@@ -71,6 +71,7 @@ pub struct Progress {
 #[derive(Clone, Debug)]
 pub enum Kind {
     Review,
+    PrComment,
     Comment(Anchor),
     Close,
 }
@@ -89,6 +90,7 @@ impl Compose {
         match &self.kind {
             Kind::Comment(anchor) => format!("{}:{anchor:?}", self.key.id()),
             Kind::Review => format!("{}:review", self.key.id()),
+            Kind::PrComment => format!("{}:pr-comment", self.key.id()),
             Kind::Close => format!("{}:close", self.key.id()),
         }
     }
@@ -97,6 +99,7 @@ impl Compose {
             Kind::Review => vec!["Comment", "Approve", "Request changes"],
             Kind::Comment(_) => vec!["Standalone comment", "Add to pending review"],
             Kind::Close => vec!["Close PR"],
+            Kind::PrComment => vec!["Post comment"],
         }
     }
     pub fn operation(&self) -> Operation {
@@ -117,6 +120,7 @@ impl Compose {
                 pending: self.choice == 1,
             },
             Kind::Close => Operation::Close { body },
+            Kind::PrComment => Operation::PrComment { body },
         }
     }
 }
@@ -132,6 +136,8 @@ pub fn control_commands(query: &str) -> Vec<(usize, &'static str)> {
         "Squash merge with admin override",
         "Close PR (optional comment)",
         "Resolve conflicts",
+        "Add comment",
+        "Request reviewers",
     ]
     .into_iter()
     .enumerate()
@@ -144,6 +150,7 @@ pub fn control_commands(query: &str) -> Vec<(usize, &'static str)> {
 
 #[derive(Clone, Debug)]
 pub enum Wizard {
+    Reviewers(ReviewerPicker),
     Resolve {
         key: PrKey,
         head: String,
@@ -180,6 +187,7 @@ pub enum Wizard {
 }
 #[derive(Clone, Debug)]
 pub enum WAction {
+    ToggleReviewer(usize),
     Resolve,
     CancelResolution,
     Open,
@@ -200,6 +208,7 @@ pub enum WAction {
     FocusChoice,
 }
 pub enum Event {
+    Reviewers(PrKey, Result<Vec<review::Reviewer>, String>),
     ResolutionProgress(String),
     Resolved(PrKey, Result<String, String>),
     Written(PrKey, Operation, Result<String, String>),
@@ -207,6 +216,32 @@ pub enum Event {
     Mentions(PrKey, Result<review::Mentions, String>),
     Trees(Result<Vec<worktrees::Entry>, String>),
     Deleted(Result<(), String>),
+}
+
+#[derive(Clone, Debug)]
+pub struct ReviewerPicker {
+    pub key: PrKey,
+    pub head: String,
+    pub query: Editor,
+    pub options: Vec<review::Reviewer>,
+    pub chosen: BTreeSet<review::Reviewer>,
+    pub selected: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+impl ReviewerPicker {
+    pub fn visible(&self) -> Vec<usize> {
+        let query = self.query.text().to_lowercase();
+        self.options
+            .iter()
+            .enumerate()
+            .filter(|(_, option)| {
+                let label = option.label(&self.key.owner).to_lowercase();
+                query.split_whitespace().all(|term| label.contains(term))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
 }
 fn result<T>(r: anyhow::Result<T>) -> Result<T, String> {
     r.map_err(|e| format!("{e:#}"))
@@ -221,6 +256,15 @@ impl App {
             return;
         }
         match action {
+            WAction::ToggleReviewer(index) => {
+                if let Some(Modal::Workflow(modal)) = &mut self.modal
+                    && let Wizard::Reviewers(picker) = modal.as_mut()
+                    && let Some(option) = picker.options.get(index).cloned()
+                    && !picker.chosen.remove(&option)
+                {
+                    picker.chosen.insert(option);
+                }
+            }
             WAction::CancelResolution => {
                 if let Some(cancel) = &self.workflow.conflict_cancel {
                     cancel.cancel();
@@ -288,6 +332,10 @@ impl App {
                 }
             }
             WAction::Controls => {
+                if self.review().is_some_and(|r| r.local.is_some()) {
+                    self.notice = Notice::info("GitHub controls are available on pull requests.");
+                    return;
+                }
                 if let Some(pr) = self.review().and_then(|r| r.detail.clone()) {
                     self.wizard(Wizard::Controls {
                         key: pr.key.clone(),
@@ -324,6 +372,25 @@ impl App {
                             draft: None,
                         }),
                         5 => self.compose(key, head, Kind::Close),
+                        7 => self.compose(key, head, Kind::PrComment),
+                        8 => {
+                            let request_key = key.clone();
+                            self.wizard(Wizard::Reviewers(ReviewerPicker {
+                                key,
+                                head,
+                                query: Editor::default(),
+                                options: Vec::new(),
+                                chosen: BTreeSet::new(),
+                                selected: 0,
+                                loading: true,
+                                error: None,
+                            }));
+                            self.spawn(move |tx, cancel| {
+                                let output = result(review::reviewers(&request_key, &cancel));
+                                let _ = tx
+                                    .send(Message::Workflow(Event::Reviewers(request_key, output)));
+                            });
+                        }
                         6 => self.wizard(Wizard::Resolve {
                             key,
                             head,
@@ -347,6 +414,35 @@ impl App {
                 }
             }
             WAction::Next => {
+                if let Some(Modal::Workflow(modal)) = &self.modal
+                    && let Wizard::Reviewers(picker) = modal.as_ref()
+                {
+                    if picker.chosen.is_empty() {
+                        self.notice = Notice::info("Select at least one reviewer");
+                        return;
+                    }
+                    let operation = Operation::RequestReviewers {
+                        users: picker
+                            .chosen
+                            .iter()
+                            .filter(|r| !r.team)
+                            .map(|r| r.name.clone())
+                            .collect(),
+                        teams: picker
+                            .chosen
+                            .iter()
+                            .filter(|r| r.team)
+                            .map(|r| r.name.clone())
+                            .collect(),
+                    };
+                    self.wizard(Wizard::Confirm {
+                        key: picker.key.clone(),
+                        head: picker.head.clone(),
+                        operation,
+                        draft: None,
+                    });
+                    return;
+                }
                 if let Some(Modal::Workflow(modal)) = self.modal.take() {
                     if let Wizard::Compose(draft) = *modal {
                         self.workflow.drafts.insert(draft.id(), draft.clone());
@@ -557,6 +653,9 @@ impl App {
         });
     }
     pub fn load_viewed(&mut self) {
+        if self.review().is_some_and(|r| r.local.is_some()) {
+            return;
+        }
         let Some(id) = self.key() else {
             return;
         };
@@ -580,6 +679,28 @@ impl App {
     }
     pub fn workflow_receive(&mut self, event: Event) {
         match event {
+            Event::Reviewers(key, output) => {
+                let author = self
+                    .reviews
+                    .get(&key.id())
+                    .and_then(|r| r.detail.as_ref())
+                    .map(|p| p.author.clone());
+                if let Some(Modal::Workflow(modal)) = &mut self.modal
+                    && let Wizard::Reviewers(picker) = modal.as_mut()
+                    && picker.key == key
+                {
+                    picker.loading = false;
+                    match output {
+                        Ok(options) => {
+                            picker.options = options
+                                .into_iter()
+                                .filter(|r| r.team || author.as_ref() != Some(&r.name))
+                                .collect()
+                        }
+                        Err(error) => picker.error = Some(error),
+                    }
+                }
+            }
             Event::ResolutionProgress(activity) => {
                 if let Some(Modal::Workflow(modal)) = &mut self.modal
                     && let Wizard::Resolving { activity: current } = modal.as_mut()
@@ -737,6 +858,25 @@ impl App {
         let mut wizard = *modal;
         let mut action = None;
         match &mut wizard {
+            Wizard::Reviewers(picker) => {
+                let visible = picker.visible();
+                match key.code {
+                    KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+                    KeyCode::Down => {
+                        picker.selected = (picker.selected + 1).min(visible.len().saturating_sub(1))
+                    }
+                    KeyCode::Char(' ') if key.modifiers.is_empty() => {
+                        if let Some(index) = visible.get(picker.selected) {
+                            action = Some(WAction::ToggleReviewer(*index));
+                        }
+                    }
+                    KeyCode::Enter => action = Some(WAction::Next),
+                    _ => {
+                        picker.query.key(key);
+                        picker.selected = 0;
+                    }
+                }
+            }
             Wizard::Resolve { .. } => {
                 if key.code == KeyCode::Enter {
                     action = Some(WAction::Resolve);
@@ -942,6 +1082,9 @@ impl App {
                 let Some(pr) = r.detail.clone() else {
                     return;
                 };
+                if r.local.is_some() {
+                    return;
+                }
                 if !r.interaction.github_loaded {
                     self.load_viewed();
                     self.notice =
@@ -963,6 +1106,9 @@ impl App {
                 });
             }
             Some(target) => {
+                if self.review().is_some_and(|r| r.local.is_some()) {
+                    return;
+                }
                 let Some(mut anchor) = target.line(self.workflow.side) else {
                     self.notice =
                         Notice::info("Choose a side with a code line using Alt+Left/Right");

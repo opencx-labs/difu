@@ -127,6 +127,7 @@ pub struct Browser {
     _directory: tempfile::TempDir,
     listener: UnixListener,
     stream: Option<UnixStream>,
+    initialized: bool,
     input: Vec<u8>,
     output: Vec<u8>,
     area: Rect,
@@ -226,6 +227,7 @@ impl Browser {
             _directory: directory,
             listener,
             stream: None,
+            initialized: false,
             input: Vec::new(),
             output: Vec::new(),
             area: Rect::default(),
@@ -311,13 +313,19 @@ impl Browser {
             let message: Value = serde_json::from_slice(&line)?;
             match message.get("type").and_then(Value::as_str) {
                 Some("join") => {
+                    ensure!(!self.initialized, "Embedded browser joined twice");
                     let mut init = self.size("init");
                     if let Some(init) = init.as_object_mut() {
                         init.insert("imageId".into(), json!(self.image));
                         init.insert("transport".into(), json!("file"));
                         init.insert("focused".into(), json!(self.focused));
                     }
+                    // Layout and focus can change while the engine is starting.
+                    // Its first host message MUST be init, before any queued events.
+                    let pending = std::mem::take(&mut self.output);
                     self.send(init);
+                    self.output.extend(pending);
+                    self.initialized = true;
                 }
                 Some("placed") => {
                     self.grid = Some((
@@ -336,7 +344,9 @@ impl Browser {
                 _ => {}
             }
         }
-        if let Some(stream) = &mut self.stream {
+        if self.initialized
+            && let Some(stream) = &mut self.stream
+        {
             while !self.output.is_empty() {
                 match stream.write(&self.output) {
                     Ok(0) => anyhow::bail!("Embedded browser socket closed"),
@@ -555,6 +565,9 @@ mod tests {
         let path = PathBuf::from(std::env::var("DIFU_BROWSER_SMOKE_ARTIFACT")?);
         let mut browser = Browser::open(&path)?;
         browser.area = Rect::new(1, 2, 70, 24);
+        // Reproduce the real UI: layout/focus events arrive before the join.
+        browser.send(browser.size("size"));
+        browser.focus(true);
         let start = Instant::now();
         let mut resized = false;
         while start.elapsed() < Duration::from_secs(30) {
@@ -593,6 +606,7 @@ mod tests {
             _directory: directory,
             listener,
             stream: None,
+            initialized: false,
             input: Vec::new(),
             output: Vec::new(),
             area: Rect::default(),
@@ -606,21 +620,37 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(80, 30))?;
         let area = Rect::new(10, 4, 20, 12);
         terminal.draw(|frame| browser.draw(frame, area))?;
+        browser.focus(true);
+        browser.visible(false);
+        // Even an accepted connection must receive nothing until it joins.
+        browser.poll()?;
+        peer.set_nonblocking(true)?;
+        assert_eq!(
+            peer.read(&mut [0; 1])
+                .err()
+                .context("No event before join")?
+                .kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        peer.set_nonblocking(false)?;
         peer.write_all(b"{\"type\":\"join\"}\n")?;
         browser.poll()?;
         let mut reader = BufReader::new(peer.try_clone()?);
         let mut line = String::new();
         reader.read_line(&mut line)?;
-        assert_eq!(
-            serde_json::from_str::<Value>(&line)?.get("type"),
-            Some(&json!("size"))
-        );
-        line.clear();
-        reader.read_line(&mut line)?;
         let init: Value = serde_json::from_str(&line)?;
         assert_eq!(init.get("type"), Some(&json!("init")));
         assert_eq!(init.get("width"), Some(&json!(200)));
         assert_eq!(init.get("height"), Some(&json!(240)));
+        assert_eq!(init.get("focused"), Some(&json!(true)));
+        for expected in ["size", "focus", "visible"] {
+            line.clear();
+            reader.read_line(&mut line)?;
+            assert_eq!(
+                serde_json::from_str::<Value>(&line)?.get("type"),
+                Some(&json!(expected))
+            );
+        }
         peer.write_all(b"{\"type\":\"placed\",\"cols\":90,\"rows\":80}\n")?;
         browser.poll()?;
         terminal.draw(|frame| browser.draw(frame, area))?;
