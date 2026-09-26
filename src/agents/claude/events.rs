@@ -109,8 +109,10 @@ impl Decoder {
         for entry in &mut session.entries {
             if entry.id.starts_with("claude-") && entry.finished_at.is_none() {
                 entry.finished_at = Some(now);
-                if entry.is_tool() {
-                    entry.data["status"] = json!("interrupted");
+                if entry.is_tool()
+                    && let Some(data) = entry.data.as_object_mut()
+                {
+                    data.insert("status".into(), json!("interrupted"));
                 }
             }
         }
@@ -190,7 +192,9 @@ impl Decoder {
                                 input.push_str(partial);
                                 if let Ok(arguments) = serde_json::from_str::<Value>(input) {
                                     entry.text = arguments.to_string();
-                                    entry.data["arguments"] = arguments;
+                                    if let Some(data) = entry.data.as_object_mut() {
+                                        data.insert("arguments".into(), arguments);
+                                    }
                                 }
                             }
                         }
@@ -247,10 +251,16 @@ impl Decoder {
                             entry.finished_at = Some(now);
                             let failed =
                                 block.get("is_error").and_then(Value::as_bool) == Some(true);
-                            entry.data["status"] =
-                                json!(if failed { "failed" } else { "completed" });
-                            entry.data["result"] =
-                                block.get("content").cloned().unwrap_or(Value::Null);
+                            if let Some(data) = entry.data.as_object_mut() {
+                                data.insert(
+                                    "status".into(),
+                                    json!(if failed { "failed" } else { "completed" }),
+                                );
+                                data.insert(
+                                    "result".into(),
+                                    block.get("content").cloned().unwrap_or(Value::Null),
+                                );
+                            }
                             entry.text = format!(
                                 "{}\n{}",
                                 entry.text,

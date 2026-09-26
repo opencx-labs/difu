@@ -135,11 +135,14 @@ fn request(store: &Store, id: &str, rpc: &mut Connection, frame: &Value) -> Resu
             .iter()
             .enumerate()
             .map(|(index, question)| {
-                let mut question = question.clone();
-                question["id"] = json!(index.to_string());
-                question
+                let mut question = question
+                    .as_object()
+                    .cloned()
+                    .context("Invalid Claude question")?;
+                question.insert("id".into(), json!(index.to_string()));
+                Ok(Value::Object(question))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         Pending {
             id: request_id,
             method: "item/tool/requestUserInput".into(),
@@ -218,7 +221,10 @@ fn respond(
                 ),
             );
         }
-        input["answers"] = Value::Object(values);
+        input
+            .as_object_mut()
+            .context("Invalid Claude tool input")?
+            .insert("answers".into(), Value::Object(values));
         json!({"behavior":"allow","updatedInput":input})
     } else {
         let action = response
@@ -477,7 +483,7 @@ pub(super) fn run(
         model: session
             .model
             .as_deref()
-            .or_else(|| {
+            .or({
                 if let Job::Coding(launch) = &session.job {
                     launch.model.as_deref()
                 } else {
@@ -485,7 +491,7 @@ pub(super) fn run(
                 }
             })
             .map(Provider::native_model),
-        effort: session.effort.as_deref().or_else(|| {
+        effort: session.effort.as_deref().or({
             if let Job::Coding(launch) = &session.job {
                 launch.effort.as_deref()
             } else {

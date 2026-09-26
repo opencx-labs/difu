@@ -344,7 +344,7 @@ pub(crate) fn rows_with_images(review: &Review, width: u16, images: bool) -> Vec
             rows.extend(card(
                 width,
                 vec![bold(
-                    &format!(
+                    format!(
                         "{} WORKFLOWS AWAITING APPROVAL",
                         report.awaiting_workflows.len()
                     ),
