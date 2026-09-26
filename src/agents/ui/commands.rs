@@ -10,11 +10,28 @@ const COMMANDS: &[(&str, &str)] = &[
     ("diff", "Show current session changes"),
     ("new", "Launch a new coding session"),
     ("rename", "Rename this session"),
+    ("repo", "Change repository before the first worktree"),
     ("help", "Search keyboard shortcuts"),
     ("actions", "Open difu session controls"),
 ];
 
 impl Ui {
+    pub(super) fn change_repository(&mut self, path: &str) {
+        if self.busy || path.trim().is_empty() {
+            return;
+        }
+        if let Some(id) = self.selected.clone() {
+            self.busy = true;
+            self.task(
+                Task::Repository(id.clone()),
+                Request::Repository {
+                    id,
+                    repository: path.trim().into(),
+                },
+                false,
+            );
+        }
+    }
     pub(super) fn open_commands(&mut self, skills_only: bool) {
         self.drilled = true;
         self.focus = Focus::Composer;
@@ -46,7 +63,13 @@ impl Ui {
             && self.paths_loading.insert(id.clone())
         {
             self.task(
-                Task::WorkspacePaths(id.clone()),
+                Task::WorkspacePaths(
+                    id.clone(),
+                    self.sessions
+                        .get(&id)
+                        .map(|s| s.job.root().clone())
+                        .unwrap_or_default(),
+                ),
                 Request::WorkspacePaths { id },
                 false,
             );
@@ -58,7 +81,17 @@ impl Ui {
         {
             self.skills_loading = Some(id.clone());
             self.task(
-                Task::Skills(id.clone()),
+                Task::Skills(
+                    id.clone(),
+                    self.sessions
+                        .get(&id)
+                        .map(|s| s.job.root().clone())
+                        .unwrap_or_default(),
+                    self.sessions
+                        .get(&id)
+                        .map(|s| s.provider)
+                        .unwrap_or_default(),
+                ),
                 Request::Skills { id, force },
                 false,
             );
@@ -74,7 +107,15 @@ impl Ui {
         else {
             return Vec::new();
         };
-        let query = query.text().to_lowercase();
+        self.available_commands(&query.text(), *skills_only, *files_only)
+    }
+    fn available_commands(
+        &self,
+        query: &str,
+        skills_only: bool,
+        files_only: bool,
+    ) -> Vec<(String, String, Option<Skill>)> {
+        let query = query.to_lowercase();
         let query = query.trim_start_matches('/');
         let mut result = Vec::new();
         // Once a complete command is followed by a space, the rest is its arguments,
@@ -86,7 +127,7 @@ impl Ui {
         {
             return vec![(format!("/{name}"), (*description).into(), None)];
         }
-        if *files_only {
+        if files_only {
             if let Some(paths) = self
                 .selected
                 .as_ref()
@@ -136,6 +177,46 @@ impl Ui {
             }
         }
         result
+    }
+    pub(crate) fn palette_commands(&self) -> Vec<(String, String, Option<Skill>)> {
+        self.available_commands("", false, false)
+    }
+    pub(crate) fn prepare_palette(&mut self) {
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|id| !self.skills.contains_key(id))
+        {
+            self.load_skills(false);
+        }
+    }
+    pub(crate) fn run_palette_command(&mut self, name: &str, query: &str) {
+        let command = query.trim().trim_start_matches('/');
+        let args = command
+            .split_once(char::is_whitespace)
+            .filter(|(first, _)| first.eq_ignore_ascii_case(name.trim_start_matches('/')))
+            .map(|(_, args)| args);
+        let query = if let Some(args) = args {
+            format!("{} {args}", name.trim_start_matches('/'))
+        } else {
+            name.trim_start_matches(['/', '$']).to_owned()
+        };
+        self.panels.focused = false;
+        self.drilled = true;
+        self.focus = Focus::Composer;
+        self.modal = Some(Modal::Commands {
+            query: Editor::from(query.as_str()),
+            selected: 0,
+            skills_only: name.starts_with('$'),
+            files_only: false,
+        });
+        if let Some(index) = self
+            .command_entries()
+            .iter()
+            .position(|(candidate, _, _)| candidate == name)
+        {
+            self.run_command(index);
+        }
     }
     pub(super) fn command_key(&mut self, key: KeyEvent) {
         let entries = self.command_entries();
@@ -247,6 +328,13 @@ impl Ui {
             }
             "/new" => self.launch(),
             "/rename" => self.menu_action(3),
+            "/repo" => {
+                if let Some(session) = self.selected.as_ref().and_then(|id| self.sessions.get(id)) {
+                    self.modal = Some(Modal::ChangeRepository(Editor::from(
+                        session.job.root().to_string_lossy().as_ref(),
+                    )));
+                }
+            }
             "/help" => self.modal = Some(Modal::Help(Default::default())),
             "/actions" => {
                 self.modal = Some(Modal::Menu {
@@ -259,6 +347,7 @@ impl Ui {
     }
     fn run_command_arguments(&mut self, name: &str, args: &str) {
         match name {
+            "/repo" => self.change_repository(args),
             "/rename" => {
                 if !self.busy
                     && let Some(id) = self.selected.clone()
@@ -294,10 +383,14 @@ impl Ui {
                 let (model, effort) = if name == "/model" {
                     (
                         fields.first().map(|value| (*value).to_owned()),
-                        fields
-                            .get(1)
-                            .map(|value| (*value).to_owned())
-                            .or_else(|| session.and_then(|s| s.effort.clone())),
+                        fields.get(1).map(|value| (*value).to_owned()).or_else(|| {
+                            session
+                                .filter(|s| {
+                                    provider::Provider::for_model(fields.first().copied())
+                                        == s.provider
+                                })
+                                .and_then(|s| s.effort.clone())
+                        }),
                     )
                 } else {
                     (
@@ -484,7 +577,7 @@ impl Ui {
             return;
         };
         let text = format!(
-            "{}\n\nModel: {} · {}\nState: {:?}\nWorkspace: {}\nBranch: {}\nCodex thread: {}\n\nPermissions\n{}\n\nUses the installed Codex configuration, native workspace instructions, skills and enabled local memory.\n\nEsc Close",
+            "{}\n\nModel: {} · {}\nState: {:?}\nWorkspace: {}\nBranch: {}\nProvider: {}\nProvider session: {}\n\nPermissions\n{}\n\nUses the selected provider’s installed CLI configuration and native workspace instructions.\n\nEsc Close",
             s.title,
             s.model.as_deref().unwrap_or("Inherited"),
             s.effort.as_deref().unwrap_or("Inherited"),
@@ -494,7 +587,8 @@ impl Ui {
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
             s.branch.as_deref().unwrap_or("Existing directory"),
-            s.thread_id.as_deref().unwrap_or("Connecting"),
+            s.provider.label(),
+            s.thread_id.as_deref().unwrap_or("Not connected"),
             serde_json::to_string_pretty(&s.permissions).unwrap_or_default()
         );
         frame.render_widget(

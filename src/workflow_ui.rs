@@ -330,6 +330,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 inner.width as usize,
             ));
             match operation {
+                crate::review::Operation::ApproveWorkflows { runs } => {
+                    rows.extend(ui::prose(&format!("Run IDs: {}\nThis authorizes GitHub Actions to execute the code in this PR revision.", runs.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")), inner.width as usize));
+                }
                 crate::review::Operation::RequestReviewers { users, teams } => {
                     rows.extend(ui::prose(
                         &format!("Users: {}\nTeams: {}", users.join(", "), teams.join(", ")),

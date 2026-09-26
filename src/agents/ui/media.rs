@@ -117,6 +117,9 @@ impl Ui {
                     *counter = counter.saturating_add(1);
                     attachment.label = format!("{kind} {counter}");
                     p.draft.insert_attachment(&attachment.token());
+                    if attachment.kind == super::super::media::Kind::Image {
+                        p.draft.insert(" ");
+                    }
                     p.attachments.push(attachment);
                 }
                 let active = p.active_attachments();

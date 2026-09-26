@@ -56,6 +56,11 @@ if args[:2] == ['api', '--method']:
             assert 'reviews(first:1,states:[PENDING],author:$login)' in query
             pending = [dict(id='pending-1')] if (root/'pending-review').exists() else []
             value = dict(data=dict(repository=dict(pullRequest=dict(id='PR_fixture',headRefOid=revs['head'],reviews=dict(nodes=pending),files=dict(nodes=[dict(path='main.rs',viewerViewedState='VIEWED' if (root/'viewed').exists() else 'UNVIEWED')],pageInfo=dict(hasNextPage=False,endCursor=None))))))
+    elif endpoint.endswith('/approve') and '/actions/runs/' in endpoint:
+        if (root/'fail-workflow').exists() and endpoint.endswith('/202/approve'):
+            print('Fixture workflow approval denied', file=sys.stderr);sys.exit(1)
+        with (root/'writes.jsonl').open('a') as log: log.write(json.dumps(dict(endpoint=endpoint,method=method,body=body))+'\n')
+        sys.exit(0) # GitHub returns 204 with no body.
     elif method != 'GET':
         with (root / 'writes.jsonl').open('a') as log: log.write(json.dumps(dict(endpoint=endpoint,method=method,body=body))+'\n')
         value = dict(id=100)
@@ -89,6 +94,15 @@ elif args[0:2] == ['api', 'graphql'] and any('statusCheckRollup' in a for a in a
     rollup = None if mode in ('conflict', 'unknown') else dict(contexts=contexts)
     pr = dict(mergeable='CONFLICTING' if mode=='conflict' else 'UNKNOWN' if mode=='unknown' else 'MERGEABLE', mergeStateStatus='DIRTY' if mode=='conflict' else 'CLEAN', headRefOid=revs['head'], baseRefOid=revs['base'], state='OPEN', baseRef=dict(name='main',branchProtectionRule=None), commits=dict(nodes=[dict(commit=dict(statusCheckRollup=rollup))]))
     value = dict(data=dict(repository=dict(pullRequest=pr)))
+elif '/actions/runs?' in args[-1]:
+    if (root/'workflow-read-error').exists():
+        print('Fixture Actions access denied', file=sys.stderr);sys.exit(1)
+    runs = []
+    if (root/'awaiting-workflows').exists():
+        def run(id, **extra):
+            return dict(dict(id=id, name=f'Workflow {id}', html_url=f'https://github.com/example/project/actions/runs/{id}', head_sha=revs['head'], event='pull_request', status='completed', conclusion='action_required', pull_requests=[dict(number=1)], head_branch='feature', head_repository=dict(full_name='fork/project')), **extra)
+        runs = [run(101), run(101), run(202, pull_requests=[]), run(303, head_sha='a'*40), run(404, event='push'), run(505, pull_requests=[dict(number=2)]), run(606, pull_requests=[], head_repository=dict(full_name='other/project'))]
+    value = [dict(workflow_runs=runs)]
 elif '/rules/branches/' in args[-1]:
     mode = (root / 'status-case').read_text() if (root / 'status-case').exists() else 'normal'
     if mode=='rules-denied':
@@ -121,7 +135,7 @@ elif 'timeline?' in args[-1]:
 elif '/comments?' in args[-1]:
     value = [[]]
 else:
-    value = dict(title='Describe the behavior', body='PR description with `code`.', user=dict(login='author'), head=dict(sha=revs['head'], ref='feature'), base=dict(sha=revs['base'], ref='main'), state='closed' if (root / 'closed-pr').exists() else 'open', draft=(root / 'draft-pr').exists(), merged=False, additions=1, deletions=1, changed_files=1)
+    value = dict(title='Describe the behavior', body='PR description with `code`.', user=dict(login='author'), head=dict(sha=revs['head'], ref='feature', repo=dict(full_name='fork/project')), base=dict(sha=revs['base'], ref='main'), state='closed' if (root / 'closed-pr').exists() else 'open', draft=(root / 'draft-pr').exists(), merged=False, additions=1, deletions=1, changed_files=1)
 if (root / 'updated-title').exists():
     if isinstance(value, list) and value and isinstance(value[0], dict) and 'title' in value[0]:
         value[0]['title'] = 'Fresh title from GitHub'

@@ -887,6 +887,55 @@ fn exercise_checks(root: &Path) -> Result<()> {
         Some("fail")
     );
     fs::remove_file(root.join("status-case"))?;
+    fs::write(root.join("awaiting-workflows"), "yes")?;
+    let report = difu::github::checks(&key, &cancel)?;
+    assert!(report.workflows_error.is_none());
+    assert_eq!(
+        report
+            .awaiting_workflows
+            .iter()
+            .map(|run| run.id)
+            .collect::<Vec<_>>(),
+        vec![101, 202]
+    );
+    let before = fs::read_to_string(root.join("writes.jsonl")).unwrap_or_default();
+    let operation = difu::review::Operation::ApproveWorkflows {
+        runs: vec![101, 202],
+    };
+    assert!(difu::review::execute(&key, "stale-head", &operation, &cancel).is_err());
+    assert!(difu::review::execute(
+        &key,
+        &report.head,
+        &difu::review::Operation::ApproveWorkflows { runs: vec![505] },
+        &cancel
+    )
+    .is_err());
+    assert_eq!(
+        fs::read_to_string(root.join("writes.jsonl")).unwrap_or_default(),
+        before
+    );
+    fs::write(root.join("fail-workflow"), "yes")?;
+    let error = difu::review::execute(&key, &report.head, &operation, &cancel)
+        .err()
+        .context("Partial failure")?;
+    assert!(format!("{error:#}").contains("1 workflows approved"));
+    let writes = fs::read_to_string(root.join("writes.jsonl"))?;
+    assert_eq!(writes.matches("/actions/runs/101/approve").count(), 1);
+    assert!(!writes.contains("/actions/runs/202/approve"));
+    fs::remove_file(root.join("fail-workflow"))?;
+    let result = difu::review::execute(
+        &key,
+        &report.head,
+        &difu::review::Operation::ApproveWorkflows { runs: vec![202] },
+        &cancel,
+    )?;
+    assert!(result.contains("Approved 1"));
+    fs::write(root.join("workflow-read-error"), "yes")?;
+    let report = difu::github::checks(&key, &cancel)?;
+    assert!(report.workflows_error.is_some() && report.awaiting_workflows.is_empty());
+    fs::remove_file(root.join("workflow-read-error"))?;
+    fs::remove_file(root.join("awaiting-workflows"))?;
+    fs::remove_file(root.join("writes.jsonl"))?;
     Ok(())
 }
 

@@ -4,10 +4,10 @@ use crate::storage::AgentDefaults;
 pub struct Settings {
     pub fields: Vec<Editor>,
     pub field: usize,
-    pub isolated: bool,
     pub error: Option<String>,
     selected: usize,
     filled: bool,
+    provider: super::super::provider::Provider,
     directory: Option<std::path::PathBuf>,
     directories: Vec<String>,
     directory_error: Option<String>,
@@ -18,7 +18,9 @@ pub struct Settings {
 }
 impl Settings {
     fn new(defaults: AgentDefaults) -> Self {
+        let provider = super::super::provider::Provider::for_model(defaults.model.as_deref());
         Self {
+            provider,
             fields: vec![
                 Editor::from(
                     defaults
@@ -30,7 +32,6 @@ impl Settings {
                 Editor::from(defaults.effort.unwrap_or_default()),
             ],
             field: 0,
-            isolated: defaults.isolated,
             error: None,
             selected: 0,
             filled: false,
@@ -44,6 +45,13 @@ impl Settings {
         }
     }
     pub(super) fn changed(&mut self) {
+        let provider = super::super::provider::Provider::for_model(self.value(1).as_deref());
+        if provider != self.provider {
+            if let Some(effort) = self.fields.get_mut(2) {
+                *effort = Editor::default();
+            }
+            self.provider = provider;
+        }
         self.selected = 0;
         self.filled = false;
     }
@@ -174,7 +182,7 @@ impl Ui {
             repository: form.value(0).map(std::path::PathBuf::from),
             model: form.value(1),
             effort: form.value(2),
-            isolated: form.isolated,
+            isolated: true,
         };
         let result = self.storage.load_config().and_then(|mut config| {
             config.agent_defaults = defaults.clone();
@@ -197,7 +205,7 @@ impl Ui {
         match key.code {
             KeyCode::Esc => self.modal = None,
             KeyCode::Tab | KeyCode::BackTab => {
-                form.field = (form.field + if key.code == KeyCode::Tab { 1 } else { 4 }) % 5;
+                form.field = (form.field + if key.code == KeyCode::Tab { 1 } else { 3 }) % 4;
                 form.changed();
             }
             KeyCode::Up | KeyCode::Down if key.modifiers.is_empty() && form.field < 3 => {
@@ -208,11 +216,8 @@ impl Ui {
                 };
                 form.filled = false;
             }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) || form.field == 4 => {
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) || form.field == 3 => {
                 self.save_defaults()
-            }
-            KeyCode::Enter | KeyCode::Char(' ') if form.field == 3 => {
-                form.isolated = !form.isolated
             }
             KeyCode::Enter => {
                 if !form.filled
@@ -221,10 +226,10 @@ impl Ui {
                     if let Some(editor) = form.fields.get_mut(form.field) {
                         *editor = Editor::from(value.as_str());
                     }
-                    form.selected = 0;
+                    form.changed();
                     form.filled = true;
                 } else {
-                    form.field = (form.field + 1) % 5;
+                    form.field = (form.field + 1) % 4;
                     form.changed();
                 }
             }
@@ -256,7 +261,7 @@ impl Ui {
         let labels = [
             "Default local repository",
             "Default model · blank inherits Codex",
-            "Default reasoning · blank inherits Codex",
+            "Default reasoning · blank uses provider default",
         ];
         for (i, label) in labels.into_iter().enumerate() {
             let rect = Rect::new(area.x, area.y.saturating_add(i as u16 * 4), area.width, 3)
@@ -267,24 +272,15 @@ impl Ui {
             buttons.push((rect, Action::DefaultField(i)));
         }
         let toggle = Rect::new(area.x, area.y + 12, area.width, 1).intersection(area);
-        let text = if form.isolated {
-            "[x] New isolated worktree"
-        } else {
-            "[ ] Use the repository directory"
-        };
         frame.render_widget(
-            Paragraph::new(text).style(Style::default().fg(if form.field == 3 {
-                ACCENT
-            } else {
-                TEXT
-            })),
+            Paragraph::new("New sessions always use an isolated worktree")
+                .style(Style::default().fg(TEXT)),
             toggle,
         );
-        buttons.push((toggle, Action::DefaultToggle));
         let save = Rect::new(area.x, area.y + 15, area.width, 1).intersection(area);
         frame.render_widget(
             Paragraph::new("[ Save defaults · Ctrl+Enter ]")
-                .style(Style::default().fg(if form.field == 4 { ACCENT } else { TEXT })),
+                .style(Style::default().fg(if form.field == 3 { ACCENT } else { TEXT })),
             save,
         );
         buttons.push((save, Action::DefaultSave));

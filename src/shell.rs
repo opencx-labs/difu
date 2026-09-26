@@ -19,12 +19,14 @@ use unicode_width::UnicodeWidthStr;
 
 const TAB_LABELS: [&str; 2] = [" Agents (⌥+1) ", " Reviews (⌥+2) "];
 const TAB_MARGIN: u16 = 1;
+mod palette;
 
 pub struct Shell {
     pub reviews: App,
     pub agents: Ui,
     pub agents_active: bool,
     reviews_started: bool,
+    palette: Option<palette::Palette>,
 }
 impl Shell {
     pub fn new(storage: Storage, config: Config, pr: Option<PrKey>) -> Self {
@@ -38,6 +40,7 @@ impl Shell {
             agents: Ui::new(storage, &config),
             agents_active: !reviews_started,
             reviews_started,
+            palette: None,
         }
     }
     pub fn local(storage: Storage, config: Config, path: std::path::PathBuf) -> Self {
@@ -68,11 +71,16 @@ impl Shell {
         }
     }
     pub fn tick(&mut self) {
-        self.agents.tick(self.agents_active);
+        let selected = self.palette_selection();
+        self.agents
+            .tick(self.agents_active || self.palette.is_some());
+        self.tick_palette();
+        self.restore_palette_selection(selected);
         self.reviews.config.agent_defaults = self.agents.defaults.clone();
         self.reviews.config.agent_list_visible = self.agents.list_visible;
         self.reviews.config.agent_changes_visible = self.agents.changes_visible;
         self.reviews.config.agent_panel_right = self.agents.panel_right();
+        self.reviews.config.pinned_sessions = self.agents.pinned_sessions.clone();
         self.reviews.config.voice_enabled = self.agents.voice_enabled();
         if self.reviews_started {
             self.reviews.tick_visible(!self.agents_active);
@@ -89,6 +97,20 @@ impl Shell {
             } else {
                 self.reviews.key_event(key);
             }
+            return;
+        }
+        if key.code == KeyCode::Char('k') && key.modifiers == KeyModifiers::SUPER {
+            if self.palette.is_some() {
+                self.palette = None;
+            } else {
+                self.agents.cancel_voice();
+                self.agents.prepare_palette();
+                self.palette = Some(palette::Palette::new(self.reviews.storage.clone()));
+            }
+            return;
+        }
+        if self.palette.is_some() {
+            self.palette_key(key);
             return;
         }
         if key.modifiers == KeyModifiers::ALT {
@@ -122,6 +144,10 @@ impl Shell {
         }
     }
     pub fn mouse(&mut self, mouse: MouseEvent) {
+        if self.palette.is_some() {
+            self.palette_mouse(mouse);
+            return;
+        }
         if mouse.row == 0 && mouse.kind == MouseEventKind::Down(MouseButton::Left) {
             let mut x = TAB_MARGIN;
             for (index, label) in TAB_LABELS.iter().enumerate() {
@@ -141,6 +167,10 @@ impl Shell {
         }
     }
     pub fn paste(&mut self, text: String) {
+        if let Some(palette) = &mut self.palette {
+            palette.paste(&text);
+            return;
+        }
         if self.agents_active {
             self.agents.paste(&text);
         } else {
@@ -167,6 +197,7 @@ impl Shell {
             );
             x += width;
         }
+        self.draw_palette(frame);
     }
     pub fn clipboard(&mut self, output: &mut impl Write) {
         self.reviews.flush_clipboard(output);

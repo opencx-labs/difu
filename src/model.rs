@@ -165,9 +165,18 @@ pub struct Check {
     pub url: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct WorkflowRun {
+    pub id: u64,
+    pub name: String,
+    pub url: String,
+}
+
 /// Live GitHub state, independent of the pinned review snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct CheckReport {
+    pub awaiting_workflows: Vec<WorkflowRun>,
+    pub workflows_error: Option<String>,
     pub checks: Vec<Check>,
     pub mergeable: String,
     pub merge_state: String,

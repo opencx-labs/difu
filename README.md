@@ -2,7 +2,7 @@
 
 *dīfu* is your diff *shīfu*... guides you through the depths of every diff... may you fathom whatever slop you're feasting your eyes on
 
-A terminal workspace for Codex agents and GitHub pull request reviews, built in
+A terminal workspace for Codex and Claude Code agents and GitHub pull request reviews, built in
 Rust with Ratatui and Crossterm. Launch background coding agents, browse your
 review inbox, read PR activity, and follow AI-generated
 chapters that explain related changes across files. Write comments and reviews,
@@ -15,6 +15,8 @@ track chapter completion, and merge or close PRs without leaving the terminal.
 - **[GitHub CLI](https://cli.github.com/)** (`gh`) for GitHub authentication and PR data.
 - **[Codex CLI](https://github.com/openai/codex)** for guide generation using your
   existing login. The integration has been tested with Codex CLI 0.155.1.
+- **[Claude Code](https://code.claude.com/docs/en/overview)** (optional) for Claude
+  coding sessions, installed and authenticated with `claude` on your `PATH`.
 - **[Rust 1.90 or newer](https://www.rust-lang.org/tools/install)** when building
   from source.
 
@@ -79,6 +81,20 @@ difu
 tab thereafter. Click a tab or use **⌥+1 / ⌥+2** to switch while preserving
 your place. An explicit PR argument opens Reviews.
 
+### Command palette
+
+**Cmd+K** opens global search from either tab. Search sessions by title,
+repository, branch, worktree, or PR number, and launch commands from both the
+Agents and Reviews `/` menus. PR results offer a preview alongside connected
+sessions. A bare number (or `#1524`) searches the local cache only;
+`opencx#1524` or `owner/opencx#1524` also looks up GitHub when absent locally.
+The background service refreshes authored and review-requested PRs every 30
+seconds, even with no terminal open. Failed refreshes retain cached results.
+
+Pin or unpin a session in its actions menu, or select it in Cmd+K and press
+**Cmd+P**. Pins persist across restarts and appear first in the session list,
+with a ◆ marker, within the current active/archived view.
+
 ### Local diffs and branch PRs
 
 Run `difu pr .` from a checkout to open the PR for its current branch. If the
@@ -135,25 +151,35 @@ and ignored files prevent deletion and retain the chat. Existing directories,
 Git branches and commits, and Codex’s own history are retained. Archive remains
 a separate action that keeps the chat and worktree.
 
-Press **n** (or `/new`) to open an empty session immediately. Repository, model,
-reasoning, and isolation defaults live in **/actions → Default repository, model,
-reasoning and worktree**. Without a saved repository, difu uses the current Git
-repository; outside one, it asks you to choose and remembers that choice.
+Press **n** (or `/new`) to open an empty session and create its isolated Git
+worktree. Repository, model, and reasoning defaults live in **/actions → Default
+repository, model, reasoning and worktree**. Without a saved repository, difu
+uses the current Git repository; outside one, it asks you to choose and remembers
+that choice. No model turn runs until your first message. Both Codex and Claude
+use this worktree from the start. Existing local changes are never copied, and
+missing local guidance requires your approval before copying.
 
-No Codex turn runs until your first message. With isolation enabled, questions and
-investigation run read-only in the original repository. When the agent requests
-editing, difu stops the read-only turn, creates a branch/worktree from the pinned
-starting commit, and continues the same conversation there. No clone or fetch is
-needed. Existing local changes are never copied into that worktree. Missing local
-guidance still requires your approval before copying. With isolation disabled,
-the session works in the selected repository directly.
+Use **/model** to choose a Codex or Claude Code model (for example,
+`/model claude/sonnet`). Changing provider requires a stopped or idle session with no
+pending requests or queued messages. Difu retains the chat and workspace and
+passes prior visible conversation to the selected provider on the next message.
+Each provider keeps its own native session; returning to it supplies conversation
+since its last use. Provider selection does not run a task or repeat prior actions.
+Codex uses your installed app-server; Claude uses the installed CLI's streaming
+protocol through an isolated Rust adapter, without Python or an SDK dependency.
 
-Model and reasoning inherit your Codex configuration unless overridden. During
-read-only investigation, filesystem writes and permission escalation are disabled.
-After switching to the worktree, difu restores the inherited sandbox and approval
-settings. A restart never automatically replays a task or workspace transition.
+Use **/repo** (or `/repo /path/to/checkout`) to change an idle legacy session's
+repository before a worktree exists. New sessions already have a worktree, so
+choose their repository before opening them. The command preserves conversation
+and validates the new repository; it does not change the new-session default.
 
-The searchable session list previews conversations. Selecting or entering a
+Codex model and reasoning inherit your configuration unless overridden. Legacy
+read-only investigation sessions permit app/MCP approval prompts while blocking
+filesystem escalation. In worktrees, Codex's inherited permissions apply. Claude
+permission requests appear in difu's approval panel. A restart never automatically
+replays a task or an uncertain tool approval.
+
+The session list previews conversations; use **Cmd+K** to search sessions. Selecting or entering a
 session scrolls to its latest messages; scrolling up afterward keeps your reading
 position through background updates. **Enter** opens a session;
 **Esc** interrupts the active agent and keeps the chat open, or returns to the
@@ -169,8 +195,8 @@ files or changes your index. Changes display is limited to 32 MiB; larger result
 produce an explicit error.
 
 Difu discovers each coding session's PR from its Git branch and remembers the PR
-across restarts. Status refreshes in the background every 30 seconds for the
-selected session and sessions visible in the sidebar; cached status remains
+across restarts. The background service refreshes links for sessions with branches,
+and the UI refreshes visible statuses every 30 seconds; cached status remains
 available between refreshes and during network failures. Badges show **Open**,
 **Draft**, **Merged**, **Closed**, or **Has conflicts**. In the sidebar, **Needs
 input** appears below the diff counts, followed by the PR badge.
@@ -184,7 +210,9 @@ between Shells, Artifacts, and the PR badge, and **Enter** opens the selection.
 
 In the composer, **Enter** sends a message and steers an active turn immediately.
 **Ctrl+Enter** explicitly queues it for the next turn; **Shift+Enter** inserts a
-newline. Drafts remain until delivery is acknowledged. Shift+arrows selects text;
+newline. Sent messages appear immediately; while a tool is running, they appear
+in the waiting queue and move into the chat after that tool finishes. Drafts
+remain until delivery is acknowledged. Shift+arrows selects text;
 typing replaces the selection, and Command+C copies it. **Shift+Alt+Left/Right**
 extends the selection by a word; **Alt+Backspace** deletes the previous word.
 **Cmd+Backspace** deletes the entire current line; **Cmd+Left/Right** moves to its
@@ -353,8 +381,7 @@ or open a PR only when explicitly requested by the task. Review conflict jobs re
 their separately authorized automatic, validated push behavior.
 
 Session history and managed coding worktrees live in an `agents` directory beside
-`config.json`, with owner-only directory/socket access. The service uses Codex's
-app-server interface and existing login. No additional daemon package is required.
+`config.json`, with owner-only directory/socket access. The service uses Codex's app-server or Claude Code's streaming CLI and their existing logins. No additional daemon package is required.
 
 ### Reviews
 
@@ -519,6 +546,12 @@ Merge requests also pass GitHub's atomic expected-head guard. GitHub permissions
 branch protection, and merge-queue rules still apply; admin is used only when
 explicitly selected. Failed or uncertain writes are never automatically retried.
 **Add comment** posts to the PR discussion without closing it or submitting a pending review.
+**Approve workflows to run** appears in PR controls; the preview warns when
+GitHub Actions runs await approval. Confirmation lists the runs and pins the PR
+revision. Difu rechecks the revision and run associations before approval; partial
+failures report how many requests succeeded and are never retried automatically.
+**Open in browser** opens the PR on GitHub from the same controls menu.
+
 **Request reviewers** loads repository users and teams into a searchable picker.
 Type to filter, use **Space** to toggle selections, and **Enter** to review and
 confirm the request. The overview shows requested users/teams and review outcomes.

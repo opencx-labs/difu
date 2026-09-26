@@ -94,23 +94,38 @@ fn search_prs(scope: &str, state: PrState, cancel: &Cancel) -> Result<Vec<PrSumm
         .as_array()
         .context("Invalid inbox response")?
         .iter()
-        .map(|v| {
-            Ok(PrSummary {
-                key: PrKey::from_url(&text(v, "url"))?,
-                title: text(v, "title"),
-                author: text(v.get("author").unwrap_or(&Value::Null), "login"),
-                updated: text(v, "updatedAt"),
-                created: text(v, "createdAt"),
-                stats: None,
-                stats_error: false,
-                draft: v
-                    .get("isDraft")
-                    .unwrap_or(&Value::Null)
-                    .as_bool()
-                    .unwrap_or(false),
-            })
-        })
+        .map(pr_summary_value)
         .collect()
+}
+
+fn pr_summary_value(v: &Value) -> Result<PrSummary> {
+    Ok(PrSummary {
+        key: PrKey::from_url(&text(v, "url"))?,
+        title: text(v, "title"),
+        author: text(v.get("author").unwrap_or(&Value::Null), "login"),
+        updated: text(v, "updatedAt"),
+        created: text(v, "createdAt"),
+        stats: None,
+        stats_error: false,
+        draft: v
+            .get("isDraft")
+            .unwrap_or(&Value::Null)
+            .as_bool()
+            .unwrap_or(false),
+    })
+}
+
+pub(crate) fn pr_summary(key: &PrKey, cancel: &Cancel) -> Result<PrSummary> {
+    key.validate()?;
+    pr_summary_value(&json(
+        &[
+            "pr",
+            "view",
+            &key.url(),
+            "--json=number,title,url,author,updatedAt,createdAt,isDraft",
+        ],
+        cancel,
+    )?)
 }
 
 /// Resolve a bounded batch without downloading patches or Git objects.
@@ -526,6 +541,89 @@ fn parse_check(v: &Value) -> Result<(Check, Option<u64>)> {
     ))
 }
 
+/// Only PR-associated runs awaiting fork approval, pinned to the current head.
+pub fn awaiting_workflows(key: &PrKey, head: &str, cancel: &Cancel) -> Result<Vec<WorkflowRun>> {
+    key.validate()?;
+    anyhow::ensure!(
+        !head.is_empty() && head.bytes().all(|b| b.is_ascii_hexdigit()),
+        "Invalid PR head"
+    );
+    let endpoint = format!("repos/{}/actions/runs?head_sha={head}&event=pull_request&status=action_required&per_page=100", key.repository());
+    let pages = json(&["api", "--paginate", "--slurp", &endpoint], cancel)?;
+    let mut runs = Vec::new();
+    let mut source = None;
+    for page in pages.as_array().context("Invalid workflow pages")? {
+        for run in page
+            .get("workflow_runs")
+            .and_then(Value::as_array)
+            .context("Missing workflow runs")?
+        {
+            if run.get("head_sha").and_then(Value::as_str) != Some(head)
+                || run.get("event").and_then(Value::as_str) != Some("pull_request")
+                || !["status", "conclusion"]
+                    .iter()
+                    .any(|field| run.get(*field).and_then(Value::as_str) == Some("action_required"))
+            {
+                continue;
+            }
+            let prs = run
+                .get("pull_requests")
+                .and_then(Value::as_array)
+                .context("Missing workflow PR associations")?;
+            if prs.is_empty() {
+                // GitHub may omit PR associations for fork runs. Verify the source
+                // repository, branch and SHA against the PR before offering approval.
+                if source.is_none() {
+                    source = Some(json(
+                        &[
+                            "api",
+                            &format!("repos/{}/pulls/{}", key.repository(), key.number),
+                        ],
+                        cancel,
+                    )?);
+                }
+                let pr = source.as_ref().context("Missing PR source")?;
+                let repository = pr
+                    .pointer("/head/repo/full_name")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty());
+                let branch = pr
+                    .pointer("/head/ref")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty());
+                if pr.pointer("/head/sha").and_then(Value::as_str) != Some(head)
+                    || repository.is_none()
+                    || branch.is_none()
+                    || repository
+                        != run
+                            .pointer("/head_repository/full_name")
+                            .and_then(Value::as_str)
+                    || branch != run.get("head_branch").and_then(Value::as_str)
+                {
+                    continue;
+                }
+            } else if !prs
+                .iter()
+                .any(|pr| pr.get("number").and_then(Value::as_u64) == Some(key.number))
+            {
+                continue;
+            }
+            let id = run
+                .get("id")
+                .and_then(Value::as_u64)
+                .context("Missing workflow run ID")?;
+            if !runs.iter().any(|run: &WorkflowRun| run.id == id) {
+                runs.push(WorkflowRun {
+                    id,
+                    name: text(run, "name"),
+                    url: text(run, "html_url"),
+                });
+            }
+        }
+    }
+    Ok(runs)
+}
+
 pub fn checks(key: &PrKey, cancel: &Cancel) -> Result<CheckReport> {
     key.validate()?;
     let mut report = CheckReport::default();
@@ -654,6 +752,15 @@ pub fn checks(key: &PrKey, cancel: &Cancel) -> Result<CheckReport> {
     report
         .checks
         .extend(actual.into_iter().map(|(check, _)| check));
+    if report.state == "OPEN" {
+        match awaiting_workflows(key, &report.head, cancel) {
+            Ok(runs) => report.awaiting_workflows = runs,
+            Err(error) => {
+                report.workflows_error =
+                    Some(format!("Could not load workflow approvals: {error:#}"))
+            }
+        }
+    }
     Ok(report)
 }
 

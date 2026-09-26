@@ -110,6 +110,9 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
     fs::write(repo.join("tracked.txt"), "precious local edit\n")?;
     let bin = root.join("bin");
     fs::create_dir(&bin)?;
+    let gh = bin.join("gh");
+    fs::write(&gh, "#!/bin/sh\nprintf '[]\\n'\n")?;
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o700))?;
     let codex = bin.join("codex");
     fs::write(&codex, include_str!("fixtures/agent_codex.py"))?;
     fs::set_permissions(&codex, fs::Permissions::from_mode(0o700))?;
@@ -925,7 +928,7 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
 }
 
 #[test]
-fn empty_sessions_defer_worktrees_until_editing_and_restore_permissions() -> Result<()> {
+fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_context() -> Result<()> {
     let tmp = tempfile::Builder::new()
         .prefix("difu-lazy-agent-")
         .tempdir_in("/tmp")?;
@@ -939,6 +942,12 @@ fn empty_sessions_defer_worktrees_until_editing_and_restore_permissions() -> Res
     fs::write(repo.join("tracked.txt"), "precious local edit\n")?;
     let bin = root.join("bin");
     fs::create_dir(&bin)?;
+    let gh = bin.join("gh");
+    fs::write(&gh, "#!/bin/sh\nprintf '[]\\n'\n")?;
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o700))?;
+    let claude = bin.join("claude");
+    fs::write(&claude, include_str!("fixtures/agent_claude.py"))?;
+    fs::set_permissions(&claude, fs::Permissions::from_mode(0o700))?;
     let codex = bin.join("codex");
     fs::write(&codex, include_str!("fixtures/agent_codex.py"))?;
     fs::set_permissions(&codex, fs::Permissions::from_mode(0o700))?;
@@ -980,23 +989,31 @@ fn empty_sessions_defer_worktrees_until_editing_and_restore_permissions() -> Res
     };
     let empty = session(&storage, &id)?;
     assert_eq!(empty.status, Status::Idle);
-    assert!(empty.thread_id.is_none() && empty.waiting_for_workspace());
+    assert!(empty.thread_id.is_none() && empty.workspace_ready);
+    let workspace = empty.workspace.clone().context("worktree")?;
+    assert_ne!(workspace, repo.canonicalize()?);
+    assert!(!root.join("protocol.jsonl").exists());
+    assert_eq!(
+        fs::read_to_string(workspace.join("tracked.txt"))?,
+        "original\n"
+    );
     assert_eq!(
         storage.load_config()?.agent_defaults.repository,
         Some(repo.canonicalize()?)
     );
-    assert!(!root.join("protocol.jsonl").exists());
-    assert_eq!(
-        git(&repo, &["worktree", "list", "--porcelain"])?
-            .matches("worktree ")
-            .count(),
-        1
-    );
+    assert!(client::request(
+        &storage,
+        Request::Repository {
+            id: id.clone(),
+            repository: repo.clone()
+        }
+    )
+    .is_err());
     let Reply::Changes(patch) = client::request(&storage, Request::Changes { id: id.clone() })?
     else {
         anyhow::bail!("Changes");
     };
-    assert!(patch.is_empty()); // Never attribute original checkout edits to this session.
+    assert!(patch.is_empty());
     let message = |text: &str| Control::Message {
         text: text.into(),
         queue: false,
@@ -1004,151 +1021,154 @@ fn empty_sessions_defer_worktrees_until_editing_and_restore_permissions() -> Res
         attachments: Vec::new(),
     };
     control(&storage, &id, message("chat only: explain this repository"))?;
-    let chatting = wait(&storage, &id, |s| {
+    let codex = wait(&storage, &id, |s| {
         s.status == Status::Idle
             && s.thread_id.is_some()
-            && s.entries.iter().any(|entry| {
-                entry.kind == "userMessage" && entry.text == "chat only: explain this repository"
-            })
             && s.entries
                 .iter()
-                .any(|entry| entry.kind == "agentMessage" && entry.text == "Finished fixture task")
+                .any(|e| e.kind == "agentMessage" && e.text == "Finished fixture task")
     })?;
-    assert!(chatting.waiting_for_workspace());
     assert_eq!(
-        chatting
-            .permissions
-            .pointer("/sandbox/type")
-            .and_then(|v| v.as_str()),
-        Some("readOnly")
-    );
-    let thread = chatting.thread_id.clone();
-    assert!(!repo.join("new.txt").exists());
-    // Guidance must still be checked when a live read-only thread switches workspaces.
-    fs::write(repo.join("AGENTS.md"), "Keep this repository guidance.\n")?;
-    control(
-        &storage,
-        &id,
-        message("need edit with questions: make the requested change"),
-    )?;
-    let awaiting = wait(&storage, &id, |s| s.status == Status::Waiting)?;
-    assert_eq!(awaiting.thread_id, thread);
-    assert_eq!(awaiting.pending_question_count(), 2);
-    let before_guidance = fs::read_to_string(root.join("protocol.jsonl"))?;
-    control(&storage, &id, message("chat only: are you there?"))?;
-    control(
-        &storage,
-        &id,
-        Control::AnswerQuestion {
-            request: serde_json::json!("difu-async:workspace-question"),
-            question: "0".into(),
-            answer: Some("Full\nAdditional note: keep the same conversation".into()),
-        },
-    )?;
-    let queued = session(&storage, &id)?;
-    assert_eq!(queued.thread_id, thread);
-    assert_eq!(queued.status, Status::Waiting);
-    assert_eq!(queued.pending_question_count(), 1);
-    assert_eq!(queued.queue.len(), 2);
-    assert_eq!(
-        queued.queue.first().map(|p| p.text()),
-        Some("chat only: are you there?")
-    );
-    assert!(
-        queued
-            .queue
-            .last()
-            .is_some_and(|p| p.text().contains("Additional note:"))
-    );
-    assert!(!queued.guidance_checked);
-    assert!(
-        !queued
-            .workspace
-            .as_ref()
-            .context("worktree")?
-            .join("AGENTS.md")
-            .exists()
-    );
-    assert_eq!(
-        fs::read_to_string(root.join("protocol.jsonl"))?,
-        before_guidance
-    );
-    // A repeated answer cannot enqueue a second copy.
-    assert!(
-        control(
-            &storage,
-            &id,
-            Control::AnswerQuestion {
-                request: serde_json::json!("difu-async:workspace-question"),
-                question: "0".into(),
-                answer: Some("Full".into()),
-            }
-        )
-        .is_err()
-    );
-    control(
-        &storage,
-        &id,
-        Control::Respond {
-            request: serde_json::json!("difu-missing-guidance"),
-            response: serde_json::json!({"answers":{"copy_guidance":{"answers":["Copy missing guidance"]}}}),
-        },
-    )?;
-    let editing = wait(&storage, &id, |s| {
-        s.status == Status::Idle
-            && s.workspace_ready
-            && s.queue.is_empty()
-            && s.entries
-                .iter()
-                .any(|e| e.kind == "userMessage" && e.text.contains("Additional note:"))
-            && s.workspace
-                .as_ref()
-                .is_some_and(|p| p.join("new.txt").exists())
-    })?;
-    assert_eq!(editing.thread_id, thread);
-    assert_eq!(
-        editing
+        codex
             .permissions
             .pointer("/sandbox/type")
             .and_then(|v| v.as_str()),
         Some("workspaceWrite")
     );
+    control(
+        &storage,
+        &id,
+        message("app approval: perform my authorized action"),
+    )?;
+    let awaiting = wait(&storage, &id, |s| !s.pending.is_empty())?;
+    let request = awaiting.pending.first().context("approval")?.id.clone();
+    control(
+        &storage,
+        &id,
+        Control::Respond {
+            request,
+            response: serde_json::json!({"action":"accept","content":{}}),
+        },
+    )?;
+    wait(&storage, &id, |s| {
+        s.status == Status::Idle && s.pending.is_empty()
+    })?;
+
+    control(
+        &storage,
+        &id,
+        Control::Model {
+            model: Some("claude/sonnet".into()),
+            effort: None,
+        },
+    )?;
+    let switched = session(&storage, &id)?;
+    assert_eq!(switched.provider, difu::agents::provider::Provider::Claude);
+    assert_eq!(switched.workspace.as_ref(), Some(&workspace));
+    assert!(switched.thread_id.is_none());
+    assert!(switched
+        .provider_context
+        .as_deref()
+        .is_some_and(|c| c.contains("explain this repository")));
+    control(
+        &storage,
+        &id,
+        message("claude tool: execute the approved task"),
+    )?;
+    let awaiting = wait(&storage, &id, |s| !s.pending.is_empty())?;
+    assert!(awaiting.tool_running());
+    assert!(control(
+        &storage,
+        &id,
+        Control::Model {
+            model: Some("fixture-model".into()),
+            effort: None
+        }
+    )
+    .is_err());
+    control(
+        &storage,
+        &id,
+        Control::Respond {
+            request: awaiting
+                .pending
+                .first()
+                .context("Claude approval")?
+                .id
+                .clone(),
+            response: serde_json::json!({"action":"accept"}),
+        },
+    )?;
+    let claude = wait(&storage, &id, |s| {
+        s.status == Status::Idle && s.pending.is_empty()
+    })?;
+    assert!(!claude.tool_running());
+    assert!(claude.provider_context.is_none());
     assert_eq!(
-        editing
-            .permissions
-            .get("approvalPolicy")
-            .and_then(|v| v.as_str()),
-        Some("on-request")
-    );
-    let workspace = editing.workspace.context("worktree")?;
-    assert_ne!(workspace, repo.canonicalize()?);
-    assert_eq!(
-        fs::read_to_string(workspace.join("new.txt"))?,
-        "agent change\n"
+        claude
+            .entries
+            .iter()
+            .filter(
+                |e| e.kind == "userMessage" && e.text == "claude tool: execute the approved task"
+            )
+            .count(),
+        1
     );
     assert_eq!(
-        fs::read_to_string(workspace.join("AGENTS.md"))?,
-        "Keep this repository guidance.\n"
+        claude
+            .entries
+            .iter()
+            .filter(|e| e.kind == "agentMessage" && e.text == "Finished Claude task")
+            .count(),
+        1
     );
+    control(
+        &storage,
+        &id,
+        Control::Model {
+            model: Some("fixture-model".into()),
+            effort: None,
+        },
+    )?;
+    let restored = session(&storage, &id)?;
+    assert_eq!(restored.thread_id, codex.thread_id);
+    assert!(restored
+        .provider_context
+        .as_deref()
+        .is_some_and(|c| c.contains("Finished Claude task")));
+    control(&storage, &id, message("chat only: resume Codex"))?;
+    wait(&storage, &id, |s| {
+        s.status == Status::Idle && s.provider_context.is_none()
+    })?;
+    control(
+        &storage,
+        &id,
+        Control::Model {
+            model: Some("claude/sonnet".into()),
+            effort: Some("high".into()),
+        },
+    )?;
+    assert_eq!(session(&storage, &id)?.thread_id, claude.thread_id);
+    control(&storage, &id, message("finish with Claude"))?;
+    wait(&storage, &id, |s| {
+        s.status == Status::Idle && workspace.join("claude.txt").exists()
+    })?;
+    let starts = fs::read_to_string(root.join("claude-starts.jsonl"))?;
+    assert!(starts.contains("--resume=fixture-claude") && starts.contains("--effort=high"));
+    assert!(!repo.join("claude.txt").exists());
     assert_eq!(
         fs::read_to_string(repo.join("tracked.txt"))?,
         "precious local edit\n"
     );
-    assert!(!repo.join("new.txt").exists());
-    assert_eq!(
-        editing
-            .entries
-            .iter()
-            .filter(|e| e.kind == "userMessage")
-            .count(),
-        4
-    );
-    // Isolation disabled uses the selected checkout without a worktree or read-only transition.
-    let Reply::Launched(direct) = client::request(
+
+    // Both providers isolate immediately, including configurations saved before
+    // isolation became mandatory for new sessions.
+    let Reply::Launched(second) = client::request(
         &storage,
         Request::NewAgent {
             defaults: difu::storage::AgentDefaults {
                 isolated: false,
+                model: Some("claude/sonnet".into()),
                 ..defaults
             },
             cwd: root.into(),
@@ -1156,20 +1176,12 @@ fn empty_sessions_defer_worktrees_until_editing_and_restore_permissions() -> Res
         },
     )?
     else {
-        anyhow::bail!("Expected direct session");
+        anyhow::bail!("Expected Claude session");
     };
-    control(&storage, &direct, message("make change directly"))?;
-    let direct = wait(&storage, &direct, |s| {
-        s.status == Status::Idle && s.thread_id.is_some() && repo.join("new.txt").exists()
-    })?;
-    assert_eq!(direct.workspace, Some(repo.canonicalize()?));
-    assert!(repo.join("new.txt").exists());
-    assert_eq!(
-        git(&repo, &["worktree", "list", "--porcelain"])?
-            .matches("worktree ")
-            .count(),
-        2
-    );
+    let second = session(&storage, &second)?;
+    assert!(second.workspace_ready && second.thread_id.is_none());
+    assert_ne!(second.workspace, Some(repo.canonicalize()?));
+    assert_eq!(second.provider, difu::agents::provider::Provider::Claude);
     daemon.stop()?;
     Ok(())
 }
@@ -1190,6 +1202,9 @@ fn guidance_wait_survives_frontend_reconnect_and_service_restart_without_permiss
     fs::write(repo.join("AGENTS.md"), "Untracked repository guidance\n")?;
     let bin = root.join("bin");
     fs::create_dir(&bin)?;
+    let gh = bin.join("gh");
+    fs::write(&gh, "#!/bin/sh\nprintf '[]\\n'\n")?;
+    fs::set_permissions(&gh, fs::Permissions::from_mode(0o700))?;
     let codex = bin.join("codex");
     fs::write(&codex, include_str!("fixtures/agent_codex.py"))?;
     fs::set_permissions(&codex, fs::Permissions::from_mode(0o700))?;
