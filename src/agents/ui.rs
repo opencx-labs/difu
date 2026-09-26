@@ -6332,19 +6332,15 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn filter_help_copy_and_all_input_layouts_remain_usable() -> Result<()> {
+    fn sidebar_help_copy_and_all_input_layouts_remain_usable() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut ui = state(Storage {
             config: directory.path().join("config.json"),
             cache: directory.path().into(),
         });
-        ui.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-        ui.paste("IMPLEMENT");
+        let (screen, _) = draw(&mut ui, 120, 35)?;
+        assert!(!screen.contains("f Filter"));
         assert_eq!(ui.filtered().len(), 1);
-        ui.paste("missing");
-        assert!(ui.filtered().is_empty());
-        ui.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         ui.selected = Some("one".into());
         ui.drilled = true;
         ui.focus = Focus::Changes;
