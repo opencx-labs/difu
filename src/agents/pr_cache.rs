@@ -62,11 +62,7 @@ pub(crate) fn sort_links(
             let relevant = current(link, workspace, branch);
             (
                 if link.pr.state == "OPEN" {
-                    if relevant {
-                        0
-                    } else {
-                        1
-                    }
+                    if relevant { 0 } else { 1 }
                 } else {
                     2
                 },

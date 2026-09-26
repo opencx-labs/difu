@@ -1010,12 +1010,16 @@ fn exercise_reviewer_picker_and_branch_lookup(root: &Path) -> Result<()> {
     assert_eq!(merged.label(), "Merged");
     let history = difu::github::session_prs(&root.join("clone"), "session-branch", &cancel)?;
     assert_eq!(history.len(), 2);
-    assert!(history
-        .iter()
-        .any(|pr| pr.key.number == 1 && pr.state == "MERGED"));
-    assert!(history
-        .iter()
-        .any(|pr| pr.key.number == 2 && pr.state == "OPEN"));
+    assert!(
+        history
+            .iter()
+            .any(|pr| pr.key.number == 1 && pr.state == "MERGED")
+    );
+    assert!(
+        history
+            .iter()
+            .any(|pr| pr.key.number == 2 && pr.state == "OPEN")
+    );
     fs::write(root.join("session-pr-error"), "offline")?;
     assert!(
         difu::github::session_pr(&root.join("clone"), None, Some(&discovered.key), &cancel)

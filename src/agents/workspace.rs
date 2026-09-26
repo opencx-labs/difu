@@ -212,7 +212,10 @@ fn comparison(
         if ancestor.code == 0 {
             return Ok(head.clone());
         }
-        ensure!(ancestor.code == 1, "Cannot locate the merged PR's final head locally; fetch its branch before viewing changes");
+        ensure!(
+            ancestor.code == 1,
+            "Cannot locate the merged PR's final head locally; fetch its branch before viewing changes"
+        );
     }
     let base = if let Some(base) = &session.comparison_base {
         base.clone()
@@ -483,8 +486,8 @@ mod tests {
     use super::*;
     use crate::{
         agents::{
-            pr_cache::{SessionLink, SessionLinks},
             Launch, Status,
+            pr_cache::{SessionLink, SessionLinks},
         },
         github::SessionPr,
         model::PrKey,
@@ -635,12 +638,14 @@ mod tests {
         assert_eq!(session.workspace_revision, 1);
         assert_eq!(statistics(&session, &storage, &cancel)?.added, 0);
         assert!(changes(&session, &storage, &cancel)?.is_empty());
-        assert!(super::super::registration::prepare(
-            &session,
-            &serde_json::json!({"path":repository}),
-            &cancel
-        )
-        .is_err());
+        assert!(
+            super::super::registration::prepare(
+                &session,
+                &serde_json::json!({"path":repository}),
+                &cancel
+            )
+            .is_err()
+        );
         let explicit = super::super::registration::prepare(
             &session,
             &serde_json::json!({"path":second,"base":"first"}),

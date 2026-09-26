@@ -9,7 +9,7 @@ struct Update {
     revision: u64,
     result: Result<Vec<Cached>, String>,
 }
-use crate::agents::pr_cache::{self, SessionLink as Cached, SESSION_LINKS};
+use crate::agents::pr_cache::{self, SESSION_LINKS, SessionLink as Cached};
 pub(super) struct State {
     cache: pr_cache::SessionLinks,
     loaded_at: Option<Instant>,

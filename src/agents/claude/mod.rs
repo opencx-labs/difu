@@ -122,7 +122,9 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                         params: args.clone(),
                         responded: false,
                     });
-                    Ok("Worktree registration accepted. Stop here; difu will resume this conversation in the registered workspace.")
+                    Ok(
+                        "Worktree registration accepted. Stop here; difu will resume this conversation in the registered workspace.",
+                    )
                 })(),
                 _ => anyhow::bail!("Unknown difu tool"),
             };

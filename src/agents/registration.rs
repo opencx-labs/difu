@@ -1,14 +1,14 @@
 //! Explicit workspace changes retain history and validate repository ownership.
 use super::{
-    workspace::{self, Workspace},
     Job, Session,
+    workspace::{self, Workspace},
 };
 use crate::{
     process::{self, Cancel},
     repo,
 };
-use anyhow::{ensure, Context, Result};
-use serde_json::{json, Value};
+use anyhow::{Context, Result, ensure};
+use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 pub(super) const TOOL: &str = "difu_register_worktree";

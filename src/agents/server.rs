@@ -532,10 +532,15 @@ impl Service {
             }
             Request::RegisterWorktree { id, path, base } => {
                 let session = self.store.get(&id)?;
-                ensure!(!session.status.active() && session.turn_id.is_none()
-                    && session.pending.is_empty() && session.queue.is_empty()
-                    && !session.switching_workspace && !session.archived,
-                    "Wait for an idle session with no pending requests before registering a worktree");
+                ensure!(
+                    !session.status.active()
+                        && session.turn_id.is_none()
+                        && session.pending.is_empty()
+                        && session.queue.is_empty()
+                        && !session.switching_workspace
+                        && !session.archived,
+                    "Wait for an idle session with no pending requests before registering a worktree"
+                );
                 let prepared = super::registration::prepare(
                     &session,
                     &serde_json::json!({"path":path,"base":base}),
