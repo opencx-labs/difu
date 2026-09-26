@@ -1563,11 +1563,7 @@ impl Ui {
         } else if self.focus == Focus::List {
             0
         } else if self.changes_visible && self.drilled {
-            if self.focus == Focus::Changes {
-                4
-            } else {
-                3
-            }
+            if self.focus == Focus::Changes { 4 } else { 3 }
         } else {
             1
         };
@@ -3764,10 +3760,11 @@ mod tests {
         assert!(screen.contains("› Show this immediately"));
         assert!(!screen.contains("Preparing session…"));
         assert!(!screen.contains("Messages to be submitted"));
-        assert!(ui
-            .conversation_sections
-            .iter()
-            .any(|s| s.id == "difu-outgoing-0"));
+        assert!(
+            ui.conversation_sections
+                .iter()
+                .any(|s| s.id == "difu-outgoing-0")
+        );
 
         release.send(())?;
         let response = ui.receiver.recv_timeout(Duration::from_secs(5))?;
@@ -3792,12 +3789,13 @@ mod tests {
         assert_eq!(screen.matches("Show this immediately").count(), 1);
         assert!(screen.contains("› Show this immediately"));
         assert!(!screen.contains("Messages to be submitted"));
-        assert!(ui
-            .positions
-            .get("one")
-            .context("position")?
-            .outgoing
-            .is_empty());
+        assert!(
+            ui.positions
+                .get("one")
+                .context("position")?
+                .outgoing
+                .is_empty()
+        );
         worker
             .join()
             .map_err(|_| anyhow::anyhow!("fixture panicked"))??;

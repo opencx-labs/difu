@@ -354,9 +354,16 @@ impl Service {
                         .map(|model| provider::Provider::for_model(Some(model)))
                         .unwrap_or(session.provider);
                     if target != session.provider || target == provider::Provider::Claude {
-                        ensure!(matches!(session.status, Status::Idle | Status::Interrupted | Status::Failed) && session.turn_id.is_none()
-                            && session.pending.is_empty() && session.queue.is_empty() && !session.switching_workspace,
-                            "Finish the current turn and pending requests before switching models or providers");
+                        ensure!(
+                            matches!(
+                                session.status,
+                                Status::Idle | Status::Interrupted | Status::Failed
+                            ) && session.turn_id.is_none()
+                                && session.pending.is_empty()
+                                && session.queue.is_empty()
+                                && !session.switching_workspace,
+                            "Finish the current turn and pending requests before switching models or providers"
+                        );
                         if let Some(worker) = self
                             .workers
                             .lock()

@@ -1001,14 +1001,16 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
         storage.load_config()?.agent_defaults.repository,
         Some(repo.canonicalize()?)
     );
-    assert!(client::request(
-        &storage,
-        Request::Repository {
-            id: id.clone(),
-            repository: repo.clone()
-        }
-    )
-    .is_err());
+    assert!(
+        client::request(
+            &storage,
+            Request::Repository {
+                id: id.clone(),
+                repository: repo.clone()
+            }
+        )
+        .is_err()
+    );
     let Reply::Changes(patch) = client::request(&storage, Request::Changes { id: id.clone() })?
     else {
         anyhow::bail!("Changes");
@@ -1066,10 +1068,12 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     assert_eq!(switched.provider, difu::agents::provider::Provider::Claude);
     assert_eq!(switched.workspace.as_ref(), Some(&workspace));
     assert!(switched.thread_id.is_none());
-    assert!(switched
-        .provider_context
-        .as_deref()
-        .is_some_and(|c| c.contains("explain this repository")));
+    assert!(
+        switched
+            .provider_context
+            .as_deref()
+            .is_some_and(|c| c.contains("explain this repository"))
+    );
     control(
         &storage,
         &id,
@@ -1077,15 +1081,17 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     )?;
     let awaiting = wait(&storage, &id, |s| !s.pending.is_empty())?;
     assert!(awaiting.tool_running());
-    assert!(control(
-        &storage,
-        &id,
-        Control::Model {
-            model: Some("fixture-model".into()),
-            effort: None
-        }
-    )
-    .is_err());
+    assert!(
+        control(
+            &storage,
+            &id,
+            Control::Model {
+                model: Some("fixture-model".into()),
+                effort: None
+            }
+        )
+        .is_err()
+    );
     control(
         &storage,
         &id,
@@ -1132,10 +1138,12 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     )?;
     let restored = session(&storage, &id)?;
     assert_eq!(restored.thread_id, codex.thread_id);
-    assert!(restored
-        .provider_context
-        .as_deref()
-        .is_some_and(|c| c.contains("Finished Claude task")));
+    assert!(
+        restored
+            .provider_context
+            .as_deref()
+            .is_some_and(|c| c.contains("Finished Claude task"))
+    );
     control(&storage, &id, message("chat only: resume Codex"))?;
     wait(&storage, &id, |s| {
         s.status == Status::Idle && s.provider_context.is_none()

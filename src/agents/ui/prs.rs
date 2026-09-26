@@ -8,7 +8,7 @@ struct Update {
     workspace: PathBuf,
     result: Result<SessionPr, String>,
 }
-use crate::agents::pr_cache::{SessionLink as Cached, SESSION_LINKS};
+use crate::agents::pr_cache::{SESSION_LINKS, SessionLink as Cached};
 pub(super) struct State {
     cache: HashMap<String, Cached>,
     loaded_at: Option<Instant>,

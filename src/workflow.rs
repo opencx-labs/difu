@@ -388,7 +388,9 @@ impl App {
                                 })
                                 .unwrap_or_default();
                             if runs.is_empty() {
-                                self.notice = Notice::info("No workflows awaiting approval for this revision. Refresh the PR to check again.");
+                                self.notice = Notice::info(
+                                    "No workflows awaiting approval for this revision. Refresh the PR to check again.",
+                                );
                             } else {
                                 self.wizard(Wizard::Confirm {
                                     key,

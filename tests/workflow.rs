@@ -903,13 +903,15 @@ fn exercise_checks(root: &Path) -> Result<()> {
         runs: vec![101, 202],
     };
     assert!(difu::review::execute(&key, "stale-head", &operation, &cancel).is_err());
-    assert!(difu::review::execute(
-        &key,
-        &report.head,
-        &difu::review::Operation::ApproveWorkflows { runs: vec![505] },
-        &cancel
-    )
-    .is_err());
+    assert!(
+        difu::review::execute(
+            &key,
+            &report.head,
+            &difu::review::Operation::ApproveWorkflows { runs: vec![505] },
+            &cancel
+        )
+        .is_err()
+    );
     assert_eq!(
         fs::read_to_string(root.join("writes.jsonl")).unwrap_or_default(),
         before

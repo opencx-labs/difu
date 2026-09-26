@@ -872,12 +872,16 @@ mod tests {
             query(&mut shell, text);
             let items = shell.palette_items();
             assert_eq!(items.len(), 2, "{text}");
-            assert!(items
-                .iter()
-                .any(|item| matches!(&item.action, Action::Preview(pr) if pr.key.number == 1524)));
-            assert!(items
-                .iter()
-                .any(|item| matches!(&item.action, Action::Session(id) if id == "one")));
+            assert!(
+                items.iter().any(
+                    |item| matches!(&item.action, Action::Preview(pr) if pr.key.number == 1524)
+                )
+            );
+            assert!(
+                items
+                    .iter()
+                    .any(|item| matches!(&item.action, Action::Session(id) if id == "one"))
+            );
             shell.palette.as_mut().context("palette")?.changed =
                 Instant::now() - Duration::from_secs(1);
             shell.tick_palette();
@@ -887,12 +891,14 @@ mod tests {
         shell.palette.as_mut().context("palette")?.changed =
             Instant::now() - Duration::from_secs(1);
         shell.tick_palette();
-        assert!(shell
-            .palette
-            .as_ref()
-            .context("palette")?
-            .attempted
-            .is_none());
+        assert!(
+            shell
+                .palette
+                .as_ref()
+                .context("palette")?
+                .attempted
+                .is_none()
+        );
         assert!(shell.palette_items().is_empty());
         Ok(())
     }
@@ -916,10 +922,12 @@ mod tests {
             ));
         }
         query(&mut shell, "squash merge");
-        assert!(shell
-            .palette_items()
-            .iter()
-            .any(|item| matches!(item.action, Action::ReviewCommand(2))));
+        assert!(
+            shell
+                .palette_items()
+                .iter()
+                .any(|item| matches!(item.action, Action::ReviewCommand(2)))
+        );
         query(&mut shell, "/rename New title");
         assert!(
             matches!(shell.palette_items().first().map(|i| &i.action), Some(Action::AgentCommand(name)) if name == "/rename")

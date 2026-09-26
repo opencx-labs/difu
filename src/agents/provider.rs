@@ -176,10 +176,12 @@ mod tests {
             Some("claude/sonnet".into()),
             None,
         )?;
-        assert!(session
-            .provider_context
-            .as_deref()
-            .is_some_and(|c| c.contains("Keep the requested behavior")));
+        assert!(
+            session
+                .provider_context
+                .as_deref()
+                .is_some_and(|c| c.contains("Keep the requested behavior"))
+        );
         assert_eq!(
             session.workspace.as_deref(),
             Some(std::path::Path::new("/worktree"))

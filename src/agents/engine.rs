@@ -554,10 +554,12 @@ fn send_turn(
         put(
             &mut params,
             "expectedTurnId",
-            json!(session
-                .turn_id
-                .as_ref()
-                .context("No active turn to steer; send the message again")?),
+            json!(
+                session
+                    .turn_id
+                    .as_ref()
+                    .context("No active turn to steer; send the message again")?
+            ),
         )?;
         "turn/steer"
     } else {
@@ -1050,7 +1052,10 @@ fn instructions(session: &Session) -> String {
     } else {
         super::CODING_INSTRUCTIONS
     };
-    let base = format!("{base}\n\nCurrent repository: {}. Read instructions in the current repository before continuing; earlier conversation may refer to a different repository.", session.job.root().display());
+    let base = format!(
+        "{base}\n\nCurrent repository: {}. Read instructions in the current repository before continuing; earlier conversation may refer to a different repository.",
+        session.job.root().display()
+    );
     if session.artifact_tools {
         format!("{base}\n\n{}", super::artifacts::INSTRUCTIONS)
     } else {

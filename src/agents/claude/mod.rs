@@ -209,11 +209,13 @@ fn respond(
                     .and_then(Value::as_str)
                     .context("Missing question")?
                     .into(),
-                json!(answer
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join("\n")),
+                json!(
+                    answer
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
             );
         }
         input["answers"] = Value::Object(values);
@@ -405,7 +407,9 @@ fn command(
             }
         }
         Control::Resume => {
-            let prompt = Prompt::from("Continue the task from its current state. Inspect prior actions; do not repeat completed work or publication.");
+            let prompt = Prompt::from(
+                "Continue the task from its current state. Inspect prior actions; do not repeat completed work or publication.",
+            );
             send(store, id, rpc, decoder, &prompt)?;
         }
         Control::Compact => {

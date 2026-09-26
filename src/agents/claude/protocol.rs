@@ -181,7 +181,10 @@ impl Connection {
         let start = Instant::now();
         loop {
             cancel.check()?;
-            ensure!(start.elapsed() < Duration::from_secs(45), "Claude did not acknowledge the control request; inspect the session before retrying");
+            ensure!(
+                start.elapsed() < Duration::from_secs(45),
+                "Claude did not acknowledge the control request; inspect the session before retrying"
+            );
             match self.output.recv_timeout(Duration::from_millis(40)) {
                 Ok(Ok(frame))
                     if frame.get("type").and_then(Value::as_str) == Some("control_response")
@@ -215,7 +218,7 @@ impl Connection {
                 Ok(Ok(frame)) => self.backlog.push_back(frame),
                 Ok(Err(error)) => return Err(self.disconnected(&error)),
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(self.disconnected("Claude disconnected"))
+                    return Err(self.disconnected("Claude disconnected"));
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }

@@ -141,8 +141,8 @@ mod tests {
     use super::*;
     use crate::model::{PrKey, PrSummary};
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     #[test]

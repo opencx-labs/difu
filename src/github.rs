@@ -548,7 +548,10 @@ pub fn awaiting_workflows(key: &PrKey, head: &str, cancel: &Cancel) -> Result<Ve
         !head.is_empty() && head.bytes().all(|b| b.is_ascii_hexdigit()),
         "Invalid PR head"
     );
-    let endpoint = format!("repos/{}/actions/runs?head_sha={head}&event=pull_request&status=action_required&per_page=100", key.repository());
+    let endpoint = format!(
+        "repos/{}/actions/runs?head_sha={head}&event=pull_request&status=action_required&per_page=100",
+        key.repository()
+    );
     let pages = json(&["api", "--paginate", "--slurp", &endpoint], cancel)?;
     let mut runs = Vec::new();
     let mut source = None;

@@ -224,7 +224,11 @@ pub fn execute(key: &PrKey, head: &str, operation: &Operation, cancel: &Cancel) 
             );
             ensure!(!runs.is_empty(), "No workflows selected for approval");
             let current = github::awaiting_workflows(key, head, cancel)?;
-            ensure!(runs.iter().all(|id| current.iter().any(|run| run.id == *id)), "Workflow approvals changed. Refresh the PR and review the current runs before approving.");
+            ensure!(
+                runs.iter()
+                    .all(|id| current.iter().any(|run| run.id == *id)),
+                "Workflow approvals changed. Refresh the PR and review the current runs before approving."
+            );
             let mut approved = BTreeSet::new();
             for id in runs {
                 if approved.contains(id) {
@@ -238,7 +242,10 @@ pub fn execute(key: &PrKey, head: &str, operation: &Operation, cancel: &Cancel) 
                     None,
                     cancel,
                 ) {
-                    bail!("{} workflows approved; approval of run {id} failed: {error:#}. Refresh before trying again; no request was retried.", approved.len());
+                    bail!(
+                        "{} workflows approved; approval of run {id} failed: {error:#}. Refresh before trying again; no request was retried.",
+                        approved.len()
+                    );
                 }
                 approved.insert(*id);
             }

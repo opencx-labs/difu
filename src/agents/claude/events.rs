@@ -386,9 +386,11 @@ mod tests {
         );
         assert_eq!(session.status, Status::Failed);
         assert!(session.turn_id.is_none());
-        assert!(session
-            .entries
-            .iter()
-            .any(|e| e.kind == "unsent or unacknowledged" && e.text == "Keep this draft"));
+        assert!(
+            session
+                .entries
+                .iter()
+                .any(|e| e.kind == "unsent or unacknowledged" && e.text == "Keep this draft")
+        );
     }
 }
