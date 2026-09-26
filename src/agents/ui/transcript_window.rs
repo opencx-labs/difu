@@ -10,11 +10,13 @@ pub(super) struct Window {
     revision: Option<(u64, i64, Option<String>)>,
     heights: HashMap<String, usize>,
     rows: HashMap<String, Vec<Line<'static>>>,
+    links: HashMap<String, Vec<transcript::Link>>,
     #[cfg(test)]
     pub formatted: usize,
 }
 pub(super) struct View {
     pub lines: Vec<Line<'static>>,
+    pub links: Vec<transcript::Link>,
     pub start: usize,
     pub total: usize,
     pub sections: Vec<transcript::Section>,
@@ -49,6 +51,7 @@ impl Window {
             self.width = width;
             self.heights.clear();
             self.rows.clear();
+            self.links.clear();
             self.revision = None;
         }
         let revision = (
@@ -66,6 +69,7 @@ impl Window {
         );
         if self.revision.as_ref() != Some(&revision) {
             self.rows.clear();
+            self.links.clear();
             self.revision = Some(revision);
         }
         let outgoing = position
@@ -83,6 +87,7 @@ impl Window {
         // Outgoing slots can be reused without a new session revision.
         for entry in &outgoing {
             self.rows.remove(&entry.id);
+            self.links.remove(&entry.id);
         }
         let visible = session
             .entries
@@ -96,6 +101,7 @@ impl Window {
         if sections.is_empty() {
             return View {
                 lines: Vec::new(),
+                links: Vec::new(),
                 start: 0,
                 total: 0,
                 sections,
@@ -166,7 +172,7 @@ impl Window {
                 if !self.rows.contains_key(&section.id)
                     && let Some(entry) = entries.get(section.id.as_str())
                 {
-                    let (rows, _) = transcript::render_entries(
+                    let (rows, _, links) = transcript::render_entries(
                         session,
                         std::slice::from_ref(*entry),
                         position,
@@ -175,6 +181,7 @@ impl Window {
                     );
                     self.heights.insert(section.id.clone(), rows.len());
                     self.rows.insert(section.id.clone(), rows);
+                    self.links.insert(section.id.clone(), links);
                     #[cfg(test)]
                     {
                         self.formatted += 1;
@@ -248,6 +255,23 @@ impl Window {
             .map(|s| s.id.as_str())
             .collect();
         self.rows.retain(|id, _| keep.contains(id.as_str()));
+        self.links.retain(|id, _| keep.contains(id.as_str()));
+        let links = sections
+            .get(first..end)
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|section| {
+                self.links
+                    .get(&section.id)
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+                    .map(move |mut link| {
+                        link.row += section.row;
+                        link
+                    })
+            })
+            .collect();
         let lines = sections
             .get(first..end)
             .unwrap_or_default()
@@ -256,6 +280,7 @@ impl Window {
             .collect();
         View {
             lines,
+            links,
             start: sections.get(first).map_or(0, |s| s.row),
             total,
             sections,

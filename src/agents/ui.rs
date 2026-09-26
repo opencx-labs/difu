@@ -127,6 +127,7 @@ enum Action {
     MenuItem(usize),
     Command(usize),
     ToggleEntry(String),
+    Link(String),
     Pending,
     Queue,
     EditQueued(usize),
@@ -157,6 +158,7 @@ pub enum Modal {
         entry: String,
         scroll: usize,
         rows: Vec<Line<'static>>,
+        links: Vec<transcript::Link>,
         layout: Option<(u16, u64)>,
         height: usize,
     },
@@ -228,6 +230,7 @@ enum Task {
     Statistics(String),
     Shells(String),
     OpenArtifact,
+    OpenLink,
     InstallBrowser(String, std::path::PathBuf, String),
     WorkspacePaths(String, std::path::PathBuf),
     Defaults(String),
@@ -370,6 +373,7 @@ impl Ui {
         });
     }
     pub fn tick(&mut self, visible: bool) {
+        self.tick_selection_click();
         self.tick_panels(visible);
         self.tick_prs(visible);
         self.tick_models();
@@ -402,6 +406,7 @@ impl Ui {
                 Task::Defaults(_)
                 | Task::Question
                 | Task::OpenArtifact
+                | Task::OpenLink
                 | Task::InstallBrowser(..) => {}
                 Task::WorkspacePaths(id, _) => {
                     self.paths_loading.remove(id);
@@ -2096,12 +2101,25 @@ impl Ui {
             Action::BrowserChoice(index) => self.browser_choice(index),
             Action::MenuItem(index) => self.menu_action(index),
             Action::Command(index) => self.run_command(index),
+            Action::Link(url) => {
+                let sender = self.sender.clone();
+                thread::spawn(move || {
+                    let result = crate::github::open_url(&url, &crate::process::Cancel::default())
+                        .map(|()| Reply::Ok)
+                        .map_err(|error| format!("{error:#}"));
+                    let _ = sender.send(ResultMessage {
+                        kind: Task::OpenLink,
+                        result,
+                    });
+                });
+            }
             Action::ToggleEntry(entry) => {
                 self.text_selection.clear();
                 self.modal = Some(Modal::Transcript {
                     entry,
                     scroll: 0,
                     rows: Vec::new(),
+                    links: Vec::new(),
                     layout: None,
                     height: 0,
                 });
@@ -2522,8 +2540,7 @@ impl Ui {
         let heights = list
             .iter()
             .map(|session| {
-                3 + usize::from(self.sidebar.counts.contains_key(&session.id))
-                    + usize::from(session.status == Status::Waiting)
+                4 + usize::from(self.sidebar.counts.contains_key(&session.id))
                     + usize::from(self.prs.get(&session.id).is_some())
             })
             .collect::<Vec<_>>();
@@ -2548,7 +2565,7 @@ impl Ui {
             if offset >= usize::from(items.height) {
                 break;
             }
-            let height = heights.get(index).copied().unwrap_or(3);
+            let height = heights.get(index).copied().unwrap_or(4);
             let selected = Some(&session.id) == self.selected.as_ref();
             let row = Rect::new(
                 items.x,
@@ -2587,33 +2604,22 @@ impl Ui {
                 elapsed,
                 if session.archived { " · archived" } else { "" }
             );
-            let title_status = if session.status == Status::Waiting {
-                String::new()
-            } else {
-                format!(" {status}")
-            };
             let pin = if self.pinned_sessions.contains(&session.id) {
                 "◆ "
             } else {
                 ""
             };
-            let title_width = usize::from(row.width).saturating_sub(
-                unicode_width::UnicodeWidthStr::width(title_status.as_str())
-                    + 2
-                    + unicode_width::UnicodeWidthStr::width(pin),
-            );
+            let title_width = usize::from(row.width)
+                .saturating_sub(2 + unicode_width::UnicodeWidthStr::width(pin));
             let mut lines = vec![
-                Line::from(vec![
-                    Span::styled(
-                        format!(
-                            "{} {pin}{}",
-                            if selected { "›" } else { " " },
-                            crate::ui::crop(&session.title, 0, title_width)
-                        ),
-                        Style::default().fg(if selected { ACCENT } else { TEXT }),
+                Line::from(Span::styled(
+                    format!(
+                        "{} {pin}{}",
+                        if selected { "›" } else { " " },
+                        crate::ui::crop(&session.title, 0, title_width)
                     ),
-                    Span::styled(title_status, Style::default().fg(color)),
-                ]),
+                    Style::default().fg(if selected { ACCENT } else { TEXT }),
+                )),
                 Line::from(Span::styled(
                     format!(
                         "  {}{}{}",
@@ -2643,12 +2649,10 @@ impl Ui {
                     Span::styled(format!(" -{}", stats.removed), Style::default().fg(RED)),
                 ]));
             }
-            if session.status == Status::Waiting {
-                lines.push(Line::from(Span::styled(
-                    format!("  {status}"),
-                    Style::default().fg(color),
-                )));
-            }
+            lines.push(Line::from(Span::styled(
+                format!("  {status}"),
+                Style::default().fg(color),
+            )));
             if let Some(pr) = self.prs.get(&session.id) {
                 lines.push(Line::from(Span::styled(
                     format!("  PR #{} · {}", pr.key.number, pr.label()),
@@ -2656,7 +2660,11 @@ impl Ui {
                 )));
             }
             frame.render_widget(
-                Paragraph::new(lines).style(Style::default().bg(if selected { PANEL } else { BG })),
+                Paragraph::new(lines).style(if selected {
+                    crate::ui::user_message_style()
+                } else {
+                    Style::default().bg(BG)
+                }),
                 row,
             );
             self.hits.push((row, Action::Select(session.id.clone())));
@@ -2787,6 +2795,7 @@ impl Ui {
             .rebase(1, position.conversation as isize - before_measure as isize);
         let transcript_window::View {
             mut lines,
+            links,
             start,
             mut total,
             sections,
@@ -2829,6 +2838,8 @@ impl Ui {
                 ));
             }
         }
+        self.hits
+            .extend(transcript::link_hits(&links, body, position.conversation));
         self.conversation_sections = sections;
         self.text_selection
             .register_window(1, body, position.conversation, start, &lines);
@@ -3013,6 +3024,7 @@ impl Ui {
             entry,
             scroll,
             rows,
+            links,
             layout,
             height,
         }) = &mut self.modal
@@ -3023,14 +3035,15 @@ impl Ui {
                     if let Some(source) = session.entries.iter().find(|e| e.id == *entry) {
                         let mut position = Position::default();
                         position.expanded.insert(entry.clone());
-                        *rows = transcript::render_entries(
+                        let (rendered, _, targets) = transcript::render_entries(
                             session,
                             std::slice::from_ref(source),
                             &position,
                             area.width,
                             false,
-                        )
-                        .0;
+                        );
+                        *rows = rendered;
+                        *links = targets;
                     }
                     *layout = Some(key);
                 }
@@ -3043,6 +3056,8 @@ impl Ui {
                 .take(*height)
                 .cloned()
                 .collect::<Vec<_>>();
+            self.hits
+                .extend(transcript::link_hits(links, area, *scroll));
             self.text_selection
                 .register_window(3, area, *scroll, *scroll, &visible);
             frame.render_widget(Paragraph::new(visible), area);
@@ -5914,6 +5929,29 @@ mod tests {
             ui.positions.get("one").context("draft")?.draft.text(),
             "Inspect @src/main.rs $inspect "
         );
+        Ok(())
+    }
+    #[test]
+    fn chat_and_expanded_messages_keep_link_targets_after_resize() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().into(),
+        });
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.entries.clear();
+        session.note(
+            "agentMessage",
+            "Open [the invoice](https://example.com/invoice)",
+        );
+        let entry = session.entries.last().context("message")?.id.clone();
+        for width in [120, 90] {
+            draw(&mut ui, width, 35)?;
+            assert!(ui.hits.iter().any(|(_, action)| matches!(action, Action::Link(url) if url == "https://example.com/invoice")));
+        }
+        ui.action(Action::ToggleEntry(entry));
+        draw(&mut ui, 120, 35)?;
+        assert!(ui.hits.iter().any(|(_, action)| matches!(action, Action::Link(url) if url == "https://example.com/invoice")));
         Ok(())
     }
     #[test]

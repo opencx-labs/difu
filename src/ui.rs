@@ -1134,6 +1134,15 @@ pub(crate) fn paint(frame: &mut Frame, rect: Rect, row: &TextRow, app: &mut App)
     if let Some(action) = &row.action {
         app.hits.push((rect, action.clone()));
     }
+    for link in &row.code_links {
+        if matches!(link.action, Action::Link(_)) && link.column < usize::from(rect.width) {
+            let width = link.width.min(usize::from(rect.width) - link.column);
+            app.hits.push((
+                Rect::new(rect.x + link.column as u16, rect.y, width as u16, 1),
+                link.action.clone(),
+            ));
+        }
+    }
 }
 fn paint_diff(
     frame: &mut Frame,
