@@ -57,6 +57,22 @@ pub(super) fn models(cancel: &Cancel) -> Result<Vec<ModelInfo>> {
         })
         .collect())
 }
+pub(super) fn usage(store: &Store, id: &str, session: &Session, cancel: &Cancel) -> Result<Value> {
+    let mut rpc = Connection::open(Options {
+        cwd: session.workspace.as_deref().unwrap_or(session.job.root()),
+        model: None,
+        effort: None,
+        resume: session.thread_id.as_deref(),
+        instructions: "",
+        discovery: false,
+    })?;
+    rpc.call(json!({"subtype":"initialize"}), cancel, |frame| {
+        mcp(store, id, frame)
+    })?;
+    rpc.call(json!({"subtype":"get_usage"}), cancel, |frame| {
+        mcp(store, id, frame)
+    })
+}
 fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
     let request = frame
         .get("request")
@@ -73,31 +89,54 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
         }
         Some("notifications/initialized" | "ping") => json!({}),
         Some("tools/list") => {
-            let mut tool = super::artifacts::tool();
-            if let Some(tool) = tool.as_object_mut() {
-                tool.remove("type");
-            }
-            json!({"tools":[tool]})
+            let tools = [super::artifacts::tool(), super::registration::tool()]
+                .into_iter()
+                .map(|mut tool| {
+                    if let Some(tool) = tool.as_object_mut() {
+                        tool.remove("type");
+                    }
+                    tool
+                })
+                .collect::<Vec<_>>();
+            json!({"tools":tools})
         }
         Some("tools/call") => {
-            ensure!(
-                message.pointer("/params/name").and_then(Value::as_str)
-                    == Some(super::artifacts::TOOL),
-                "Unknown difu tool"
-            );
+            let name = message
+                .pointer("/params/name")
+                .and_then(Value::as_str)
+                .context("Missing tool name")?;
+            let args = message.pointer("/params/arguments").unwrap_or(&Value::Null);
             let mut session = store.get(id)?;
-            let result = super::artifacts::register(
-                &mut session,
-                message.pointer("/params/arguments").unwrap_or(&Value::Null),
-            );
-            let text = match &result {
-                Ok(()) => "Artifact registered in difu".into(),
-                Err(error) => format!("{error:#}"),
+            let result = match name {
+                super::artifacts::TOOL => super::artifacts::register(&mut session, args)
+                    .map(|()| "Artifact registered in difu"),
+                super::registration::TOOL => (|| {
+                    ensure!(
+                        session.registration_requests.is_empty(),
+                        "Register one worktree at a time"
+                    );
+                    super::registration::prepare(&session, args, &Cancel::default())?;
+                    session.registration_requests.push(Pending {
+                        id: message.get("id").cloned().unwrap_or(Value::Null),
+                        method: "worktree".into(),
+                        params: args.clone(),
+                        responded: false,
+                    });
+                    Ok("Worktree registration accepted. Stop here; difu will resume this conversation in the registered workspace.")
+                })(),
+                _ => anyhow::bail!("Unknown difu tool"),
             };
             if result.is_ok() {
-                store.update(id, |s| s.artifacts = session.artifacts)?;
+                store.update(id, |s| {
+                    s.artifacts = session.artifacts;
+                    s.registration_requests = session.registration_requests;
+                })?;
                 store.save(id)?;
             }
+            let text = match &result {
+                Ok(text) => (*text).to_owned(),
+                Err(error) => format!("{error:#}"),
+            };
             json!({"isError":result.is_err(),"content":[{"type":"text","text":text}]})
         }
         _ => anyhow::bail!("Unknown difu MCP method"),
@@ -352,6 +391,13 @@ fn command(
 ) -> Result<()> {
     let session = store.get(id)?;
     match control {
+        Control::ReadUsage => {
+            let usage = rpc.call(json!({"subtype":"get_usage"}), cancel, |frame| {
+                mcp(store, id, frame)
+            })?;
+            store.update(id, |s| s.usage = usage)?;
+        }
+
         Control::Message {
             text,
             queue,
@@ -453,30 +499,12 @@ fn command(
     store.save(id)
 }
 
-pub(super) fn run(
-    store: &Arc<Store>,
-    id: &str,
-    controls: mpsc::Receiver<AgentCommand>,
-    cancel: &Cancel,
-    initial: Option<Control>,
-) -> Result<()> {
-    let mut session = store.get(id)?;
-    super::workspace::prepare(&mut session, &store.home, cancel, |prepared| {
-        store.update(id, |s| {
-            s.job = prepared.job.clone();
-            s.workspace = prepared.workspace.clone();
-            s.workspace_ready = prepared.workspace_ready;
-            s.baseline = prepared.baseline.clone();
-            s.branch = prepared.branch.clone();
-        })?;
-        store.save(id)
-    })?;
-    super::guidance::confirm(store, id, &session, &controls, cancel)?;
-    session = store.get(id)?;
+fn connect(store: &Store, id: &str, session: &Session, cancel: &Cancel) -> Result<Connection> {
     let instructions = format!(
-        "{}\n\n{}",
+        "{}\n\n{}\n\n{}",
         super::WORKTREE_INSTRUCTIONS,
-        super::artifacts::INSTRUCTIONS
+        super::artifacts::INSTRUCTIONS,
+        super::registration::INSTRUCTIONS
     );
     let mut rpc = Connection::open(Options {
         cwd: session.workspace.as_deref().context("Missing workspace")?,
@@ -508,7 +536,94 @@ pub(super) fn run(
     store.update(id, |s| {
         s.status = Status::Idle;
         s.artifact_tools = true;
+        s.registration_tools = true;
     })?;
+    Ok(rpc)
+}
+
+fn transition(
+    store: &Arc<Store>,
+    id: &str,
+    rpc: &mut Connection,
+    decoder: &mut events::Decoder,
+    controls: &mpsc::Receiver<AgentCommand>,
+    cancel: &Cancel,
+) -> Result<()> {
+    let session = store.get(id)?;
+    let Some(pending) = session.registration_requests.first() else {
+        return Ok(());
+    };
+    let prepared = super::registration::prepare(&session, &pending.params, cancel)?;
+    store.update(id, |s| {
+        s.registration_requests.clear();
+        s.switching_workspace = true;
+    })?;
+    if session.turn_id.is_some() {
+        rpc.call(json!({"subtype":"interrupt"}), cancel, |frame| {
+            mcp(store, id, frame)
+        })?;
+        let started = Instant::now();
+        while store.get(id)?.turn_id.is_some() {
+            cancel.check()?;
+            ensure!(
+                started.elapsed() < Duration::from_secs(45),
+                "Claude did not stop before the workspace switch"
+            );
+            if let Some(frame) = rpc.next_frame()? {
+                if frame.get("type").and_then(Value::as_str) == Some("control_request") {
+                    request(store, id, rpc, &frame)?;
+                } else {
+                    store.update(id, |s| decoder.apply(s, &frame))?;
+                }
+            } else {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+    rpc.stop()?;
+    store.update(id, |s| super::registration::apply(s, &prepared))?;
+    store.save(id)?;
+    let session = store.get(id)?;
+    super::guidance::confirm(store, id, &session, controls, cancel)?;
+    *rpc = connect(store, id, &session, cancel)?;
+    *decoder = events::Decoder::default();
+    store.update(id, |s| {
+        s.switching_workspace = false;
+        s.note(
+            "progress",
+            format!("Active worktree: {}", prepared.workspace.path.display()),
+        );
+    })?;
+    send(
+        store,
+        id,
+        rpc,
+        decoder,
+        &Prompt::from(super::registration::CONTINUE),
+    )
+}
+
+pub(super) fn run(
+    store: &Arc<Store>,
+    id: &str,
+    controls: mpsc::Receiver<AgentCommand>,
+    cancel: &Cancel,
+    initial: Option<Control>,
+) -> Result<()> {
+    let mut session = store.get(id)?;
+    super::workspace::prepare(&mut session, &store.home, cancel, |prepared| {
+        store.update(id, |s| {
+            s.job = prepared.job.clone();
+            s.workspace = prepared.workspace.clone();
+            s.workspace_ready = prepared.workspace_ready;
+            s.baseline = prepared.baseline.clone();
+            s.branch = prepared.branch.clone();
+        })?;
+        store.save(id)
+    })?;
+    super::guidance::confirm(store, id, &session, &controls, cancel)?;
+    session = store.get(id)?;
+    let mut rpc = connect(store, id, &session, cancel)?;
     let mut decoder = events::Decoder::default();
     if let Some(control) = initial {
         command(store, id, &mut rpc, &mut decoder, control, cancel)?;
@@ -548,6 +663,9 @@ pub(super) fn run(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if !store.get(id)?.registration_requests.is_empty() {
+            transition(store, id, &mut rpc, &mut decoder, &controls, cancel)?;
         }
         let session = store.get(id)?;
         if session.status == Status::Idle && !session.queue.is_empty() {

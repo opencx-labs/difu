@@ -107,6 +107,15 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
     git(&repo, &["add", "."])?;
     git(&repo, &["commit", "-m", "base"])?;
     let base = git(&repo, &["rev-parse", "HEAD"])?;
+    git(&repo, &["update-ref", "refs/remotes/origin/main", &base])?;
+    git(
+        &repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    )?;
     fs::write(repo.join("tracked.txt"), "precious local edit\n")?;
     let bin = root.join("bin");
     fs::create_dir(&bin)?;
@@ -939,6 +948,15 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     fs::write(repo.join("tracked.txt"), "original\n")?;
     git(&repo, &["add", "."])?;
     git(&repo, &["commit", "-m", "base"])?;
+    git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])?;
+    git(
+        &repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ],
+    )?;
     fs::write(repo.join("tracked.txt"), "precious local edit\n")?;
     let bin = root.join("bin");
     fs::create_dir(&bin)?;
@@ -1037,6 +1055,17 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
             .and_then(|v| v.as_str()),
         Some("workspaceWrite")
     );
+    let before_usage = session(&storage, &id)?.entries.len();
+    let Reply::Usage(usage) = client::request(&storage, Request::Usage { id: id.clone() })? else {
+        anyhow::bail!("usage response");
+    };
+    assert_eq!(
+        usage
+            .pointer("/limits/rateLimits/primary/usedPercent")
+            .and_then(|v| v.as_u64()),
+        Some(25)
+    );
+    assert_eq!(session(&storage, &id)?.entries.len(), before_usage);
     control(
         &storage,
         &id,
@@ -1108,6 +1137,17 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     let claude = wait(&storage, &id, |s| {
         s.status == Status::Idle && s.pending.is_empty()
     })?;
+    let before_usage = session(&storage, &id)?.entries.len();
+    let Reply::Usage(usage) = client::request(&storage, Request::Usage { id: id.clone() })? else {
+        anyhow::bail!("Claude usage response");
+    };
+    assert_eq!(
+        usage
+            .pointer("/rate_limits/five_hour/utilization")
+            .and_then(|v| v.as_u64()),
+        Some(40)
+    );
+    assert_eq!(session(&storage, &id)?.entries.len(), before_usage);
     assert!(!claude.tool_running());
     assert!(claude.provider_context.is_none());
     assert_eq!(
@@ -1168,6 +1208,98 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
         fs::read_to_string(repo.join("tracked.txt"))?,
         "precious local edit\n"
     );
+
+    let registered = root.join("manual worktree");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "manual",
+            registered.to_str().context("path")?,
+            "HEAD",
+        ],
+    )?;
+    let registered = registered.canonicalize()?;
+    let Reply::Session(changed) = client::request(
+        &storage,
+        Request::RegisterWorktree {
+            id: id.clone(),
+            path: registered.clone(),
+            base: Some("origin/main".into()),
+        },
+    )?
+    else {
+        anyhow::bail!("registered session");
+    };
+    assert_eq!(changed.thread_id, claude.thread_id);
+    assert_eq!(changed.workspace.as_ref(), Some(&registered));
+    assert!(changed.workspaces.iter().any(|w| w.path == workspace));
+    control(&storage, &id, message("continue in registered worktree"))?;
+    wait(&storage, &id, |s| {
+        s.status == Status::Idle && registered.join("claude.txt").exists()
+    })?;
+    let claude_tree = root.join("claude registered");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "claude-registered",
+            claude_tree.to_str().context("path")?,
+            "HEAD",
+        ],
+    )?;
+    let claude_tree = claude_tree.canonicalize()?;
+    control(
+        &storage,
+        &id,
+        message(&format!(
+            "claude register worktree: {}",
+            claude_tree.display()
+        )),
+    )?;
+    let moved = wait(&storage, &id, |s| {
+        s.status == Status::Idle
+            && s.workspace.as_ref() == Some(&claude_tree)
+            && claude_tree.join("claude.txt").exists()
+    })?;
+    assert_eq!(moved.thread_id, claude.thread_id);
+    control(
+        &storage,
+        &id,
+        Control::Model {
+            model: Some("fixture-model".into()),
+            effort: None,
+        },
+    )?;
+    let codex_tree = root.join("codex registered");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "codex-registered",
+            codex_tree.to_str().context("path")?,
+            "HEAD",
+        ],
+    )?;
+    let codex_tree = codex_tree.canonicalize()?;
+    control(
+        &storage,
+        &id,
+        message(&format!("register worktree: {}", codex_tree.display())),
+    )?;
+    let moved = wait(&storage, &id, |s| {
+        s.status == Status::Idle
+            && s.workspace.as_ref() == Some(&codex_tree)
+            && codex_tree.join("new.txt").exists()
+    })?;
+    assert_eq!(moved.thread_id, codex.thread_id);
+    assert_eq!(moved.workspaces.len(), 4);
 
     // Both providers isolate immediately, including configurations saved before
     // isolation became mandatory for new sessions.

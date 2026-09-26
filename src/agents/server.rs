@@ -157,6 +157,8 @@ impl Service {
                             }
                         }
                         s.turn_id = None;
+                        s.switching_workspace = false;
+                        s.registration_requests.clear();
                     });
                 }
                 if let Err(error) = store.save(&id_owned) {
@@ -223,6 +225,8 @@ impl Service {
             | Request::Delete { id }
             | Request::Archive { id, .. }
             | Request::Repository { id, .. }
+            | Request::RegisterWorktree { id, .. }
+            | Request::Usage { id }
             | Request::Rename { id, .. } => Some(id.clone()),
             _ => None,
         };
@@ -491,6 +495,76 @@ impl Service {
                 }
                 Ok(Reply::Ok)
             }
+            Request::Usage { id } => {
+                let session = self.store.get(&id)?;
+                ensure!(
+                    matches!(session.job, Job::Coding(_)),
+                    "Usage is available for coding sessions"
+                );
+                let sender = self
+                    .workers
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Worker lock failed"))?
+                    .get(&id)
+                    .filter(|w| !w.handle.is_finished())
+                    .map(|w| w.sender.clone());
+                if let Some(sender) = sender {
+                    let (reply, response) = mpsc::channel();
+                    sender
+                        .send(Command {
+                            control: Control::ReadUsage,
+                            reply,
+                        })
+                        .context("Provider disconnected before usage was read")?;
+                    response
+                        .recv_timeout(Duration::from_secs(60))
+                        .context("Provider did not return usage in time")??;
+                    return Ok(Reply::Usage(self.store.get(&id)?.usage));
+                }
+                let cancel = Cancel::default();
+                let usage = match session.provider {
+                    provider::Provider::Codex => super::engine::usage(&session, &cancel)?,
+                    provider::Provider::Claude => {
+                        super::claude::usage(&self.store, &id, &session, &cancel)?
+                    }
+                };
+                Ok(Reply::Usage(usage))
+            }
+            Request::RegisterWorktree { id, path, base } => {
+                let session = self.store.get(&id)?;
+                ensure!(!session.status.active() && session.turn_id.is_none()
+                    && session.pending.is_empty() && session.queue.is_empty()
+                    && !session.switching_workspace && !session.archived,
+                    "Wait for an idle session with no pending requests before registering a worktree");
+                let prepared = super::registration::prepare(
+                    &session,
+                    &serde_json::json!({"path":path,"base":base}),
+                    &Cancel::default(),
+                )?;
+                if let Some(worker) = self
+                    .workers
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Worker lock failed"))?
+                    .remove(&id)
+                {
+                    worker.cancel.cancel();
+                    worker
+                        .handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("Session worker stopped unexpectedly"))?;
+                }
+                self.store.update(&id, |s| {
+                    super::registration::apply(s, &prepared);
+                    s.status = Status::Idle;
+                    s.error = None;
+                    s.shells.clear();
+                    s.suggestion = None;
+                    s.suggestion_attempted = None;
+                    s.note("system", format!("Active worktree: {}. Resume in this workspace and re-read repository instructions.", prepared.workspace.path.display()));
+                })?;
+                self.store.save(&id)?;
+                Ok(Reply::Session(Box::new(self.store.get(&id)?)))
+            }
             Request::Repository { id, repository } => {
                 let mut candidate = self.store.get(&id)?;
                 ensure!(
@@ -644,10 +718,12 @@ impl Service {
             }
             Request::Changes { id } => Ok(Reply::Changes(super::workspace::changes(
                 &self.store.get(&id)?,
+                &self.store.storage,
                 &Cancel::default(),
             )?)),
             Request::Statistics { id } => Ok(Reply::Statistics(super::workspace::statistics(
                 &self.store.get(&id)?,
+                &self.store.storage,
                 &Cancel::default(),
             )?)),
             Request::WorkspacePaths { id } => Ok(Reply::WorkspacePaths(super::workspace::paths(

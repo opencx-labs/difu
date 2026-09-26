@@ -10,6 +10,8 @@ pub const INSTRUCTIONS: &str = "Prefer self-contained HTML rather than Markdown 
 pub struct Artifact {
     pub path: PathBuf,
     pub title: String,
+    #[serde(default)]
+    pub workspace: Option<PathBuf>,
 }
 pub fn tool() -> Value {
     json!({"type":"function","name":TOOL,"description":"Present a completed local HTML deliverable in difu. The file must already exist inside the current workspace.","inputSchema":{"type":"object","properties":{"path":{"type":"string"},"title":{"type":"string"}},"required":["path","title"],"additionalProperties":false}})
@@ -53,9 +55,14 @@ pub fn register(session: &mut super::Session, args: &Value) -> Result<()> {
         .to_owned();
     let artifact = Artifact {
         path: path.clone(),
+        workspace: Some(root.clone()),
         title: crate::model::clean(title).chars().take(160).collect(),
     };
-    if let Some(existing) = session.artifacts.iter_mut().find(|a| a.path == path) {
+    if let Some(existing) = session
+        .artifacts
+        .iter_mut()
+        .find(|a| a.path == path && a.workspace.as_ref().is_none_or(|w| w == &root))
+    {
         *existing = artifact;
     } else {
         session.artifacts.push(artifact);

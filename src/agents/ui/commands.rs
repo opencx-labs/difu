@@ -7,10 +7,15 @@ const COMMANDS: &[(&str, &str)] = &[
     ("effort", "Choose the reasoning level"),
     ("skills", "Browse skills for this workspace"),
     ("status", "Show session, workspace and permissions"),
+    ("usage", "Show provider usage and rate limits"),
     ("diff", "Show current session changes"),
     ("new", "Launch a new coding session"),
     ("rename", "Rename this session"),
     ("repo", "Change repository before the first worktree"),
+    (
+        "worktree",
+        "Register active worktree: /worktree <path> [base]",
+    ),
     ("help", "Search keyboard shortcuts"),
     ("actions", "Open difu session controls"),
 ];
@@ -30,6 +35,28 @@ impl Ui {
                 },
                 false,
             );
+        }
+    }
+    fn register_worktree(&mut self, args: &str) {
+        if self.busy {
+            return;
+        }
+        let parsed = super::super::registration::parse_command(args);
+        let (path, base) = match parsed {
+            Ok(value) => value,
+            Err(error) => {
+                self.notice = Some((format!("{error:#}"), true));
+                return;
+            }
+        };
+        if let Some(id) = self.selected.clone() {
+            self.busy = true;
+            self.task(
+                Task::Worktree(id.clone()),
+                Request::RegisterWorktree { id, path, base },
+                false,
+            );
+            self.modal = None;
         }
     }
     pub(super) fn open_commands(&mut self, skills_only: bool) {
@@ -67,7 +94,7 @@ impl Ui {
                     id.clone(),
                     self.sessions
                         .get(&id)
-                        .map(|s| s.job.root().clone())
+                        .map(|s| s.workspace.as_ref().unwrap_or(s.job.root()).clone())
                         .unwrap_or_default(),
                 ),
                 Request::WorkspacePaths { id },
@@ -85,7 +112,7 @@ impl Ui {
                     id.clone(),
                     self.sessions
                         .get(&id)
-                        .map(|s| s.job.root().clone())
+                        .map(|s| s.workspace.as_ref().unwrap_or(s.job.root()).clone())
                         .unwrap_or_default(),
                     self.sessions
                         .get(&id)
@@ -318,6 +345,15 @@ impl Ui {
             "/effort" => self.open_model(1),
             "/skills" => self.open_commands(true),
             "/status" => self.modal = Some(Modal::Status),
+            "/usage" => self.open_usage(),
+            "/worktree" => {
+                self.modal = Some(Modal::Commands {
+                    query: Editor::from("worktree "),
+                    selected: 0,
+                    skills_only: false,
+                    files_only: false,
+                });
+            }
             "/diff" => {
                 if !self.changes_visible {
                     self.toggle_changes();
@@ -348,6 +384,7 @@ impl Ui {
     fn run_command_arguments(&mut self, name: &str, args: &str) {
         match name {
             "/repo" => self.change_repository(args),
+            "/worktree" => self.register_worktree(args),
             "/rename" => {
                 if !self.busy
                     && let Some(id) = self.selected.clone()

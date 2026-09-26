@@ -8,6 +8,7 @@ pub mod media;
 pub(crate) mod pr_cache;
 pub mod provider;
 mod questions;
+mod registration;
 pub mod server;
 mod suggestions;
 mod title;
@@ -215,6 +216,8 @@ pub struct Session {
     #[serde(default)]
     pub workspace_ready: bool,
     #[serde(default)]
+    pub workspaces: Vec<workspace::Workspace>,
+    #[serde(default)]
     pub deferred_workspace: bool,
     #[serde(default)]
     pub inherited_permissions: Value,
@@ -223,10 +226,18 @@ pub struct Session {
     #[serde(skip)]
     pub switching_workspace: bool,
     #[serde(default)]
+    pub registration_tools: bool,
+    #[serde(skip)]
+    pub registration_requests: Vec<Pending>,
+    #[serde(default)]
     pub guidance_checked: bool,
     #[serde(default)]
     pub workspace_removed: bool,
     pub baseline: Option<String>,
+    #[serde(default)]
+    pub comparison_base: Option<String>,
+    #[serde(default)]
+    pub workspace_revision: u64,
     pub branch: Option<String>,
     pub thread_id: Option<String>,
     pub turn_id: Option<String>,
@@ -234,6 +245,8 @@ pub struct Session {
     pub turn_started_at: Option<i64>,
     #[serde(default)]
     pub token_usage: Value,
+    #[serde(skip)]
+    pub usage: Value,
     #[serde(default)]
     pub completed_turn: Option<String>,
     pub model: Option<String>,
@@ -284,18 +297,24 @@ impl Session {
             version: 0,
             workspace: None,
             workspace_ready: false,
+            workspaces: Vec::new(),
             deferred_workspace: false,
             inherited_permissions: Value::Null,
             workspace_requests: Vec::new(),
             switching_workspace: false,
+            registration_tools: false,
+            registration_requests: Vec::new(),
             guidance_checked: false,
             workspace_removed: false,
             baseline: None,
+            comparison_base: None,
+            workspace_revision: 0,
             branch: None,
             thread_id: None,
             turn_id: None,
             turn_started_at: None,
             token_usage: Value::Null,
+            usage: Value::Null,
             completed_turn: None,
             model,
             effort,
@@ -393,6 +412,8 @@ impl Session {
             queued: self.queue.len(),
             turn_started_at: self.turn_started_at,
             branch: self.branch.clone(),
+            workspaces: self.workspaces.clone(),
+            workspace_revision: self.workspace_revision,
             repository: Some(self.job.root().clone()),
             worktree: self.workspace_ready
                 && !self.workspace_removed
@@ -416,6 +437,10 @@ pub struct Summary {
     #[serde(default)]
     pub turn_started_at: Option<i64>,
     pub workspace: PathBuf,
+    #[serde(default)]
+    pub workspace_revision: u64,
+    #[serde(default)]
+    pub workspaces: Vec<workspace::Workspace>,
     #[serde(default)]
     pub repository: Option<PathBuf>,
     #[serde(default)]
@@ -490,6 +515,7 @@ impl From<Prompt> for String {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Control {
+    ReadUsage,
     Message {
         text: String,
         queue: bool,
@@ -530,6 +556,9 @@ pub enum Control {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
+    Usage {
+        id: String,
+    },
     Ping,
     ServiceVersion,
     List,
@@ -567,6 +596,11 @@ pub enum Request {
     Delete {
         id: String,
     },
+    RegisterWorktree {
+        id: String,
+        path: PathBuf,
+        base: Option<String>,
+    },
     Changes {
         id: String,
     },
@@ -589,6 +623,7 @@ pub enum Request {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
+    Usage(Value),
     Ok,
     ServiceVersion {
         version: String,

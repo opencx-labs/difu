@@ -9,10 +9,116 @@ use std::{
 pub(crate) const PERSONAL: &str = "palette-personal";
 pub(crate) const LOOKUPS: &str = "palette-lookups";
 pub(crate) const SESSION_LINKS: &str = "palette-session-prs.json";
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SessionLink {
     pub workspace: std::path::PathBuf,
     pub pr: github::SessionPr,
+}
+
+pub(crate) type SessionLinks = std::collections::HashMap<String, Vec<SessionLink>>;
+
+/// Accept the single-PR cache written by earlier versions without losing history.
+pub(crate) fn load_links(path: &std::path::Path) -> SessionLinks {
+    let Ok(bytes) = std::fs::read(path) else {
+        return Default::default();
+    };
+    serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+        serde_json::from_slice::<std::collections::HashMap<String, SessionLink>>(&bytes)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, link)| (id, vec![link]))
+            .collect()
+    })
+}
+
+pub(crate) fn merge_links(target: &mut Vec<SessionLink>, incoming: Vec<SessionLink>) {
+    for link in incoming {
+        if let Some(old) = target.iter_mut().find(|old| old.pr.key == link.pr.key) {
+            if link.pr.updated >= old.pr.updated {
+                *old = link;
+            }
+        } else {
+            target.push(link);
+        }
+    }
+}
+
+pub(crate) fn current(
+    link: &SessionLink,
+    workspace: &std::path::Path,
+    branch: Option<&str>,
+) -> bool {
+    link.workspace == workspace
+        && (link.pr.head_branch.is_empty() || branch == Some(link.pr.head_branch.as_str()))
+}
+
+pub(crate) fn sort_links(
+    links: &mut [SessionLink],
+    workspace: &std::path::Path,
+    branch: Option<&str>,
+) {
+    links.sort_by(|a, b| {
+        let rank = |link: &SessionLink| {
+            let relevant = current(link, workspace, branch);
+            (
+                if link.pr.state == "OPEN" {
+                    if relevant {
+                        0
+                    } else {
+                        1
+                    }
+                } else {
+                    2
+                },
+                !relevant,
+            )
+        };
+        rank(a)
+            .cmp(&rank(b))
+            .then_with(|| b.pr.updated.cmp(&a.pr.updated))
+            .then_with(|| a.pr.key.id().cmp(&b.pr.key.id()))
+    });
+}
+
+pub(crate) fn refresh_session(
+    session: &super::Summary,
+    mut links: Vec<SessionLink>,
+    cancel: &Cancel,
+) -> anyhow::Result<Vec<SessionLink>> {
+    // Refresh historical PRs by URL even if their worktree has been deleted.
+    for link in &mut links {
+        cancel.check()?;
+        if let Ok(pr) = github::session_pr(&link.workspace, None, Some(&link.pr.key), cancel) {
+            link.pr = pr;
+        }
+    }
+    let mut workspaces = session.workspaces.clone();
+    workspaces.retain(|w| w.path != session.workspace || w.branch != session.branch);
+    workspaces.push(super::workspace::Workspace {
+        path: session.workspace.clone(),
+        branch: session.branch.clone(),
+        base: None,
+    });
+    for workspace in workspaces {
+        cancel.check()?;
+        let Some(branch) = workspace.branch.as_deref() else {
+            continue;
+        };
+        if let Ok(prs) = github::session_prs(&workspace.path, branch, cancel) {
+            merge_links(
+                &mut links,
+                prs.into_iter()
+                    .map(|pr| SessionLink {
+                        workspace: workspace.path.clone(),
+                        pr,
+                    })
+                    .collect(),
+            );
+        }
+    }
+    cancel.check()?;
+    sort_links(&mut links, &session.workspace, session.branch.as_deref());
+    Ok(links)
 }
 
 fn refresh_links(
@@ -21,33 +127,16 @@ fn refresh_links(
     cancel: &Cancel,
 ) -> anyhow::Result<()> {
     let path = storage.cache.join(SESSION_LINKS);
-    let mut links: std::collections::HashMap<String, SessionLink> = std::fs::read(&path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default();
+    let mut links = load_links(&path);
+    // Include UI discoveries made before the background cache existed.
+    for (id, prs) in load_links(&storage.cache.join("agent-prs.json")) {
+        merge_links(links.entry(id).or_default(), prs);
+    }
     let sessions = store.list()?;
-    links.retain(|id, link| {
-        sessions
-            .iter()
-            .any(|s| &s.id == id && s.workspace == link.workspace)
-    });
-    for session in sessions
-        .iter()
-        .filter(|s| s.kind == "Coding" && s.branch.is_some())
-    {
-        cancel.check()?;
-        let known = links.get(&session.id).map(|link| &link.pr.key);
-        if let Ok(pr) =
-            github::session_pr(&session.workspace, session.branch.as_deref(), known, cancel)
-        {
-            links.insert(
-                session.id.clone(),
-                SessionLink {
-                    workspace: session.workspace.clone(),
-                    pr,
-                },
-            );
-        }
+    links.retain(|id, _| sessions.iter().any(|s| &s.id == id));
+    for session in sessions.iter().filter(|s| s.kind == "Coding") {
+        let known = links.remove(&session.id).unwrap_or_default();
+        links.insert(session.id.clone(), refresh_session(session, known, cancel)?);
     }
     cancel.check()?;
     std::fs::create_dir_all(&storage.cache)?;
@@ -144,6 +233,66 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn migrates_single_pr_cache_and_orders_retained_history() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("links.json");
+        let make = |number, state: &str, workspace: &str, updated: &str| SessionLink {
+            workspace: workspace.into(),
+            pr: github::SessionPr {
+                key: PrKey {
+                    owner: "example".into(),
+                    repo: "project".into(),
+                    number,
+                },
+                state: state.into(),
+                draft: false,
+                conflicts: false,
+                head_branch: String::new(),
+                head: String::new(),
+                updated: updated.into(),
+            },
+        };
+        let old = make(1, "MERGED", "/old", "2026-09-20");
+        crate::storage::atomic_json(
+            &path,
+            &std::collections::HashMap::from([("session", old.clone())]),
+        )?;
+        let mut cache = load_links(&path);
+        let links = cache
+            .get_mut("session")
+            .ok_or_else(|| anyhow::anyhow!("missing migrated history"))?;
+        merge_links(
+            links,
+            vec![
+                make(2, "OPEN", "/old", "2026-09-25"),
+                make(3, "OPEN", "/current", "2026-09-24"),
+                make(4, "MERGED", "/current", "2026-09-19"),
+            ],
+        );
+        sort_links(links, std::path::Path::new("/current"), None);
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| link.pr.key.number)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 4, 1]
+        );
+        merge_links(links, vec![make(3, "MERGED", "/current", "2026-09-26")]);
+        // An older UI snapshot cannot overwrite the newer merged status.
+        merge_links(links, vec![make(3, "OPEN", "/current", "2026-09-24")]);
+        sort_links(links, std::path::Path::new("/current"), None);
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| link.pr.key.number)
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4, 1]
+        );
+        assert_eq!(links.len(), 4);
+        Ok(())
+    }
 
     #[test]
     fn refreshes_without_a_ui_and_preserves_cache_after_failure() -> anyhow::Result<()> {
