@@ -372,7 +372,7 @@ impl App {
                         _ => {}
                     },
                     Wizard::Controls { key, head, .. } => match index {
-                        12 => self.action(Action::Link(key.url())),
+                        12 => self.action(crate::app::Action::Link(key.url())),
                         11 => {
                             let runs = self
                                 .reviews
