@@ -1,4 +1,5 @@
 mod isolation;
+mod registration;
 use super::{
     Control, Entry, Job, Pending, Prompt, Reply, Session, Skill, Status,
     server::{Command as AgentCommand, Store},
@@ -101,6 +102,24 @@ impl Connection {
         self.call("initialize", json!({"clientInfo":{"name":"difu","title":"difu","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}), cancel, |_| Ok(()))?;
         self.write(json!({"method":"initialized","params":{}}))
     }
+}
+
+pub(super) fn usage(session: &Session, cancel: &Cancel) -> Result<Value> {
+    let cwd = session.workspace.as_deref().unwrap_or(session.job.root());
+    let mut rpc = Connection::open(cwd)?;
+    rpc.initialize(cancel)?;
+    usage_with(&mut rpc, session, cancel, |_| Ok(()))
+}
+fn usage_with(
+    rpc: &mut Connection,
+    session: &Session,
+    cancel: &Cancel,
+    event: impl FnMut(Value) -> Result<()>,
+) -> Result<Value> {
+    let limits = rpc.call("account/rateLimits/read", Value::Null, cancel, event)?;
+    Ok(
+        json!({"model":session.model,"reasoningEffort":session.effort,"context":session.token_usage,"limits":limits}),
+    )
 }
 
 pub fn defaults(cwd: &Path) -> Result<Reply> {
@@ -212,6 +231,19 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
         .unwrap_or_default();
     let params = event.get("params").unwrap_or(&Value::Null);
     if let Some(id) = event.get("id") {
+        if session.registration_tools
+            && method == "item/tool/call"
+            && params.get("tool").and_then(Value::as_str) == Some(super::registration::TOOL)
+        {
+            session.registration_requests.push(Pending {
+                id: id.clone(),
+                method: method.into(),
+                params: params.clone(),
+                responded: false,
+            });
+            return;
+        }
+
         if session.artifact_tools
             && method == "item/tool/call"
             && params.get("tool").and_then(Value::as_str) == Some(super::artifacts::TOOL)
@@ -687,6 +719,11 @@ fn command(
 ) -> Result<()> {
     let session = store.get(id)?;
     match control {
+        Control::ReadUsage => {
+            let usage = usage_with(rpc, &session, cancel, |v| event(store, id, v))?;
+            store.update(id, |s| s.usage = usage)?;
+        }
+
         Control::Message {
             text,
             queue,
@@ -1056,6 +1093,11 @@ fn instructions(session: &Session) -> String {
         "{base}\n\nCurrent repository: {}. Read instructions in the current repository before continuing; earlier conversation may refer to a different repository.",
         session.job.root().display()
     );
+    let base = if session.registration_tools {
+        format!("{base}\n\n{}", super::registration::INSTRUCTIONS)
+    } else {
+        base
+    };
     if session.artifact_tools {
         format!("{base}\n\n{}", super::artifacts::INSTRUCTIONS)
     } else {
@@ -1064,7 +1106,10 @@ fn instructions(session: &Session) -> String {
 }
 fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool)> {
     if store.get(id)?.thread_id.is_none() {
-        store.update(id, |s| s.artifact_tools = true)?;
+        store.update(id, |s| {
+            s.artifact_tools = true;
+            s.registration_tools = true;
+        })?;
     }
     let session = store.get(id)?;
     let cwd = session
@@ -1085,7 +1130,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
         .unwrap_or_default()
         .to_owned();
     let resuming = session.thread_id.is_some();
-    let mut params = json!({"cwd":cwd,"developerInstructions":format!("{}\n\n{}", rpc.inherited, instructions(&session))});
+    let mut params = json!({"cwd":cwd,"runtimeWorkspaceRoots":[cwd],"developerInstructions":format!("{}\n\n{}", rpc.inherited, instructions(&session))});
     if let Some(thread) = &session.thread_id {
         put(&mut params, "threadId", json!(thread))?;
     }
@@ -1109,7 +1154,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
         )?;
     }
     if !resuming {
-        let mut tools = vec![super::artifacts::tool()];
+        let mut tools = vec![super::artifacts::tool(), super::registration::tool()];
         if session.deferred_workspace && launch.isolated {
             tools.extend(isolation::tools().as_array().cloned().unwrap_or_default());
         }
@@ -1206,7 +1251,10 @@ pub fn run(
         }
         match controls.recv_timeout(Duration::from_millis(40)) {
             Ok(command_request) => {
-                let read_only = matches!(command_request.control, Control::RefreshShells);
+                let read_only = matches!(
+                    command_request.control,
+                    Control::RefreshShells | Control::ReadUsage
+                );
                 let result = command(&mut rpc, store, id, command_request.control, cancel);
                 if let Err(error) = &result
                     && !read_only
@@ -1248,6 +1296,10 @@ pub fn run(
         let requests = store.get(id)?.workspace_requests;
         if !requests.is_empty() {
             isolation::transition(&mut rpc, store, id, requests, &controls, cancel)?;
+        }
+        let requests = store.get(id)?.registration_requests;
+        if !requests.is_empty() {
+            registration::transition(&mut rpc, store, id, requests, &controls, cancel)?;
         }
         naming.start(store, id, cancel)?;
         suggesting.start(store, id, cancel)?;

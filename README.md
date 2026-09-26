@@ -189,24 +189,37 @@ the main area with a file tree and a syntax-highlighted diff; **Esc** returns to
 chat. The right helper canvas hosts shells, artifacts, and session PRs. **Tab** and
 **Shift+Tab** cycle between visible panes: sessions, chat (or file tree and diff),
 and the helper canvas. **Esc** closes a focused canvas. Visibility is remembered.
-Changes compares the workspace with its session-start commit and includes later
-commits, staged/unstaged edits, and non-ignored untracked files. It never stages
-files or changes your index. Changes display is limited to 32 MiB; larger results
-produce an explicit error.
+Changes and the sidebar counts follow the active worktree. With an open PR, they
+show staged, unstaged, and non-ignored untracked changes against HEAD. Without an
+open PR, they also include commits since the merge base with the repository's
+default branch (`origin/HEAD`). Continuing the same branch after a merge uses
+that PR's final head as the baseline, so squash-merged work does not reappear.
+No diff operation stages files, modifies the index, or fetches Git refs. Changes
+display is limited to 32 MiB; larger results produce an explicit error.
 
-Difu discovers each coding session's PR from its Git branch and remembers the PR
-across restarts. The background service refreshes links for sessions with branches,
-and the UI refreshes visible statuses every 30 seconds; cached status remains
-available between refreshes and during network failures. Badges show **Open**,
-**Draft**, **Merged**, **Closed**, or **Has conflicts**. In the sidebar, **Needs
-input** appears below the diff counts, followed by the PR badge.
+Before moving to another existing worktree, agents call **difu_register_worktree**.
+Difu validates that it belongs to the same repository, resumes the native
+conversation there, and retains previous worktrees and their PR history. For an
+idle session, **/worktree <absolute path> [base]** performs the same registration;
+quote paths containing spaces. This command also supports existing Codex threads
+that cannot acquire newly added tools. The optional base overrides the default
+comparison branch. If the default branch is unavailable locally, register an
+explicit base or set `origin/HEAD`. The original checkout cannot be registered.
 
-Select the bottom PR badge to open the existing PR viewer in the helper canvas,
+Difu discovers multiple PRs per coding session and remembers them across restarts
+and worktree changes. Open PRs on the current worktree appear first, then other
+open session PRs, then merged/closed PRs. Within those groups, current-worktree
+relevance and the most recent update determine order. The background service and
+visible-session UI refresh every 30 seconds; network failures retain cached
+history. Badges show **Open**, **Draft**, **Merged**, **Closed**, or **Has conflicts**.
+The sidebar shows status below the diff counts, followed by the PR history.
+
+Select a bottom PR badge to open the existing PR viewer in the helper canvas,
 starting on **Preview**. **1 / 2 / 3** selects Preview / Guide / Diff while that
 canvas is focused. **Alt+P** switches between the right pane and the main area,
 remembering the last placement. **Esc** closes a PR dialog first, then the canvas.
 From the composer, **Down** focuses the bottom resources; **Left/Right** moves
-between Shells, Artifacts, and the PR badge, and **Enter** opens the selection.
+between Shells, Artifacts, and the PR badges, and **Enter** opens the selection.
 
 In the composer, **Enter** sends a message and steers an active turn immediately.
 **Ctrl+Enter** explicitly queues it for the next turn; **Shift+Enter** inserts a
@@ -223,7 +236,11 @@ With an empty composer, **Up** recalls sent prompts from the current session.
 Recalled prompts are editable and never sent automatically.
 
 Type **/** in an empty composer for native commands: `/compact`, `/model`, `/effort`,
-`/skills`, `/status`, `/diff`, `/new`, `/rename`, `/help`, `/voice`, and `/actions`.
+`/skills`, `/status`, `/usage`, `/diff`, `/new`, `/rename`, `/repo`, `/worktree`,
+`/help`, `/voice`, and `/actions`.
+**/usage** reads Claude Code's structured `/usage` data or Codex's account limits
+and session token usage, without sending a model prompt. Use **r** to refresh and
+**↑/↓** or **PgUp/PgDn** to scroll. Provider errors appear in the panel.
 Commands filter as you type. Inline arguments also work: `/rename <title>`,
 `/model <model> [effort]`, `/effort <level>`, `/skills <search>`, `/help <search>`,
 `/actions <search>`, and `/voice on|off`. With no arguments, commands retain their

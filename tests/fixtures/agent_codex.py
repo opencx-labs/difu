@@ -38,6 +38,7 @@ for line in sys.stdin:
     params = request.get('params',{})
     if method == 'initialize': reply(request, {'userAgent':'fixture'})
     elif method == 'initialized': pass
+    elif method == 'account/rateLimits/read': reply(request, {'rateLimits':{'planType':'pro','primary':{'usedPercent':25,'windowDurationMins':300,'resetsAt':1800000000}}})
     elif method == 'config/read': reply(request, {'config':{'model':'fixture-model','model_reasoning_effort':'high','developer_instructions':'Preserve inherited guidance.'},'origins':{}})
     elif method == 'thread/backgroundTerminals/list':
         reply(request, {'data':[{'command':'fixture shell','cwd':os.getcwd(),'itemId':'shell-item','processId':'123'}], 'nextCursor':None})
@@ -71,6 +72,8 @@ for line in sys.stdin:
                     'id':'workspace-question','type':'agentMessage','delivery':'async','text':'One question',
                     'questions':[{'title':'Which detail?','options':['Brief','Full']}]}})
             emit({'id':900+turn,'method':'item/tool/call','params':{'threadId':thread_id,'turnId':active,'callId':'workspace','tool':'difu_begin_editing','arguments':{}}})
+        elif text.startswith('register worktree: '):
+            emit({'id':900+turn,'method':'item/tool/call','params':{'threadId':thread_id,'turnId':active,'tool':'difu_register_worktree','arguments':{'path':text.split(': ',1)[1]}}})
         elif text.startswith('artifact'):
             pathlib.Path('report.html').write_text('<h1>Fixture artifact</h1>')
             emit({'id':900+turn,'method':'item/tool/call','params':{'threadId':thread_id,'turnId':active,'tool':'difu_present_artifact','arguments':{'path':'report.html','title':'Fixture report'}}})

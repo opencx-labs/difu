@@ -5,7 +5,7 @@ pub(super) struct State {
     pub counts: HashMap<String, DiffStatistics>,
     refreshed: HashMap<String, Instant>,
     pending: HashSet<String>,
-    turns: HashMap<String, (bool, Option<i64>)>,
+    turns: HashMap<String, (bool, Option<i64>, u64)>,
     dirty: HashSet<String>,
 }
 
@@ -28,13 +28,23 @@ impl State {
     }
     pub fn observe(&mut self, sessions: &[Summary]) {
         for session in sessions {
-            let current = (session.status.active(), session.turn_started_at);
+            let current = (
+                session.status.active(),
+                session.turn_started_at,
+                session.workspace_revision,
+            );
             if let Some(previous) = self.turns.insert(session.id.clone(), current)
                 && previous != current
             {
                 self.dirty.insert(session.id.clone());
+                if previous.2 != current.2 {
+                    self.counts.remove(&session.id);
+                }
             }
         }
+    }
+    pub fn invalidate(&mut self, id: &str) {
+        self.dirty.insert(id.to_owned());
     }
     pub fn finished(&mut self, id: &str) {
         self.pending.remove(id);
@@ -45,7 +55,8 @@ impl State {
             && !self.pending.contains(&session.id)
             && (self.dirty.contains(&session.id)
                 || self.refreshed.get(&session.id).is_none_or(|at| {
-                    session.status.active() && at.elapsed() >= Duration::from_secs(10)
+                    at.elapsed()
+                        >= Duration::from_secs(if session.status.active() { 10 } else { 30 })
                 }))
     }
 }
@@ -57,7 +68,7 @@ impl Ui {
                 self.sidebar.pending.insert(session.id.clone());
                 self.sidebar.dirty.remove(&session.id);
                 self.task(
-                    Task::Statistics(session.id.clone()),
+                    Task::Statistics(session.id.clone(), session.workspace_revision),
                     Request::Statistics {
                         id: session.id.clone(),
                     },

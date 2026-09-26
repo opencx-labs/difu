@@ -47,7 +47,7 @@ struct Item {
     search: String,
     category: &'static str,
     action: Action,
-    pr: Option<PrKey>,
+    prs: Vec<PrKey>,
     pinned: bool,
 }
 enum Update {
@@ -300,12 +300,12 @@ impl Shell {
             prs.entry(pr.key.id()).or_insert_with(|| pr.clone());
         }
         for session in &self.agents.summaries {
-            if let Some(pr) = self.agents.session_pr(&session.id) {
+            for pr in self.agents.session_prs(&session.id) {
                 prs.entry(pr.key.id()).or_insert_with(|| PrSummary {
                     key: pr.key.clone(),
                     title: session.title.clone(),
                     author: String::new(),
-                    updated: String::new(),
+                    updated: pr.updated.clone(),
                     created: String::new(),
                     stats: None,
                     stats_error: false,
@@ -331,7 +331,12 @@ impl Shell {
         let reference = Reference::parse(&query);
         let mut items = Vec::new();
         for session in self.agents.summaries.iter().filter(|s| s.kind != "Guide") {
-            let pr = self.agents.session_pr(&session.id).map(|pr| pr.key.clone());
+            let prs = self
+                .agents
+                .session_prs(&session.id)
+                .iter()
+                .map(|pr| pr.key.clone())
+                .collect::<Vec<_>>();
             let repository = session.repository.as_ref().unwrap_or(&session.workspace);
             let detail = format!(
                 "{} · {} · {}{}{}",
@@ -342,9 +347,9 @@ impl Shell {
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy(),
-                pr.as_ref()
+                prs.iter()
                     .map(|pr| format!(" · {}", pr.id()))
-                    .unwrap_or_default(),
+                    .collect::<String>(),
                 if session.archived { " · archived" } else { "" }
             );
             items.push(Item {
@@ -358,7 +363,7 @@ impl Shell {
                 detail,
                 category: "Session",
                 action: Action::Session(session.id.clone()),
-                pr,
+                prs,
                 pinned: self.agents.pinned_sessions.contains(&session.id),
             });
         }
@@ -368,7 +373,7 @@ impl Shell {
                 detail: "Open pull request preview".into(),
                 search: format!("{} {}", pr.key.id(), pr.title),
                 category: "PR",
-                pr: Some(pr.key.clone()),
+                prs: vec![pr.key.clone()],
                 action: Action::Preview(pr),
                 pinned: false,
             });
@@ -380,7 +385,7 @@ impl Shell {
                 detail: description,
                 category: "Agents",
                 action: Action::AgentCommand(name),
-                pr: None,
+                prs: Vec::new(),
                 pinned: false,
             });
         }
@@ -397,7 +402,7 @@ impl Shell {
                 search: label.into(),
                 category: "Agents",
                 action: Action::AgentMenu(index),
-                pr: None,
+                prs: Vec::new(),
                 pinned: false,
             });
         }
@@ -416,7 +421,7 @@ impl Shell {
                 search: (*label).into(),
                 category: "Reviews",
                 action: Action::ReviewHome(index),
-                pr: None,
+                prs: Vec::new(),
                 pinned: false,
             });
         }
@@ -432,13 +437,13 @@ impl Shell {
                 search: label.into(),
                 category: "Reviews",
                 action: Action::ReviewCommand(index),
-                pr: None,
+                prs: Vec::new(),
                 pinned: false,
             });
         }
         let mut matched = items.into_iter().filter_map(|item| {
             let rank = if let Some(reference) = &reference {
-                if !item.pr.as_ref().is_some_and(|pr| reference.matches(pr)) { return None; }
+                if !item.prs.iter().any(|pr| reference.matches(pr)) { return None; }
                 0
             } else if query.trim_start().starts_with('/') {
                 let name = query.split_whitespace().next().unwrap_or_default();

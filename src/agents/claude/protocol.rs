@@ -31,6 +31,9 @@ pub(super) struct Connection {
     stderr: Arc<Mutex<VecDeque<u8>>>,
 }
 impl Connection {
+    pub fn stop(&mut self) -> Result<()> {
+        self._child.stop()
+    }
     pub fn open(options: Options<'_>) -> Result<Self> {
         let mut command = Command::new("claude");
         command

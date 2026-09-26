@@ -393,7 +393,7 @@ impl Ui {
                 rect.width.saturating_sub(width),
                 rect.height,
             ),
-            "Changes since session start",
+            "Current worktree changes",
             !self.panels.focused && self.focus == Focus::Changes,
         );
         self.hits.push((tree, Action::Focus(Focus::ChangeTree)));
@@ -416,7 +416,10 @@ impl Ui {
             return;
         };
         if document.files.is_empty() {
-            frame.render_widget(Paragraph::new("No changes since session start"), content);
+            frame.render_widget(
+                Paragraph::new("No changes in the current worktree"),
+                content,
+            );
             return;
         }
         let p = self.positions.entry(id).or_default();

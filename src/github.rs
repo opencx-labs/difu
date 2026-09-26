@@ -192,6 +192,12 @@ pub struct SessionPr {
     pub state: String,
     pub draft: bool,
     pub conflicts: bool,
+    #[serde(default)]
+    pub head_branch: String,
+    #[serde(default)]
+    pub head: String,
+    #[serde(default)]
+    pub updated: String,
 }
 impl SessionPr {
     pub fn label(&self) -> &'static str {
@@ -226,7 +232,7 @@ pub fn session_pr(
             cmd.arg(branch);
         }
     }
-    cmd.arg("--json=url,state,isDraft,mergeable");
+    cmd.arg("--json=url,state,isDraft,mergeable,headRefName,headRefOid,updatedAt");
     let output = process::run(&mut cmd, None, cancel)?;
     anyhow::ensure!(
         output.code == 0,
@@ -234,20 +240,66 @@ pub fn session_pr(
         String::from_utf8_lossy(&output.stderr).trim()
     );
     let value: Value = serde_json::from_slice(&output.stdout)?;
-    let state = text(&value, "state");
+    session_pr_value(&value)
+}
+
+fn session_pr_value(value: &Value) -> Result<SessionPr> {
+    let state = text(value, "state");
     anyhow::ensure!(
         matches!(state.as_str(), "OPEN" | "CLOSED" | "MERGED"),
         "Invalid PR state"
     );
     Ok(SessionPr {
-        key: PrKey::from_url(&text(&value, "url"))?,
+        key: PrKey::from_url(&text(value, "url"))?,
         state,
         draft: value
             .get("isDraft")
             .and_then(Value::as_bool)
             .context("Missing PR draft status")?,
-        conflicts: text(&value, "mergeable") == "CONFLICTING",
+        conflicts: text(value, "mergeable") == "CONFLICTING",
+        head_branch: text(value, "headRefName"),
+        head: text(value, "headRefOid"),
+        updated: text(value, "updatedAt"),
     })
+}
+
+/// Discover new PRs independently of previously remembered PR URLs.
+pub fn session_prs(
+    workspace: &std::path::Path,
+    branch: &str,
+    cancel: &Cancel,
+) -> Result<Vec<SessionPr>> {
+    anyhow::ensure!(
+        !branch.is_empty() && branch != "HEAD" && !branch.starts_with('-'),
+        "No named workspace branch"
+    );
+    let output = process::run(
+        command().current_dir(workspace).args([
+            "pr",
+            "list",
+            "--head",
+            branch,
+            "--state",
+            "all",
+            "--limit",
+            "1000",
+            "--json=url,state,isDraft,mergeable,headRefName,headRefOid,updatedAt",
+        ]),
+        None,
+        cancel,
+    )?;
+    anyhow::ensure!(
+        output.code == 0,
+        "GitHub: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let value: Value = serde_json::from_slice(&output.stdout)?;
+    value
+        .as_array()
+        .context("Invalid session PR response")?
+        .iter()
+        .map(session_pr_value)
+        .collect()
 }
 
 pub fn current_repository(cancel: &Cancel) -> Result<String> {

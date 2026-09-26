@@ -49,6 +49,8 @@ pub struct NativeSession {
     pub permissions: Value,
     pub inherited_permissions: Value,
     pub artifact_tools: bool,
+    #[serde(default)]
+    pub registration_tools: bool,
 }
 
 pub fn switch(
@@ -86,6 +88,7 @@ pub fn switch(
             permissions: session.permissions.clone(),
             inherited_permissions: session.inherited_permissions.clone(),
             artifact_tools: session.artifact_tools,
+            registration_tools: session.registration_tools,
         },
     );
     let target = session
@@ -114,6 +117,8 @@ pub fn switch(
     session.permissions = target.permissions;
     session.inherited_permissions = target.inherited_permissions;
     session.artifact_tools = target.artifact_tools;
+    session.registration_tools = target.registration_tools;
+    session.usage = Value::Null;
     session.token_usage = Value::Null;
     session.completed_turn = None;
     session.suggestion = None;

@@ -16,6 +16,7 @@ mod selection;
 mod sidebar;
 mod transcript;
 mod transcript_window;
+mod usage;
 mod voice;
 use crate::{
     editor::Editor,
@@ -45,7 +46,7 @@ pub enum Focus {
     Changes,
     ChangeTree,
     Resources(bool),
-    PullRequest,
+    PullRequest(usize),
 }
 pub(super) struct PendingSend {
     text: String,
@@ -114,7 +115,7 @@ enum Action {
     Focus(Focus),
     Menu,
     Resources(bool),
-    PullRequest,
+    PullRequest(usize),
     Resource(bool, usize),
     RefreshArtifact,
     ExternalArtifact,
@@ -185,6 +186,14 @@ pub enum Modal {
         files_only: bool,
     },
     Status,
+    Usage {
+        id: String,
+        provider: provider::Provider,
+        data: Option<Value>,
+        error: Option<String>,
+        scroll: usize,
+        maximum: usize,
+    },
     Pending {
         selected: usize,
     },
@@ -226,8 +235,8 @@ struct ResultMessage {
 enum Task {
     List,
     Read(String),
-    Changes(String),
-    Statistics(String),
+    Changes(String, u64),
+    Statistics(String, u64),
     Shells(String),
     OpenArtifact,
     OpenLink,
@@ -237,6 +246,8 @@ enum Task {
     Skills(String, std::path::PathBuf, provider::Provider),
     Launch,
     Repository(String),
+    Worktree(String),
+    Usage(String),
     Action,
     Interrupt(String),
     Question,
@@ -391,12 +402,13 @@ impl Ui {
                     self.refreshed = Some(Instant::now());
                 }
                 Task::Read(_) => self.reading = false,
-                Task::Changes(_) => {
+                Task::Changes(..) => {
                     self.changing = false;
                     self.changes_at = Some(Instant::now());
                 }
                 Task::Launch
                 | Task::Repository(_)
+                | Task::Worktree(_)
                 | Task::Action
                 | Task::Delete(_)
                 | Task::Send(..) => self.busy = false,
@@ -407,14 +419,34 @@ impl Ui {
                 | Task::Question
                 | Task::OpenArtifact
                 | Task::OpenLink
-                | Task::InstallBrowser(..) => {}
+                | Task::InstallBrowser(..)
+                | Task::Usage(_) => {}
                 Task::WorkspacePaths(id, _) => {
                     self.paths_loading.remove(id);
                 }
-                Task::Statistics(id) => {
+                Task::Statistics(id, _) => {
                     self.sidebar.finished(id);
                 }
                 Task::Skills(..) => self.skills_loading = None,
+            }
+            if let Task::Usage(id) = &message.kind {
+                if let Some(Modal::Usage {
+                    id: shown,
+                    data,
+                    error,
+                    ..
+                }) = &mut self.modal
+                    && shown == id
+                {
+                    match message.result {
+                        Ok(Reply::Usage(value)) => *data = Some(value),
+                        Err(message) => {
+                            *error = Some(format!("Could not read provider usage: {message}"))
+                        }
+                        _ => *error = Some("Provider returned an unexpected usage response".into()),
+                    }
+                }
+                continue;
             }
             if let Task::Shells(id) = &message.kind {
                 match &message.result {
@@ -471,12 +503,19 @@ impl Ui {
                         if self
                             .sessions
                             .get(&id)
-                            .is_some_and(|s| s.job.root() == &root)
+                            .is_some_and(|s| s.workspace.as_ref().unwrap_or(s.job.root()) == &root)
                         {
                             self.workspace_paths.insert(id, paths);
                         }
                     }
-                    (Task::Statistics(id), Reply::Statistics(stats)) => {
+                    (Task::Statistics(id, revision), Reply::Statistics(stats)) => {
+                        if self
+                            .summaries
+                            .iter()
+                            .any(|s| s.id == id && s.workspace_revision != revision)
+                        {
+                            continue;
+                        }
                         self.sidebar.counts.insert(id, stats);
                         if let Err(error) = self.sidebar.save(&self.storage) {
                             self.notice =
@@ -484,11 +523,10 @@ impl Ui {
                         }
                     }
                     (Task::Skills(id, root, provider), Reply::Skills { skills, errors }) => {
-                        if self
-                            .sessions
-                            .get(&id)
-                            .is_some_and(|s| s.job.root() == &root && s.provider == provider)
-                        {
+                        if self.sessions.get(&id).is_some_and(|s| {
+                            s.workspace.as_ref().unwrap_or(s.job.root()) == &root
+                                && s.provider == provider
+                        }) {
                             self.skills.insert(id, (skills, errors));
                         }
                     }
@@ -514,7 +552,7 @@ impl Ui {
                         self.modal = None;
                         self.refreshed = None;
                     }
-                    (Task::Read(id), Reply::Session(session)) => {
+                    (Task::Read(id) | Task::Worktree(id), Reply::Session(session)) => {
                         if self
                             .sessions
                             .get(&id)
@@ -539,8 +577,15 @@ impl Ui {
                                 true,
                             );
                         }
-                        if session.workspace_removed {
+                        if session.workspace_removed
+                            || self.sessions.get(&id).is_some_and(|old| {
+                                old.workspace_revision != session.workspace_revision
+                            })
+                        {
                             self.changes.remove(&id);
+                            self.changes_at = None;
+                            self.workspace_paths.remove(&id);
+                            self.skills.remove(&id);
                         }
                         if Some(&id) == self.selected.as_ref()
                             && let Some(Modal::Approval { pending, .. }) = &self.modal
@@ -552,7 +597,14 @@ impl Ui {
                         self.sessions.insert(id.clone(), *session);
                         self.question_received(&id);
                     }
-                    (Task::Changes(id), Reply::Changes(patch)) => {
+                    (Task::Changes(id, revision), Reply::Changes(patch)) => {
+                        if self
+                            .sessions
+                            .get(&id)
+                            .is_some_and(|s| s.workspace_revision != revision)
+                        {
+                            continue;
+                        }
                         self.receive_changes(id, patch.into());
                     }
                     (
@@ -692,7 +744,12 @@ impl Ui {
                 })
             {
                 self.changing = true;
-                self.task(Task::Changes(id.clone()), Request::Changes { id }, false);
+                let revision = self.sessions.get(&id).map_or(0, |s| s.workspace_revision);
+                self.task(
+                    Task::Changes(id.clone(), revision),
+                    Request::Changes { id },
+                    false,
+                );
             }
         }
     }
@@ -927,8 +984,8 @@ impl Ui {
         self.modal = None;
         self.action(Action::Open);
     }
-    pub(crate) fn session_pr(&self, id: &str) -> Option<&crate::github::SessionPr> {
-        self.prs.get(id)
+    pub(crate) fn session_prs(&self, id: &str) -> Vec<&crate::github::SessionPr> {
+        self.prs.all(id).iter().map(|link| &link.pr).collect()
     }
     pub(crate) fn palette_review(&self) -> Option<&crate::app::App> {
         match &self.panels.view {
@@ -1819,6 +1876,10 @@ impl Ui {
         }
     }
     fn modal_key(&mut self, key: KeyEvent) {
+        if matches!(self.modal, Some(Modal::Usage { .. })) {
+            self.usage_key(key);
+            return;
+        }
         if matches!(self.modal, Some(Modal::Model { .. })) {
             self.model_key(key);
             return;
@@ -2093,7 +2154,7 @@ impl Ui {
                     *selected = 0;
                 }
             }
-            Action::PullRequest => self.open_pr_panel(),
+            Action::PullRequest(index) => self.open_pr_panel(index),
             Action::Resources(artifacts) => self.open_resources(artifacts),
             Action::Resource(artifacts, index) => self.select_resource(artifacts, index),
             Action::RefreshArtifact => self.refresh_artifact(),
@@ -2377,12 +2438,12 @@ impl Ui {
             );
         }
         let resources = self.visible_resources();
-        let session_pr = self
+        let session_prs = self
             .selected
             .as_ref()
-            .and_then(|id| self.prs.get(id))
-            .cloned();
-        let resource_height = u16::from(!resources.is_empty() || session_pr.is_some());
+            .map(|id| self.prs.all(id).to_vec())
+            .unwrap_or_default();
+        let resource_height = u16::from(!resources.is_empty() || !session_prs.is_empty());
         let content = Rect::new(
             1,
             4,
@@ -2446,20 +2507,29 @@ impl Ui {
             );
             x = x.saturating_add(width + 1);
         }
-        if let Some(pr) = session_pr {
+        let start = match self.focus {
+            Focus::PullRequest(index) => index.min(session_prs.len().saturating_sub(1)),
+            _ => 0,
+        };
+        for (index, link) in session_prs.iter().enumerate().skip(start) {
+            let pr = &link.pr;
             let label = format!(" PR #{} · {} ", pr.key.number, pr.label());
             let width = (unicode_width::UnicodeWidthStr::width(label.as_str()) as u16)
                 .min(conversation.right().saturating_sub(x));
+            if width == 0 {
+                break;
+            }
             let rect = Rect::new(x, content.bottom(), width, 1);
-            self.hits.push((rect, Action::PullRequest));
+            self.hits.push((rect, Action::PullRequest(index)));
             frame.render_widget(
-                Paragraph::new(label).style(if self.focus == Focus::PullRequest {
-                    Style::default().bg(prs::color(&pr)).fg(crate::ui::INK)
+                Paragraph::new(label).style(if self.focus == Focus::PullRequest(index) {
+                    Style::default().bg(prs::color(pr)).fg(crate::ui::INK)
                 } else {
-                    Style::default().fg(prs::color(&pr)).bg(BG)
+                    Style::default().fg(prs::color(pr)).bg(BG)
                 }),
                 rect,
             );
+            x = x.saturating_add(width + 1);
         }
         self.text_selection.highlight(frame);
         self.draw_modal(frame);
@@ -2541,7 +2611,7 @@ impl Ui {
             .iter()
             .map(|session| {
                 4 + usize::from(self.sidebar.counts.contains_key(&session.id))
-                    + usize::from(self.prs.get(&session.id).is_some())
+                    + self.prs.all(&session.id).len()
             })
             .collect::<Vec<_>>();
         let selected = list
@@ -2653,7 +2723,8 @@ impl Ui {
                 format!("  {status}"),
                 Style::default().fg(color),
             )));
-            if let Some(pr) = self.prs.get(&session.id) {
+            for link in self.prs.all(&session.id) {
+                let pr = &link.pr;
                 lines.push(Line::from(Span::styled(
                     format!("  PR #{} · {}", pr.key.number, pr.label()),
                     Style::default().fg(prs::color(pr)),
@@ -2869,7 +2940,7 @@ impl Ui {
             let header = format!("{questions} · {approval_count} approval(s) · Alt+↑ Questions");
             self.button(
                 frame,
-                Rect::new(area.x, body.bottom(), area.width, 1),
+                Rect::new(area.x, body.bottom() + activity_height, area.width, 1),
                 &header,
                 Action::Pending,
                 true,
@@ -2879,16 +2950,16 @@ impl Ui {
                 .min(area.width);
             self.draw_question_tabs(
                 frame,
-                Rect::new(area.x + offset, body.bottom(), area.width - offset, 1),
+                Rect::new(
+                    area.x + offset,
+                    body.bottom() + activity_height,
+                    area.width - offset,
+                    1,
+                ),
             );
         }
         if activity_height > 0 {
-            let activity_area = Rect::new(
-                area.x,
-                body.bottom() + u16::from(pending),
-                area.width,
-                activity_height,
-            );
+            let activity_area = Rect::new(area.x, body.bottom(), area.width, activity_height);
             frame.render_widget(
                 Paragraph::new(
                     activity_rows
@@ -3004,6 +3075,7 @@ impl Ui {
             Some(Modal::Menu { .. }) => "Agent actions",
             Some(Modal::Commands { .. }) => "Session commands",
             Some(Modal::Status) => "Session status",
+            Some(Modal::Usage { .. }) => "Provider usage · ↑/↓ Scroll · r Refresh · Esc Close",
             Some(Modal::Pending { .. }) => "Pending questions and approvals",
             Some(Modal::Queue { .. }) => "Queued outgoing messages",
             Some(Modal::QueuedEdit { .. }) => "Edit queued message",
@@ -3078,6 +3150,10 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::Voice { .. })) {
             self.draw_voice_settings(frame, area);
+            return;
+        }
+        if matches!(self.modal, Some(Modal::Usage { .. })) {
+            self.draw_usage(frame, area);
             return;
         }
         if matches!(self.modal, Some(Modal::Status)) {
@@ -3365,6 +3441,7 @@ impl Ui {
                 | Modal::Voice { .. }
                 | Modal::Commands { .. }
                 | Modal::Status
+                | Modal::Usage { .. }
                 | Modal::Pending { .. }
                 | Modal::Queue { .. }
                 | Modal::QueuedEdit { .. },
@@ -4498,6 +4575,7 @@ mod tests {
             .context("session")?
             .artifacts
             .push(super::super::artifacts::Artifact {
+                workspace: None,
                 path: "report.html".into(),
                 title: "Report".into(),
             });
@@ -5172,7 +5250,7 @@ mod tests {
             "Keep this draft"
         );
         let (text, _) = draw(&mut ui, 120, 40)?;
-        assert!(text.contains("Changes since session start"));
+        assert!(text.contains("Current worktree changes"));
         ui.menu_action(14);
         let (text, _) = draw(&mut ui, 120, 40)?;
         assert!(text.contains("Stop this agent"));
@@ -6361,7 +6439,7 @@ mod tests {
         ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(ui.focus == Focus::ChangeTree);
         let (screen, cursor) = draw(&mut ui, 140, 35)?;
-        assert!(!screen.contains("draft text") && screen.contains("Changes since session start"));
+        assert!(!screen.contains("draft text") && screen.contains("Current worktree changes"));
         assert_eq!(cursor, Some((0, 0)));
         ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let (screen, _) = draw(&mut ui, 140, 35)?;

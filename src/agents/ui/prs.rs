@@ -6,14 +6,16 @@ use std::path::PathBuf;
 struct Update {
     id: String,
     workspace: PathBuf,
-    result: Result<SessionPr, String>,
+    revision: u64,
+    result: Result<Vec<Cached>, String>,
 }
-use crate::agents::pr_cache::{SESSION_LINKS, SessionLink as Cached};
+use crate::agents::pr_cache::{self, SESSION_LINKS, SessionLink as Cached};
 pub(super) struct State {
-    cache: HashMap<String, Cached>,
+    cache: pr_cache::SessionLinks,
     loaded_at: Option<Instant>,
     pub visible: HashSet<String>,
     refreshed: HashMap<String, Instant>,
+    revisions: HashMap<String, u64>,
     pending: HashMap<String, Cancel>,
     sender: mpsc::Sender<Update>,
     receiver: mpsc::Receiver<Update>,
@@ -21,22 +23,16 @@ pub(super) struct State {
 impl State {
     pub fn load(storage: &Storage) -> Self {
         let (sender, receiver) = mpsc::channel();
-        let mut cache: HashMap<String, Cached> =
-            std::fs::read(storage.cache.join("agent-prs.json"))
-                .ok()
-                .and_then(|v| serde_json::from_slice(&v).ok())
-                .unwrap_or_default();
-        if let Some(links) = std::fs::read(storage.cache.join(SESSION_LINKS))
-            .ok()
-            .and_then(|v| serde_json::from_slice::<HashMap<String, Cached>>(&v).ok())
-        {
-            cache.extend(links);
+        let mut cache = pr_cache::load_links(&storage.cache.join("agent-prs.json"));
+        for (id, links) in pr_cache::load_links(&storage.cache.join(SESSION_LINKS)) {
+            pr_cache::merge_links(cache.entry(id).or_default(), links);
         }
         Self {
             cache,
             loaded_at: None,
             visible: HashSet::new(),
             refreshed: HashMap::new(),
+            revisions: HashMap::new(),
             pending: HashMap::new(),
             sender,
             receiver,
@@ -48,10 +44,15 @@ impl State {
         }
         self.cache.remove(id);
         self.refreshed.remove(id);
+        self.revisions.remove(id);
         self.save(storage)
     }
+    #[cfg(test)]
     pub fn get(&self, id: &str) -> Option<&SessionPr> {
-        self.cache.get(id).map(|c| &c.pr)
+        self.all(id).first().map(|c| &c.pr)
+    }
+    pub fn all(&self, id: &str) -> &[Cached] {
+        self.cache.get(id).map(Vec::as_slice).unwrap_or_default()
     }
     fn due(&self, id: &str) -> bool {
         !self.pending.contains_key(id)
@@ -63,17 +64,10 @@ impl State {
     fn receive(&mut self, update: Update) -> bool {
         self.pending.remove(&update.id);
         self.refreshed.insert(update.id.clone(), Instant::now());
-        if let Ok(pr) = update.result {
-            self.cache.insert(
-                update.id,
-                Cached {
-                    workspace: update.workspace,
-                    pr,
-                },
-            );
+        if let Ok(links) = update.result {
+            pr_cache::merge_links(self.cache.entry(update.id).or_default(), links);
             true
         } else {
-            // A branch without a PR is normal; transient failures retain cached status.
             false
         }
     }
@@ -99,22 +93,20 @@ pub(super) fn color(pr: &SessionPr) -> ratatui::style::Color {
 }
 impl Ui {
     pub(super) fn tick_prs(&mut self, visible: bool) {
-        let invalid = self
-            .prs
-            .cache
-            .iter()
-            .filter(|(id, cached)| {
-                self.summaries
-                    .iter()
-                    .any(|s| &s.id == *id && s.workspace != cached.workspace)
-            })
-            .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
-        for id in invalid {
-            if let Err(error) = self.prs.forget(&id, &self.storage) {
-                self.notice = Some((format!("Cannot clear cached PR: {error:#}"), true));
+        for session in &self.summaries {
+            if self
+                .prs
+                .revisions
+                .insert(session.id.clone(), session.workspace_revision)
+                .is_some_and(|old| old != session.workspace_revision)
+            {
+                if let Some(cancel) = self.prs.pending.remove(&session.id) {
+                    cancel.cancel();
+                }
+                self.prs.refreshed.remove(&session.id);
             }
         }
+        let previous = self.prs.cache.clone();
         let mut changed = false;
         if self
             .prs
@@ -122,28 +114,33 @@ impl Ui {
             .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
         {
             self.prs.loaded_at = Some(Instant::now());
-            if let Some(links) = std::fs::read(self.storage.cache.join(SESSION_LINKS))
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<HashMap<String, Cached>>(&bytes).ok())
-            {
-                for (id, link) in links {
-                    if self
-                        .summaries
-                        .iter()
-                        .any(|s| s.id == id && s.workspace == link.workspace)
-                    {
-                        self.prs.cache.insert(id, link);
-                    }
+            for (id, links) in pr_cache::load_links(&self.storage.cache.join(SESSION_LINKS)) {
+                if self.summaries.iter().any(|s| s.id == id) {
+                    pr_cache::merge_links(self.prs.cache.entry(id).or_default(), links);
+                    changed = true;
                 }
             }
         }
         while let Ok(update) = self.prs.receiver.try_recv() {
-            if self
-                .summaries
-                .iter()
-                .any(|s| s.id == update.id && s.workspace == update.workspace)
-            {
+            if self.summaries.iter().any(|s| {
+                s.id == update.id
+                    && s.workspace == update.workspace
+                    && s.workspace_revision == update.revision
+            }) {
                 changed |= self.prs.receive(update);
+            }
+        }
+        for session in &self.summaries {
+            if let Some(links) = self.prs.cache.get_mut(&session.id) {
+                pr_cache::sort_links(links, &session.workspace, session.branch.as_deref());
+            }
+        }
+        for session in &self.summaries {
+            if previous.get(&session.id) != self.prs.cache.get(&session.id) {
+                self.sidebar.invalidate(&session.id);
+                if self.selected.as_ref() == Some(&session.id) {
+                    self.changes_at = None;
+                }
             }
         }
         if changed && let Err(error) = self.prs.save(&self.storage) {
@@ -166,32 +163,28 @@ impl Ui {
             }
             let id = summary.id.clone();
             let workspace = summary.workspace.clone();
-            let branch = summary.branch.clone();
-            let known = self.prs.get(&id).map(|p| p.key.clone());
+            let summary = summary.clone();
+            let known = self.prs.all(&id).to_vec();
             let cancel = Cancel::default();
             self.prs.pending.insert(id.clone(), cancel.clone());
             let sender = self.prs.sender.clone();
             thread::spawn(move || {
-                let result = crate::github::session_pr(
-                    &workspace,
-                    branch.as_deref(),
-                    known.as_ref(),
-                    &cancel,
-                )
-                .map_err(|e| format!("{e:#}"));
+                let result = pr_cache::refresh_session(&summary, known, &cancel)
+                    .map_err(|e| format!("{e:#}"));
                 let _ = sender.send(Update {
                     id,
                     workspace,
+                    revision: summary.workspace_revision,
                     result,
                 });
             });
         }
     }
-    pub(super) fn open_pr_panel(&mut self) {
+    pub(super) fn open_pr_panel(&mut self, index: usize) {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        let Some(pr) = self.prs.get(&id).cloned() else {
+        let Some(pr) = self.prs.all(&id).get(index).map(|link| link.pr.clone()) else {
             return;
         };
         let config = match self.storage.load_config() {
@@ -209,6 +202,7 @@ impl Ui {
             .prs
             .cache
             .get(&id)
+            .and_then(|links| links.iter().find(|link| link.pr.key == key))
             .map(|c| c.workspace.clone())
             .filter(|p| p.is_dir())
             && let Some(review) = app.reviews.get_mut(&key.id())
@@ -243,6 +237,9 @@ mod tests {
             state: "OPEN".into(),
             draft: false,
             conflicts: false,
+            head_branch: String::new(),
+            head: String::new(),
+            updated: String::new(),
         }
     }
     fn store(root: &std::path::Path) -> Storage {
@@ -276,7 +273,11 @@ mod tests {
         state.receive(Update {
             id: "one".into(),
             workspace: temp.path().into(),
-            result: Ok(badge),
+            revision: 0,
+            result: Ok(vec![Cached {
+                workspace: temp.path().into(),
+                pr: badge,
+            }]),
         });
         assert!(!state.due("one"));
         state.refreshed.insert(
@@ -289,6 +290,7 @@ mod tests {
         assert!(!state.receive(Update {
             id: "one".into(),
             workspace: temp.path().into(),
+            revision: 0,
             result: Err("offline".into())
         }));
         assert_eq!(state.get("one").context("cached")?.label(), "Merged");
@@ -331,7 +333,11 @@ mod tests {
         ui.prs.receive(Update {
             id: "one".into(),
             workspace: temp.path().into(),
-            result: Ok(pr()),
+            revision: 0,
+            result: Ok(vec![Cached {
+                workspace: temp.path().into(),
+                pr: pr(),
+            }]),
         });
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 45))?;
         terminal.draw(|f| ui.draw(f))?;
@@ -377,7 +383,7 @@ mod tests {
         assert_eq!(waiting_row, diff_row + 1);
         assert_eq!(pr_row, waiting_row + 1);
         ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
-        assert_eq!(ui.focus, Focus::PullRequest);
+        assert_eq!(ui.focus, Focus::PullRequest(0));
         ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(ui.focus, Focus::Composer);
         // A loading fixture prevents any network or model work in this UI test.

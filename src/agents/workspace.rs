@@ -9,6 +9,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct Workspace {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub base: Option<String>,
+}
+
 fn read(root: &Path, args: &[&str], cancel: &Cancel) -> Result<String> {
     Ok(process::checked(
         repo::git(root).env("GIT_OPTIONAL_LOCKS", "0").args(args),
@@ -162,8 +170,73 @@ pub fn prepare(
     persist(session)
 }
 
+/// Both diff consumers resolve the current workspace against the same cached PR history.
+fn comparison(
+    session: &Session,
+    storage: &crate::storage::Storage,
+    cancel: &Cancel,
+) -> Result<String> {
+    let path = session
+        .workspace
+        .as_deref()
+        .context("No coding workspace")?;
+    let branch = read(path, &["branch", "--show-current"], cancel)?;
+    let mut links =
+        super::pr_cache::load_links(&storage.cache.join(super::pr_cache::SESSION_LINKS))
+            .remove(&session.id)
+            .unwrap_or_default();
+    let local = super::pr_cache::load_links(&storage.cache.join("agent-prs.json"))
+        .remove(&session.id)
+        .unwrap_or_default();
+    super::pr_cache::merge_links(&mut links, local);
+    links.retain(|link| super::pr_cache::current(link, path, Some(&branch)));
+    if links.iter().any(|link| link.pr.state == "OPEN") {
+        return read(path, &["rev-parse", "--verify", "HEAD^{commit}"], cancel);
+    }
+    links.sort_by(|a, b| b.pr.updated.cmp(&a.pr.updated));
+    for link in links
+        .iter()
+        .filter(|link| link.pr.state == "MERGED" && !link.pr.head.is_empty())
+    {
+        let head = &link.pr.head;
+        ensure!(
+            head.chars().all(|c| c.is_ascii_hexdigit()),
+            "Invalid merged PR revision"
+        );
+        // A reused branch name on a fresh history must not resurrect its old diff.
+        let ancestor = process::run(
+            repo::git(path).args(["merge-base", "--is-ancestor", head, "HEAD"]),
+            None,
+            cancel,
+        )?;
+        if ancestor.code == 0 {
+            return Ok(head.clone());
+        }
+        ensure!(
+            ancestor.code == 1,
+            "Cannot locate the merged PR's final head locally; fetch its branch before viewing changes"
+        );
+    }
+    let base = if let Some(base) = &session.comparison_base {
+        base.clone()
+    } else {
+        read(path, &["symbolic-ref", "refs/remotes/origin/HEAD"], cancel)
+            .context("Cannot resolve the repository default branch locally; set origin/HEAD or register an explicit comparison base")?
+    };
+    ensure!(
+        !base.starts_with('-') && !base.is_empty(),
+        "Invalid comparison base"
+    );
+    read(path, &["merge-base", "HEAD", &base], cancel)
+        .with_context(|| format!("Cannot find the workspace merge base against {base}"))
+}
+
 /// Read worktree changes without touching its index, checking out code or fetching.
-pub fn changes(session: &Session, cancel: &Cancel) -> Result<String> {
+pub fn changes(
+    session: &Session,
+    storage: &crate::storage::Storage,
+    cancel: &Cancel,
+) -> Result<String> {
     ensure!(
         !session.workspace_removed,
         "This worktree was removed; its named branch and commits remain in the repository"
@@ -175,10 +248,7 @@ pub fn changes(session: &Session, cancel: &Cancel) -> Result<String> {
         .workspace
         .as_deref()
         .context("No coding workspace for this job")?;
-    let base = session
-        .baseline
-        .as_deref()
-        .context("Session has no starting revision")?;
+    let base = comparison(session, storage, cancel)?;
     let root = PathBuf::from(read(path, &["rev-parse", "--show-toplevel"], cancel)?);
     let path = root.as_path();
     let mut command = repo::git(path);
@@ -188,7 +258,7 @@ pub fn changes(session: &Session, cancel: &Cancel) -> Result<String> {
         "--no-textconv",
         "--no-color",
         "--find-renames",
-        base,
+        &base,
         "--",
     ]);
     let output = process::run_limited(&mut command, cancel, 32 * 1024 * 1024)?;
@@ -234,7 +304,11 @@ pub fn changes(session: &Session, cancel: &Cancel) -> Result<String> {
 }
 
 /// Lightweight counts use the same baseline and untracked-file scope as Changes.
-pub fn statistics(session: &Session, cancel: &Cancel) -> Result<super::DiffStatistics> {
+pub fn statistics(
+    session: &Session,
+    storage: &crate::storage::Storage,
+    cancel: &Cancel,
+) -> Result<super::DiffStatistics> {
     ensure!(!session.workspace_removed, "Session worktree was removed");
     if session.waiting_for_workspace() {
         return Ok(super::DiffStatistics::default());
@@ -243,10 +317,7 @@ pub fn statistics(session: &Session, cancel: &Cancel) -> Result<super::DiffStati
         .workspace
         .as_deref()
         .context("No coding workspace")?;
-    let base = session
-        .baseline
-        .as_deref()
-        .context("No starting revision")?;
+    let base = comparison(session, storage, cancel)?;
     let mut stats = super::DiffStatistics::default();
     let output = read(
         path,
@@ -257,7 +328,7 @@ pub fn statistics(session: &Session, cancel: &Cancel) -> Result<super::DiffStati
             "--find-renames",
             "--no-ext-diff",
             "--no-textconv",
-            base,
+            &base,
             "--",
         ],
         cancel,
@@ -408,4 +479,184 @@ pub fn cleanup(session: &Session, home: &Path, cancel: &Cancel) -> Result<()> {
         cancel,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        agents::{
+            Launch, Status,
+            pr_cache::{SessionLink, SessionLinks},
+        },
+        github::SessionPr,
+        model::PrKey,
+        storage::Storage,
+    };
+
+    fn git(root: &Path, args: &[&str]) -> Result<String> {
+        process::checked(
+            repo::git(root)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args),
+            &Cancel::default(),
+        )
+        .map(|s| s.trim().to_owned())
+    }
+    #[test]
+    fn current_worktree_diff_tracks_pr_lifecycle_and_registered_workspaces() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let repository = root.join("repo");
+        fs::create_dir(&repository)?;
+        git(&repository, &["init", "-b", "main"])?;
+        fs::write(repository.join("tracked.txt"), "base\n")?;
+        git(&repository, &["add", "."])?;
+        git(&repository, &["commit", "-m", "base"])?;
+        git(
+            &repository,
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        )?;
+        git(
+            &repository,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        )?;
+        let workspace = root.join("first");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "first",
+                workspace.to_str().context("path")?,
+            ],
+        )?;
+        let mut session = Session::new(
+            "one".into(),
+            Job::Coding(Launch {
+                repository: repository.clone(),
+                isolated: true,
+                base: "HEAD".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.status = Status::Idle;
+        session.workspace = Some(workspace.clone());
+        session.branch = Some("first".into());
+        session.workspace_ready = true;
+        let storage = Storage {
+            config: root.join("config.json"),
+            cache: root.join("cache"),
+        };
+        fs::create_dir(&storage.cache)?;
+        let cancel = Cancel::default();
+        fs::write(workspace.join("tracked.txt"), "base\ncommitted\n")?;
+        git(&workspace, &["add", "."])?;
+        git(&workspace, &["commit", "-m", "PR commit"])?;
+        let head = git(&workspace, &["rev-parse", "HEAD"])?;
+        fs::write(workspace.join("tracked.txt"), "base\ncommitted\nlocal\n")?;
+        fs::write(workspace.join("staged.txt"), "staged\n")?;
+        git(&workspace, &["add", "staged.txt"])?;
+        fs::write(workspace.join("untracked.txt"), "untracked\n")?;
+        assert_eq!(statistics(&session, &storage, &cancel)?.added, 4);
+        assert!(changes(&session, &storage, &cancel)?.contains("+committed"));
+        let mut link = SessionLink {
+            workspace: workspace.clone(),
+            pr: SessionPr {
+                key: PrKey {
+                    owner: "example".into(),
+                    repo: "project".into(),
+                    number: 1,
+                },
+                state: "OPEN".into(),
+                draft: false,
+                conflicts: false,
+                head_branch: "first".into(),
+                head: head.clone(),
+                updated: "2026-09-26T00:00:00Z".into(),
+            },
+        };
+        let cache = storage.cache.join(super::super::pr_cache::SESSION_LINKS);
+        let save = |link: &SessionLink| -> Result<()> {
+            let links: SessionLinks = [(session.id.clone(), vec![link.clone()])]
+                .into_iter()
+                .collect();
+            crate::storage::atomic_json(&cache, &links)
+        };
+        save(&link)?;
+        assert_eq!(statistics(&session, &storage, &cancel)?.added, 3);
+        let patch = changes(&session, &storage, &cancel)?;
+        assert!(!patch.contains("+committed"));
+        assert!(
+            patch.contains("+local") && patch.contains("+staged") && patch.contains("+untracked")
+        );
+        // Squash merge: default-branch history contains the work under a different SHA.
+        fs::write(repository.join("tracked.txt"), "base\ncommitted\n")?;
+        git(&repository, &["add", "."])?;
+        git(&repository, &["commit", "-m", "Squash PR"])?;
+        git(
+            &repository,
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        )?;
+        link.pr.state = "MERGED".into();
+        save(&link)?;
+        assert_eq!(comparison(&session, &storage, &cancel)?, head);
+        assert_eq!(statistics(&session, &storage, &cancel)?.added, 3);
+        let second = root.join("second");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "second",
+                second.to_str().context("path")?,
+                "origin/main",
+            ],
+        )?;
+        let prepared = super::super::registration::prepare(
+            &session,
+            &serde_json::json!({"path":second}),
+            &cancel,
+        )?;
+        super::super::registration::apply(&mut session, &prepared);
+        assert_eq!(session.workspaces.len(), 2);
+        assert_eq!(session.workspace_revision, 1);
+        assert_eq!(statistics(&session, &storage, &cancel)?.added, 0);
+        assert!(changes(&session, &storage, &cancel)?.is_empty());
+        assert!(
+            super::super::registration::prepare(
+                &session,
+                &serde_json::json!({"path":repository}),
+                &cancel
+            )
+            .is_err()
+        );
+        let explicit = super::super::registration::prepare(
+            &session,
+            &serde_json::json!({"path":second,"base":"first"}),
+            &cancel,
+        )?;
+        super::super::registration::apply(&mut session, &explicit);
+        assert_eq!(session.comparison_base.as_deref(), Some("first"));
+        assert_eq!(
+            comparison(&session, &storage, &cancel)?,
+            git(&second, &["merge-base", "HEAD", "first"])?
+        );
+        Ok(())
+    }
 }

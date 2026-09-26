@@ -167,7 +167,11 @@ impl Ui {
             };
             let result = (|| -> Result<PathBuf> {
                 super::super::artifacts::resolve(
-                    session.workspace.as_deref().context("No workspace")?,
+                    artifact
+                        .workspace
+                        .as_deref()
+                        .or(session.workspace.as_deref())
+                        .context("No workspace")?,
                     &artifact.path,
                 )
             })();
@@ -582,13 +586,8 @@ impl Ui {
                 .into_iter()
                 .map(|(a, _)| Focus::Resources(a))
                 .collect::<Vec<_>>();
-            if self
-                .selected
-                .as_ref()
-                .and_then(|id| self.prs.get(id))
-                .is_some()
-            {
-                visible.push(Focus::PullRequest);
+            if let Some(id) = &self.selected {
+                visible.extend((0..self.prs.all(id).len()).map(Focus::PullRequest));
             }
             if self.focus == Focus::Composer
                 && key.code == KeyCode::Down
@@ -598,7 +597,7 @@ impl Ui {
                 self.focus = *first;
                 return true;
             }
-            if matches!(self.focus, Focus::Resources(_) | Focus::PullRequest) {
+            if matches!(self.focus, Focus::Resources(_) | Focus::PullRequest(_)) {
                 if visible.is_empty() {
                     self.focus = Focus::Composer;
                     return false;
@@ -617,7 +616,7 @@ impl Ui {
                         }
                     }
                     KeyCode::Enter => match self.focus {
-                        Focus::PullRequest => self.open_pr_panel(),
+                        Focus::PullRequest(index) => self.open_pr_panel(index),
                         Focus::Resources(a) => self.open_resources(a),
                         _ => {}
                     },
