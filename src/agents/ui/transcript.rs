@@ -813,15 +813,15 @@ mod tests {
     #[test]
     fn links_keep_targets_and_viewport_coordinates() {
         let (rows, links) = prose_links("Open [the invoice](https://example.com/invoice)", 12);
-        assert!(links
-            .iter()
-            .any(|link| link.url == "https://example.com/invoice"
+        assert!(links.iter().any(|link| {
+            link.url == "https://example.com/invoice"
                 && crate::ui::crop(
                     &rows.get(link.row).map(Line::to_string).unwrap_or_default(),
                     link.column,
-                    link.width
+                    link.width,
                 )
-                .contains("invoice")));
+                .contains("invoice")
+        }));
         let url_row = links
             .iter()
             .find(|link| {
@@ -831,10 +831,11 @@ mod tests {
             .map(|link| link.row)
             .unwrap_or_default();
         let hits = link_hits(&links, Rect::new(40, 8, 12, 2), url_row);
-        assert!(hits
-            .iter()
-            .any(|(rect, action)| *rect == Rect::new(40, 8, 12, 1)
-                && matches!(action, Action::Link(url) if url == "https://example.com/invoice")));
+        assert!(
+            hits.iter()
+                .any(|(rect, action)| *rect == Rect::new(40, 8, 12, 1)
+                    && matches!(action, Action::Link(url) if url == "https://example.com/invoice"))
+        );
         assert!(link_hits(&links, Rect::new(40, 8, 12, 2), rows.len()).is_empty());
     }
     #[test]

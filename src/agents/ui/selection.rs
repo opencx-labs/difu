@@ -352,9 +352,11 @@ mod tests {
         let now = Instant::now();
         selection.press(point, Some(Action::Link("https://example.com".into())), now);
         selection.release(now);
-        assert!(selection
-            .ready_click(now + Duration::from_millis(100))
-            .is_none());
+        assert!(
+            selection
+                .ready_click(now + Duration::from_millis(100))
+                .is_none()
+        );
         selection.press(
             point,
             Some(Action::Link("https://example.com".into())),
@@ -362,9 +364,11 @@ mod tests {
         );
         selection.release(now + Duration::from_millis(200));
         assert_eq!(selection.text().as_deref(), Some("hello 界!"));
-        assert!(selection
-            .ready_click(now + Duration::from_secs(1))
-            .is_none());
+        assert!(
+            selection
+                .ready_click(now + Duration::from_secs(1))
+                .is_none()
+        );
         assert_eq!(
             selection.range().map(|(a, b)| (a.column, b.column)),
             Some((0, 9))
@@ -384,16 +388,20 @@ mod tests {
         assert!(
             matches!(selection.ready_click(now + Duration::from_millis(350)), Some(Action::Link(url)) if url == "https://example.com")
         );
-        assert!(selection
-            .ready_click(now + Duration::from_secs(1))
-            .is_none());
+        assert!(
+            selection
+                .ready_click(now + Duration::from_secs(1))
+                .is_none()
+        );
         selection.press(point, Some(Action::Link("https://example.com".into())), now);
         selection.dragging = true;
         selection.end = Some(Point { column: 4, ..point });
         selection.release(now);
-        assert!(selection
-            .ready_click(now + Duration::from_secs(1))
-            .is_none());
+        assert!(
+            selection
+                .ready_click(now + Duration::from_secs(1))
+                .is_none()
+        );
     }
     #[test]
     fn selection_survives_loading_and_rebasing_virtual_rows() {

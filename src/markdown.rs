@@ -428,10 +428,12 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        assert!(labels
-            .iter()
-            .any(|(text, action)| text.trim_end() == "one two"
-                && matches!(action, Action::Link(url) if url == "https://one.example")));
+        assert!(
+            labels
+                .iter()
+                .any(|(text, action)| text.trim_end() == "one two"
+                    && matches!(action, Action::Link(url) if url == "https://one.example"))
+        );
         assert!(labels.iter().any(|(text, action)| text == "three"
             && matches!(action, Action::Link(url) if url == "https://one.example")));
         assert!(labels.iter().any(|(text, action)| text == "next"
@@ -451,9 +453,11 @@ mod tests {
                     link.width,
                 ) == "invoice"
         })));
-        assert!(rows("[unsafe](file:///tmp/file)", 40)
-            .iter()
-            .all(|row| row.code_links.is_empty()));
+        assert!(
+            rows("[unsafe](file:///tmp/file)", 40)
+                .iter()
+                .all(|row| row.code_links.is_empty())
+        );
     }
     #[test]
     fn renders_github_table_and_preserves_styling_when_wrapped() {
