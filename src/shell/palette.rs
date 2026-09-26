@@ -25,7 +25,7 @@ enum Action {
     Session(String),
     Preview(PrSummary),
     AgentCommand(String),
-    AgentCommand(usize),
+    AgentMenu(usize),
     ReviewHome(usize),
     ReviewCommand(usize),
 }
@@ -35,7 +35,7 @@ impl Action {
             Self::Session(id) => format!("session:{id}"),
             Self::Preview(pr) => format!("pr:{}", pr.key.id()),
             Self::AgentCommand(name) => format!("command:{name}"),
-            Self::AgentCommand(index) => format!("agent:{index}"),
+            Self::AgentMenu(index) => format!("agent:{index}"),
             Self::ReviewHome(index) => format!("review-home:{index}"),
             Self::ReviewCommand(index) => format!("review:{index}"),
         }
@@ -396,7 +396,7 @@ impl Shell {
                     .unwrap_or_else(|| "Select an agent session first".into()),
                 search: label.into(),
                 category: "Agents",
-                action: Action::AgentCommand(index),
+                action: Action::AgentMenu(index),
                 pr: None,
                 pinned: false,
             });
@@ -616,7 +616,7 @@ impl Shell {
                 self.switch(true);
                 self.agents.run_palette_command(&name, &query);
             }
-            Action::AgentCommand(index) => {
+            Action::AgentMenu(index) => {
                 self.switch(true);
                 self.agents.menu_action(index);
             }
