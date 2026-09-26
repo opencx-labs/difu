@@ -1,6 +1,8 @@
 //! Text selection uses terminal columns, including wide Unicode characters.
 use super::*;
 use unicode_width::UnicodeWidthChar;
+
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(350);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct Point {
     region: usize,
@@ -15,6 +17,8 @@ pub(super) struct Selection {
     end: Option<Point>,
     dragging: bool,
     click: Option<Action>,
+    last_click: Option<(Point, Instant)>,
+    pending_click: Option<(Action, Instant)>,
 }
 impl Selection {
     pub fn frame(&mut self) {
@@ -26,6 +30,54 @@ impl Selection {
         self.end = None;
         self.dragging = false;
         self.click = None;
+        self.last_click = None;
+        self.pending_click = None;
+    }
+    fn press(&mut self, point: Point, action: Option<Action>, now: Instant) {
+        let double = self.last_click.is_some_and(|(last, at)| {
+            last.region == point.region
+                && last.row == point.row
+                && last.column.abs_diff(point.column) <= 1
+                && now.saturating_duration_since(at) < DOUBLE_CLICK_WINDOW
+        });
+        self.pending_click = None;
+        self.anchor = Some(point);
+        self.end = Some(point);
+        self.dragging = double;
+        self.click = if double { None } else { action };
+        self.last_click = None;
+        if double {
+            let width = self
+                .documents
+                .get(&point.region)
+                .and_then(|rows| rows.get(&point.row))
+                .map_or(0, Line::width);
+            self.anchor = Some(Point { column: 0, ..point });
+            self.end = Some(Point {
+                column: width,
+                ..point
+            });
+        }
+    }
+    fn release(&mut self, now: Instant) {
+        if !self.dragging {
+            self.last_click = self.anchor.map(|point| (point, now));
+            self.pending_click = self.click.take().map(|action| (action, now));
+            self.anchor = None;
+            self.end = None;
+        }
+    }
+    fn ready_click(&mut self, now: Instant) -> Option<Action> {
+        if self
+            .pending_click
+            .as_ref()
+            .is_some_and(|(_, at)| now.saturating_duration_since(*at) >= DOUBLE_CLICK_WINDOW)
+        {
+            self.last_click = None;
+            self.pending_click.take().map(|(action, _)| action)
+        } else {
+            None
+        }
     }
     #[cfg(test)]
     pub fn register(&mut self, region: usize, area: Rect, offset: usize, lines: &[Line<'static>]) {
@@ -41,6 +93,11 @@ impl Selection {
             if point.region == region {
                 point.row = point.row.saturating_add_signed(delta);
             }
+        }
+        if let Some((point, _)) = &mut self.last_click
+            && point.region == region
+        {
+            point.row = point.row.saturating_add_signed(delta);
         }
         if let Some(rows) = self.documents.get_mut(&region) {
             *rows = std::mem::take(rows)
@@ -150,6 +207,11 @@ impl Selection {
     }
 }
 impl Ui {
+    pub(super) fn tick_selection_click(&mut self) {
+        if let Some(action) = self.text_selection.ready_click(Instant::now()) {
+            self.action(action);
+        }
+    }
     pub fn copy_chat_selection(&mut self) -> bool {
         if let Some(text) = self.focused_editor().and_then(Editor::selected_text) {
             self.clipboard = Some(text);
@@ -172,15 +234,15 @@ impl Ui {
         let point = self.text_selection.point(event.column, event.row);
         match event.kind {
             MouseEventKind::Down(MouseButton::Left) if point.is_some() => {
-                self.text_selection.anchor = point;
-                self.text_selection.end = point;
-                self.text_selection.dragging = false;
-                self.text_selection.click = self
+                let action = self
                     .hits
                     .iter()
                     .rev()
                     .find(|(r, _)| r.contains((event.column, event.row).into()))
                     .map(|(_, action)| action.clone());
+                if let Some(point) = point {
+                    self.text_selection.press(point, action, Instant::now());
+                }
                 if let Some(p) = self
                     .selected
                     .as_ref()
@@ -226,13 +288,7 @@ impl Ui {
                 true
             }
             MouseEventKind::Up(MouseButton::Left) if self.text_selection.anchor.is_some() => {
-                if !self.text_selection.dragging {
-                    let click = self.text_selection.click.take();
-                    self.text_selection.clear();
-                    if let Some(action) = click {
-                        self.action(action);
-                    }
-                }
+                self.text_selection.release(Instant::now());
                 true
             }
             MouseEventKind::Down(_) => {
@@ -246,6 +302,107 @@ impl Ui {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn link_clicks_accept_plain_and_command_modified_mouse_events() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut ui = Ui::new(
+            Storage {
+                config: temp.path().join("config.json"),
+                cache: temp.path().into(),
+            },
+            &Config::default(),
+        );
+        let area = Rect::new(10, 5, 20, 1);
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SUPER] {
+            ui.text_selection
+                .register(1, area, 0, &[Line::from("invoice")]);
+            ui.hits = vec![(area, Action::Link("https://example.com/invoice".into()))];
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                assert!(ui.selection_mouse(MouseEvent {
+                    kind,
+                    column: 12,
+                    row: 5,
+                    modifiers
+                }));
+            }
+            assert!(
+                matches!(ui.text_selection.ready_click(Instant::now() + Duration::from_secs(1)), Some(Action::Link(url)) if url == "https://example.com/invoice")
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn double_click_selects_the_displayed_row_and_cancels_link_activation() {
+        let mut selection = Selection::default();
+        selection.register_window(
+            1,
+            Rect::new(10, 5, 30, 2),
+            8,
+            8,
+            &[Line::from("hello 界!"), Line::from("next row")],
+        );
+        let point = Point {
+            region: 1,
+            row: 8,
+            column: 6,
+        };
+        let now = Instant::now();
+        selection.press(point, Some(Action::Link("https://example.com".into())), now);
+        selection.release(now);
+        assert!(
+            selection
+                .ready_click(now + Duration::from_millis(100))
+                .is_none()
+        );
+        selection.press(
+            point,
+            Some(Action::Link("https://example.com".into())),
+            now + Duration::from_millis(150),
+        );
+        selection.release(now + Duration::from_millis(200));
+        assert_eq!(selection.text().as_deref(), Some("hello 界!"));
+        assert!(
+            selection
+                .ready_click(now + Duration::from_secs(1))
+                .is_none()
+        );
+        assert_eq!(
+            selection.range().map(|(a, b)| (a.column, b.column)),
+            Some((0, 9))
+        );
+    }
+    #[test]
+    fn single_click_opens_once_and_dragging_never_activates_a_link() {
+        let mut selection = Selection::default();
+        let point = Point {
+            region: 1,
+            row: 0,
+            column: 0,
+        };
+        let now = Instant::now();
+        selection.press(point, Some(Action::Link("https://example.com".into())), now);
+        selection.release(now);
+        assert!(
+            matches!(selection.ready_click(now + Duration::from_millis(350)), Some(Action::Link(url)) if url == "https://example.com")
+        );
+        assert!(
+            selection
+                .ready_click(now + Duration::from_secs(1))
+                .is_none()
+        );
+        selection.press(point, Some(Action::Link("https://example.com".into())), now);
+        selection.dragging = true;
+        selection.end = Some(Point { column: 4, ..point });
+        selection.release(now);
+        assert!(
+            selection
+                .ready_click(now + Duration::from_secs(1))
+                .is_none()
+        );
+    }
     #[test]
     fn selection_survives_loading_and_rebasing_virtual_rows() {
         let mut s = Selection::default();

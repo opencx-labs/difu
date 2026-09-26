@@ -11,29 +11,58 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthChar;
 
+#[derive(Clone)]
+struct Inline {
+    span: Span<'static>,
+    url: Option<String>,
+}
+impl From<Span<'static>> for Inline {
+    fn from(span: Span<'static>) -> Self {
+        Self { span, url: None }
+    }
+}
+
 /// Wrap styled text without losing emphasis across terminal rows.
 pub(crate) fn wrap(spans: Vec<Span<'static>>, width: usize) -> Vec<TextRow> {
+    wrap_inline(spans.into_iter().map(Inline::from).collect(), width)
+}
+
+fn wrap_inline(spans: Vec<Inline>, width: usize) -> Vec<TextRow> {
     let width = width.max(1);
     let mut rows = Vec::new();
     let mut row = TextRow::default();
     let mut used = 0;
-    let mut word: Vec<(char, Style)> = Vec::new();
-    let emit = |word: &mut Vec<(char, Style)>,
+    let mut word: Vec<(char, Style, Option<String>)> = Vec::new();
+    let emit = |word: &mut Vec<(char, Style, Option<String>)>,
                 row: &mut TextRow,
                 rows: &mut Vec<TextRow>,
                 used: &mut usize| {
-        let size: usize = word.iter().map(|(c, _)| c.width().unwrap_or(0)).sum();
+        let size: usize = word.iter().map(|(c, _, _)| c.width().unwrap_or(0)).sum();
         if *used > 0 && *used + size > width && size <= width {
             rows.push(std::mem::take(row));
             *used = 0;
         }
-        for (ch, style) in word.drain(..) {
+        for (ch, style, url) in word.drain(..) {
             let size = ch.width().unwrap_or(0);
             if ch == '\n' || *used + size > width {
                 rows.push(std::mem::take(row));
                 *used = 0;
                 if ch == '\n' {
                     continue;
+                }
+            }
+            if let Some(url) = url {
+                if let Some(last) = row.code_links.last_mut().filter(|link| {
+                    link.column + link.width == *used
+                        && matches!(&link.action, Action::Link(target) if target == &url)
+                }) {
+                    last.width += size;
+                } else {
+                    row.code_links.push(crate::ui::CodeLink {
+                        column: *used,
+                        width: size,
+                        action: Action::Link(url),
+                    });
                 }
             }
             if let Some(last) = row.spans.last_mut().filter(|s| s.style == style) {
@@ -44,16 +73,16 @@ pub(crate) fn wrap(spans: Vec<Span<'static>>, width: usize) -> Vec<TextRow> {
             *used += size;
         }
     };
-    for span in spans {
+    for Inline { span, url } in spans {
         for ch in span.content.chars() {
             if ch.is_whitespace() {
                 emit(&mut word, &mut row, &mut rows, &mut used);
                 if ch == '\n' || used < width {
-                    word.push((ch, span.style));
+                    word.push((ch, span.style, url.clone()));
                     emit(&mut word, &mut row, &mut rows, &mut used);
                 }
             } else {
-                word.push((ch, span.style));
+                word.push((ch, span.style, url.clone()));
             }
         }
     }
@@ -64,7 +93,7 @@ pub(crate) fn wrap(spans: Vec<Span<'static>>, width: usize) -> Vec<TextRow> {
     rows
 }
 
-fn table(cells: Vec<Vec<Vec<Span<'static>>>>, align: &[Alignment], width: usize) -> Vec<TextRow> {
+fn table(cells: Vec<Vec<Vec<Inline>>>, align: &[Alignment], width: usize) -> Vec<TextRow> {
     let count = align.len();
     if count == 0 {
         return Vec::new();
@@ -75,7 +104,7 @@ fn table(cells: Vec<Vec<Vec<Span<'static>>>>, align: &[Alignment], width: usize)
             cells
                 .iter()
                 .filter_map(|r| r.get(col))
-                .map(|c| c.iter().map(Span::width).sum::<usize>())
+                .map(|c| c.iter().map(|s| s.span.width()).sum::<usize>())
                 .max()
                 .unwrap_or(1)
                 .max(1)
@@ -114,15 +143,16 @@ fn table(cells: Vec<Vec<Vec<Span<'static>>>>, align: &[Alignment], width: usize)
                 let mut spans = cells.get(i).cloned().unwrap_or_default();
                 if index == 0 {
                     for span in &mut spans {
-                        span.style = span.style.add_modifier(Modifier::BOLD);
+                        span.span.style = span.span.style.add_modifier(Modifier::BOLD);
                     }
                 }
-                wrap(spans, *size)
+                wrap_inline(spans, *size)
             })
             .collect::<Vec<_>>();
         let height = columns.iter().map(Vec::len).max().unwrap_or(1).max(1);
         for line in 0..height {
             let mut spans = vec![Span::styled("│", Style::default().fg(BORDER))];
+            let mut links = Vec::new();
             for (col, size) in sizes.iter().enumerate() {
                 let content = columns.get(col).and_then(|r| r.get(line));
                 let used = content
@@ -136,12 +166,38 @@ fn table(cells: Vec<Vec<Vec<Span<'static>>>>, align: &[Alignment], width: usize)
                 };
                 spans.push(Span::raw(" ".repeat(left + 1)));
                 if let Some(content) = content {
+                    let offset = spans.iter().map(Span::width).sum::<usize>();
+                    links.extend(content.code_links.iter().cloned().map(|mut link| {
+                        link.column += offset;
+                        link
+                    }));
                     spans.extend(content.spans.clone());
                 }
                 spans.push(Span::raw(" ".repeat(padding - left + 1)));
                 spans.push(Span::styled("│", Style::default().fg(BORDER)));
             }
-            rows.extend(wrap(spans, width));
+            let mut column = 0;
+            let mut linked = Vec::new();
+            for span in spans {
+                for ch in span.content.chars() {
+                    let url = links.iter().find_map(|link| {
+                        if column >= link.column
+                            && column < link.column + link.width
+                            && let Action::Link(url) = &link.action
+                        {
+                            Some(url.clone())
+                        } else {
+                            None
+                        }
+                    });
+                    linked.push(Inline {
+                        span: Span::styled(ch.to_string(), span.style),
+                        url,
+                    });
+                    column += ch.width().unwrap_or(0);
+                }
+            }
+            rows.extend(wrap_inline(linked, width));
         }
         if index == 0 {
             rows.push(rule("├", "┼", "┤"));
@@ -158,13 +214,14 @@ pub(crate) fn rows(source: &str, width: usize) -> Vec<TextRow> {
     let mut styles = vec![Style::default().fg(TEXT)];
     let mut lists: Vec<Option<u64>> = Vec::new();
     let mut links = Vec::new();
+    let mut active_link = None;
     let mut quote = 0usize;
     let mut code = false;
     let mut alignment = None;
     let mut cells = Vec::new();
     let mut table_row = Vec::new();
-    let flush = |spans: &mut Vec<Span<'static>>, rows: &mut Vec<TextRow>| {
-        rows.extend(wrap(std::mem::take(spans), width));
+    let flush = |spans: &mut Vec<Inline>, rows: &mut Vec<TextRow>| {
+        rows.extend(wrap_inline(std::mem::take(spans), width));
     };
     let blank = |rows: &mut Vec<TextRow>| {
         if rows.last().is_some_and(|r| !r.spans.is_empty()) {
@@ -206,12 +263,17 @@ pub(crate) fn rows(source: &str, width: usize) -> Vec<TextRow> {
             Event::Start(Tag::Link { dest_url, .. }) => {
                 if dest_url.starts_with("https://") || dest_url.starts_with("http://") {
                     links.push(dest_url.to_string());
+                    active_link = Some(dest_url.to_string());
                 }
                 styles.push(style.fg(ACCENT).add_modifier(Modifier::UNDERLINED));
             }
-            Event::End(
-                TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough | TagEnd::Link,
-            ) => {
+            Event::End(TagEnd::Link) => {
+                active_link = None;
+                if styles.len() > 1 {
+                    styles.pop();
+                }
+            }
+            Event::End(TagEnd::Strong | TagEnd::Emphasis | TagEnd::Strikethrough) => {
                 if styles.len() > 1 {
                     styles.pop();
                 }
@@ -259,10 +321,13 @@ pub(crate) fn rows(source: &str, width: usize) -> Vec<TextRow> {
                 } else {
                     "• ".into()
                 };
-                spans.push(Span::styled(
-                    format!("{}{marker}", "  ".repeat(lists.len().saturating_sub(1))),
-                    style,
-                ));
+                spans.push(
+                    Span::styled(
+                        format!("{}{marker}", "  ".repeat(lists.len().saturating_sub(1))),
+                        style,
+                    )
+                    .into(),
+                );
             }
             Event::End(TagEnd::Item) => flush(&mut spans, &mut rows),
             Event::Start(Tag::BlockQuote(_)) => {
@@ -275,7 +340,7 @@ pub(crate) fn rows(source: &str, width: usize) -> Vec<TextRow> {
                 blank(&mut rows);
             }
             Event::Start(Tag::Paragraph) if quote > 0 => {
-                spans.push(Span::styled("│ ".repeat(quote), Style::default().fg(DIM)))
+                spans.push(Span::styled("│ ".repeat(quote), Style::default().fg(DIM)).into())
             }
             Event::End(TagEnd::Paragraph) => {
                 flush(&mut spans, &mut rows);
@@ -286,17 +351,22 @@ pub(crate) fn rows(source: &str, width: usize) -> Vec<TextRow> {
                     blank(&mut rows);
                 }
             }
-            Event::Text(value) => spans.push(Span::styled(
-                value.to_string(),
-                if code { style.fg(DIM) } else { style },
-            )),
-            Event::Code(value) => spans.push(Span::styled(value.to_string(), style.fg(ACCENT))),
-            Event::SoftBreak => spans.push(Span::raw(" ")),
+            Event::Text(value) => spans.push(Inline {
+                span: Span::styled(value.to_string(), if code { style.fg(DIM) } else { style }),
+                url: active_link.clone(),
+            }),
+            Event::Code(value) => spans.push(Inline {
+                span: Span::styled(value.to_string(), style.fg(ACCENT)),
+                url: active_link.clone(),
+            }),
+            Event::SoftBreak => spans.push(Inline {
+                span: Span::raw(" "),
+                url: active_link.clone(),
+            }),
             Event::HardBreak => flush(&mut spans, &mut rows),
-            Event::TaskListMarker(done) => spans.push(Span::styled(
-                if done { "☑ " } else { "☐ " },
-                style.fg(ACCENT),
-            )),
+            Event::TaskListMarker(done) => {
+                spans.push(Span::styled(if done { "☑ " } else { "☐ " }, style.fg(ACCENT)).into())
+            }
             Event::Rule => {
                 flush(&mut spans, &mut rows);
                 rows.push(text("─".repeat(width.max(1)), BORDER));
@@ -306,7 +376,7 @@ pub(crate) fn rows(source: &str, width: usize) -> Vec<TextRow> {
                 let fragment = scraper::Html::parse_fragment(&value);
                 let value = fragment.root_element().text().collect::<String>();
                 if !value.trim().is_empty() {
-                    spans.push(Span::styled(value, style));
+                    spans.push(Span::styled(value, style).into());
                 }
             }
             _ => {}
@@ -335,6 +405,59 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+    #[test]
+    fn link_targets_follow_wrapped_labels_and_table_cells() {
+        let output = rows(
+            "界 [**one two three**](https://one.example) [next](https://two.example)",
+            10,
+        );
+        let labels = output
+            .iter()
+            .flat_map(|row| {
+                let text = row
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                row.code_links.iter().map(move |link| {
+                    (
+                        crate::ui::crop(&text, link.column, link.width),
+                        link.action.clone(),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            labels
+                .iter()
+                .any(|(text, action)| text.trim_end() == "one two"
+                    && matches!(action, Action::Link(url) if url == "https://one.example"))
+        );
+        assert!(labels.iter().any(|(text, action)| text == "three"
+            && matches!(action, Action::Link(url) if url == "https://one.example")));
+        assert!(labels.iter().any(|(text, action)| text == "next"
+            && matches!(action, Action::Link(url) if url == "https://two.example")));
+        let table = rows(
+            "| Link |\n|---|\n| [invoice](https://example.com/invoice) |",
+            24,
+        );
+        assert!(table.iter().any(|row| row.code_links.iter().any(|link| {
+            matches!(&link.action, Action::Link(url) if url == "https://example.com/invoice")
+                && crate::ui::crop(
+                    &row.spans
+                        .iter()
+                        .map(|s| s.content.as_ref())
+                        .collect::<String>(),
+                    link.column,
+                    link.width,
+                ) == "invoice"
+        })));
+        assert!(
+            rows("[unsafe](file:///tmp/file)", 40)
+                .iter()
+                .all(|row| row.code_links.is_empty())
+        );
     }
     #[test]
     fn renders_github_table_and_preserves_styling_when_wrapped() {

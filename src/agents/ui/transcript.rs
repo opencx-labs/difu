@@ -13,16 +13,75 @@ fn field(value: &Value, key: &str) -> String {
         .map(crate::model::clean)
         .unwrap_or_default()
 }
+#[derive(Clone)]
+pub struct Link {
+    pub row: usize,
+    pub column: usize,
+    pub width: usize,
+    pub url: String,
+}
+pub(super) fn link_hits(links: &[Link], area: Rect, scroll: usize) -> Vec<(Rect, Action)> {
+    links
+        .iter()
+        .filter_map(|link| {
+            let row = link.row.checked_sub(scroll)?;
+            let width = link
+                .width
+                .min(usize::from(area.width).saturating_sub(link.column));
+            if row >= usize::from(area.height) || width == 0 {
+                return None;
+            }
+            Some((
+                Rect::new(
+                    area.x + link.column as u16,
+                    area.y + row as u16,
+                    width as u16,
+                    1,
+                ),
+                Action::Link(link.url.clone()),
+            ))
+        })
+        .collect()
+}
+#[cfg(test)]
 fn prose(text: &str, width: u16) -> Vec<Line<'static>> {
+    prose_links(text, width).0
+}
+fn append_prose(lines: &mut Vec<Line<'static>>, links: &mut Vec<Link>, text: &str, width: u16) {
+    let (rows, targets) = prose_links(text, width);
+    links.extend(targets.into_iter().map(|mut link| {
+        link.row += lines.len();
+        link
+    }));
+    lines.extend(rows);
+}
+fn prose_links(text: &str, width: u16) -> (Vec<Line<'static>>, Vec<Link>) {
+    let mut links = Vec::new();
     let mut rows = Vec::new();
     let mut normal = String::new();
     let mut fence: Option<String> = None;
-    let flush = |normal: &mut String, rows: &mut Vec<Line<'static>>| {
-        rows.extend(
-            crate::ui::prose(normal, width.max(1) as usize)
-                .into_iter()
-                .map(|row| Line::from(row.spans)),
-        );
+    let mut flush = |normal: &mut String, rows: &mut Vec<Line<'static>>| {
+        for row in crate::ui::prose(normal, width.max(1) as usize) {
+            if let Some(crate::app::Action::Link(url)) = row.action {
+                links.push(Link {
+                    row: rows.len(),
+                    column: 0,
+                    width: row.spans.iter().map(Span::width).sum(),
+                    url,
+                });
+            }
+            for link in row.code_links {
+                if let crate::app::Action::Link(url) = link.action {
+                    links.push(Link {
+                        row: rows.len(),
+                        column: link.column,
+                        width: link.width,
+                        url,
+                    });
+                }
+            }
+            rows.push(Line::from(row.spans));
+        }
         normal.clear();
     };
     for line in text.lines() {
@@ -59,7 +118,7 @@ fn prose(text: &str, width: u16) -> Vec<Line<'static>> {
         }
     }
     flush(&mut normal, &mut rows);
-    rows
+    (rows, links)
 }
 
 pub(super) fn tool(entry: &Entry) -> bool {
@@ -308,7 +367,12 @@ pub(super) fn waiting_messages(
 fn prefix(text: &str, budget: usize) -> String {
     text.chars().take(budget).collect()
 }
-fn preview(session: &Session, entry: &Entry, width: u16, focused: bool) -> Vec<Line<'static>> {
+fn preview(
+    session: &Session,
+    entry: &Entry,
+    width: u16,
+    focused: bool,
+) -> (Vec<Line<'static>>, Vec<Link>) {
     let budget = usize::from(width.max(1)).saturating_mul(16);
     let mut data = serde_json::Map::new();
     for key in [
@@ -354,7 +418,7 @@ fn preview(session: &Session, entry: &Entry, width: u16, focused: bool) -> Vec<L
     if focused {
         position.focused_entry = Some(entry.id.clone());
     }
-    let (mut rows, _) = render_entries(
+    let (mut rows, _, mut links) = render_entries(
         session,
         std::slice::from_ref(&bounded),
         &position,
@@ -363,12 +427,13 @@ fn preview(session: &Session, entry: &Entry, width: u16, focused: bool) -> Vec<L
     );
     // A multiline command or very long JSON response shares the same preview budget.
     rows.truncate(4);
+    links.retain(|link| link.row < rows.len());
     rows.push(Line::from(Span::styled(
         "    Enter/click to expand",
         Style::default().fg(DIM),
     )));
     rows.push(Line::default());
-    rows
+    (rows, links)
 }
 
 #[cfg(test)]
@@ -378,7 +443,8 @@ pub(super) fn render(
     width: u16,
     focused: bool,
 ) -> (Vec<Line<'static>>, Vec<Section>) {
-    render_entries(session, &session.entries, position, width, focused)
+    let (lines, sections, _) = render_entries(session, &session.entries, position, width, focused);
+    (lines, sections)
 }
 pub(super) fn render_entries(
     session: &Session,
@@ -386,7 +452,8 @@ pub(super) fn render_entries(
     position: &Position,
     width: u16,
     focused: bool,
-) -> (Vec<Line<'static>>, Vec<Section>) {
+) -> (Vec<Line<'static>>, Vec<Section>, Vec<Link>) {
+    let mut links = Vec::new();
     let mut lines = Vec::new();
     let mut sections = Vec::new();
     for entry in entries {
@@ -400,12 +467,17 @@ pub(super) fn render_entries(
             tool: is_tool,
         });
         if is_tool && !position.expanded.contains(&entry.id) {
-            lines.extend(preview(
+            let (rows, targets) = preview(
                 session,
                 entry,
                 width,
                 focused && position.focused_entry.as_ref() == Some(&entry.id),
-            ));
+            );
+            links.extend(targets.into_iter().map(|mut link| {
+                link.row += lines.len();
+                link
+            }));
+            lines.extend(rows);
             continue;
         }
         match entry.kind.as_str() {
@@ -441,7 +513,7 @@ pub(super) fn render_entries(
                 }
                 lines.push(padding());
             }
-            "agentMessage" | "result" => lines.extend(prose(&entry.text, width)),
+            "agentMessage" | "result" => append_prose(&mut lines, &mut links, &entry.text, width),
             "reasoning" => {
                 let heading = entry
                     .text
@@ -466,10 +538,15 @@ pub(super) fn render_entries(
                             "inProgress" | "in_progress" => "›",
                             _ => "○",
                         };
-                        lines.extend(prose(&format!("{marker} {}", field(step, "step")), width));
+                        append_prose(
+                            &mut lines,
+                            &mut links,
+                            &format!("{marker} {}", field(step, "step")),
+                            width,
+                        );
                     }
                 } else {
-                    lines.extend(prose(&entry.text, width));
+                    append_prose(&mut lines, &mut links, &entry.text, width);
                 }
             }
             "error" | "system" => lines.extend(wrapped(&entry.text, width).into_iter().map(|s| {
@@ -657,7 +734,13 @@ pub(super) fn render_entries(
                         })
                         .collect::<Vec<_>>()
                 } else {
-                    prose(&shown, width.saturating_sub(4))
+                    let (rows, targets) = prose_links(&shown, width.saturating_sub(4));
+                    links.extend(targets.into_iter().map(|mut link| {
+                        link.row += lines.len();
+                        link.column += 4;
+                        link
+                    }));
+                    rows
                 };
                 if !shown.is_empty() {
                     for (index, mut row) in rows.into_iter().enumerate() {
@@ -694,6 +777,9 @@ pub(super) fn render_entries(
                     marker.content = "▸ ".into();
                 }
             } else {
+                for link in links.iter_mut().filter(|link| link.row == section.row) {
+                    link.column += 2;
+                }
                 line.spans
                     .insert(0, Span::styled("› ", Style::default().fg(ACCENT)));
                 line.style = Style::default().bg(PANEL);
@@ -718,12 +804,40 @@ pub(super) fn render_entries(
         }
         lines.push(Line::default());
     }
-    (lines, sections)
+    (lines, sections, links)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn links_keep_targets_and_viewport_coordinates() {
+        let (rows, links) = prose_links("Open [the invoice](https://example.com/invoice)", 12);
+        assert!(links.iter().any(|link| {
+            link.url == "https://example.com/invoice"
+                && crate::ui::crop(
+                    &rows.get(link.row).map(Line::to_string).unwrap_or_default(),
+                    link.column,
+                    link.width,
+                )
+                .contains("invoice")
+        }));
+        let url_row = links
+            .iter()
+            .find(|link| {
+                rows.get(link.row)
+                    .is_some_and(|row| row.to_string().starts_with("↗ "))
+            })
+            .map(|link| link.row)
+            .unwrap_or_default();
+        let hits = link_hits(&links, Rect::new(40, 8, 12, 2), url_row);
+        assert!(
+            hits.iter()
+                .any(|(rect, action)| *rect == Rect::new(40, 8, 12, 1)
+                    && matches!(action, Action::Link(url) if url == "https://example.com/invoice"))
+        );
+        assert!(link_hits(&links, Rect::new(40, 8, 12, 2), rows.len()).is_empty());
+    }
     #[test]
     fn shimmer_changes_only_color_without_moving_text_or_painting_background() {
         let first = shimmer("Reviewing approval request", 480);
