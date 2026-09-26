@@ -33,6 +33,9 @@ pub struct Anchor {
 }
 #[derive(Clone, Debug)]
 pub enum Operation {
+    ApproveWorkflows {
+        runs: Vec<u64>,
+    },
     Draft {
         draft: bool,
     },
@@ -67,6 +70,7 @@ pub enum Operation {
 impl Operation {
     pub fn label(&self) -> String {
         match self {
+            Self::ApproveWorkflows { runs } => format!("Approve {} workflows to run", runs.len()),
             Self::Draft { draft } => if *draft {
                 "Convert to draft"
             } else {
@@ -213,6 +217,40 @@ pub fn execute(key: &PrKey, head: &str, operation: &Operation, cancel: &Cancel) 
     let current = matching(key, head, cancel)?;
     let endpoint = format!("repos/{}/{}/pulls/{}", key.owner, key.repo, key.number);
     match operation {
+        Operation::ApproveWorkflows { runs } => {
+            ensure!(
+                current.state == "open",
+                "Only open PR workflows can be approved"
+            );
+            ensure!(!runs.is_empty(), "No workflows selected for approval");
+            let current = github::awaiting_workflows(key, head, cancel)?;
+            ensure!(
+                runs.iter()
+                    .all(|id| current.iter().any(|run| run.id == *id)),
+                "Workflow approvals changed. Refresh the PR and review the current runs before approving."
+            );
+            let mut approved = BTreeSet::new();
+            for id in runs {
+                if approved.contains(id) {
+                    continue;
+                }
+                matching(key, head, cancel)
+                    .with_context(|| format!("{} workflows already approved", approved.len()))?;
+                if let Err(error) = api(
+                    &format!("repos/{}/actions/runs/{id}/approve", key.repository()),
+                    "POST",
+                    None,
+                    cancel,
+                ) {
+                    bail!(
+                        "{} workflows approved; approval of run {id} failed: {error:#}. Refresh before trying again; no request was retried.",
+                        approved.len()
+                    );
+                }
+                approved.insert(*id);
+            }
+            return Ok(format!("Approved {} workflows to run", approved.len()));
+        }
         Operation::Draft { draft } => {
             ensure!(
                 current.state == "open",

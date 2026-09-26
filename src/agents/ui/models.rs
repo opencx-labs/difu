@@ -30,7 +30,29 @@ impl State {
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
         thread::spawn(move || {
-            let _ = tx.send(crate::codex::models(&cancel).map_err(|error| format!("{error:#}")));
+            let (codex, claude) = thread::scope(|scope| {
+                let codex = scope.spawn(|| crate::codex::models(&cancel));
+                let claude = super::super::claude::models(&cancel);
+                (
+                    codex
+                        .join()
+                        .unwrap_or_else(|_| Err(anyhow::anyhow!("Codex model discovery stopped"))),
+                    claude,
+                )
+            });
+            let mut models = Vec::new();
+            let mut errors = Vec::new();
+            for result in [codex, claude] {
+                match result {
+                    Ok(options) => models.extend(options),
+                    Err(error) => errors.push(format!("{error:#}")),
+                }
+            }
+            let _ = tx.send(if models.is_empty() {
+                Err(errors.join("; "))
+            } else {
+                Ok(models)
+            });
         });
     }
     pub(super) fn choices(&self, model: &str, effort: &str, choosing_model: bool) -> Vec<String> {
@@ -59,7 +81,7 @@ impl State {
     }
     pub(super) fn empty_label(&self) -> &str {
         if self.receiver.is_some() {
-            "Loading Codex options…"
+            "Loading model options…"
         } else {
             self.error.as_deref().unwrap_or("No matching options")
         }
@@ -124,7 +146,11 @@ impl Ui {
         }) = &mut self.modal
         {
             if *field == 0 {
+                let before = super::super::provider::Provider::for_model(Some(&model.text()));
                 model.insert(text);
+                if before != super::super::provider::Provider::for_model(Some(&model.text())) {
+                    *effort = Editor::default();
+                }
             } else {
                 effort.insert(text);
             }
@@ -162,6 +188,12 @@ impl Ui {
                 if !self.model_completion.filled
                     && let Some(value) = options.get(self.model_completion.selected)
                 {
+                    if *field == 0
+                        && super::super::provider::Provider::for_model(Some(&model.text()))
+                            != super::super::provider::Provider::for_model(Some(value))
+                    {
+                        *effort = Editor::default();
+                    }
                     let editor = if *field == 0 { model } else { effort };
                     *editor = Editor::from(value.as_str());
                     self.model_completion.selected = 0;
@@ -177,7 +209,11 @@ impl Ui {
             }
             _ => {
                 if *field == 0 {
+                    let before = super::super::provider::Provider::for_model(Some(&model.text()));
                     model.key(key);
+                    if before != super::super::provider::Provider::for_model(Some(&model.text())) {
+                        *effort = Editor::default();
+                    }
                 } else {
                     effort.key(key);
                 }
@@ -240,7 +276,7 @@ impl Ui {
         }
         if options.is_empty() && height > 0 {
             let label = if state.receiver.is_some() {
-                "Loading Codex options…"
+                "Loading model options…"
             } else {
                 state.error.as_deref().unwrap_or("No matching options")
             };

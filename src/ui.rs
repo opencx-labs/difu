@@ -18,7 +18,7 @@ pub(crate) const INK: Color = Color::Rgb(12, 14, 18);
 pub(crate) const PANEL: Color = Color::Reset;
 pub(crate) const TEXT: Color = Color::Rgb(220, 225, 232);
 pub(crate) const DIM: Color = Color::Rgb(130, 140, 156);
-pub(crate) const BORDER: Color = Color::Rgb(42, 48, 61);
+pub(crate) const BORDER: Color = Color::Rgb(96, 106, 122);
 pub(crate) const ACCENT: Color = Color::Rgb(0, 255, 65);
 /// Dark theme tint with white text (approximately 12:1 contrast).
 pub(crate) fn user_message_style() -> Style {
@@ -1682,7 +1682,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .min(main.height as usize - 1) as u16;
         frame.render_widget(
             Paragraph::new("┃").style(Style::default().fg(ACCENT)),
-            Rect::new(area.width - 1, main.y + thumb, 1, 1),
+            Rect::new(area.right() - 1, main.y + thumb, 1, 1),
         );
     }
     app.document = Some(doc);
@@ -2703,6 +2703,29 @@ mod tests {
         );
         app.action(Action::SetView(View::Guide));
         app
+    }
+
+    #[test]
+    fn embedded_review_scrollbar_uses_the_panes_right_edge() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        let area = Rect::new(70, 3, 90, 25);
+        app.render_area = Some(area);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(170, 32))?;
+        terminal.draw(|frame| draw(frame, &mut app))?;
+        let thumbs = (area.y..area.bottom())
+            .flat_map(|y| (0..170).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((x, y))
+                    .is_some_and(|cell| cell.symbol() == "┃")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(thumbs.len(), 1);
+        assert_eq!(thumbs.first().map(|&(x, _)| x), Some(area.right() - 1));
+        Ok(())
     }
 
     #[test]

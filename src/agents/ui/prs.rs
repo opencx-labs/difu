@@ -8,13 +8,10 @@ struct Update {
     workspace: PathBuf,
     result: Result<SessionPr, String>,
 }
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-struct Cached {
-    workspace: PathBuf,
-    pr: SessionPr,
-}
+use crate::agents::pr_cache::{SESSION_LINKS, SessionLink as Cached};
 pub(super) struct State {
     cache: HashMap<String, Cached>,
+    loaded_at: Option<Instant>,
     pub visible: HashSet<String>,
     refreshed: HashMap<String, Instant>,
     pending: HashMap<String, Cancel>,
@@ -24,17 +21,34 @@ pub(super) struct State {
 impl State {
     pub fn load(storage: &Storage) -> Self {
         let (sender, receiver) = mpsc::channel();
-        Self {
-            cache: std::fs::read(storage.cache.join("agent-prs.json"))
+        let mut cache: HashMap<String, Cached> =
+            std::fs::read(storage.cache.join("agent-prs.json"))
                 .ok()
                 .and_then(|v| serde_json::from_slice(&v).ok())
-                .unwrap_or_default(),
+                .unwrap_or_default();
+        if let Some(links) = std::fs::read(storage.cache.join(SESSION_LINKS))
+            .ok()
+            .and_then(|v| serde_json::from_slice::<HashMap<String, Cached>>(&v).ok())
+        {
+            cache.extend(links);
+        }
+        Self {
+            cache,
+            loaded_at: None,
             visible: HashSet::new(),
             refreshed: HashMap::new(),
             pending: HashMap::new(),
             sender,
             receiver,
         }
+    }
+    pub fn forget(&mut self, id: &str, storage: &Storage) -> anyhow::Result<()> {
+        if let Some(cancel) = self.pending.remove(id) {
+            cancel.cancel();
+        }
+        self.cache.remove(id);
+        self.refreshed.remove(id);
+        self.save(storage)
     }
     pub fn get(&self, id: &str) -> Option<&SessionPr> {
         self.cache.get(id).map(|c| &c.pr)
@@ -85,9 +99,52 @@ pub(super) fn color(pr: &SessionPr) -> ratatui::style::Color {
 }
 impl Ui {
     pub(super) fn tick_prs(&mut self, visible: bool) {
+        let invalid = self
+            .prs
+            .cache
+            .iter()
+            .filter(|(id, cached)| {
+                self.summaries
+                    .iter()
+                    .any(|s| &s.id == *id && s.workspace != cached.workspace)
+            })
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in invalid {
+            if let Err(error) = self.prs.forget(&id, &self.storage) {
+                self.notice = Some((format!("Cannot clear cached PR: {error:#}"), true));
+            }
+        }
         let mut changed = false;
+        if self
+            .prs
+            .loaded_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
+        {
+            self.prs.loaded_at = Some(Instant::now());
+            if let Some(links) = std::fs::read(self.storage.cache.join(SESSION_LINKS))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<HashMap<String, Cached>>(&bytes).ok())
+            {
+                for (id, link) in links {
+                    if self
+                        .summaries
+                        .iter()
+                        .any(|s| s.id == id && s.workspace == link.workspace)
+                    {
+                        self.prs.cache.insert(id, link);
+                    }
+                }
+            }
+        }
         while let Ok(update) = self.prs.receiver.try_recv() {
-            changed |= self.prs.receive(update);
+            if self
+                .summaries
+                .iter()
+                .any(|s| s.id == update.id && s.workspace == update.workspace)
+            {
+                changed |= self.prs.receive(update);
+            }
         }
         if changed && let Err(error) = self.prs.save(&self.storage) {
             self.notice = Some((format!("Cannot cache session PRs: {error:#}"), true));

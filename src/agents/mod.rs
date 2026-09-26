@@ -1,9 +1,12 @@
-//! Durable, local Codex sessions. Only sessions launched by difu are registered.
+//! Durable, local coding sessions. Only sessions launched by difu are registered.
 mod artifacts;
+mod claude;
 pub mod client;
 mod engine;
 mod guidance;
 pub mod media;
+pub(crate) mod pr_cache;
+pub mod provider;
 mod questions;
 pub mod server;
 mod suggestions;
@@ -198,6 +201,12 @@ pub struct Session {
     #[serde(default)]
     pub suggestion_attempted: Option<String>,
     pub job: Job,
+    #[serde(default)]
+    pub provider: provider::Provider,
+    #[serde(default)]
+    pub provider_threads: std::collections::BTreeMap<String, provider::NativeSession>,
+    #[serde(default)]
+    pub provider_context: Option<String>,
     pub status: Status,
     pub archived: bool,
     pub updated: i64,
@@ -249,6 +258,10 @@ pub struct Session {
 }
 impl Session {
     pub fn new(id: String, job: Job) -> Self {
+        let (model, effort) = match &job {
+            Job::Coding(launch) => (launch.model.clone(), launch.effort.clone()),
+            _ => (None, None),
+        };
         Self {
             title: job.title(),
             title_ready: false,
@@ -258,6 +271,12 @@ impl Session {
             suggestion: None,
             suggestion_attempted: None,
             id,
+            provider: match &job {
+                Job::Coding(launch) => provider::Provider::for_model(launch.model.as_deref()),
+                _ => provider::Provider::Codex,
+            },
+            provider_threads: Default::default(),
+            provider_context: None,
             job,
             status: Status::Starting,
             archived: false,
@@ -278,8 +297,8 @@ impl Session {
             turn_started_at: None,
             token_usage: Value::Null,
             completed_turn: None,
-            model: None,
-            effort: None,
+            model,
+            effort,
             permissions: Value::Null,
             artifacts: Vec::new(),
             artifact_tools: false,
@@ -529,6 +548,10 @@ pub enum Request {
     Control {
         id: String,
         control: Control,
+    },
+    Repository {
+        id: String,
+        repository: PathBuf,
     },
     Rename {
         id: String,

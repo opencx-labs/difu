@@ -81,6 +81,11 @@ for line in sys.stdin:
             active = None
         elif text.startswith('approval'):
             emit({'id':900+turn,'method':'item/commandExecution/requestApproval','params':{'threadId':thread_id,'turnId':active,'itemId':'command','command':'git diff --check','reason':'Inspect diff only'}})
+        elif text.startswith('app approval'):
+            if sandbox == 'read-only':
+                assert params['approvalPolicy']['granular']['mcp_elicitations']
+                assert not params['approvalPolicy']['granular']['sandbox_approval']
+            emit({'id':900+turn,'method':'mcpServer/elicitation/request','params':{'threadId':thread_id,'turnId':active,'serverName':'fixture-app','message':'Approve the explicitly requested app action','requestedSchema':{'type':'object','properties':{}}}})
         elif text.startswith('wait'):
             event('item/started', {'threadId':thread_id,'turnId':active,'item':{'id':'waiting-'+active,'type':'commandExecution','command':'fixture long-running tool','status':'inProgress'}})
         elif text.startswith('async questions'):

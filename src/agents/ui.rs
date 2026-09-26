@@ -40,7 +40,6 @@ use std::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     List,
-    Filter,
     Conversation,
     Composer,
     Changes,
@@ -54,6 +53,9 @@ pub(super) struct PendingSend {
     observed_before: usize,
 }
 impl PendingSend {
+    fn in_chat(&self, session: &Session) -> bool {
+        !self.queued && !session.tool_running()
+    }
     fn matching(session: &Session, text: &str) -> usize {
         session
             .entries
@@ -136,11 +138,11 @@ enum Action {
     AnswerFocus,
     QueueEditorFocus,
     ChooseRepository,
+    ChangeRepository,
     DefaultField(usize),
     DefaultOption(usize),
     ModelField(usize),
     ModelOption(usize),
-    DefaultToggle,
     DefaultSave,
     Approve(usize),
     Answer(usize, String),
@@ -173,6 +175,7 @@ pub enum Modal {
         field: usize,
     },
     Repository(Editor),
+    ChangeRepository(Editor),
     Commands {
         query: Editor,
         selected: usize,
@@ -226,10 +229,11 @@ enum Task {
     Shells(String),
     OpenArtifact,
     InstallBrowser(String, std::path::PathBuf, String),
-    WorkspacePaths(String),
+    WorkspacePaths(String, std::path::PathBuf),
     Defaults(String),
-    Skills(String),
+    Skills(String, std::path::PathBuf, provider::Provider),
     Launch,
+    Repository(String),
     Action,
     Interrupt(String),
     Question,
@@ -250,7 +254,7 @@ pub struct Ui {
     pub drilled: bool,
     pub list_visible: bool,
     pub changes_visible: bool,
-    pub filter: Editor,
+    pub pinned_sessions: std::collections::BTreeSet<String>,
     pub archived: bool,
     pub modal: Option<Modal>,
     pub notice: Option<(String, bool)>,
@@ -308,7 +312,7 @@ impl Ui {
             drilled: false,
             list_visible: config.agent_list_visible,
             changes_visible: config.agent_changes_visible,
-            filter: Editor::default(),
+            pinned_sessions: config.pinned_sessions.clone(),
             archived: false,
             modal: None,
             notice: None,
@@ -387,7 +391,11 @@ impl Ui {
                     self.changing = false;
                     self.changes_at = Some(Instant::now());
                 }
-                Task::Launch | Task::Action | Task::Delete(_) | Task::Send(..) => self.busy = false,
+                Task::Launch
+                | Task::Repository(_)
+                | Task::Action
+                | Task::Delete(_)
+                | Task::Send(..) => self.busy = false,
                 Task::Interrupt(id) => {
                     self.interrupting.remove(id);
                 }
@@ -395,13 +403,13 @@ impl Ui {
                 | Task::Question
                 | Task::OpenArtifact
                 | Task::InstallBrowser(..) => {}
-                Task::WorkspacePaths(id) => {
+                Task::WorkspacePaths(id, _) => {
                     self.paths_loading.remove(id);
                 }
                 Task::Statistics(id) => {
                     self.sidebar.finished(id);
                 }
-                Task::Skills(_) => self.skills_loading = None,
+                Task::Skills(..) => self.skills_loading = None,
             }
             if let Task::Shells(id) = &message.kind {
                 match &message.result {
@@ -454,8 +462,14 @@ impl Ui {
                     self.notice = Some((error, true));
                 }
                 Ok(reply) => match (message.kind, reply) {
-                    (Task::WorkspacePaths(id), Reply::WorkspacePaths(paths)) => {
-                        self.workspace_paths.insert(id, paths);
+                    (Task::WorkspacePaths(id, root), Reply::WorkspacePaths(paths)) => {
+                        if self
+                            .sessions
+                            .get(&id)
+                            .is_some_and(|s| s.job.root() == &root)
+                        {
+                            self.workspace_paths.insert(id, paths);
+                        }
                     }
                     (Task::Statistics(id), Reply::Statistics(stats)) => {
                         self.sidebar.counts.insert(id, stats);
@@ -464,21 +478,54 @@ impl Ui {
                                 Some((format!("Cannot cache session statistics: {error:#}"), true));
                         }
                     }
-                    (Task::Skills(id), Reply::Skills { skills, errors }) => {
-                        self.skills.insert(id, (skills, errors));
+                    (Task::Skills(id, root, provider), Reply::Skills { skills, errors }) => {
+                        if self
+                            .sessions
+                            .get(&id)
+                            .is_some_and(|s| s.job.root() == &root && s.provider == provider)
+                        {
+                            self.skills.insert(id, (skills, errors));
+                        }
                     }
                     (Task::List, Reply::Sessions(sessions)) => {
                         self.sidebar.observe(&sessions);
                         self.summaries = sessions;
                         self.ensure_selected();
                     }
+                    (Task::Repository(id), Reply::Session(session)) => {
+                        self.skills.remove(&id);
+                        self.workspace_paths.remove(&id);
+                        self.changes.remove(&id);
+                        self.sidebar = sidebar::State::load(&self.storage);
+                        self.sidebar.counts.remove(&id);
+                        if let Err(error) = self.prs.forget(&id, &self.storage) {
+                            self.notice =
+                                Some((format!("Cannot clear cached PR: {error:#}"), true));
+                        }
+                        self.panels = panels::Panels::new(self.panels.right);
+                        self.summaries.retain(|s| s.id != id);
+                        self.summaries.push(session.summary());
+                        self.sessions.insert(id, *session);
+                        self.modal = None;
+                        self.refreshed = None;
+                    }
                     (Task::Read(id), Reply::Session(session)) => {
+                        if self
+                            .sessions
+                            .get(&id)
+                            .is_some_and(|current| current.version > session.version)
+                        {
+                            continue;
+                        }
                         if let Some(position) = self.positions.get_mut(&id) {
                             position
                                 .outgoing
                                 .retain(|pending| !pending.observed(&session));
                         }
-                        if !self.sessions.contains_key(&id) && session.thread_id.is_none() {
+                        if !self.sessions.contains_key(&id)
+                            && session.thread_id.is_none()
+                            && session.provider == provider::Provider::Codex
+                        {
                             self.task(
                                 Task::Defaults(id.clone()),
                                 Request::Defaults {
@@ -513,6 +560,7 @@ impl Ui {
                     ) => {
                         if let Some(session) = self.sessions.get_mut(&id)
                             && session.thread_id.is_none()
+                            && session.provider == provider::Provider::Codex
                         {
                             let Job::Coding(launch) = &session.job else {
                                 continue;
@@ -586,6 +634,9 @@ impl Ui {
                         self.notice = Some(("Chat deleted".into(), false));
                     }
                     (Task::Action, Reply::Ok) => {
+                        if let Some(id) = &self.selected {
+                            self.skills.remove(id);
+                        }
                         self.modal = None;
                         self.notice = Some(("Action accepted".into(), false));
                         self.refreshed = None;
@@ -641,18 +692,14 @@ impl Ui {
         }
     }
     fn filtered(&self) -> Vec<Summary> {
-        let query = self.filter.text().to_lowercase();
-        self.summaries
+        let mut sessions = self
+            .summaries
             .iter()
-            .filter(|s| {
-                s.kind != "Guide"
-                    && s.archived == self.archived
-                    && format!("{} {} {}", s.title, s.kind, s.workspace.display())
-                        .to_lowercase()
-                        .contains(&query)
-            })
+            .filter(|s| s.kind != "Guide" && s.archived == self.archived)
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        sessions.sort_by_key(|s| !self.pinned_sessions.contains(&s.id));
+        sessions
     }
     fn ensure_selected(&mut self) {
         let list = self.filtered();
@@ -747,7 +794,7 @@ impl Ui {
             true,
         );
     }
-    fn menu_entries(&self) -> Vec<&'static str> {
+    pub(crate) fn menu_entries(&self) -> Vec<&'static str> {
         let archived = self
             .sessions
             .get(self.selected.as_deref().unwrap_or_default())
@@ -775,10 +822,25 @@ impl Ui {
             "Open shells",
             "HTML artifacts",
             "Move shell / artifact pane · Alt+P",
+            if self
+                .selected
+                .as_ref()
+                .is_some_and(|id| self.pinned_sessions.contains(id))
+            {
+                "Unpin session"
+            } else {
+                "Pin session"
+            },
         ]
     }
-    fn menu_action(&mut self, index: usize) {
+    pub(crate) fn menu_action(&mut self, index: usize) {
         match index {
+            18 => {
+                if let Some(id) = self.selected.clone() {
+                    self.toggle_pin(&id);
+                    self.modal = None;
+                }
+            }
             15 => self.open_resources(false),
             16 => self.open_resources(true),
             17 => {
@@ -832,6 +894,52 @@ impl Ui {
             _ => {}
         }
     }
+    pub(crate) fn toggle_pin(&mut self, id: &str) {
+        let result = self.storage.load_config().and_then(|mut config| {
+            if !config.pinned_sessions.remove(id) {
+                config.pinned_sessions.insert(id.to_owned());
+            }
+            self.storage.save_config(&config)?;
+            Ok(config.pinned_sessions)
+        });
+        match result {
+            Ok(pins) => self.pinned_sessions = pins,
+            Err(error) => {
+                self.notice = Some((format!("Could not save session pin: {error:#}"), true))
+            }
+        }
+    }
+    pub(crate) fn open_session(&mut self, id: String) {
+        self.archived = self
+            .summaries
+            .iter()
+            .find(|s| s.id == id)
+            .is_some_and(|s| s.archived);
+        self.select(id);
+        self.tick_panels(false);
+        self.panels.focused = false;
+        self.changes_visible = false;
+        self.modal = None;
+        self.action(Action::Open);
+    }
+    pub(crate) fn session_pr(&self, id: &str) -> Option<&crate::github::SessionPr> {
+        self.prs.get(id)
+    }
+    pub(crate) fn palette_review(&self) -> Option<&crate::app::App> {
+        match &self.panels.view {
+            Some(panels::View::PullRequest { app }) if self.panels.visible() => Some(app),
+            _ => None,
+        }
+    }
+    pub(crate) fn palette_review_mut(&mut self) -> Option<&mut crate::app::App> {
+        if !self.panels.visible() {
+            return None;
+        }
+        match &mut self.panels.view {
+            Some(panels::View::PullRequest { app }) => Some(app),
+            _ => None,
+        }
+    }
     fn save_visibility(&mut self) {
         let result = self.storage.load_config().and_then(|mut config| {
             config.agent_list_visible = self.list_visible;
@@ -844,7 +952,7 @@ impl Ui {
     }
     pub fn toggle_list(&mut self) {
         self.list_visible = !self.list_visible;
-        if !self.list_visible && matches!(self.focus, Focus::List | Focus::Filter) {
+        if !self.list_visible && self.focus == Focus::List {
             self.focus = if self.changes_visible && self.drilled {
                 Focus::ChangeTree
             } else {
@@ -897,25 +1005,21 @@ impl Ui {
                 .unwrap_or_default();
             let text = draft.clone();
             if !text.trim().is_empty() {
-                if let Some(session) = self.sessions.get(&id)
-                    && (session.tool_running()
-                        || queue && session.turn_id.is_some()
-                        || session
-                            .pending
-                            .iter()
-                            .any(|p| p.id == "difu-missing-guidance"))
-                {
+                if let Some(session) = self.sessions.get(&id) {
                     let position = self.positions.entry(id.clone()).or_default();
                     let earlier = position.outgoing.iter().filter(|p| p.text == text).count();
                     position.outgoing.push(PendingSend {
                         text: text.clone(),
-                        queued: queue
+                        queued: (queue && session.turn_id.is_some())
                             || session
                                 .pending
                                 .iter()
                                 .any(|p| p.id == "difu-missing-guidance"),
                         observed_before: PendingSend::matching(session, &text) + earlier,
                     });
+                    position.follow = true;
+                    position.keep_transcript_position = false;
+                    position.transcript_viewport = None;
                 }
                 self.busy = true;
                 self.task(
@@ -1053,7 +1157,7 @@ impl Ui {
             return Some(note);
         }
         match &self.modal {
-            Some(Modal::Repository(editor)) => Some(editor),
+            Some(Modal::Repository(editor) | Modal::ChangeRepository(editor)) => Some(editor),
             Some(Modal::AgentDefaults(form)) => form.fields.get(form.field),
             Some(Modal::Menu { query, .. } | Modal::Commands { query, .. }) => Some(query),
             Some(Modal::Help(state)) => Some(&state.query),
@@ -1064,7 +1168,6 @@ impl Ui {
                 field,
             }) => Some(if *field == 0 { model } else { effort }),
             Some(Modal::Approval { answers, field, .. }) => answers.get(*field),
-            None if self.focus == Focus::Filter => Some(&self.filter),
             None if self.focus == Focus::Composer && self.drilled => self
                 .selected
                 .as_ref()
@@ -1229,15 +1332,6 @@ impl Ui {
                 _ => {}
             }
         }
-        if self.focus == Focus::Filter {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter => self.focus = Focus::List,
-                KeyCode::Char('u') if ctrl => self.filter.clear(),
-                _ => self.filter.key(key),
-            }
-            self.ensure_selected();
-            return;
-        }
         if self.focus == Focus::Composer && self.drilled {
             if key.modifiers.is_empty()
                 && key.code == KeyCode::Right
@@ -1330,7 +1424,6 @@ impl Ui {
                 })
             }
             KeyCode::Char('?') => self.modal = Some(Modal::Help(Default::default())),
-            KeyCode::Char('f') if self.list_visible => self.focus = Focus::Filter,
             KeyCode::Char('r') => {
                 self.refreshed = None;
                 self.changes_at = None;
@@ -1467,7 +1560,7 @@ impl Ui {
         }
         let current = if self.panels.focused && helper {
             2
-        } else if matches!(self.focus, Focus::List | Focus::Filter) {
+        } else if self.focus == Focus::List {
             0
         } else if self.changes_visible && self.drilled {
             if self.focus == Focus::Changes { 4 } else { 3 }
@@ -1507,7 +1600,7 @@ impl Ui {
                     .and_then(|id| self.sessions.get(id))
                     .is_some_and(|s| matches!(s.job, Job::Coding(_)))
                 {
-                    if matches!(self.focus, Focus::List | Focus::Filter) || !self.drilled {
+                    if self.focus == Focus::List || !self.drilled {
                         self.follow_latest();
                     }
                     self.drilled = true;
@@ -1682,7 +1775,9 @@ impl Ui {
                     form.changed();
                 }
             }
-            Some(Modal::Repository(editor)) => editor.insert(text),
+            Some(Modal::Repository(editor) | Modal::ChangeRepository(editor)) => {
+                editor.insert(text)
+            }
             Some(
                 Modal::Rename(e)
                 | Modal::QueuedEdit { editor: e, .. }
@@ -1710,10 +1805,6 @@ impl Ui {
             }
             Some(Modal::Menu { query, .. } | Modal::Commands { query, .. }) => query.insert(text),
             Some(Modal::Help(state)) => state.query.insert(text),
-            None if self.focus == Focus::Filter => {
-                self.filter.insert(text);
-                self.ensure_selected();
-            }
             None if self.focus == Focus::Composer => {
                 if let Some(id) = self.selected.clone() {
                     self.positions.entry(id).or_default().draft.paste(text);
@@ -1769,6 +1860,13 @@ impl Ui {
                     _ => *scroll,
                 };
             }
+            Some(Modal::ChangeRepository(editor)) => match key.code {
+                KeyCode::Enter => action = Some(Action::ChangeRepository),
+                KeyCode::Esc => self.modal = None,
+                _ => {
+                    editor.key(key);
+                }
+            },
             Some(Modal::Repository(editor)) => match key.code {
                 KeyCode::Enter => action = Some(Action::ChooseRepository),
                 KeyCode::Char('u') if ctrl => editor.clear(),
@@ -1907,12 +2005,6 @@ impl Ui {
                     form.changed();
                 }
             }
-            Action::DefaultToggle => {
-                if let Some(Modal::AgentDefaults(form)) = &mut self.modal {
-                    form.field = 3;
-                    form.isolated = !form.isolated;
-                }
-            }
             Action::DefaultSave => self.save_defaults(),
             Action::Select(id) => {
                 self.select(id);
@@ -2013,6 +2105,12 @@ impl Ui {
                     layout: None,
                     height: 0,
                 });
+            }
+            Action::ChangeRepository => {
+                if let Some(Modal::ChangeRepository(editor)) = &self.modal {
+                    let path = editor.text();
+                    self.change_repository(&path);
+                }
             }
             Action::ChooseRepository => {
                 if let Some(Modal::Repository(editor)) = &self.modal {
@@ -2137,6 +2235,18 @@ fn panel(frame: &mut Frame, rect: Rect, title: &str, focused: bool) -> Rect {
     }
     frame.render_widget(block, rect);
     inner(rect)
+}
+fn join_bottom_border(frame: &mut Frame, rect: Rect) {
+    if rect.width > 1 && rect.height > 1 {
+        for x in [rect.x, rect.right().saturating_sub(1)] {
+            if let Some(cell) = frame
+                .buffer_mut()
+                .cell_mut((x, rect.bottom().saturating_sub(1)))
+            {
+                cell.set_symbol("┴");
+            }
+        }
+    }
 }
 fn editor(frame: &mut Frame, rect: Rect, label: &str, value: &Editor, focused: bool) {
     let area = panel(frame, rect, label, focused);
@@ -2325,13 +2435,11 @@ impl Ui {
             let rect = Rect::new(x, content.bottom(), width, 1);
             self.hits.push((rect, Action::PullRequest));
             frame.render_widget(
-                Paragraph::new(label).style(Style::default().fg(prs::color(&pr)).bg(
-                    if self.focus == Focus::PullRequest {
-                        PANEL
-                    } else {
-                        BG
-                    },
-                )),
+                Paragraph::new(label).style(if self.focus == Focus::PullRequest {
+                    Style::default().bg(prs::color(&pr)).fg(crate::ui::INK)
+                } else {
+                    Style::default().fg(prs::color(&pr)).bg(BG)
+                }),
                 rect,
             );
         }
@@ -2401,28 +2509,14 @@ impl Ui {
             } else {
                 "Agents"
             },
-            !self.panels.focused && matches!(self.focus, Focus::List | Focus::Filter),
+            !self.panels.focused && self.focus == Focus::List,
         );
         self.hits.push((rect, Action::Focus(Focus::List)));
-        let filter = Rect::new(
+        let items = Rect::new(
             area.x,
             area.y.saturating_add(1),
             area.width,
-            3.min(area.height.saturating_sub(1)),
-        );
-        editor(
-            frame,
-            filter,
-            "f Filter",
-            &self.filter,
-            self.focus == Focus::Filter && self.modal.is_none(),
-        );
-        self.hits.push((filter, Action::Focus(Focus::Filter)));
-        let items = Rect::new(
-            area.x,
-            filter.bottom().saturating_add(1),
-            area.width,
-            area.height.saturating_sub(filter.height + 2),
+            area.height.saturating_sub(1),
         );
         let list = self.filtered();
         let heights = list
@@ -2498,13 +2592,21 @@ impl Ui {
             } else {
                 format!(" {status}")
             };
-            let title_width = usize::from(row.width)
-                .saturating_sub(unicode_width::UnicodeWidthStr::width(title_status.as_str()) + 2);
+            let pin = if self.pinned_sessions.contains(&session.id) {
+                "◆ "
+            } else {
+                ""
+            };
+            let title_width = usize::from(row.width).saturating_sub(
+                unicode_width::UnicodeWidthStr::width(title_status.as_str())
+                    + 2
+                    + unicode_width::UnicodeWidthStr::width(pin),
+            );
             let mut lines = vec![
                 Line::from(vec![
                     Span::styled(
                         format!(
-                            "{} {}",
+                            "{} {pin}{}",
                             if selected { "›" } else { " " },
                             crate::ui::crop(&session.title, 0, title_width)
                         ),
@@ -2579,7 +2681,7 @@ impl Ui {
             .and_then(|id| self.sessions.get(id))
             .map(|s| format!("{} · {}", s.title, s.status.label()))
             .unwrap_or_else(|| "Conversation".into());
-        let area = panel(
+        let mut area = panel(
             frame,
             rect,
             &crate::model::clean(&title),
@@ -2619,6 +2721,14 @@ impl Ui {
         } else {
             0
         };
+        let dock_composer = composer_height > 0 && !self.inline_question() && !area.is_empty();
+        if dock_composer {
+            // The input's last row shares the pane border; reclaim the old inset.
+            area.height = area
+                .height
+                .saturating_add(1)
+                .min(rect.bottom().saturating_sub(area.y));
+        }
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
@@ -2639,7 +2749,7 @@ impl Ui {
                 (model.model.as_str(), model.effort.as_str())
             }
             Job::Coding(_) => (
-                session.model.as_deref().unwrap_or("Codex defaults"),
+                session.model.as_deref().unwrap_or("Provider defaults"),
                 session.effort.as_deref().unwrap_or("default reasoning"),
             ),
         };
@@ -2681,7 +2791,7 @@ impl Ui {
             mut total,
             sections,
         } = view;
-        if session.entries.is_empty() {
+        if session.entries.is_empty() && total == 0 {
             lines.push(Line::from("Preparing session…"));
             total = 1;
         }
@@ -2794,6 +2904,9 @@ impl Ui {
             }
             if matches!(self.modal, Some(Modal::Commands { .. })) {
                 self.draw_commands(frame, composer);
+                if dock_composer {
+                    join_bottom_border(frame, composer);
+                }
                 return;
             }
             let composer = if voice_status.is_some() {
@@ -2827,6 +2940,9 @@ impl Ui {
                     Paragraph::new(placeholder).style(Style::default().fg(DIM)),
                     inner(composer),
                 );
+            }
+            if dock_composer {
+                join_bottom_border(frame, composer);
             }
             self.hits.push((composer, Action::Focus(Focus::Composer)));
         } else if !self.drilled {
@@ -2873,8 +2989,9 @@ impl Ui {
             Some(Modal::AgentDefaults(_)) => "New agent defaults · Tab fields · Esc cancels",
             Some(Modal::Voice { .. }) => "Voice settings",
             Some(Modal::Repository(_)) => "Choose and remember your default repository",
+            Some(Modal::ChangeRepository(_)) => "Change session repository",
             Some(Modal::Menu { .. }) => "Agent actions",
-            Some(Modal::Commands { .. }) => "Codex commands",
+            Some(Modal::Commands { .. }) => "Session commands",
             Some(Modal::Status) => "Session status",
             Some(Modal::Pending { .. }) => "Pending questions and approvals",
             Some(Modal::Queue { .. }) => "Queued outgoing messages",
@@ -2976,6 +3093,16 @@ impl Ui {
                 | Modal::Resources { .. }
                 | Modal::InstallBrowser { .. },
             ) => {}
+            Some(Modal::ChangeRepository(value)) => {
+                let input = Rect::new(area.x, area.y, area.width, area.height.min(3));
+                editor(frame, input, "Local repository", value, true);
+                deferred.push((
+                    Rect::new(area.x, area.y.saturating_add(4), area.width, 1).intersection(area),
+                    "[ Enter · Change repository ]".into(),
+                    Action::ChangeRepository,
+                    true,
+                ));
+            }
             Some(Modal::Repository(value)) => {
                 let input = Rect::new(area.x, area.y, area.width, area.height.min(3));
                 editor(frame, input, "Local repository", value, true);
@@ -3022,7 +3149,7 @@ impl Ui {
                 );
             }
             Some(Modal::Delete) => {
-                frame.render_widget(Paragraph::new("Stop this agent and permanently delete its difu chat, saved questions, queue, and attachments? Its clean, unlocked difu-owned worktree will also be removed.\n\nModified worktrees remain protected: deletion stops with an error and retains the chat. Existing directories, named branches, commits, and Codex’s own history are not deleted.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
+                frame.render_widget(Paragraph::new("Stop this agent and permanently delete its difu chat, saved questions, queue, and attachments? Its clean, unlocked difu-owned worktree will also be removed.\n\nModified worktrees remain protected: deletion stops with an error and retains the chat. Existing directories, named branches, commits, and native provider history are not deleted.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
             }
             Some(Modal::Cleanup) => {
                 frame.render_widget(Paragraph::new("Delete this session’s clean, inactive worktree?\n\nModified, untracked, ignored, active and Git-locked worktrees are protected. Existing directories are never deleted. The named branch and its commits are retained.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
@@ -3267,7 +3394,7 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
             "Enter / Esc",
             "Open session / interrupt agent and send waiting messages; go back when idle",
         ),
-        ("f / Ctrl+U", "Focus session filter / clear filter"),
+        ("Cmd+K", "Search sessions, pull requests and commands"),
         (
             "Tab / Shift+Tab",
             "Cycle sessions, chat or tree/diff, and helper canvas",
@@ -3329,7 +3456,7 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
         ("i", "Focus message composer"),
         (
             "/",
-            "Search Codex commands / skills; /actions opens session controls",
+            "Search session commands / skills; /actions opens session controls",
         ),
         ("r", "Reconnect / refresh sessions and changes"),
         ("← / →", "Scroll Changes horizontally"),
@@ -3384,6 +3511,34 @@ mod tests {
         ui.select("one".into());
         ui
     }
+    #[test]
+    fn session_pins_persist_sort_first_and_obey_archive_filter() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        let mut ui = state(storage.clone());
+        let mut other = ui.summaries.first().context("session")?.clone();
+        other.id = "two".into();
+        other.title = "Pinned task".into();
+        ui.summaries.push(other);
+        ui.toggle_pin("two");
+        assert_eq!(ui.filtered().first().map(|s| s.id.as_str()), Some("two"));
+        let restored = Ui::new(storage.clone(), &storage.load_config()?);
+        assert!(restored.pinned_sessions.contains("two"));
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert!(screen.contains("◆ Pinned task"));
+        assert!(!screen.contains("f Filter"));
+        ui.summaries.last_mut().context("other")?.archived = true;
+        assert!(ui.filtered().iter().all(|s| s.id != "two"));
+        ui.archived = true;
+        assert_eq!(ui.filtered().first().map(|s| s.id.as_str()), Some("two"));
+        ui.toggle_pin("two");
+        assert!(!storage.load_config()?.pinned_sessions.contains("two"));
+        Ok(())
+    }
+
     #[test]
     fn entering_sessions_follows_latest_without_resetting_in_session_scrolling() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -3568,6 +3723,138 @@ mod tests {
         worker
             .join()
             .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn sends_without_tools_appear_before_acknowledgement_and_reconcile_once() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let listener = UnixListener::bind(super::super::server::socket(&storage)?)?;
+        let (release, hold) = mpsc::channel();
+        let worker = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut line = String::new();
+            BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+            hold.recv_timeout(Duration::from_secs(5))?;
+            serde_json::to_writer(&mut stream, &Reply::Ok)?;
+            stream.write_all(b"\n")?;
+            Ok(())
+        });
+        let mut ui = state(storage);
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.entries.clear();
+        session.status = Status::Idle;
+        session.turn_id = None;
+        ui.positions.get_mut("one").context("position")?.draft =
+            Editor::from("Show this immediately");
+        ui.send(false);
+        let (screen, _) = draw(&mut ui, 150, 40)?;
+        assert!(screen.contains("› Show this immediately"));
+        assert!(!screen.contains("Preparing session…"));
+        assert!(!screen.contains("Messages to be submitted"));
+        assert!(
+            ui.conversation_sections
+                .iter()
+                .any(|s| s.id == "difu-outgoing-0")
+        );
+
+        release.send(())?;
+        let response = ui.receiver.recv_timeout(Duration::from_secs(5))?;
+        ui.sender.send(response)?;
+        ui.tick(false);
+        let (screen, _) = draw(&mut ui, 150, 40)?;
+        assert_eq!(screen.matches("Show this immediately").count(), 1);
+
+        // A canonical send replaces the placeholder even before Codex acknowledges it.
+        let mut canonical = ui.sessions.get("one").context("session")?.clone();
+        canonical.status = Status::Running;
+        canonical.turn_id = Some("t".into());
+        canonical.note("sending", "Show this immediately");
+        canonical.entries.last_mut().context("message")?.data =
+            serde_json::json!({"difuSteeringTurn":"t"});
+        ui.sender.send(ResultMessage {
+            kind: Task::Read("one".into()),
+            result: Ok(Reply::Session(Box::new(canonical))),
+        })?;
+        ui.tick(false);
+        let (screen, _) = draw(&mut ui, 150, 40)?;
+        assert_eq!(screen.matches("Show this immediately").count(), 1);
+        assert!(screen.contains("› Show this immediately"));
+        assert!(!screen.contains("Messages to be submitted"));
+        assert!(
+            ui.positions
+                .get("one")
+                .context("position")?
+                .outgoing
+                .is_empty()
+        );
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn optimistic_steering_moves_to_chat_when_tools_finish_before_send_ack() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        ui.drilled = true;
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.status = Status::Running;
+        session.turn_id = Some("t".into());
+        session.entries = vec![Entry {
+            id: "tool".into(),
+            kind: "commandExecution".into(),
+            started_at: Some(1),
+            ..Entry::default()
+        }];
+        let position = ui.positions.get_mut("one").context("position")?;
+        position.follow = true;
+        position.outgoing = vec![
+            PendingSend {
+                text: "Follow up".into(),
+                queued: false,
+                observed_before: 0,
+            },
+            PendingSend {
+                text: "Next turn".into(),
+                queued: true,
+                observed_before: 0,
+            },
+        ];
+        let (screen, _) = draw(&mut ui, 150, 40)?;
+        assert!(screen.contains("↳ Follow up"));
+        assert!(!screen.contains("› Follow up"));
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.entries.first_mut().context("tool")?.finished_at = Some(2);
+        session.touch();
+        let (screen, _) = draw(&mut ui, 150, 40)?;
+        assert_eq!(screen.matches("Follow up").count(), 1);
+        assert!(screen.contains("› Follow up"));
+        assert!(screen.contains("↳ Next turn"));
+        assert!(!screen.contains("Messages to be submitted after the next tool call"));
+        // A reused optimistic slot must not display cached text from the previous send.
+        ui.positions
+            .get_mut("one")
+            .context("position")?
+            .outgoing
+            .first_mut()
+            .context("outgoing")?
+            .text = "Another follow up".into();
+        let (screen, _) = draw(&mut ui, 150, 40)?;
+        assert!(screen.contains("› Another follow up"));
+        assert!(!screen.contains("› Follow up"));
         Ok(())
     }
 
@@ -4984,14 +5271,13 @@ mod tests {
             Editor::from("fixture-model"),
             Editor::from("medium"),
         ];
-        form.isolated = false;
         for (width, height) in [(40, 12), (100, 30)] {
             draw(&mut ui, width, height)?;
         }
         ui.save_defaults();
         let saved = storage.load_config()?;
         assert!(saved.wrap_diff);
-        assert!(!saved.agent_defaults.isolated);
+        assert!(saved.agent_defaults.isolated);
         assert_eq!(saved.agent_defaults.model.as_deref(), Some("fixture-model"));
         assert_eq!(ui.defaults.effort.as_deref(), Some("medium"));
         assert_eq!(ui.sessions.get("one").context("session")?.model, before);
@@ -5955,10 +6241,6 @@ mod tests {
             "before"
         );
         assert!(!ui.busy);
-        ui.focus = Focus::Filter;
-        ui.filter.insert("first\nsecond");
-        ui.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        assert_eq!(ui.filter.text(), "");
         Ok(())
     }
     #[test]
@@ -6050,19 +6332,15 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn filter_help_copy_and_all_input_layouts_remain_usable() -> Result<()> {
+    fn sidebar_help_copy_and_all_input_layouts_remain_usable() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut ui = state(Storage {
             config: directory.path().join("config.json"),
             cache: directory.path().into(),
         });
-        ui.key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE));
-        ui.paste("IMPLEMENT");
+        let (screen, _) = draw(&mut ui, 120, 35)?;
+        assert!(!screen.contains("f Filter"));
         assert_eq!(ui.filtered().len(), 1);
-        ui.paste("missing");
-        assert!(ui.filtered().is_empty());
-        ui.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
-        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         ui.selected = Some("one".into());
         ui.drilled = true;
         ui.focus = Focus::Changes;

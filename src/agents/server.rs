@@ -51,7 +51,7 @@ impl Store {
             .map_err(|_| anyhow::anyhow!("Persistence lock failed"))?;
         storage::atomic_json(&self.home.join(format!("{id}.json")), &self.get(id)?)
     }
-    fn list(&self) -> Result<Vec<Summary>> {
+    pub(super) fn list(&self) -> Result<Vec<Summary>> {
         let mut list: Vec<_> = self
             .sessions
             .lock()
@@ -120,9 +120,14 @@ impl Service {
             .name(format!("difu-agent-{id}"))
             .spawn(move || {
                 let output = match session.job {
-                    Job::Coding(_) => {
-                        super::engine::run(&store, &id_owned, receiver, &token, initial)
-                    }
+                    Job::Coding(_) => match session.provider {
+                        provider::Provider::Codex => {
+                            super::engine::run(&store, &id_owned, receiver, &token, initial)
+                        }
+                        provider::Provider::Claude => {
+                            super::claude::run(&store, &id_owned, receiver, &token, initial)
+                        }
+                    },
                     _ => run_review(&store, &id_owned, &token),
                 };
                 if let Err(error) = output {
@@ -146,6 +151,11 @@ impl Service {
                             s.unsent(text);
                         }
                         s.pending.retain(Pending::is_async_question);
+                        for entry in &mut s.entries {
+                            if entry.kind == "sending" {
+                                entry.kind = "unsent or unacknowledged".into();
+                            }
+                        }
                         s.turn_id = None;
                     });
                 }
@@ -163,7 +173,7 @@ impl Service {
         );
         Ok(())
     }
-    fn insert_session(&self, job: Job, deferred: bool) -> Result<String> {
+    fn insert_session(&self, mut job: Job, empty: bool) -> Result<String> {
         let entropy = tempfile::Builder::new()
             .prefix("id-")
             .tempfile_in(&self.store.home)?;
@@ -175,12 +185,25 @@ impl Service {
                 .take(8)
                 .collect::<String>()
         );
+        if let Job::Coding(launch) = &mut job {
+            launch.isolated = true;
+        }
         let mut session = Session::new(id.clone(), job);
-        if deferred {
-            session.deferred_workspace = true;
+        if empty {
             session.title = "New session".into();
             session.status = Status::Idle;
-            super::workspace::inspect(&mut session, &Cancel::default())?;
+            if let Err(error) = super::workspace::prepare(
+                &mut session,
+                &self.store.home,
+                &Cancel::default(),
+                |prepared| {
+                    storage::atomic_json(&self.store.home.join(format!("{id}.json")), prepared)
+                },
+            ) {
+                session.status = Status::Failed;
+                session.error = Some(format!("{error:#}"));
+                session.note("error", format!("Cannot prepare worktree: {error:#}"));
+            }
         }
         storage::atomic_json(&self.store.home.join(format!("{id}.json")), &session)?;
         self.store
@@ -188,7 +211,7 @@ impl Service {
             .lock()
             .map_err(|_| anyhow::anyhow!("Session lock failed"))?
             .insert(id.clone(), session);
-        if !deferred {
+        if !empty {
             self.start(&id, None)?;
         }
         Ok(id)
@@ -199,6 +222,7 @@ impl Service {
             | Request::Cleanup { id }
             | Request::Delete { id }
             | Request::Archive { id, .. }
+            | Request::Repository { id, .. }
             | Request::Rename { id, .. } => Some(id.clone()),
             _ => None,
         };
@@ -324,6 +348,51 @@ impl Service {
                     super::questions::save_answer(&self.store, &id, updated)?;
                     return Ok(Reply::Ok);
                 }
+                if let Control::Model { model, effort } = &control {
+                    let target = model
+                        .as_deref()
+                        .map(|model| provider::Provider::for_model(Some(model)))
+                        .unwrap_or(session.provider);
+                    if target != session.provider || target == provider::Provider::Claude {
+                        ensure!(
+                            matches!(
+                                session.status,
+                                Status::Idle | Status::Interrupted | Status::Failed
+                            ) && session.turn_id.is_none()
+                                && session.pending.is_empty()
+                                && session.queue.is_empty()
+                                && !session.switching_workspace,
+                            "Finish the current turn and pending requests before switching models or providers"
+                        );
+                        if let Some(worker) = self
+                            .workers
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("Worker lock failed"))?
+                            .remove(&id)
+                        {
+                            worker.cancel.cancel();
+                            worker.handle.join().map_err(|_| {
+                                anyhow::anyhow!("Session worker stopped unexpectedly")
+                            })?;
+                        }
+                        let mut updated = self.store.get(&id)?;
+                        if target != updated.provider {
+                            provider::switch(&mut updated, target, model.clone(), effort.clone())?;
+                        } else {
+                            updated.model = model.clone();
+                            updated.effort = effort.clone();
+                            updated.status = Status::Idle;
+                            updated.error = None;
+                            if let Job::Coding(launch) = &mut updated.job {
+                                launch.model = model.clone();
+                                launch.effort = effort.clone();
+                            }
+                        }
+                        self.store.update(&id, |s| *s = updated)?;
+                        self.store.save(&id)?;
+                        return Ok(Reply::Ok);
+                    }
+                }
                 let async_response = matches!(&control, Control::Respond { request, .. } | Control::AnswerQuestion { request, .. }
                     if session.pending.iter().any(|p| p.id == *request && p.is_async_question() && !p.responded));
                 let sends_message = matches!(
@@ -422,6 +491,54 @@ impl Service {
                 }
                 Ok(Reply::Ok)
             }
+            Request::Repository { id, repository } => {
+                let mut candidate = self.store.get(&id)?;
+                ensure!(
+                    candidate.waiting_for_workspace(),
+                    "Repository can only change before the first worktree is created"
+                );
+                ensure!(
+                    candidate.status == Status::Idle
+                        && candidate.turn_id.is_none()
+                        && candidate.pending.is_empty()
+                        && candidate.queue.is_empty()
+                        && !candidate.switching_workspace
+                        && !candidate.archived,
+                    "Wait for an idle session with no pending requests before changing repository"
+                );
+                let Job::Coding(launch) = &mut candidate.job else {
+                    anyhow::bail!("Only coding sessions can change repository");
+                };
+                launch.repository = repository;
+                candidate.baseline = None;
+                super::workspace::inspect(&mut candidate, &Cancel::default())?;
+                // Validate first so an invalid path leaves the current connection intact.
+                if let Some(worker) = self
+                    .workers
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Worker lock failed"))?
+                    .remove(&id)
+                {
+                    worker.cancel.cancel();
+                    worker
+                        .handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("Session worker stopped unexpectedly"))?;
+                }
+                self.store.update(&id, |s| {
+                    s.job = candidate.job;
+                    s.workspace = candidate.workspace;
+                    s.baseline = candidate.baseline;
+                    s.branch = None;
+                    s.guidance_checked = false;
+                    s.shells.clear();
+                    s.suggestion = None;
+                    s.suggestion_attempted = None;
+                    s.note("system", format!("Repository changed to {}. Re-read repository instructions before continuing.", s.job.root().display()));
+                })?;
+                self.store.save(&id)?;
+                Ok(Reply::Session(Box::new(self.store.get(&id)?)))
+            }
             Request::Rename { id, title } => {
                 ensure!(!title.trim().is_empty(), "Session name cannot be empty");
                 self.store.update(&id, |s| {
@@ -453,7 +570,7 @@ impl Service {
                     reply: tx,
                 })?;
                 rx.recv_timeout(Duration::from_secs(50))
-                    .context("Shell list unavailable while Codex is busy")??;
+                    .context("Shell list unavailable while the agent is busy")??;
                 Ok(Reply::Shells(self.store.get(&id)?.shells))
             }
             Request::Delete { id } => {
@@ -540,6 +657,9 @@ impl Service {
             Request::Defaults { cwd } => super::engine::defaults(&cwd),
             Request::Skills { id, force } => {
                 let session = self.store.get(&id)?;
+                if session.provider == provider::Provider::Claude {
+                    return Ok(super::claude::skills());
+                }
                 ensure!(
                     matches!(session.job, Job::Coding(_)),
                     "Skills are available for coding agents"
@@ -641,6 +761,11 @@ pub fn run(storage: Storage) -> Result<()> {
             session.pending.retain(Pending::is_async_question);
             session.note("system", "Service restarted. Work was interrupted; send a message or choose Continue to resume. No prompt or publication action was replayed.");
         }
+        for entry in &mut session.entries {
+            if entry.kind == "sending" {
+                entry.kind = "unsent or unacknowledged".into();
+            }
+        }
         // Queued messages remain visible, but never replay after a service restart.
         if !session.queue.is_empty() {
             let queued = std::mem::take(&mut session.queue);
@@ -663,6 +788,8 @@ pub fn run(storage: Storage) -> Result<()> {
         action_locks: Mutex::new(BTreeMap::new()),
         launch_lock: Mutex::new(()),
     });
+    let _pr_cache =
+        super::pr_cache::Refresher::start(service.store.storage.clone(), service.store.clone())?;
     let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         signal_hook::flag::register(signal, stopped.clone())?;

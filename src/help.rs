@@ -12,6 +12,7 @@ pub fn entries(query: &str) -> Vec<(&'static str, &'static str)> {
     let query = query.to_lowercase();
     [
         ("⌥+1 / ⌥+2", "Switch Agents / Reviews"),
+        ("Cmd+K", "Search sessions, pull requests and commands"),
         ("↑ / ↓", "Navigate repositories, PRs, files, or code"),
         ("Alt+↑ / ↓", "Previous / next guide chapter"),
         ("Tab / Shift+Tab", "Switch navigation / content focus"),

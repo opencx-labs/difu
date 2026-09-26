@@ -20,12 +20,10 @@ pub(super) struct View {
     pub sections: Vec<transcript::Section>,
 }
 impl Window {
-    fn sections(&self, session: &Session) -> (Vec<transcript::Section>, usize) {
+    fn sections(&self, entries: &[&Entry]) -> (Vec<transcript::Section>, usize) {
         let mut row = 0;
-        let sections = session
-            .entries
+        let sections = entries
             .iter()
-            .filter(|e| transcript::visible(session, e))
             .map(|entry| {
                 let section = transcript::Section {
                     id: entry.id.clone(),
@@ -70,8 +68,30 @@ impl Window {
             self.rows.clear();
             self.revision = Some(revision);
         }
-        let entries: HashMap<_, _> = session.entries.iter().map(|e| (e.id.as_str(), e)).collect();
-        let (mut sections, _) = self.sections(session);
+        let outgoing = position
+            .outgoing
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| pending.in_chat(session))
+            .map(|(index, pending)| Entry {
+                id: format!("difu-outgoing-{index}"),
+                kind: "sending".into(),
+                text: pending.text.clone(),
+                ..Entry::default()
+            })
+            .collect::<Vec<_>>();
+        // Outgoing slots can be reused without a new session revision.
+        for entry in &outgoing {
+            self.rows.remove(&entry.id);
+        }
+        let visible = session
+            .entries
+            .iter()
+            .chain(&outgoing)
+            .filter(|entry| transcript::visible(session, entry))
+            .collect::<Vec<_>>();
+        let entries: HashMap<_, _> = visible.iter().map(|&e| (e.id.as_str(), e)).collect();
+        let (mut sections, _) = self.sections(&visible);
         let mut total;
         if sections.is_empty() {
             return View {
@@ -161,7 +181,7 @@ impl Window {
                     }
                 }
             }
-            (sections, total) = self.sections(session);
+            (sections, total) = self.sections(&visible);
             position.conversation = if follow {
                 total.saturating_sub(usize::from(height))
             } else {

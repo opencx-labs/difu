@@ -511,6 +511,9 @@ fn send_turn(
         .as_ref()
         .context("Codex session is not connected")?;
     let mut input = vec![json!({"type":"text","text":text})];
+    if let Some(context) = &session.provider_context {
+        input.push(json!({"type":"text","text":context}));
+    }
     if let Some(context) = super::questions::pending_context(&session, prompt) {
         input.push(json!({"type":"text","text":context}));
     }
@@ -540,7 +543,11 @@ fn send_turn(
             "sandboxPolicy",
             isolation::read_only_policy(&session),
         )?;
-        put(&mut params, "approvalPolicy", json!("never"))?;
+        put(
+            &mut params,
+            "approvalPolicy",
+            isolation::investigation_approvals(),
+        )?;
     }
 
     let method = if steer {
@@ -557,7 +564,11 @@ fn send_turn(
         "turn/steer"
     } else {
         if let Some(model) = &session.model {
-            put(&mut params, "model", json!(model))?;
+            put(
+                &mut params,
+                "model",
+                json!(super::provider::Provider::native_model(model)),
+            )?;
         }
         if let Some(effort) = &session.effort {
             put(&mut params, "effort", json!(effort))?;
@@ -608,9 +619,10 @@ fn send_turn(
                     entry.kind = "userMessage".into();
                 }
 
+                s.provider_context = None;
                 s.finish_steering_wait();
                 if session.waiting_for_workspace() && !steer {
-                    s.permissions = json!({"sandbox":isolation::read_only_policy(&session),"approvalPolicy":"never",
+                    s.permissions = json!({"sandbox":isolation::read_only_policy(&session),"approvalPolicy":isolation::investigation_approvals(),
                         "approvalsReviewer":session.inherited_permissions.get("approvalsReviewer")});
                 }
                 if let Some(turn) = response.pointer("/turn/id").and_then(Value::as_str)
@@ -655,7 +667,11 @@ fn resume_thread(
     );
     let mut params = json!({"threadId":session.thread_id,"cwd":session.workspace,"developerInstructions":format!("{}\n\n{}", rpc.inherited, instructions(session))});
     if let Some(model) = &session.model {
-        put(&mut params, "model", json!(model))?;
+        put(
+            &mut params,
+            "model",
+            json!(super::provider::Provider::native_model(model)),
+        )?;
     }
     isolation::settings(&mut params, session)?;
     rpc.call("thread/resume", params, cancel, |v| event(store, id, v))?;
@@ -998,7 +1014,11 @@ fn command(
             // Server validates these settings on thread/resume before persisting them.
             let mut params = json!({"threadId":session.thread_id,"cwd":session.workspace,"developerInstructions":format!("{}\n\n{}", rpc.inherited, instructions(&session))});
             if let Some(model) = &model {
-                put(&mut params, "model", json!(model))?;
+                put(
+                    &mut params,
+                    "model",
+                    json!(super::provider::Provider::native_model(model)),
+                )?;
             }
             if let Some(effort) = &effort {
                 put(
@@ -1032,10 +1052,14 @@ fn instructions(session: &Session) -> String {
     } else {
         super::CODING_INSTRUCTIONS
     };
+    let base = format!(
+        "{base}\n\nCurrent repository: {}. Read instructions in the current repository before continuing; earlier conversation may refer to a different repository.",
+        session.job.root().display()
+    );
     if session.artifact_tools {
         format!("{base}\n\n{}", super::artifacts::INSTRUCTIONS)
     } else {
-        base.into()
+        base
     }
 }
 fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool)> {
@@ -1071,7 +1095,11 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
     let model = session.model.as_ref().or(launch.model.as_ref());
     let effort = session.effort.as_ref().or(launch.effort.as_ref());
     if let Some(model) = model {
-        put(&mut params, "model", json!(model))?;
+        put(
+            &mut params,
+            "model",
+            json!(super::provider::Provider::native_model(model)),
+        )?;
     }
     if let Some(effort) = effort {
         put(

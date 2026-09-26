@@ -66,7 +66,8 @@ pub(super) fn tool(entry: &Entry) -> bool {
     entry.is_tool()
 }
 pub(super) fn visible(session: &Session, entry: &Entry) -> bool {
-    !(entry.text.is_empty() && entry.kind == "reasoning") && !session.is_pending_steering(entry)
+    !(entry.text.is_empty() && entry.kind == "reasoning")
+        && !(session.is_pending_steering(entry) && session.tool_running())
 }
 
 fn label(entry: &Entry, running: bool) -> String {
@@ -273,13 +274,14 @@ pub(super) fn waiting_messages(
     };
     let mut steering = session
         .pending_steering()
+        .filter(|_| session.tool_running())
         .map(|entry| entry.text.as_str())
         .collect::<Vec<_>>();
     let mut queue = session.queue.iter().map(Prompt::text).collect::<Vec<_>>();
     for outgoing in outgoing {
         if outgoing.queued {
             queue.push(&outgoing.text);
-        } else {
+        } else if !outgoing.in_chat(session) {
             steering.push(&outgoing.text);
         }
     }

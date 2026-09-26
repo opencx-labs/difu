@@ -28,8 +28,7 @@ pub(super) fn read_only_policy(session: &Session) -> Value {
 pub(super) fn settings(params: &mut Value, session: &Session) -> Result<()> {
     if session.waiting_for_workspace() {
         put(params, "sandbox", json!("read-only"))?;
-        // Prevent an approval from granting writes to the original checkout.
-        put(params, "approvalPolicy", json!("never"))?;
+        put(params, "approvalPolicy", investigation_approvals())?;
     } else if session.deferred_workspace && !session.inherited_permissions.is_null() {
         let mode = match session
             .inherited_permissions
@@ -52,6 +51,17 @@ pub(super) fn settings(params: &mut Value, session: &Session) -> Result<()> {
         put(params, "approvalPolicy", approval.clone())?;
     }
     Ok(())
+}
+
+pub(super) fn investigation_approvals() -> Value {
+    // App approvals can honor the user's instructions without granting local writes.
+    json!({"granular": {
+        "sandbox_approval": false,
+        "rules": false,
+        "mcp_elicitations": true,
+        "request_permissions": false,
+        "skill_approval": false
+    }})
 }
 
 pub(super) fn transition(

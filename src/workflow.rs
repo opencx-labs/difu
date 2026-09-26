@@ -140,6 +140,8 @@ pub fn control_commands(query: &str, draft: Option<bool>) -> Vec<(usize, &'stati
         "Request reviewers",
         "Convert to draft",
         "Mark ready for review",
+        "Approve workflows to run",
+        "Open in browser",
     ]
     .into_iter()
     .enumerate()
@@ -370,6 +372,34 @@ impl App {
                         _ => {}
                     },
                     Wizard::Controls { key, head, .. } => match index {
+                        12 => self.action(crate::app::Action::Link(key.url())),
+                        11 => {
+                            let runs = self
+                                .reviews
+                                .get(&key.id())
+                                .and_then(|r| r.check_report.as_ref())
+                                .filter(|report| report.head == head)
+                                .map(|report| {
+                                    report
+                                        .awaiting_workflows
+                                        .iter()
+                                        .map(|run| run.id)
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            if runs.is_empty() {
+                                self.notice = Notice::info(
+                                    "No workflows awaiting approval for this revision. Refresh the PR to check again.",
+                                );
+                            } else {
+                                self.wizard(Wizard::Confirm {
+                                    key,
+                                    head,
+                                    operation: Operation::ApproveWorkflows { runs },
+                                    draft: None,
+                                });
+                            }
+                        }
                         0 => self.compose(key, head, Kind::Review),
                         1..=4 => self.wizard(Wizard::Confirm {
                             key,
@@ -805,8 +835,12 @@ impl App {
                                 result(crate::github::detail(&key, &cancel)),
                             ));
                             let _ = tx.send(Message::Timeline(
-                                id,
+                                id.clone(),
                                 result(crate::github::timeline(&key, &cancel)),
+                            ));
+                            let _ = tx.send(Message::Checks(
+                                id,
+                                result(crate::github::checks(&key, &cancel)),
                             ));
                         });
                     }

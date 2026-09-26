@@ -329,6 +329,35 @@ pub(crate) fn rows_with_images(review: &Review, width: u16, images: bool) -> Vec
         rows.extend(card(width, vec![bold(title, color)], body));
         rows.push(TextRow::default());
     }
+    if let Some(report) = &review.check_report {
+        if !report.awaiting_workflows.is_empty() {
+            let mut body = prose(
+                "Workflows will not run until approved by a user with write permission. Use / → PR controls → Approve workflows to run.",
+                inner,
+            );
+            for run in &report.awaiting_workflows {
+                body.push(link(
+                    format!("{} · run {}", run.name, run.id),
+                    Action::Link(run.url.clone()),
+                ));
+            }
+            rows.extend(card(
+                width,
+                vec![bold(
+                    format!(
+                        "{} WORKFLOWS AWAITING APPROVAL",
+                        report.awaiting_workflows.len()
+                    ),
+                    crate::ui::YELLOW,
+                )],
+                body,
+            ));
+            rows.push(TextRow::default());
+        }
+        if let Some(error) = &report.workflows_error {
+            rows.extend(prose(error, inner));
+        }
+    }
     let mut checks = Vec::new();
     if let Some(error) = &review.checks_error {
         checks.extend(prose(error, inner));
