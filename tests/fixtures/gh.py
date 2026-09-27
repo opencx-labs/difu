@@ -12,7 +12,7 @@ if args[:2] == ['pr', 'list']:
         dict(url=url,state='MERGED',isDraft=False,mergeable='UNKNOWN',headRefName='session-branch',headRefOid=revs['head'],updatedAt='2026-09-25T00:00:00Z'),
         dict(url=url[:-1]+'2',state='OPEN',isDraft=False,mergeable='MERGEABLE',headRefName='session-branch',headRefOid=revs['head'],updatedAt='2026-09-26T00:00:00Z')
     ]));sys.exit(0)
-if args[:2] == ['pr', 'view'] and '--json=url,state,isDraft,mergeable,headRefName,headRefOid,updatedAt' in args:
+if args[:2] == ['pr', 'view'] and any(arg.startswith('--json=url,state,isDraft,mergeable,headRefName,headRefOid,updatedAt') for arg in args):
     if (root / 'session-pr-error').exists():
         print('GitHub unavailable', file=sys.stderr);sys.exit(1)
     if len(args) == 4 and not args[2].startswith('https://'):
