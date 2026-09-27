@@ -1129,7 +1129,13 @@ fn new_sessions_accept_input_while_worktrees_are_preparing() -> Result<()> {
             .iter()
             .find(|e| e.kind == "unsent")
             .context("unsent prompt")?;
-        let prompt: difu::agents::Prompt = serde_json::from_value(unsent.data["prompt"].clone())?;
+        let prompt: difu::agents::Prompt = serde_json::from_value(
+            unsent
+                .data
+                .get("prompt")
+                .context("Missing unsent prompt")?
+                .clone(),
+        )?;
         assert_eq!(prompt.attachments(), attachments);
         fs::remove_file(root.join("fail-worktree"))?;
 
