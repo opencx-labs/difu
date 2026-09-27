@@ -234,7 +234,9 @@ and worktree changes. Open PRs on the current worktree appear first, then other
 open session PRs, then merged/closed PRs. Within those groups, current-worktree
 relevance and the most recent update determine order. Open PRs refresh every five
 minutes. Active sessions also rediscover open PRs on their current branch, even
-when an earlier PR was closed or merged. The service and UI
+when an earlier PR was closed or merged. Discovery reads the current Git branch,
+so switching branches within an existing session does not leave its old PR as the
+active badge. Open PRs take precedence over merged history. The service and UI
 share cached results and deduplicate concurrent requests. Archived sessions and
 closed/merged history refresh when opened or explicitly refreshed with **r**;
 they are not polled in the background. Network failures retain cached history and
