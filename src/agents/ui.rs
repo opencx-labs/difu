@@ -632,6 +632,15 @@ impl Ui {
                         self.modal = Some(Modal::Repository(Editor::default()));
                     }
                     (Task::Launch, Reply::Launched(id)) => {
+                        self.reading = true;
+                        self.task(
+                            Task::Read(id.clone()),
+                            Request::Read {
+                                id: id.clone(),
+                                version: None,
+                            },
+                            false,
+                        );
                         self.selected = Some(id.clone());
                         self.changes_visible = false;
                         self.positions.entry(id).or_default().follow = true;
@@ -740,7 +749,10 @@ impl Ui {
                     .changes_at
                     .is_none_or(|at| at.elapsed() >= Duration::from_secs(2))
                 && self.sessions.get(&id).is_some_and(|s| {
-                    matches!(s.job, Job::Coding(_)) && s.baseline.is_some() && !s.workspace_removed
+                    matches!(s.job, Job::Coding(_))
+                        && s.workspace_ready
+                        && s.baseline.is_some()
+                        && !s.workspace_removed
                 })
             {
                 self.changing = true;
@@ -1073,6 +1085,7 @@ impl Ui {
                     position.outgoing.push(PendingSend {
                         text: text.clone(),
                         queued: (queue && session.turn_id.is_some())
+                            || session.preparing()
                             || session
                                 .pending
                                 .iter()
@@ -1489,6 +1502,9 @@ impl Ui {
             KeyCode::Char('r') => {
                 self.refreshed = None;
                 self.changes_at = None;
+                if let Some(id) = &self.selected {
+                    self.prs.refresh(id);
+                }
             }
             KeyCode::Enter
                 if self.drilled
@@ -2513,7 +2529,13 @@ impl Ui {
         };
         for (index, link) in session_prs.iter().enumerate().skip(start) {
             let pr = &link.pr;
-            let label = format!(" PR #{} · {} ", pr.key.number, pr.label());
+            let stale = self.selected.as_ref().is_some_and(|id| self.prs.stale(id));
+            let label = format!(
+                " PR #{} · {}{} ",
+                pr.key.number,
+                pr.label(),
+                if stale { " · stale" } else { "" }
+            );
             let width = (unicode_width::UnicodeWidthStr::width(label.as_str()) as u16)
                 .min(conversation.right().saturating_sub(x));
             if width == 0 {
@@ -2726,7 +2748,16 @@ impl Ui {
             for link in self.prs.all(&session.id) {
                 let pr = &link.pr;
                 lines.push(Line::from(Span::styled(
-                    format!("  PR #{} · {}", pr.key.number, pr.label()),
+                    format!(
+                        "  PR #{} · {}{}",
+                        pr.key.number,
+                        pr.label(),
+                        if self.prs.stale(&session.id) {
+                            " · stale"
+                        } else {
+                            ""
+                        }
+                    ),
                     Style::default().fg(prs::color(pr)),
                 )));
             }
@@ -2872,7 +2903,11 @@ impl Ui {
             sections,
         } = view;
         if session.entries.is_empty() && total == 0 {
-            lines.push(Line::from("Preparing session…"));
+            lines.push(Line::from(if session.status == Status::Idle {
+                "Send a message to start."
+            } else {
+                "Preparing session…"
+            }));
             total = 1;
         }
         if let Some(error) = &session.error
@@ -3693,6 +3728,70 @@ mod tests {
             ui.positions.get("one").context("position")?.draft.text(),
             "unsent draft"
         );
+        Ok(())
+    }
+    #[test]
+    fn worktree_preparation_keeps_the_composer_and_send_available() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let listener = UnixListener::bind(super::super::server::socket(&storage)?)?;
+        let worker = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut line = String::new();
+            BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+            let request: Request = serde_json::from_str(&line)?;
+            assert!(matches!(request, Request::Control {
+                control: Control::Message { text, .. }, ..
+            } if text == "Prepare this change"));
+            serde_json::to_writer(&mut stream, &Reply::Ok)?;
+            stream.write_all(b"\n")?;
+            Ok(())
+        });
+        let mut ui = state(storage);
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.status = Status::Starting;
+        session.entries.clear();
+        ui.paste("Prepare this change");
+        let (screen, _) = draw(&mut ui, 150, 35)?;
+        assert!(screen.contains("Preparing worktree"));
+        assert!(screen.contains("Messages sent now will be queued"));
+        assert!(screen.contains("Prepare this change"));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            ui.positions
+                .get("one")
+                .context("position")?
+                .outgoing
+                .first()
+                .context("outgoing message")?
+                .queued
+        );
+        let response = ui.receiver.recv_timeout(Duration::from_secs(5))?;
+        ui.sender.send(response)?;
+        ui.tick(false);
+        assert!(!ui.busy);
+        assert!(
+            ui.positions
+                .get("one")
+                .context("position")?
+                .draft
+                .text()
+                .is_empty()
+        );
+        ui.paste("Another message while preparing");
+        let (screen, _) = draw(&mut ui, 150, 35)?;
+        assert!(screen.contains("Another message while preparing"));
+        assert!(!screen.contains("interrupt and send immediately"));
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("Fixture panicked"))??;
         Ok(())
     }
     #[test]

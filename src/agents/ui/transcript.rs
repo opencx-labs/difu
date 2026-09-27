@@ -187,6 +187,18 @@ fn activity_text(session: &Session) -> (String, Option<String>, Option<i64>) {
             session.turn_started_at,
         );
     }
+    if session.preparing() {
+        return (
+            if session.workspace_ready {
+                "Connecting to agent"
+            } else {
+                "Preparing worktree"
+            }
+            .into(),
+            Some("You can keep typing. Messages sent now will be queued.".into()),
+            None,
+        );
+    }
     if let Some(review) = session
         .entries
         .iter()
@@ -267,7 +279,12 @@ pub(super) fn activity(session: &Session, width: u16, now: i64) -> Vec<Line<'sta
     } else {
         format!("{seconds}s")
     };
-    let mut lines = wrapped(&format!("• {state} ({elapsed})"), width)
+    let heading = if session.preparing() {
+        format!("• {state}")
+    } else {
+        format!("• {state} ({elapsed})")
+    };
+    let mut lines = wrapped(&heading, width)
         .into_iter()
         .map(|text| shimmer(&text, now))
         .collect::<Vec<_>>();

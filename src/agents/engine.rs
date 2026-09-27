@@ -1203,6 +1203,33 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
     store.save(id)?;
     Ok((rpc, resuming))
 }
+fn send_queued(rpc: &mut Connection, store: &Store, id: &str, cancel: &Cancel) -> Result<()> {
+    let current = store.get(id)?;
+    if current.status != Status::Idle || current.queue.is_empty() {
+        return Ok(());
+    }
+    let mut next = None;
+    store.update(id, |s| {
+        if !s.queue.is_empty() {
+            next = Some(s.queue.remove(0));
+        }
+    })?;
+    store.save(id)?;
+    if let Some(prompt) = next {
+        let before = store.get(id)?.entries.len();
+        if let Err(error) = start_turn(rpc, store, id, &prompt, false, cancel) {
+            store.update(id, |s| {
+                if s.entries.len() == before {
+                    s.unsent(prompt);
+                }
+            })?;
+            store.save(id)?;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 pub fn run(
     store: &Arc<Store>,
     id: &str,
@@ -1244,6 +1271,8 @@ pub fn run(
             cancel,
         )?;
     }
+    // Send accepted setup input before processing newer controls.
+    send_queued(&mut rpc, store, id, cancel)?;
     loop {
         cancel.check()?;
         while let Ok(value) = rpc.output.try_recv() {
@@ -1303,19 +1332,7 @@ pub fn run(
         }
         naming.start(store, id, cancel)?;
         suggesting.start(store, id, cancel)?;
-        let current = store.get(id)?;
-        if current.status == Status::Idle && !current.queue.is_empty() {
-            let mut next = None;
-            store.update(id, |s| {
-                if !s.queue.is_empty() {
-                    next = Some(s.queue.remove(0));
-                }
-            })?;
-            store.save(id)?;
-            if let Some(text) = next {
-                start_turn(&mut rpc, store, id, &text, false, cancel)?;
-            }
-        }
+        send_queued(&mut rpc, store, id, cancel)?;
     }
     Ok(())
 }

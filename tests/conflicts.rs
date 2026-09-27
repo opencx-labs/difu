@@ -148,6 +148,9 @@ print(json.dumps(dict(type='item.completed',item=dict(type='agent_message',text=
             "--nocapture",
         ])
         .env("DIFU_CONFLICT_FIXTURE", root)
+        .env("HOME", root.join("home"))
+        .env("XDG_CONFIG_HOME", root.join("home/config"))
+        .env("XDG_CACHE_HOME", root.join("home/cache"))
         .env("DIFU_REAL_GIT", real_git)
         .env("PATH", path)
         .output()?;

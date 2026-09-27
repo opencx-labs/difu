@@ -17,6 +17,9 @@ pub(super) struct State {
     refreshed: HashMap<String, Instant>,
     revisions: HashMap<String, u64>,
     pending: HashMap<String, Cancel>,
+    stale: HashSet<String>,
+    opened: Option<String>,
+    history: HashSet<String>,
     sender: mpsc::Sender<Update>,
     receiver: mpsc::Receiver<Update>,
 }
@@ -27,6 +30,7 @@ impl State {
         for (id, links) in pr_cache::load_links(&storage.cache.join(SESSION_LINKS)) {
             pr_cache::merge_links(cache.entry(id).or_default(), links);
         }
+        let stale = cache.keys().cloned().collect();
         Self {
             cache,
             loaded_at: None,
@@ -34,6 +38,9 @@ impl State {
             refreshed: HashMap::new(),
             revisions: HashMap::new(),
             pending: HashMap::new(),
+            stale,
+            opened: None,
+            history: HashSet::new(),
             sender,
             receiver,
         }
@@ -45,6 +52,8 @@ impl State {
         self.cache.remove(id);
         self.refreshed.remove(id);
         self.revisions.remove(id);
+        self.stale.remove(id);
+        self.history.remove(id);
         self.save(storage)
     }
     #[cfg(test)]
@@ -53,6 +62,13 @@ impl State {
     }
     pub fn all(&self, id: &str) -> &[Cached] {
         self.cache.get(id).map(Vec::as_slice).unwrap_or_default()
+    }
+    pub fn stale(&self, id: &str) -> bool {
+        self.stale.contains(id)
+    }
+    pub fn refresh(&mut self, id: &str) {
+        self.history.insert(id.to_owned());
+        self.refreshed.remove(id);
     }
     fn due(&self, id: &str) -> bool {
         !self.pending.contains_key(id)
@@ -65,9 +81,11 @@ impl State {
         self.pending.remove(&update.id);
         self.refreshed.insert(update.id.clone(), Instant::now());
         if let Ok(links) = update.result {
+            self.stale.remove(&update.id);
             pr_cache::merge_links(self.cache.entry(update.id).or_default(), links);
             true
         } else {
+            self.stale.insert(update.id);
             false
         }
     }
@@ -107,11 +125,12 @@ impl Ui {
             }
         }
         let previous = self.prs.cache.clone();
+        let previous_stale = self.prs.stale.clone();
         let mut changed = false;
         if self
             .prs
             .loaded_at
-            .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
+            .is_none_or(|at| at.elapsed() >= Duration::from_secs(5))
         {
             self.prs.loaded_at = Some(Instant::now());
             for (id, links) in pr_cache::load_links(&self.storage.cache.join(SESSION_LINKS)) {
@@ -119,6 +138,22 @@ impl Ui {
                     pr_cache::merge_links(self.prs.cache.entry(id).or_default(), links);
                     changed = true;
                 }
+            }
+            for session in &self.summaries {
+                let saved = pr_cache::snapshot(&self.storage, &session.id);
+                let stale = saved.error.is_some()
+                    || saved.checked_at == 0
+                    || (saved.links.iter().any(|link| link.pr.state == "OPEN")
+                        && crate::github::polling::now().saturating_sub(saved.checked_at) > 600);
+                if stale {
+                    self.prs.stale.insert(session.id.clone());
+                } else {
+                    self.prs.stale.remove(&session.id);
+                }
+                pr_cache::merge_links(
+                    self.prs.cache.entry(session.id.clone()).or_default(),
+                    saved.links,
+                );
             }
         }
         while let Ok(update) = self.prs.receiver.try_recv() {
@@ -136,7 +171,9 @@ impl Ui {
             }
         }
         for session in &self.summaries {
-            if previous.get(&session.id) != self.prs.cache.get(&session.id) {
+            if previous.get(&session.id) != self.prs.cache.get(&session.id)
+                || previous_stale.contains(&session.id) != self.prs.stale(&session.id)
+            {
                 self.sidebar.invalidate(&session.id);
                 if self.selected.as_ref() == Some(&session.id) {
                     self.changes_at = None;
@@ -146,6 +183,17 @@ impl Ui {
         if changed && let Err(error) = self.prs.save(&self.storage) {
             self.notice = Some((format!("Cannot cache session PRs: {error:#}"), true));
         }
+        let opened = if visible && self.drilled {
+            self.selected.clone()
+        } else {
+            None
+        };
+        if self.prs.opened != opened {
+            if let Some(id) = &opened {
+                self.prs.refresh(id);
+            }
+            self.prs.opened = opened;
+        }
         if !visible {
             return;
         }
@@ -153,9 +201,16 @@ impl Ui {
             if summary.kind != "Coding" && summary.kind != "coding" {
                 continue;
             }
+            if summary.status == Status::Starting && !summary.worktree {
+                continue;
+            }
             if !self.prs.visible.contains(&summary.id)
                 && self.selected.as_ref() != Some(&summary.id)
             {
+                continue;
+            }
+            let history = self.prs.history.contains(&summary.id);
+            if !history && !pr_cache::should_poll(summary, self.prs.all(&summary.id)) {
                 continue;
             }
             if self.prs.pending.len() >= 2 || !self.prs.due(&summary.id) {
@@ -165,11 +220,18 @@ impl Ui {
             let workspace = summary.workspace.clone();
             let summary = summary.clone();
             let known = self.prs.all(&id).to_vec();
+            self.prs.history.remove(&id);
+            let storage = self.storage.clone();
+            let refresh = if history {
+                pr_cache::Refresh::Open
+            } else {
+                pr_cache::Refresh::Visible
+            };
             let cancel = Cancel::default();
             self.prs.pending.insert(id.clone(), cancel.clone());
             let sender = self.prs.sender.clone();
             thread::spawn(move || {
-                let result = pr_cache::refresh_session(&summary, known, &cancel)
+                let result = pr_cache::refresh_session(&storage, &summary, known, refresh, &cancel)
                     .map_err(|e| format!("{e:#}"));
                 let _ = sender.send(Update {
                     id,
@@ -293,6 +355,7 @@ mod tests {
             revision: 0,
             result: Err("offline".into())
         }));
+        assert!(state.stale("one"));
         assert_eq!(state.get("one").context("cached")?.label(), "Merged");
         assert_eq!(
             color(state.get("one").context("cached")?),

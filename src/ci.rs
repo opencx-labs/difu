@@ -3,7 +3,7 @@
 use crate::{
     github,
     model::{Check, PrKey},
-    process::{self, Cancel},
+    process::Cancel,
 };
 use anyhow::{Context, Result, ensure};
 
@@ -32,13 +32,16 @@ pub fn load(key: &PrKey, check: &Check, cancel: &Cancel) -> Failures {
 fn read(key: &PrKey, check: &Check, cancel: &Cancel) -> Result<Failures> {
     key.validate()?;
     let job = actions_job(key, &check.url)?;
-    let output = process::run_limited(
+    let output = github::polling::run(
         github::command().args([
             "api",
             &format!("repos/{}/actions/jobs/{job}/logs", key.repository()),
         ]),
+        None,
         cancel,
-        16 * 1024 * 1024,
+        0,
+        false,
+        Some(16 * 1024 * 1024),
     )?;
     ensure!(
         output.code == 0,

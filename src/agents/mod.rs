@@ -10,6 +10,7 @@ pub mod provider;
 mod questions;
 mod registration;
 pub mod server;
+mod startup;
 mod suggestions;
 mod title;
 pub mod ui;
@@ -337,6 +338,13 @@ impl Session {
             && !self.workspace_ready
             && matches!(&self.job, Job::Coding(launch) if launch.isolated)
     }
+    pub fn preparing(&self) -> bool {
+        matches!(self.job, Job::Coding(_))
+            && self.status.active()
+            && (self.switching_workspace
+                || self.status == Status::Starting
+                    && (self.thread_id.is_none() || !self.workspace_ready))
+    }
     pub fn touch(&mut self) {
         self.version = self.version.saturating_add(1);
         self.updated = chrono::Utc::now().timestamp_millis();
@@ -387,6 +395,7 @@ impl Session {
     pub fn can_send_waiting(&self) -> bool {
         matches!(self.job, Job::Coding(_))
             && !self.archived
+            && !self.preparing()
             && !self.pending.iter().any(|p| p.id == "difu-missing-guidance")
             && (!self.queue.is_empty() || self.pending_steering().next().is_some())
     }
@@ -420,6 +429,7 @@ impl Session {
                 && matches!(&self.job, Job::Coding(launch) if launch.isolated),
             can_read_changes: self.workspace.is_some()
                 && self.baseline.is_some()
+                && self.workspace_ready
                 && !self.workspace_removed
                 && matches!(self.job, Job::Coding(_)),
         }
