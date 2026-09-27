@@ -99,6 +99,7 @@ fn fixture(root: &Path) -> Result<(App, PrDetail)> {
         created: String::new(),
         stats: None,
         stats_error: false,
+        metadata: None,
         draft: false,
     });
     let guide = Guide {

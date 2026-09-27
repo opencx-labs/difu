@@ -79,18 +79,16 @@ pub(crate) enum Refresh {
     Open,
 }
 
-pub(crate) fn should_poll(session: &super::Summary, links: &[SessionLink]) -> bool {
+pub(crate) fn should_poll(session: &super::Summary, _links: &[SessionLink]) -> bool {
     !session.archived
-        && (links.iter().any(|link| link.pr.state == "OPEN")
-            || !links
-                .iter()
-                .any(|link| current(link, &session.workspace, session.branch.as_deref())))
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Snapshot {
     pub links: Vec<SessionLink>,
     pub checked_at: u64,
+    #[serde(default)]
+    pub branch: Option<String>,
     attempted_at: u64,
     revision: u64,
     history_at: u64,
@@ -107,6 +105,21 @@ pub(crate) fn snapshot(storage: &Storage, id: &str) -> Snapshot {
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_default()
+}
+
+/// Branch switches in an existing worktree do not change its saved session ID.
+/// Discover against Git's current branch, retaining the saved branch as history.
+fn active_summary(session: &super::Summary, cancel: &Cancel) -> anyhow::Result<super::Summary> {
+    let mut current = session.clone();
+    if session.worktree && session.workspace.is_dir() {
+        let branch = crate::process::checked(
+            crate::repo::git(&session.workspace).args(["branch", "--show-current"]),
+            cancel,
+        )?;
+        let branch = branch.trim();
+        current.branch = (!branch.is_empty()).then(|| branch.to_owned());
+    }
+    Ok(current)
 }
 
 /// The UI and service share both the result and the refresh lease. A failed
@@ -139,13 +152,23 @@ pub(crate) fn refresh_session(
         })
         .collect();
     merge_links(&mut saved.links, incoming);
-    let at = github::polling::now();
-    let interval = if refresh == Refresh::Background {
-        300
-    } else {
-        30
+    let current = match active_summary(session, cancel) {
+        Ok(current) => current,
+        Err(error) => {
+            cancel.check()?;
+            saved.error = Some(format!(
+                "Cannot read the current worktree branch: {error:#}"
+            ));
+            saved.attempted_at = github::polling::now();
+            crate::storage::atomic_json(&path, &saved)?;
+            return Err(error);
+        }
     };
-    let same_workspace = saved.revision == session.workspace_revision;
+    let session = &current;
+    let at = github::polling::now();
+    let interval = if refresh != Refresh::Open { 300 } else { 30 };
+    let same_workspace =
+        saved.revision == session.workspace_revision && saved.branch == session.branch;
     if same_workspace
         && at.saturating_sub(saved.attempted_at) < interval
         && (refresh != Refresh::Open || at.saturating_sub(saved.history_at) < 30)
@@ -166,6 +189,7 @@ pub(crate) fn refresh_session(
     cancel.check()?;
     saved.attempted_at = github::polling::now();
     saved.revision = session.workspace_revision;
+    saved.branch = session.branch.clone();
     if result.is_ok() {
         saved.checked_at = saved.attempted_at;
         if history {
@@ -217,20 +241,15 @@ fn update_session(
         else {
             continue;
         };
-        // A known PR already covers this workspace. Discover again when opened;
-        // otherwise only discover workspaces that do not yet have a PR.
-        if !history
-            && links
-                .iter()
-                .any(|link| current(link, &workspace.path, Some(branch)))
-        {
-            continue;
-        }
         // Historical worktrees may have been removed; their PR URLs still work.
         if !workspace.path.is_dir() {
             continue;
         }
-        let prs = github::session_prs(&workspace.path, branch, cancel)?;
+        let prs = if history {
+            github::session_prs(&workspace.path, branch, cancel)?
+        } else {
+            github::open_session_prs(&workspace.path, branch, cancel)?
+        };
         merge_links(
             links,
             prs.into_iter()
@@ -302,6 +321,21 @@ impl Refresher {
             prs.sort_by(|a, b| b.updated.cmp(&a.updated));
             let mut seen = std::collections::HashSet::new();
             prs.retain(|pr| seen.insert(pr.key.id()));
+            let mut tracked = prs
+                .iter()
+                .filter(|pr| {
+                    pr.metadata
+                        .as_ref()
+                        .is_none_or(|m| m.state == "OPEN" || m.checked_at == 0)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            github::enrich_prs(&mut tracked, cancel)?;
+            for fresh in tracked {
+                if let Some(pr) = prs.iter_mut().find(|pr| pr.key == fresh.key) {
+                    *pr = fresh;
+                }
+            }
             Ok(prs)
         })?;
         let links = Worker::spawn(interval, move |cancel| {
@@ -381,6 +415,58 @@ mod tests {
     };
 
     #[test]
+    fn branch_switches_discover_the_current_pr_and_keep_open_prs_first() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let cancel = Cancel::default();
+        crate::process::checked(
+            crate::repo::git(dir.path()).args(["init", "-b", "new-session-branch"]),
+            &cancel,
+        )?;
+        let mut session = super::super::Session::new(
+            "switched".into(),
+            super::super::Job::Coding(super::super::Launch {
+                repository: dir.path().into(),
+                isolated: true,
+                base: "main".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.workspace = Some(dir.path().into());
+        session.workspace_ready = true;
+        session.branch = Some("old-session-branch".into());
+        let current = active_summary(&session.summary(), &cancel)?;
+        assert_eq!(current.branch.as_deref(), Some("new-session-branch"));
+        assert_eq!(session.branch.as_deref(), Some("old-session-branch"));
+        let make = |number, state: &str, branch: &str| SessionLink {
+            workspace: dir.path().into(),
+            pr: github::SessionPr {
+                summary: None,
+                key: PrKey {
+                    owner: "example".into(),
+                    repo: "project".into(),
+                    number,
+                },
+                state: state.into(),
+                draft: false,
+                conflicts: false,
+                head_branch: branch.into(),
+                head: String::new(),
+                updated: String::new(),
+            },
+        };
+        let mut links = vec![
+            make(31, "MERGED", "old-session-branch"),
+            make(32, "OPEN", "new-session-branch"),
+        ];
+        sort_links(&mut links, &current.workspace, current.branch.as_deref());
+        assert_eq!(links.first().map(|link| link.pr.key.number), Some(32));
+        assert!(should_poll(&current, &links));
+        Ok(())
+    }
+
+    #[test]
     fn shared_snapshot_preserves_fresh_conflict_status_and_reports_failures() -> anyhow::Result<()>
     {
         let dir = tempfile::tempdir()?;
@@ -404,6 +490,7 @@ mod tests {
         let link = SessionLink {
             workspace: summary.workspace.clone(),
             pr: github::SessionPr {
+                summary: None,
                 key: PrKey {
                     owner: "example".into(),
                     repo: "project".into(),
@@ -425,6 +512,7 @@ mod tests {
         let mut saved = Snapshot {
             links: vec![link.clone()],
             checked_at: github::polling::now(),
+            branch: None,
             attempted_at: github::polling::now(),
             revision: summary.workspace_revision,
             history_at: github::polling::now(),
@@ -443,6 +531,24 @@ mod tests {
             )?;
             assert_eq!(links.first().map(|link| link.pr.conflicts), Some(false));
         }
+        saved.attempted_at = github::polling::now().saturating_sub(60);
+        crate::storage::atomic_json(&path, &saved)?;
+        // Automatic visibility refresh must still use the shared five-minute lease.
+        assert!(
+            refresh_session(
+                &storage,
+                &summary,
+                Vec::new(),
+                Refresh::Visible,
+                &Cancel::default()
+            )
+            .is_ok()
+        );
+        let mut closed = saved.links.clone();
+        for link in &mut closed {
+            link.pr.state = "MERGED".into();
+        }
+        assert!(should_poll(&summary, &closed));
         saved.error = Some("GitHub rate limit; refresh paused".into());
         crate::storage::atomic_json(&path, &saved)?;
         assert!(
@@ -482,6 +588,7 @@ mod tests {
         let link = SessionLink {
             workspace: dir.path().into(),
             pr: github::SessionPr {
+                summary: None,
                 key: PrKey {
                     owner: "example".into(),
                     repo: "project".into(),
@@ -513,6 +620,7 @@ mod tests {
         let make = |number, state: &str, workspace: &str, updated: &str| SessionLink {
             workspace: workspace.into(),
             pr: github::SessionPr {
+                summary: None,
                 key: PrKey {
                     owner: "example".into(),
                     repo: "project".into(),
@@ -594,6 +702,7 @@ mod tests {
                 created: String::new(),
                 stats: None,
                 stats_error: false,
+                metadata: None,
                 draft: false,
             }])
         })?;

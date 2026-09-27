@@ -26,8 +26,8 @@ use std::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum View {
     Overview,
-    Guide,
     Diff,
+    Guide,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
@@ -103,6 +103,7 @@ pub struct Review {
     pub expanded: HashMap<String, Expansion>,
     pub guide_model: Option<ModelChoice>,
     pub generation: Option<Generation>,
+    pub generation_requested: bool,
     pub guide_error: Option<String>,
     pub newer: Option<PrDetail>,
     pub loading: bool,
@@ -390,6 +391,7 @@ impl App {
                 created: String::new(),
                 stats: None,
                 stats_error: false,
+                metadata: None,
                 draft: false,
             });
             self.pending_open = Some(id);
@@ -530,7 +532,8 @@ impl App {
                 pr.stats = cached
                     .get(&pr.key.id())
                     .filter(|(updated, _)| *updated == pr.updated)
-                    .and_then(|(_, stats)| stats.clone());
+                    .and_then(|(_, stats)| stats.clone())
+                    .or_else(|| pr.stats.clone());
             }
             let _ = tx.send(Message::Inbox(id, Ok(inbox.clone())));
             if let Err(error) = storage.save_inbox(&cache_key, &inbox) {
@@ -704,7 +707,7 @@ impl App {
         self.horizontal = 0;
         self.invalidate();
         if has_snapshot {
-            self.generate(false);
+            self.generate_for(&id, false);
             return;
         }
         if preparing {
@@ -929,6 +932,11 @@ impl App {
                 _ => {}
             }
         }
+        // Automatic entry and refresh may restore a cached guide, but only an
+        // explicit generation action may start a provider job.
+        if !force {
+            return;
+        }
         let generation = self.next_id();
         let storage = self.storage.clone();
         let job_id = id.to_owned();
@@ -979,6 +987,7 @@ impl App {
     }
     pub fn cancel(&mut self) {
         if let Some(review) = self.key().and_then(|id| self.reviews.get_mut(&id)) {
+            review.generation_requested = false;
             if let Some(job) = &mut review.generation {
                 job.cancel.cancel();
                 job.activity = "Cancelling and cleaning up…".into();
@@ -1088,6 +1097,7 @@ impl App {
         let pr = match output {
             Ok(pr) => pr,
             Err(error) => {
+                review.generation_requested = false;
                 self.notice = Notice::error(format!("Could not refresh PR: {error}"));
                 return;
             }
@@ -1220,7 +1230,7 @@ impl App {
             && !self.inbox_loading
             && self
                 .inbox_refreshed
-                .is_some_and(|t| t.elapsed() >= Duration::from_secs(30))
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(300))
         {
             self.load_inbox_with(true);
         }
@@ -1243,7 +1253,7 @@ impl App {
                 .is_none_or(|pr| !pr.state.eq_ignore_ascii_case("open"))
             || review
                 .poll_at
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(30))
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(300))
         {
             return;
         }
@@ -1270,7 +1280,7 @@ impl App {
             || review.revision_polling
             || review
                 .revision_poll_at
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(30))
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(300))
         {
             return;
         }
@@ -1412,6 +1422,10 @@ impl App {
                             summary.draft = pr.draft;
                             summary.title = pr.title.clone();
                             summary.author = pr.author.clone();
+                            let metadata = summary.metadata.get_or_insert_with(Default::default);
+                            metadata.state = pr.state.to_ascii_uppercase();
+                            metadata.reviewers = pr.requested_reviewers.clone();
+                            metadata.reviewers.extend(pr.requested_teams.clone());
                             summary.stats = Some(PrStats {
                                 additions: pr.additions,
                                 deletions: pr.deletions,
@@ -1550,6 +1564,7 @@ impl App {
                             if candidate.as_ref().is_none_or(|detail| {
                                 detail.head != snapshot.head || detail.base != snapshot.base
                             }) {
+                                r.generation_requested = false;
                                 r.guide_error = Some("PR details changed during preparation. Refresh and retry to load a matching snapshot.".into());
                                 return;
                             }
@@ -1580,12 +1595,14 @@ impl App {
                             r.bounds.clear();
                             r.expanded.clear();
                             r.guide_error = None;
+                            let manual = std::mem::take(&mut r.generation_requested);
                             self.save_config();
-                            self.generate_for(&id, false);
+                            self.generate_for(&id, manual);
                         }
                         Err(error) => {
                             r.guide_error = Some(error);
                             r.preparation_failed = true;
+                            r.generation_requested = false;
                             r.preparing_detail = None;
                         }
                     }
@@ -1937,6 +1954,10 @@ impl App {
             }
             Action::Refresh => self.refresh(),
             Action::Regenerate => {
+                if let Some(review) = self.key().and_then(|id| self.reviews.get_mut(&id)) {
+                    review.generation_requested =
+                        review.snapshot.is_none() || review.preparation_failed;
+                }
                 if self
                     .review()
                     .is_some_and(|r| r.preparation_failed && r.snapshot.is_some())
@@ -2214,18 +2235,18 @@ impl App {
             KeyCode::Char('2') => self.action(if self.home {
                 Action::SetInbox(InboxTab::Repositories)
             } else {
-                Action::SetView(View::Guide)
+                Action::SetView(View::Diff)
             }),
             KeyCode::Char('3') => self.action(if self.home {
                 Action::SetInbox(InboxTab::Diffs)
             } else {
-                Action::SetView(View::Diff)
+                Action::SetView(View::Guide)
             }),
             KeyCode::Char('[' | ']') if plain && !self.home => {
                 let next = match (self.view, key.code == KeyCode::Char(']')) {
-                    (View::Overview, true) | (View::Diff, false) => View::Guide,
-                    (View::Guide, true) | (View::Overview, false) => View::Diff,
-                    (View::Diff, true) | (View::Guide, false) => View::Overview,
+                    (View::Overview, true) | (View::Guide, false) => View::Diff,
+                    (View::Diff, true) | (View::Overview, false) => View::Guide,
+                    (View::Guide, true) | (View::Diff, false) => View::Overview,
                 };
                 self.action(Action::SetView(next));
             }
@@ -2271,6 +2292,11 @@ impl App {
     }
     fn modal_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc {
+            if let Some(Modal::Clone { key: id, .. }) = &self.modal
+                && let Some(review) = self.reviews.get_mut(id)
+            {
+                review.generation_requested = false;
+            }
             self.modal = None;
             return;
         }
@@ -2915,6 +2941,7 @@ mod tests {
             created: "2026-09-10T12:00:00Z".into(),
             stats: None,
             stats_error: false,
+            metadata: None,
             draft: false,
         });
         app.inbox_id = 2;

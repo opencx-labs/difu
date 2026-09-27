@@ -4,9 +4,12 @@ use crate::{
     repo,
 };
 use anyhow::{Context, Result, ensure};
+use nix::fcntl::{Flock, FlockArg};
 use std::{
-    fs,
+    fs::{self, OpenOptions},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -59,6 +62,56 @@ pub fn inspect(session: &mut Session, cancel: &Cancel) -> Result<()> {
     Ok(())
 }
 
+/// Serialize fetch-and-pin across sessions sharing the same Git repository.
+/// This never checks out or merges into the user's local branch.
+fn fresh_main(root: &Path, cancel: &Cancel) -> Result<String> {
+    let common = read(
+        root,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        cancel,
+    )?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(Path::new(&common).join("difu-main-fetch.lock"))?;
+    let _lease = loop {
+        cancel.check()?;
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lease) => break lease,
+            Err((returned, nix::errno::Errno::EWOULDBLOCK)) => file = returned,
+            Err((_, error)) => return Err(error.into()),
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    };
+    process::checked(
+        repo::git(root)
+            .env("GIT_ALLOW_PROTOCOL", "https:ssh:file")
+            .args([
+                "fetch",
+                "--atomic",
+                "--no-tags",
+                "--no-recurse-submodules",
+                "--no-write-fetch-head",
+                "--no-auto-maintenance",
+                "--refmap=",
+                "--",
+                "origin",
+                "+refs/heads/main:refs/remotes/origin/main",
+            ]),
+        cancel,
+    )
+    .context("Cannot fetch origin/main for the new worktree; queued messages are preserved")?;
+    read(
+        root,
+        &["rev-parse", "--verify", "refs/remotes/origin/main^{commit}"],
+        cancel,
+    )
+}
+
 pub fn prepare(
     session: &mut Session,
     home: &Path,
@@ -94,28 +147,29 @@ pub fn prepare(
     .context("Cannot find the selected local directory")?;
     let root =
         PathBuf::from(read(&path, &["rev-parse", "--show-toplevel"], cancel)?).canonicalize()?;
-    let base = if launch.isolated {
-        launch.base.trim()
+    let sha = if launch.isolated && session.branch.is_none() {
+        // Even a legacy inspection may have pinned stale HEAD. Every new
+        // isolated session must fetch before pinning its actual starting point.
+        fresh_main(&root, cancel)?
+    } else if launch.isolated {
+        // An interrupted worktree add already recorded ownership and its base.
+        // Recover that same branch; never reset a partially prepared workspace.
+        session
+            .baseline
+            .clone()
+            .context("Prepared worktree has no pinned base")?
     } else {
-        "HEAD"
-    };
-    ensure!(!base.is_empty(), "Choose a local base branch or revision");
-    let sha = match &session.baseline {
-        Some(sha) => sha.clone(),
-        None => read(
-            &root,
-            &[
-                "rev-parse",
-                "--verify",
-                "--end-of-options",
-                &format!("{base}^{{commit}}"),
-            ],
-            cancel,
-        )?,
+        match &session.baseline {
+            Some(sha) => sha.clone(),
+            None => read(&root, &["rev-parse", "--verify", "HEAD^{commit}"], cancel)?,
+        }
     };
     session.baseline = Some(sha.clone());
     if let Job::Coding(launch) = &mut session.job {
         launch.repository = root.clone();
+        if launch.isolated {
+            launch.base = "origin/main".into();
+        }
     }
     if launch.isolated {
         let trees = home.join("worktrees");
@@ -424,6 +478,15 @@ pub fn paths(session: &Session, cancel: &Cancel) -> Result<Vec<String>> {
 }
 
 pub fn validate_cleanup(session: &Session, home: &Path, cancel: &Cancel) -> Result<()> {
+    validate_removal(session, home, cancel, false)
+}
+
+fn validate_removal(
+    session: &Session,
+    home: &Path,
+    cancel: &Cancel,
+    discard_changes: bool,
+) -> Result<()> {
     ensure!(
         !session.status.active(),
         "An active session's workspace is protected"
@@ -447,6 +510,9 @@ pub fn validate_cleanup(session: &Session, home: &Path, cancel: &Cancel) -> Resu
         !fs::symlink_metadata(path)?.file_type().is_symlink(),
         "Symlink workspace is protected"
     );
+    if discard_changes {
+        return Ok(());
+    }
     let status = read(
         path,
         &[
@@ -466,7 +532,15 @@ pub fn validate_cleanup(session: &Session, home: &Path, cancel: &Cancel) -> Resu
 }
 
 pub fn cleanup(session: &Session, home: &Path, cancel: &Cancel) -> Result<()> {
-    validate_cleanup(session, home, cancel)?;
+    remove(session, home, cancel, false)
+}
+
+pub(super) fn delete(session: &Session, home: &Path, cancel: &Cancel) -> Result<()> {
+    remove(session, home, cancel, true)
+}
+
+fn remove(session: &Session, home: &Path, cancel: &Cancel, discard_changes: bool) -> Result<()> {
+    validate_removal(session, home, cancel, discard_changes)?;
     let Job::Coding(launch) = &session.job else {
         anyhow::bail!("Not a coding workspace");
     };
@@ -474,13 +548,14 @@ pub fn cleanup(session: &Session, home: &Path, cancel: &Cancel) -> Result<()> {
         .workspace
         .as_ref()
         .context("No workspace to delete")?;
-    // Git refuses locked worktrees; never pass --force. Retain the named branch and commits.
-    process::checked(
-        repo::checkout_git(&launch.repository, cancel)?
-            .args(["worktree", "remove"])
-            .arg(path),
-        cancel,
-    )?;
+    let mut command = repo::checkout_git(&launch.repository, cancel)?;
+    command.args(["worktree", "remove"]);
+    if discard_changes {
+        command.arg("--force");
+    }
+    // One --force discards changes, but Git still refuses locked worktrees.
+    // Retain the named branch and commits.
+    process::checked(command.arg(path), cancel)?;
     Ok(())
 }
 
@@ -513,6 +588,91 @@ mod tests {
         )
         .map(|s| s.trim().to_owned())
     }
+    #[test]
+    fn new_worktrees_fetch_main_without_changing_dirty_checkout_or_resumed_work() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let origin = root.join("origin");
+        let local = root.join("local");
+        for path in [&origin, &local] {
+            fs::create_dir(path)?;
+            git(path, &["init", "-b", "main"])?;
+            fs::write(path.join("tracked.txt"), "base\n")?;
+            git(path, &["add", "."])?;
+            git(path, &["commit", "-m", "base"])?;
+        }
+        git(
+            &local,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.to_str().context("origin path")?,
+            ],
+        )?;
+        git(&local, &["checkout", "-b", "unrelated-local-work"])?;
+        let original_head = git(&local, &["rev-parse", "HEAD"])?;
+        fs::write(local.join("tracked.txt"), "precious local edit\n")?;
+        let make = |id: &str| {
+            Session::new(
+                id.into(),
+                Job::Coding(Launch {
+                    repository: local.clone(),
+                    isolated: true,
+                    base: "HEAD".into(),
+                    prompt: String::new(),
+                    model: None,
+                    effort: None,
+                }),
+            )
+        };
+        let cancel = Cancel::default();
+        let mut first = make("first");
+        inspect(&mut first, &cancel)?;
+        fs::write(origin.join("tracked.txt"), "fresh remote main\n")?;
+        git(&origin, &["commit", "-am", "advance main"])?;
+        let fresh = git(&origin, &["rev-parse", "HEAD"])?;
+        prepare(&mut first, &root, &cancel, |_| Ok(()))?;
+        assert_eq!(first.baseline.as_deref(), Some(fresh.as_str()));
+        let tree = first.workspace.as_ref().context("workspace")?.clone();
+        assert_eq!(
+            fs::read_to_string(tree.join("tracked.txt"))?,
+            "fresh remote main\n"
+        );
+        assert_eq!(git(&local, &["rev-parse", "HEAD"])?, original_head);
+        assert_eq!(
+            fs::read_to_string(local.join("tracked.txt"))?,
+            "precious local edit\n"
+        );
+        fs::write(tree.join("tracked.txt"), "session edits\n")?;
+        fs::write(origin.join("tracked.txt"), "next remote commit\n")?;
+        git(&origin, &["commit", "-am", "advance again"])?;
+        let next = git(&origin, &["rev-parse", "HEAD"])?;
+        let mut second = make("second");
+        prepare(&mut second, &root, &cancel, |_| Ok(()))?;
+        assert_eq!(second.baseline.as_deref(), Some(next.as_str()));
+        git(
+            &local,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                root.join("missing").to_str().context("missing path")?,
+            ],
+        )?;
+        prepare(&mut first, &root, &cancel, |_| Ok(()))?;
+        assert_eq!(first.baseline.as_deref(), Some(fresh.as_str()));
+        assert_eq!(
+            fs::read_to_string(tree.join("tracked.txt"))?,
+            "session edits\n"
+        );
+        let mut failed = make("failed");
+        assert!(prepare(&mut failed, &root, &cancel, |_| Ok(())).is_err());
+        assert!(!root.join("worktrees/failed").exists());
+        assert!(failed.baseline.is_none());
+        Ok(())
+    }
+
     #[test]
     fn current_worktree_diff_tracks_pr_lifecycle_and_registered_workspaces() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -580,6 +740,7 @@ mod tests {
         let mut link = SessionLink {
             workspace: workspace.clone(),
             pr: SessionPr {
+                summary: None,
                 key: PrKey {
                     owner: "example".into(),
                     repo: "project".into(),

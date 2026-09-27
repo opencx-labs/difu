@@ -231,6 +231,18 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
         .unwrap_or_default();
     let params = event.get("params").unwrap_or(&Value::Null);
     if let Some(id) = event.get("id") {
+        if method == "item/tool/call"
+            && params.get("tool").and_then(Value::as_str) == Some(super::management::TOOL)
+        {
+            session.deletion_requests.push(Pending {
+                id: id.clone(),
+                method: method.into(),
+                params: params.clone(),
+                responded: false,
+            });
+            return;
+        }
+
         if session.registration_tools
             && method == "item/tool/call"
             && params.get("tool").and_then(Value::as_str) == Some(super::registration::TOOL)
@@ -1093,6 +1105,7 @@ fn instructions(session: &Session) -> String {
         "{base}\n\nCurrent repository: {}. Read instructions in the current repository before continuing; earlier conversation may refer to a different repository.",
         session.job.root().display()
     );
+    let base = format!("{base}\n\n{}", super::management::INSTRUCTIONS);
     let base = if session.registration_tools {
         format!("{base}\n\n{}", super::registration::INSTRUCTIONS)
     } else {
@@ -1154,7 +1167,11 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
         )?;
     }
     if !resuming {
-        let mut tools = vec![super::artifacts::tool(), super::registration::tool()];
+        let mut tools = vec![
+            super::artifacts::tool(),
+            super::registration::tool(),
+            super::management::tool(),
+        ];
         if session.deferred_workspace && launch.isolated {
             tools.extend(isolation::tools().as_array().cloned().unwrap_or_default());
         }
@@ -1294,6 +1311,42 @@ pub fn run(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        let requests = store.get(id)?.deletion_requests;
+        if !requests.is_empty() {
+            store.update(id, |s| s.deletion_requests.clear())?;
+            let session = store.get(id)?;
+            for request in requests {
+                let result = (|| -> Result<()> {
+                    ensure!(
+                        request.params.get("threadId").and_then(Value::as_str)
+                            == session.thread_id.as_deref()
+                            && request.params.get("turnId").and_then(Value::as_str)
+                                == session.turn_id.as_deref(),
+                        "Session deletion belongs to another turn"
+                    );
+                    let args = request
+                        .params
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let args = if let Some(text) = args.as_str() {
+                        serde_json::from_str(text)?
+                    } else {
+                        args
+                    };
+                    super::management::validate(&session, &args)
+                })();
+                let text = match &result {
+                    Ok(()) => "Session deletion accepted. Stop here; difu will close and remove this session.".into(),
+                    Err(error) => format!("{error:#}"),
+                };
+                rpc.write(json!({"id":request.id,"result":{"success":result.is_ok(),"contentItems":[{"type":"inputText","text":text}]}}))?;
+                if result.is_ok() {
+                    super::management::schedule(store, id)?;
+                    return Ok(());
+                }
+            }
         }
         let requests = store.get(id)?.artifact_requests;
         if !requests.is_empty() {

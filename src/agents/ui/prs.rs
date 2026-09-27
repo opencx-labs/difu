@@ -6,6 +6,7 @@ use std::path::PathBuf;
 struct Update {
     id: String,
     workspace: PathBuf,
+    branch: Option<String>,
     revision: u64,
     result: Result<Vec<Cached>, String>,
 }
@@ -16,6 +17,7 @@ pub(super) struct State {
     pub visible: HashSet<String>,
     refreshed: HashMap<String, Instant>,
     revisions: HashMap<String, u64>,
+    branches: HashMap<String, Option<String>>,
     pending: HashMap<String, Cancel>,
     stale: HashSet<String>,
     opened: Option<String>,
@@ -37,6 +39,7 @@ impl State {
             visible: HashSet::new(),
             refreshed: HashMap::new(),
             revisions: HashMap::new(),
+            branches: HashMap::new(),
             pending: HashMap::new(),
             stale,
             opened: None,
@@ -52,6 +55,7 @@ impl State {
         self.cache.remove(id);
         self.refreshed.remove(id);
         self.revisions.remove(id);
+        self.branches.remove(id);
         self.stale.remove(id);
         self.history.remove(id);
         self.save(storage)
@@ -75,14 +79,18 @@ impl State {
             && self
                 .refreshed
                 .get(id)
-                .is_none_or(|t| t.elapsed() >= Duration::from_secs(30))
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(300))
     }
     fn receive(&mut self, update: Update) -> bool {
         self.pending.remove(&update.id);
         self.refreshed.insert(update.id.clone(), Instant::now());
         if let Ok(links) = update.result {
             self.stale.remove(&update.id);
-            pr_cache::merge_links(self.cache.entry(update.id).or_default(), links);
+            self.branches
+                .insert(update.id.clone(), update.branch.clone());
+            let cached = self.cache.entry(update.id).or_default();
+            pr_cache::merge_links(cached, links);
+            pr_cache::sort_links(cached, &update.workspace, update.branch.as_deref());
             true
         } else {
             self.stale.insert(update.id);
@@ -141,6 +149,9 @@ impl Ui {
             }
             for session in &self.summaries {
                 let saved = pr_cache::snapshot(&self.storage, &session.id);
+                self.prs
+                    .branches
+                    .insert(session.id.clone(), saved.branch.clone());
                 let stale = saved.error.is_some()
                     || saved.checked_at == 0
                     || (saved.links.iter().any(|link| link.pr.state == "OPEN")
@@ -167,7 +178,13 @@ impl Ui {
         }
         for session in &self.summaries {
             if let Some(links) = self.prs.cache.get_mut(&session.id) {
-                pr_cache::sort_links(links, &session.workspace, session.branch.as_deref());
+                let branch = self
+                    .prs
+                    .branches
+                    .get(&session.id)
+                    .map(|b| b.as_deref())
+                    .unwrap_or(session.branch.as_deref());
+                pr_cache::sort_links(links, &session.workspace, branch);
             }
         }
         for session in &self.summaries {
@@ -236,6 +253,7 @@ impl Ui {
                 let _ = sender.send(Update {
                     id,
                     workspace,
+                    branch: pr_cache::snapshot(&storage, &summary.id).branch,
                     revision: summary.workspace_revision,
                     result,
                 });
@@ -291,6 +309,7 @@ mod tests {
 
     fn pr() -> SessionPr {
         SessionPr {
+            summary: None,
             key: PrKey {
                 owner: "example".into(),
                 repo: "project".into(),
@@ -335,6 +354,7 @@ mod tests {
         state.receive(Update {
             id: "one".into(),
             workspace: temp.path().into(),
+            branch: None,
             revision: 0,
             result: Ok(vec![Cached {
                 workspace: temp.path().into(),
@@ -345,13 +365,14 @@ mod tests {
         state.refreshed.insert(
             "one".into(),
             Instant::now()
-                .checked_sub(Duration::from_secs(31))
+                .checked_sub(Duration::from_secs(301))
                 .context("time")?,
         );
         assert!(state.due("one"));
         assert!(!state.receive(Update {
             id: "one".into(),
             workspace: temp.path().into(),
+            branch: None,
             revision: 0,
             result: Err("offline".into())
         }));
@@ -396,6 +417,7 @@ mod tests {
         ui.prs.receive(Update {
             id: "one".into(),
             workspace: temp.path().into(),
+            branch: None,
             revision: 0,
             result: Ok(vec![Cached {
                 workspace: temp.path().into(),
@@ -475,14 +497,14 @@ mod tests {
             .collect::<String>();
         assert!(screen.contains("Preserve this draft") && screen.contains("1 Preview"));
         for (key, expected) in [
-            ('2', PrView::Guide),
-            ('3', PrView::Diff),
+            ('2', PrView::Diff),
+            ('3', PrView::Guide),
             ('1', PrView::Overview),
-            (']', PrView::Guide),
             (']', PrView::Diff),
+            (']', PrView::Guide),
             (']', PrView::Overview),
-            ('[', PrView::Diff),
             ('[', PrView::Guide),
+            ('[', PrView::Diff),
             ('[', PrView::Overview),
         ] {
             ui.key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
@@ -491,7 +513,7 @@ mod tests {
             };
             assert_eq!(app.view, expected);
         }
-        ui.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
         ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(ui.panels.focused);
         let Some(panels::View::PullRequest { app }) = &ui.panels.view else {

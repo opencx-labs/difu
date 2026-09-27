@@ -50,7 +50,9 @@ pub fn my_prs(state: PrState, cancel: &Cancel) -> Result<Vec<PrSummary>> {
     let mut prs = search_prs("--author=@me", state, cancel)?;
     cancel.check()?;
     prs.extend(search_prs("--review-requested=@me", state, cancel)?);
-    Ok(ordered_unique(prs))
+    let mut prs = ordered_unique(prs);
+    enrich_prs(&mut prs, cancel)?;
+    Ok(prs)
 }
 
 fn ordered_unique(mut prs: Vec<PrSummary>) -> Vec<PrSummary> {
@@ -83,7 +85,9 @@ pub fn inbox(
             }
             combined.extend(search_prs(&format!("--repo={repository}"), state, cancel)?);
         }
-        return Ok(ordered_unique(combined));
+        let mut prs = ordered_unique(combined);
+        enrich_prs(&mut prs, cancel)?;
+        return Ok(prs);
     }
     my_prs(state, cancel)
 }
@@ -96,7 +100,7 @@ fn search_prs(scope: &str, state: PrState, cancel: &Cancel) -> Result<Vec<PrSumm
         "--sort=updated",
         "--order=desc",
         "--limit=1000",
-        "--json=number,title,url,author,updatedAt,createdAt,isDraft",
+        "--json=number,title,url,author,updatedAt,createdAt,isDraft,state",
     ];
     match state {
         PrState::Open => args.push("--state=open"),
@@ -122,6 +126,7 @@ fn pr_summary_value(v: &Value) -> Result<PrSummary> {
         created: text(v, "createdAt"),
         stats: None,
         stats_error: false,
+        metadata: Some(pr_metadata(v)),
         draft: v
             .get("isDraft")
             .unwrap_or(&Value::Null)
@@ -137,10 +142,112 @@ pub(crate) fn pr_summary(key: &PrKey, cancel: &Cancel) -> Result<PrSummary> {
             "pr",
             "view",
             &key.url(),
-            "--json=number,title,url,author,updatedAt,createdAt,isDraft",
+            "--json=number,title,url,author,updatedAt,createdAt,isDraft,state,mergeable,reviewRequests,latestReviews",
         ],
         cancel,
     )?)
+}
+
+fn pr_metadata(value: &Value) -> PrMetadata {
+    let mut reviewers = Vec::new();
+    for field in ["reviewRequests", "latestReviews"] {
+        let entries = value.get(field).and_then(|v| {
+            v.as_array()
+                .or_else(|| v.get("nodes").and_then(Value::as_array))
+        });
+        for entry in entries.into_iter().flatten() {
+            let reviewer = entry
+                .get("requestedReviewer")
+                .or_else(|| entry.get("author"))
+                .unwrap_or(entry);
+            if let Some(name) = reviewer
+                .get("login")
+                .or_else(|| reviewer.get("slug"))
+                .and_then(Value::as_str)
+            {
+                reviewers.push(name.to_owned());
+            }
+        }
+    }
+    reviewers.sort();
+    reviewers.dedup();
+    PrMetadata {
+        state: text(value, "state").to_ascii_uppercase(),
+        conflicts: text(value, "mergeable") == "CONFLICTING",
+        reviewers,
+        checked_at: if value.get("mergeable").is_some() {
+            polling::now()
+        } else {
+            0
+        },
+    }
+}
+
+/// Fetch reviewer and lifecycle metadata in bounded batches, never from typing.
+/// Counts share this request so the inbox need not request them separately.
+pub(crate) fn enrich_prs(prs: &mut [PrSummary], cancel: &Cancel) -> Result<()> {
+    let mut missing = prs
+        .iter()
+        .enumerate()
+        .filter(|(_, pr)| {
+            pr.metadata
+                .as_ref()
+                .is_none_or(|m| polling::now().saturating_sub(m.checked_at) >= 300)
+        })
+        .map(|(i, _)| i)
+        .collect::<Vec<_>>();
+    missing.sort_by_key(|i| prs.get(*i).map(|pr| pr.key.id()));
+    for batch in missing.chunks(25) {
+        cancel.check()?;
+        let mut query = String::from("query {");
+        for (alias, index) in batch.iter().enumerate() {
+            let pr = prs.get(*index).context("Missing tracked PR")?;
+            pr.key.validate()?;
+            query.push_str(&format!(
+                "r{alias}: repository(owner:{}, name:{}) {{ pullRequest(number:{}) {{ state mergeable title author {{ login }} updatedAt isDraft additions deletions changedFiles reviewRequests(first:100) {{ nodes {{ requestedReviewer {{ ... on User {{ login }} ... on Team {{ slug }} }} }} }} latestReviews(first:100) {{ nodes {{ author {{ login }} }} }} }} }}",
+                serde_json::to_string(&pr.key.owner)?, serde_json::to_string(&pr.key.repo)?, pr.key.number
+            ));
+        }
+        query.push('}');
+        let response = read_json(
+            &["api", "graphql", "-f", &format!("query={query}")],
+            cancel,
+            30,
+        )?;
+        if response
+            .get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(|errors| !errors.is_empty())
+        {
+            bail!("GitHub could not refresh tracked PR metadata");
+        }
+        for (alias, index) in batch.iter().enumerate() {
+            let Some(value) = response
+                .pointer(&format!("/data/r{alias}/pullRequest"))
+                .filter(|v| !v.is_null())
+            else {
+                continue;
+            };
+            let pr = prs.get_mut(*index).context("Missing tracked PR")?;
+            pr.metadata = Some(pr_metadata(value));
+            if let Some(title) = value.get("title").and_then(Value::as_str) {
+                pr.title = title.into();
+            }
+            if let Some(author) = value.pointer("/author/login").and_then(Value::as_str) {
+                pr.author = author.into();
+            }
+            if let Some(updated) = value.get("updatedAt").and_then(Value::as_str) {
+                pr.updated = updated.into();
+            }
+            if let Some(draft) = value.get("isDraft").and_then(Value::as_bool) {
+                pr.draft = draft;
+            }
+            if let Ok(stats) = serde_json::from_value(value.clone()) {
+                pr.stats = Some(stats);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a bounded batch without downloading patches or Git objects.
@@ -203,6 +310,8 @@ pub fn current_branch_pr(cancel: &Cancel) -> Result<PrKey> {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct SessionPr {
+    #[serde(default)]
+    pub summary: Option<PrSummary>,
     pub key: PrKey,
     pub state: String,
     pub draft: bool,
@@ -247,7 +356,7 @@ pub fn session_pr(
             cmd.arg(branch);
         }
     }
-    cmd.arg("--json=url,state,isDraft,mergeable,headRefName,headRefOid,updatedAt");
+    cmd.arg("--json=url,state,isDraft,mergeable,headRefName,headRefOid,updatedAt,title,author,reviewRequests,latestReviews");
     let output = polling::run(&mut cmd, None, cancel, 30, false, None)?;
     anyhow::ensure!(
         output.code == 0,
@@ -265,6 +374,7 @@ fn session_pr_value(value: &Value) -> Result<SessionPr> {
         "Invalid PR state"
     );
     Ok(SessionPr {
+        summary: Some(pr_summary_value(value)?),
         key: PrKey::from_url(&text(value, "url"))?,
         state,
         draft: value
@@ -284,6 +394,23 @@ pub fn session_prs(
     branch: &str,
     cancel: &Cancel,
 ) -> Result<Vec<SessionPr>> {
+    branch_prs(workspace, branch, "all", cancel)
+}
+
+pub(crate) fn open_session_prs(
+    workspace: &std::path::Path,
+    branch: &str,
+    cancel: &Cancel,
+) -> Result<Vec<SessionPr>> {
+    branch_prs(workspace, branch, "open", cancel)
+}
+
+fn branch_prs(
+    workspace: &std::path::Path,
+    branch: &str,
+    state: &str,
+    cancel: &Cancel,
+) -> Result<Vec<SessionPr>> {
     anyhow::ensure!(
         !branch.is_empty() && branch != "HEAD" && !branch.starts_with('-'),
         "No named workspace branch"
@@ -295,10 +422,10 @@ pub fn session_prs(
             "--head",
             branch,
             "--state",
-            "all",
+            state,
             "--limit",
             "1000",
-            "--json=url,state,isDraft,mergeable,headRefName,headRefOid,updatedAt",
+            "--json=url,state,isDraft,mergeable,headRefName,headRefOid,updatedAt,title,author,reviewRequests,latestReviews",
         ]),
         None,
         cancel,
@@ -884,6 +1011,24 @@ pub fn open_url(url: &str, cancel: &Cancel) -> Result<()> {
 mod inbox_tests {
     use super::*;
     #[test]
+    fn metadata_indexes_requested_and_completed_reviewers_and_status() {
+        let metadata = pr_metadata(&serde_json::json!({
+            "state":"OPEN","mergeable":"CONFLICTING",
+            "reviewRequests":{"nodes":[{"requestedReviewer":{"login":"faltawy"}},{"requestedReviewer":{"slug":"platform"}}]},
+            "latestReviews":{"nodes":[{"author":{"login":"reviewer"}},{"author":{"login":"faltawy"}}]}
+        }));
+        assert_eq!(metadata.reviewers, vec!["faltawy", "platform", "reviewer"]);
+        assert_eq!(metadata.label(), "Has conflicts");
+        let metadata = pr_metadata(&serde_json::json!({
+            "state":"MERGED","mergeable":"CONFLICTING",
+            "reviewRequests":[{"login":"requested"}],
+            "latestReviews":[{"author":{"login":"reviewed"}}]
+        }));
+        assert_eq!(metadata.label(), "Merged");
+        assert_eq!(metadata.reviewers, vec!["requested", "reviewed"]);
+    }
+
+    #[test]
     fn personal_inbox_deduplicates_across_updates_and_repositories() -> Result<()> {
         let pr = |repo: &str, number: u64, updated: &str, title: &str| PrSummary {
             key: PrKey {
@@ -897,6 +1042,7 @@ mod inbox_tests {
             created: "2026-09-01T00:00:00Z".into(),
             stats: None,
             stats_error: false,
+            metadata: None,
             draft: false,
         };
         let prs = ordered_unique(vec![

@@ -339,7 +339,12 @@ impl Service {
                 let job = Job::Coding(Launch {
                     repository: root,
                     isolated: defaults.isolated,
-                    base: "HEAD".into(),
+                    base: if defaults.isolated {
+                        "origin/main"
+                    } else {
+                        "HEAD"
+                    }
+                    .into(),
                     prompt: String::new(),
                     model: defaults.model,
                     effort: defaults.effort,
@@ -731,14 +736,23 @@ impl Service {
                         .join()
                         .map_err(|_| anyhow::anyhow!("Session worker stopped unexpectedly"))?;
                 }
+                self.store.update(&id, |s| {
+                    if s.status.active() {
+                        s.status = Status::Interrupted;
+                    }
+                    s.turn_id = None;
+                    s.deletion_requests.clear();
+                })?;
                 let session = self.store.get(&id)?;
-                if session.workspace_ready
-                    && !session.workspace_removed
+                let owned = self.store.home.join("worktrees").join(&id);
+                if owned.try_exists()?
                     && matches!(&session.job, Job::Coding(launch) if launch.isolated)
                 {
-                    super::workspace::cleanup(&session, &self.store.home, &Cancel::default())?;
-                    self.store.update(&id, |s| s.workspace_removed = true)?;
-                    self.store.save(&id)?;
+                    // Registered external worktrees are retained. The session's
+                    // original managed worktree remains owned after switching.
+                    let mut managed = session.clone();
+                    managed.workspace = Some(owned);
+                    super::workspace::delete(&managed, &self.store.home, &Cancel::default())?;
                 }
                 super::media::cleanup(&self.store.storage, &id)?;
                 let _guard = self

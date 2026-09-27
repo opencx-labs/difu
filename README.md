@@ -81,12 +81,19 @@ difu
 tab thereafter. Click a tab or use **⌥+1 / ⌥+2** to switch while preserving
 your place. An explicit PR argument opens Reviews.
 
+PR tabs are **1 Overview**, **2 Diff**, and **3 Guide**. Guide generation always
+requires **g** (Generate), including after opening or refreshing a PR. A matching
+cached guide may load automatically without starting a model run.
+
 ### Command palette
 
 **Cmd+K** opens global search from either tab. Search sessions by title,
 repository, branch, worktree, or PR number, and launch commands from both the
 Agents and Reviews `/` menus. PR results offer a preview alongside connected
-sessions. A bare number (or `#1524`) searches the local cache only;
+sessions. PR search also matches cached authors and reviewers (including requested
+reviewers); typing a name never sends a GitHub request. Matching open PRs appear
+first, then other results by relevance, with Open, Merged, Closed, or Has conflicts
+badges. A bare number (or `#1524`) searches the local cache only;
 `opencx#1524` or `owner/opencx#1524` also looks up GitHub when absent locally.
 The background service refreshes open authored and review-requested PRs every five
 minutes, even with no terminal open, and retains cached history. Failed refreshes
@@ -147,14 +154,23 @@ browser package is never bundled with difu. Without a working embedded browser, 
 
 **/actions → Delete chat and clean up worktree** confirms stopping the agent and
 permanently deleting its difu history, questions, queue, and attachment copies.
-Cleanup removes only a clean, unlocked difu-owned worktree. Modified, untracked,
-and ignored files prevent deletion and retain the chat. Existing directories,
-Git branches and commits, and Codex’s own history are retained. Archive remains
-a separate action that keeps the chat and worktree.
+Deleting a chat removes its unlocked difu-owned worktree, including modified,
+untracked, and ignored files. Existing and externally registered worktrees,
+Git branches and commits, and native provider history are retained. The separate
+worktree-only cleanup action still requires a clean worktree. Archive keeps the
+chat and worktree.
+
+Agents can call **difu_delete_session** when explicitly asked to delete their own
+session and managed worktree. It deletes the chat and attachments and discards
+uncommitted work, just like the UI action. It cannot target other sessions.
+The tool is available in new Codex threads and in Claude sessions; existing Codex
+threads keep the tools they were created with.
 
 Press **n** (or `/new`) to open an empty session immediately while its isolated Git
 worktree is created in the background. The composer stays enabled and shows the
-preparation state. Messages sent during setup are saved in the queue and sent in
+preparation state. Each new worktree fetches `origin/main` and branches from that
+fresh commit, leaving the local checkout unchanged. A failed fetch stops setup
+rather than using a stale base. Messages sent during setup are saved in the queue and sent in
 order once the worktree and provider are ready, after any required guidance
 approval. Failed or interrupted setup retains queued messages as unsent;
 restarting difu never automatically replays them.
@@ -216,8 +232,11 @@ explicit base or set `origin/HEAD`. The original checkout cannot be registered.
 Difu discovers multiple PRs per coding session and remembers them across restarts
 and worktree changes. Open PRs on the current worktree appear first, then other
 open session PRs, then merged/closed PRs. Within those groups, current-worktree
-relevance and the most recent update determine order. Visible open PRs refresh every
-30 seconds; other open session PRs refresh every five minutes. The service and UI
+relevance and the most recent update determine order. Open PRs refresh every five
+minutes. Active sessions also rediscover open PRs on their current branch, even
+when an earlier PR was closed or merged. Discovery reads the current Git branch,
+so switching branches within an existing session does not leave its old PR as the
+active badge. Open PRs take precedence over merged history. The service and UI
 share cached results and deduplicate concurrent requests. Archived sessions and
 closed/merged history refresh when opened or explicitly refreshed with **r**;
 they are not polled in the background. Network failures retain cached history and
@@ -249,7 +268,11 @@ Recalled prompts are editable and never sent automatically.
 Type **/** in an empty composer for native commands: `/compact`, `/model`, `/effort`,
 `/skills`, `/status`, `/usage`, `/diff`, `/new`, `/rename`, `/repo`, `/worktree`,
 `/help`, `/voice`, and `/actions`.
-**/usage** reads Claude Code's structured `/usage` data or Codex's account limits
+Opening a session keeps the composer focused; pending questions remain available
+through the questions control.
+
+**/usage** shows labeled quota bars and local reset times: percent used for Claude,
+percent remaining for Codex. It reads Claude Code's structured `/usage` data or Codex's account limits
 and session token usage, without sending a model prompt. Use **r** to refresh and
 **↑/↓** or **PgUp/PgDn** to scroll. Provider errors appear in the panel.
 Commands filter as you type. Inline arguments also work: `/rename <title>`,
@@ -437,8 +460,8 @@ short-lived request cache. GitHub writes are never cached or automatically retri
 
 Select a PR to preview its description, chronological activity, inline review
 comments, and checks. **Enter** drills into that PR and selects **Overview** (the
-preview), while its guide is prepared or retrieved in the background. Inside the
-PR, the tabs are **Overview / Guide / Diff**; **[ / ]** switches to the previous/next tab.
+preview), while its diff is prepared and any matching cached guide is retrieved.
+Guide generation requires **g**. Inside the PR, the tabs are **Overview / Diff / Guide**; **[ / ]** switches to the previous/next tab.
 **Esc** returns home. Guide starts with code focused; Diff starts with files focused. The
 border highlights the focused pane, the footer names it, and **Tab** switches focus. You can also launch directly:
 
@@ -495,7 +518,7 @@ all its children. Guide chapter links are unchanged.
 
 - **Overview:** a centered column (up to 110 terminal columns) with bordered cards
   for the description, chronological comments/reviews/commits, and checks.
-  Check states and durations refresh every 30 seconds for the selected open PR.
+  Check states and durations refresh every five minutes for the selected open PR.
   Click a check to open its GitHub logs.
 - **Guide:** chapters connect explanations to changes across files. While
   generation runs, the file navigator and diff stay usable. Completed guides
@@ -552,7 +575,7 @@ units. A hunk may support multiple chapters; repeated references within one
 chapter are collapsed in their original order. Unknown or missing references
 reject the guide.
 
-Difu checks the open PR's head and base commit IDs through GitHub every 30 seconds.
+Difu checks the open PR's head and base commit IDs through GitHub every five minutes.
 This metadata check does not fetch Git objects. Remote updates are announced
 without replacing your current diff or guide. **r** syncs missing revisions and
 refreshes the review; a failed sync keeps your current review usable. If guide
@@ -623,7 +646,7 @@ Overview shows GitHub's live mergeability separately from the pinned review
 snapshot, including conflicts and required checks that have not reported yet.
 The preview's Open / Merged / Closed badge updates with live status even while the
 diff and guide stay pinned. An empty check rollup is a valid state. If GitHub is still calculating mergeability,
-difu says so. Check runs and merge status refresh every 30 seconds.
+difu says so. Check runs and merge status refresh every five minutes.
 
 A **Failed tests** section appears beneath Checks when checks fail. Difu reads
 GitHub Actions job logs in the background and displays identifiable test names
@@ -698,7 +721,7 @@ bindings.
 | Left / Right | Scroll the focused Files tree or unwrapped code horizontally |
 | Alt+Left / Alt+Right | Select old/new diff side; new is selected by default |
 | Alt+Up / Alt+Down | Previous / next guide chapter |
-| 1 / 2 / 3 | Home: 1 My PRs / 2 Repositories; inside a PR: Overview / Guide / Diff |
+| 1 / 2 / 3 | Home: 1 My PRs / 2 Repositories; inside a PR: Overview / Diff / Guide |
 | ? | Search shortcut help; type to filter, Up/Down to scroll, Esc to close |
 | m | Model and reasoning picker |
 | [ / ] / s | Previous / next / next PR state |

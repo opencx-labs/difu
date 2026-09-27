@@ -193,7 +193,7 @@ fn exercise(root: &Path) -> Result<()> {
 
     assert!(overview.contains("1 My PRs"));
     assert!(overview.contains("2 Repositories"));
-    assert!(!overview.contains("2 Guide"));
+    assert!(!overview.contains("3 Guide"));
     // Card layout reflows the activity into a taller, bounded column. Checks
     // and their click targets must remain reachable after scrolling and resize.
     for width in [80, 240] {
@@ -228,6 +228,26 @@ fn exercise(root: &Path) -> Result<()> {
     app.action(Action::OpenPr);
     assert_eq!(app.focus, difu::app::Focus::Content);
     assert_eq!(app.view, View::Overview);
+    wait(&mut app, |a| {
+        a.review().is_some_and(|r| r.snapshot.is_some())
+    })?;
+    assert!(
+        app.review()
+            .is_some_and(|r| r.guide.is_none() && r.generation.is_none())
+    );
+    assert!(!root.join("turns").exists());
+    app.key_event(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+    assert_eq!(app.view, View::Diff);
+    app.key_event(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+    assert_eq!(app.view, View::Guide);
+    assert!(app.review().is_some_and(|r| r.generation.is_none()));
+    assert!(render(&mut app, 180)?.contains("press g to generate"));
+    app.key_event(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+    assert_eq!(app.view, View::Diff);
+    app.key_event(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+    assert_eq!(app.view, View::Guide);
+    app.action(Action::SetView(View::Overview));
+    app.action(Action::Regenerate);
     wait(&mut app, |a| a.review().is_some_and(|r| r.guide.is_some()))?;
     assert_eq!(app.view, View::Overview); // Background guide completion must not steal focus.
     assert!(render(&mut app, 180)?.contains("1 Overview"));
@@ -238,7 +258,7 @@ fn exercise(root: &Path) -> Result<()> {
         .context("Missing guide")?;
     assert_eq!(guide.chapters.len(), 2);
     assert!(guide.chapters.iter().all(|c| c.hunks == ["f0-h0"]));
-    // Revision checks are lightweight, spaced by 30 seconds, and pin open code.
+    // Revision checks are lightweight, spaced by five minutes, and pin open code.
     let revision_file = root.join("revisions.json");
     let original_revisions = fs::read(&revision_file)?;
     let original_head = app
@@ -251,14 +271,14 @@ fn exercise(root: &Path) -> Result<()> {
         .reviews
         .get_mut("example/project#1")
         .context("Missing review")?;
-    review.revision_poll_at = Instant::now().checked_sub(Duration::from_secs(29));
+    review.revision_poll_at = Instant::now().checked_sub(Duration::from_secs(299));
     app.tick();
     assert!(!root.join("revision-polls").exists());
     let review = app
         .reviews
         .get_mut("example/project#1")
         .context("Missing review")?;
-    review.revision_poll_at = Instant::now().checked_sub(Duration::from_secs(31));
+    review.revision_poll_at = Instant::now().checked_sub(Duration::from_secs(301));
     app.tick();
     wait(&mut app, |a| {
         a.review().is_some_and(|r| !r.revision_polling)
@@ -275,7 +295,7 @@ fn exercise(root: &Path) -> Result<()> {
     app.reviews
         .get_mut("example/project#1")
         .context("Missing review")?
-        .revision_poll_at = Instant::now().checked_sub(Duration::from_secs(31));
+        .revision_poll_at = Instant::now().checked_sub(Duration::from_secs(301));
     app.tick();
     wait(&mut app, |a| {
         a.review().is_some_and(|r| !r.revision_polling)
@@ -301,7 +321,7 @@ fn exercise(root: &Path) -> Result<()> {
     assert!(!app.home);
     assert_eq!(app.view, View::Guide);
     assert!(wide.contains("1 Overview"));
-    assert!(wide.contains("2 Guide"));
+    assert!(wide.contains("3 Guide"));
     assert!(wide.contains("Use the new behavior"));
     assert!(app.document.as_ref().is_some_and(|d| d.guide_columns));
     render(&mut app, 80)?;
@@ -379,7 +399,7 @@ fn exercise(root: &Path) -> Result<()> {
     // Periodic hydration preserves selection and loads no other state or repository.
     let selected = app.key();
     let stats_before = fs::read_to_string(root.join("stats-batches"))?;
-    app.inbox_refreshed = Some(Instant::now() - Duration::from_secs(31));
+    app.inbox_refreshed = Some(Instant::now() - Duration::from_secs(301));
     app.tick();
     assert!(app.inbox_loading);
     assert_eq!(app.key(), selected);
@@ -1104,6 +1124,7 @@ fn exercise_reviewer_picker_and_branch_lookup(root: &Path) -> Result<()> {
         created: String::new(),
         stats: None,
         stats_error: false,
+        metadata: None,
         draft: false,
     }];
     app.reviews.insert(

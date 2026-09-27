@@ -4,6 +4,7 @@ mod claude;
 pub mod client;
 mod engine;
 mod guidance;
+mod management;
 pub mod media;
 pub(crate) mod pr_cache;
 pub mod provider;
@@ -230,6 +231,8 @@ pub struct Session {
     pub registration_tools: bool,
     #[serde(skip)]
     pub registration_requests: Vec<Pending>,
+    #[serde(skip)]
+    pub deletion_requests: Vec<Pending>,
     #[serde(default)]
     pub guidance_checked: bool,
     #[serde(default)]
@@ -305,6 +308,7 @@ impl Session {
             switching_workspace: false,
             registration_tools: false,
             registration_requests: Vec::new(),
+            deletion_requests: Vec::new(),
             guidance_checked: false,
             workspace_removed: false,
             baseline: None,

@@ -532,6 +532,25 @@ impl Ui {
                     }
                     (Task::List, Reply::Sessions(sessions)) => {
                         self.sidebar.observe(&sessions);
+                        if let Some(id) = self.selected.clone()
+                            && self.summaries.iter().any(|s| s.id == id)
+                            && !sessions.iter().any(|s| s.id == id)
+                        {
+                            self.sessions.remove(&id);
+                            self.positions.remove(&id);
+                            self.changes.remove(&id);
+                            self.sidebar.counts.remove(&id);
+                            let _ = self.sidebar.save(&self.storage);
+                            let _ = self.prs.forget(&id, &self.storage);
+                            self.question_send = None;
+                            self.busy = false;
+                            self.panels = panels::Panels::new(self.panels.right);
+                            self.selected = None;
+                            self.drilled = false;
+                            self.modal = None;
+                            self.focus = Focus::List;
+                            self.notice = Some(("Chat deleted".into(), false));
+                        }
                         self.summaries = sessions;
                         self.ensure_selected();
                     }
@@ -783,6 +802,10 @@ impl Ui {
     }
     fn select(&mut self, id: String) {
         let changed = self.selected.as_ref() != Some(&id);
+        if changed && self.inline_question() {
+            self.remember_answers();
+            self.modal = None;
+        }
         self.selected = Some(id.clone());
         self.positions.entry(id.clone()).or_default();
         if changed {
@@ -1536,15 +1559,7 @@ impl Ui {
                 if self.focus == Focus::List {
                     self.follow_latest();
                 }
-                if self
-                    .sessions
-                    .get(self.selected.as_deref().unwrap_or_default())
-                    .is_some_and(|s| !s.pending.is_empty())
-                {
-                    self.pending(0);
-                } else {
-                    self.focus = Focus::Composer;
-                }
+                self.focus = Focus::Composer;
             }
             KeyCode::Enter => {
                 if self.selected.is_some() {
@@ -3275,7 +3290,7 @@ impl Ui {
                 );
             }
             Some(Modal::Delete) => {
-                frame.render_widget(Paragraph::new("Stop this agent and permanently delete its difu chat, saved questions, queue, and attachments? Its clean, unlocked difu-owned worktree will also be removed.\n\nModified worktrees remain protected: deletion stops with an error and retains the chat. Existing directories, named branches, commits, and native provider history are not deleted.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
+                frame.render_widget(Paragraph::new("Stop this agent and permanently delete its difu chat, saved questions, queue, and attachments? Its unlocked difu-owned worktree will also be removed, including all uncommitted, untracked, and ignored files. Existing directories, named branches, commits, and native provider history are not deleted.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
             }
             Some(Modal::Cleanup) => {
                 frame.render_widget(Paragraph::new("Delete this session’s clean, inactive worktree?\n\nModified, untracked, ignored, active and Git-locked worktrees are protected. Existing directories are never deleted. The named branch and its commits are retained.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
@@ -3730,6 +3745,27 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn entering_a_session_with_questions_keeps_the_composer() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        });
+        ui.sessions.get_mut("one").context("session")?.pending.push(Pending {
+            id: serde_json::json!("question"), method: "item/tool/requestUserInput".into(), responded: false,
+            params: serde_json::json!({"questions":[{"id":"q","question":"Which scope?","options":[]}]}),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::List;
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(ui.focus, Focus::Composer);
+        assert!(ui.modal.is_none());
+        ui.open_questions();
+        assert!(ui.inline_question());
+        Ok(())
+    }
+
     #[test]
     fn worktree_preparation_keeps_the_composer_and_send_available() -> Result<()> {
         use std::io::{BufRead, BufReader, Write};
