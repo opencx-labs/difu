@@ -476,14 +476,14 @@ mod tests {
             .collect::<String>();
         assert!(screen.contains("Preserve this draft") && screen.contains("1 Preview"));
         for (key, expected) in [
-            ('2', PrView::Guide),
-            ('3', PrView::Diff),
+            ('2', PrView::Diff),
+            ('3', PrView::Guide),
             ('1', PrView::Overview),
-            (']', PrView::Guide),
             (']', PrView::Diff),
+            (']', PrView::Guide),
             (']', PrView::Overview),
-            ('[', PrView::Diff),
             ('[', PrView::Guide),
+            ('[', PrView::Diff),
             ('[', PrView::Overview),
         ] {
             ui.key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
@@ -492,7 +492,7 @@ mod tests {
             };
             assert_eq!(app.view, expected);
         }
-        ui.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
         ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert!(ui.panels.focused);
         let Some(panels::View::PullRequest { app }) = &ui.panels.view else {
