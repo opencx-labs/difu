@@ -23,7 +23,7 @@ use std::{
 #[derive(Clone)]
 enum Action {
     Session(String),
-    Preview(PrSummary),
+    Preview(Box<PrSummary>),
     AgentCommand(String),
     AgentMenu(usize),
     ReviewHome(usize),
@@ -49,6 +49,7 @@ struct Item {
     action: Action,
     prs: Vec<PrKey>,
     pinned: bool,
+    badge: Option<crate::model::PrMetadata>,
 }
 enum Update {
     Cache(Result<Vec<PrSummary>, String>),
@@ -186,6 +187,11 @@ fn score(query: &str, title: &str, search: &str) -> Option<usize> {
             score += 1;
         } else if title.contains(term) {
             score += 3;
+        } else if search
+            .split_whitespace()
+            .any(|word| word.trim_start_matches('@') == term.trim_start_matches('@'))
+        {
+            score += 2;
         } else if search.contains(term) {
             score += 6;
         } else {
@@ -290,27 +296,61 @@ impl Shell {
         }
     }
     fn palette_prs(&self) -> Vec<PrSummary> {
-        let mut prs = BTreeMap::new();
+        let mut prs: BTreeMap<String, PrSummary> = BTreeMap::new();
         for pr in self
             .palette
             .iter()
             .flat_map(|p| &p.prs)
             .chain(&self.reviews.inbox)
         {
-            prs.entry(pr.key.id()).or_insert_with(|| pr.clone());
+            let entry = prs.entry(pr.key.id()).or_insert_with(|| pr.clone());
+            let checked = |p: &PrSummary| p.metadata.as_ref().map_or(0, |m| m.checked_at);
+            if pr.updated > entry.updated
+                || (pr.updated == entry.updated && checked(pr) >= checked(entry))
+            {
+                *entry = pr.clone();
+            }
         }
         for session in &self.agents.summaries {
             for pr in self.agents.session_prs(&session.id) {
-                prs.entry(pr.key.id()).or_insert_with(|| PrSummary {
-                    key: pr.key.clone(),
-                    title: session.title.clone(),
-                    author: String::new(),
-                    updated: pr.updated.clone(),
-                    created: String::new(),
-                    stats: None,
-                    stats_error: false,
-                    draft: pr.draft,
+                let summary = prs.entry(pr.key.id()).or_insert_with(|| {
+                    pr.summary.clone().unwrap_or_else(|| PrSummary {
+                        key: pr.key.clone(),
+                        title: session.title.clone(),
+                        author: String::new(),
+                        updated: pr.updated.clone(),
+                        created: String::new(),
+                        stats: None,
+                        stats_error: false,
+                        metadata: None,
+                        draft: pr.draft,
+                    })
                 });
+                let known_at = summary.metadata.as_ref().map_or(0, |m| m.checked_at);
+                let link_at = pr
+                    .summary
+                    .as_ref()
+                    .and_then(|s| s.metadata.as_ref())
+                    .map_or(0, |m| m.checked_at);
+                if pr.updated > summary.updated
+                    || (pr.updated == summary.updated && link_at >= known_at)
+                    || summary.metadata.is_none()
+                {
+                    if let Some(fresh) = &pr.summary {
+                        if !fresh.title.is_empty() {
+                            summary.title = fresh.title.clone();
+                        }
+                        if !fresh.author.is_empty() {
+                            summary.author = fresh.author.clone();
+                        }
+                        summary.metadata = fresh.metadata.clone();
+                    }
+                    let metadata = summary.metadata.get_or_insert_with(Default::default);
+                    metadata.state = pr.state.clone();
+                    metadata.conflicts = pr.conflicts;
+                    summary.updated = pr.updated.clone();
+                    summary.draft = pr.draft;
+                }
             }
         }
         prs.into_values().collect()
@@ -365,16 +405,43 @@ impl Shell {
                 action: Action::Session(session.id.clone()),
                 prs,
                 pinned: self.agents.pinned_sessions.contains(&session.id),
+                badge: None,
             });
         }
         for pr in self.palette_prs() {
+            let reviewers = pr
+                .metadata
+                .as_ref()
+                .map(|m| m.reviewers.join(", "))
+                .unwrap_or_default();
+            let detail = format!(
+                "{}{}{}",
+                if pr.author.is_empty() {
+                    String::new()
+                } else {
+                    format!("Author: @{}", pr.author)
+                },
+                if reviewers.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · Reviewers: {reviewers}")
+                },
+                if pr.draft { " · Draft" } else { "" }
+            );
             items.push(Item {
                 title: format!("{} · {}", pr.key.id(), pr.title),
-                detail: "Open pull request preview".into(),
-                search: format!("{} {}", pr.key.id(), pr.title),
+                search: format!(
+                    "{} {} {} {reviewers} @{}",
+                    pr.key.id(),
+                    pr.title,
+                    pr.author,
+                    pr.author
+                ),
+                detail,
                 category: "PR",
                 prs: vec![pr.key.clone()],
-                action: Action::Preview(pr),
+                badge: Some(pr.metadata.clone().unwrap_or_default()),
+                action: Action::Preview(Box::new(pr)),
                 pinned: false,
             });
         }
@@ -387,6 +454,7 @@ impl Shell {
                 action: Action::AgentCommand(name),
                 prs: Vec::new(),
                 pinned: false,
+                badge: None,
             });
         }
         for (index, label) in self.agents.menu_entries().into_iter().enumerate() {
@@ -404,6 +472,7 @@ impl Shell {
                 action: Action::AgentMenu(index),
                 prs: Vec::new(),
                 pinned: false,
+                badge: None,
             });
         }
         for (index, label) in [
@@ -423,6 +492,7 @@ impl Shell {
                 action: Action::ReviewHome(index),
                 prs: Vec::new(),
                 pinned: false,
+                badge: None,
             });
         }
         let review = self.palette_review();
@@ -439,6 +509,7 @@ impl Shell {
                 action: Action::ReviewCommand(index),
                 prs: Vec::new(),
                 pinned: false,
+                badge: None,
             });
         }
         let mut matched = items.into_iter().filter_map(|item| {
@@ -459,7 +530,14 @@ impl Shell {
             };
             Some((rank, category, item))
         }).collect::<Vec<_>>();
-        matched.sort_by_key(|(score, category, item)| (*score, *category, !item.pinned));
+        matched.sort_by_key(|(score, category, item)| {
+            (
+                !item.badge.as_ref().is_some_and(|m| m.state == "OPEN"),
+                *score,
+                *category,
+                !item.pinned,
+            )
+        });
         matched.into_iter().map(|(_, _, item)| item).collect()
     }
     pub(super) fn tick_palette(&mut self) {
@@ -611,7 +689,7 @@ impl Shell {
                     .iter()
                     .position(|p| p.key == pr.key)
                     .unwrap_or_else(|| {
-                        app.inbox.push(pr);
+                        app.inbox.push(*pr);
                         app.inbox.len() - 1
                     });
                 app.select(index);
@@ -715,7 +793,7 @@ impl Shell {
         );
         if palette.query.chars.is_empty() {
             frame.render_widget(
-                Paragraph::new("Search sessions, repos, branches, PRs or commands…")
+                Paragraph::new("Search sessions, PRs, authors, reviewers or commands…")
                     .style(Style::default().fg(DIM)),
                 input,
             );
@@ -757,14 +835,39 @@ impl Shell {
                     crate::ui::crop(&crate::model::clean(&title), 0, input.width as usize),
                     style,
                 )),
-                Line::from(Span::styled(
-                    crate::ui::crop(
-                        &format!("  {}", crate::model::clean(&item.detail)),
-                        0,
-                        input.width as usize,
-                    ),
-                    detail_style,
-                )),
+                Line::from({
+                    let badge = item
+                        .badge
+                        .as_ref()
+                        .map(|m| format!("[{}] ", m.label()))
+                        .unwrap_or_default();
+                    let color = match item.badge.as_ref().map(|m| m.label()) {
+                        Some("Open") => crate::ui::GREEN,
+                        Some("Merged") => crate::ui::PURPLE,
+                        Some("Closed" | "Has conflicts") => crate::ui::RED,
+                        _ => DIM,
+                    };
+                    vec![
+                        Span::styled(
+                            badge.clone(),
+                            if selected {
+                                style.add_modifier(ratatui::style::Modifier::BOLD)
+                            } else {
+                                Style::default()
+                                    .fg(color)
+                                    .add_modifier(ratatui::style::Modifier::BOLD)
+                            },
+                        ),
+                        Span::styled(
+                            crate::ui::crop(
+                                &crate::model::clean(&item.detail),
+                                0,
+                                usize::from(input.width).saturating_sub(badge.len()),
+                            ),
+                            detail_style,
+                        ),
+                    ]
+                }),
             ];
             frame.render_widget(Paragraph::new(lines).style(style), item_rect);
             palette.hits.push((item_rect, index));
@@ -816,6 +919,7 @@ mod tests {
             created: String::new(),
             stats: None,
             stats_error: false,
+            metadata: None,
             draft: false,
         };
         crate::storage::atomic_json(
@@ -907,6 +1011,61 @@ mod tests {
         assert!(shell.palette_items().is_empty());
         Ok(())
     }
+    #[test]
+    fn people_search_ranks_open_prs_first_and_keeps_status_badges() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut shell = fixture(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        })?;
+        let palette = shell.palette.as_mut().context("palette")?;
+        let template = palette.prs.first().context("pr")?.clone();
+        for (number, author, reviewer, state, conflicts) in [
+            (1, "faltawy", "someone", "MERGED", false),
+            (2, "someone", "faltawy", "OPEN", true),
+            (3, "someone", "faltawy-helper", "OPEN", false),
+            (4, "someone", "faltawy", "CLOSED", false),
+        ] {
+            let mut pr = template.clone();
+            pr.key.number = number;
+            pr.author = author.into();
+            pr.metadata = Some(crate::model::PrMetadata {
+                state: state.into(),
+                conflicts,
+                reviewers: vec![reviewer.into()],
+                checked_at: 1,
+            });
+            palette.prs.push(pr);
+        }
+        query(&mut shell, "faltawy");
+        let items = shell.palette_items();
+        let results = items
+            .iter()
+            .filter_map(|item| match &item.action {
+                Action::Preview(pr) => Some(pr.key.number),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(results, vec![2, 3, 1, 4]);
+        assert_eq!(
+            items
+                .first()
+                .and_then(|item| item.badge.as_ref())
+                .map(|m| m.label()),
+            Some("Has conflicts")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| item.badge.as_ref().is_some_and(|m| m.label() == "Merged"))
+        );
+        shell.palette.as_mut().context("palette")?.changed =
+            Instant::now() - Duration::from_secs(1);
+        shell.tick_palette();
+        assert!(shell.palette.as_ref().context("palette")?.lookup.is_none());
+        Ok(())
+    }
+
     #[test]
     fn commands_from_both_tabs_and_session_switch_preserve_composer() -> Result<()> {
         let dir = tempfile::tempdir()?;

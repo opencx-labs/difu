@@ -979,6 +979,7 @@ Useful summary text.
             created: String::new(),
             stats: None,
             stats_error: false,
+            metadata: None,
             draft: false,
         });
         app.reviews.insert(pr.key.id(), review);

@@ -75,7 +75,7 @@ impl State {
             && self
                 .refreshed
                 .get(id)
-                .is_none_or(|t| t.elapsed() >= Duration::from_secs(30))
+                .is_none_or(|t| t.elapsed() >= Duration::from_secs(300))
     }
     fn receive(&mut self, update: Update) -> bool {
         self.pending.remove(&update.id);
@@ -291,6 +291,7 @@ mod tests {
 
     fn pr() -> SessionPr {
         SessionPr {
+            summary: None,
             key: PrKey {
                 owner: "example".into(),
                 repo: "project".into(),
@@ -345,7 +346,7 @@ mod tests {
         state.refreshed.insert(
             "one".into(),
             Instant::now()
-                .checked_sub(Duration::from_secs(31))
+                .checked_sub(Duration::from_secs(301))
                 .context("time")?,
         );
         assert!(state.due("one"));

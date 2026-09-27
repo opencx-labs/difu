@@ -125,7 +125,7 @@ elif args[0:2] == ['api', 'graphql'] and 'changedFiles' in args[-1]:
     assert 0 < len(aliases) <= 25
     with (root / 'stats-batches').open('a') as log:
         log.write(str(len(aliases)) + '\n')
-    value = dict(data={alias: dict(pullRequest=dict(additions=1, deletions=1, changedFiles=1)) for alias in aliases})
+    value = dict(data={alias: dict(pullRequest=dict(additions=1, deletions=1, changedFiles=1, state='OPEN', mergeable='MERGEABLE', reviewRequests=dict(nodes=[dict(requestedReviewer=dict(login='faltawy'))]), latestReviews=dict(nodes=[]))) for alias in aliases})
 elif args[0:2] == ['api', 'graphql']:
     with (root / 'revision-polls').open('a') as log:
         log.write('poll\n')

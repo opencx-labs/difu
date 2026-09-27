@@ -104,7 +104,7 @@ impl PrKey {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PrSummary {
     pub key: PrKey,
     pub title: String,
@@ -114,7 +114,28 @@ pub struct PrSummary {
     pub stats: Option<PrStats>,
     #[serde(skip)]
     pub stats_error: bool,
+    #[serde(default)]
+    pub metadata: Option<PrMetadata>,
     pub draft: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PrMetadata {
+    pub state: String,
+    pub conflicts: bool,
+    pub reviewers: Vec<String>,
+    pub checked_at: u64,
+}
+impl PrMetadata {
+    pub fn label(&self) -> &'static str {
+        match self.state.as_str() {
+            "OPEN" if self.conflicts => "Has conflicts",
+            "OPEN" => "Open",
+            "MERGED" => "Merged",
+            "CLOSED" => "Closed",
+            _ => "Unknown",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

@@ -54,6 +54,10 @@ for line in sys.stdin:
         if prompt.startswith('claude register worktree: '):
             pending = 'register-worktree'
             emit(dict(type='control_request', request_id=pending, request=dict(subtype='mcp_message', server_name='difu', message=dict(jsonrpc='2.0', id=2, method='tools/call', params=dict(name='difu_register_worktree', arguments=dict(path=prompt.split(': ',1)[1]))))))
+        elif prompt == 'delete this session':
+            pathlib.Path('discard.txt').write_text('dirty self-deletion fixture')
+            pending = 'delete-session'
+            emit(dict(type='control_request', request_id=pending, request=dict(subtype='mcp_message', server_name='difu', message=dict(jsonrpc='2.0', id=3, method='tools/call', params=dict(name='difu_delete_session', arguments={}))))))
         elif 'claude tool' in prompt:
             tool = f'tool-{connection}-{turn}'
             emit(dict(type='assistant', message=dict(id=f'assistant-{connection}-{turn}', content=[dict(type='tool_use', id=tool, name='Bash', input=dict(command='echo fixture'))])))
@@ -71,7 +75,7 @@ for line in sys.stdin:
             reply(initializing, dict(models=[dict(value='sonnet', displayName='Sonnet', supportedEffortLevels=['high'])]))
             initializing = None
             continue
-        if frame['response']['request_id'] == 'register-worktree':
+        if frame['response']['request_id'] in ('register-worktree', 'delete-session'):
             assert not frame['response']['response']['mcp_response']['result']['isError']
             continue
         assert frame['response']['request_id'] == pending

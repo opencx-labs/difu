@@ -829,6 +829,12 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
         }
         return doc;
     }
+    if app.view == View::Guide && review.guide.is_none() && review.generation.is_none() {
+        append(
+            &mut doc.rows,
+            text("Guide generation is manual · press g to generate.", DIM),
+        );
+    }
     let Some(snapshot) = review.snapshot.as_ref() else {
         append(
             &mut doc.rows,
@@ -1387,14 +1393,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 Action::SetView(View::Overview),
             ),
             (
-                "2 Guide",
-                app.view == View::Guide,
-                Action::SetView(View::Guide),
-            ),
-            (
-                "3 Diff",
+                "2 Diff",
                 app.view == View::Diff,
                 Action::SetView(View::Diff),
+            ),
+            (
+                "3 Guide",
+                app.view == View::Guide,
+                Action::SetView(View::Guide),
             ),
         ]
     };
@@ -2678,6 +2684,7 @@ mod tests {
             created: String::new(),
             stats: None,
             stats_error: false,
+            metadata: None,
             draft: false,
         });
         app.reviews.insert(

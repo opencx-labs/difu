@@ -79,12 +79,8 @@ pub(crate) enum Refresh {
     Open,
 }
 
-pub(crate) fn should_poll(session: &super::Summary, links: &[SessionLink]) -> bool {
+pub(crate) fn should_poll(session: &super::Summary, _links: &[SessionLink]) -> bool {
     !session.archived
-        && (links.iter().any(|link| link.pr.state == "OPEN")
-            || !links
-                .iter()
-                .any(|link| current(link, &session.workspace, session.branch.as_deref())))
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -140,11 +136,7 @@ pub(crate) fn refresh_session(
         .collect();
     merge_links(&mut saved.links, incoming);
     let at = github::polling::now();
-    let interval = if refresh == Refresh::Background {
-        300
-    } else {
-        30
-    };
+    let interval = if refresh != Refresh::Open { 300 } else { 30 };
     let same_workspace = saved.revision == session.workspace_revision;
     if same_workspace
         && at.saturating_sub(saved.attempted_at) < interval
@@ -217,20 +209,15 @@ fn update_session(
         else {
             continue;
         };
-        // A known PR already covers this workspace. Discover again when opened;
-        // otherwise only discover workspaces that do not yet have a PR.
-        if !history
-            && links
-                .iter()
-                .any(|link| current(link, &workspace.path, Some(branch)))
-        {
-            continue;
-        }
         // Historical worktrees may have been removed; their PR URLs still work.
         if !workspace.path.is_dir() {
             continue;
         }
-        let prs = github::session_prs(&workspace.path, branch, cancel)?;
+        let prs = if history {
+            github::session_prs(&workspace.path, branch, cancel)?
+        } else {
+            github::open_session_prs(&workspace.path, branch, cancel)?
+        };
         merge_links(
             links,
             prs.into_iter()
@@ -302,6 +289,21 @@ impl Refresher {
             prs.sort_by(|a, b| b.updated.cmp(&a.updated));
             let mut seen = std::collections::HashSet::new();
             prs.retain(|pr| seen.insert(pr.key.id()));
+            let mut tracked = prs
+                .iter()
+                .filter(|pr| {
+                    pr.metadata
+                        .as_ref()
+                        .is_none_or(|m| m.state == "OPEN" || m.checked_at == 0)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            github::enrich_prs(&mut tracked, cancel)?;
+            for fresh in tracked {
+                if let Some(pr) = prs.iter_mut().find(|pr| pr.key == fresh.key) {
+                    *pr = fresh;
+                }
+            }
             Ok(prs)
         })?;
         let links = Worker::spawn(interval, move |cancel| {
@@ -404,6 +406,7 @@ mod tests {
         let link = SessionLink {
             workspace: summary.workspace.clone(),
             pr: github::SessionPr {
+                summary: None,
                 key: PrKey {
                     owner: "example".into(),
                     repo: "project".into(),
@@ -443,6 +446,24 @@ mod tests {
             )?;
             assert_eq!(links.first().map(|link| link.pr.conflicts), Some(false));
         }
+        saved.attempted_at = github::polling::now().saturating_sub(60);
+        crate::storage::atomic_json(&path, &saved)?;
+        // Automatic visibility refresh must still use the shared five-minute lease.
+        assert!(
+            refresh_session(
+                &storage,
+                &summary,
+                Vec::new(),
+                Refresh::Visible,
+                &Cancel::default()
+            )
+            .is_ok()
+        );
+        let mut closed = saved.links.clone();
+        for link in &mut closed {
+            link.pr.state = "MERGED".into();
+        }
+        assert!(should_poll(&summary, &closed));
         saved.error = Some("GitHub rate limit; refresh paused".into());
         crate::storage::atomic_json(&path, &saved)?;
         assert!(
@@ -482,6 +503,7 @@ mod tests {
         let link = SessionLink {
             workspace: dir.path().into(),
             pr: github::SessionPr {
+                summary: None,
                 key: PrKey {
                     owner: "example".into(),
                     repo: "project".into(),
@@ -513,6 +535,7 @@ mod tests {
         let make = |number, state: &str, workspace: &str, updated: &str| SessionLink {
             workspace: workspace.into(),
             pr: github::SessionPr {
+                summary: None,
                 key: PrKey {
                     owner: "example".into(),
                     repo: "project".into(),
@@ -594,6 +617,7 @@ mod tests {
                 created: String::new(),
                 stats: None,
                 stats_error: false,
+                metadata: None,
                 draft: false,
             }])
         })?;

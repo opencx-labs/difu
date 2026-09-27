@@ -89,15 +89,19 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
         }
         Some("notifications/initialized" | "ping") => json!({}),
         Some("tools/list") => {
-            let tools = [super::artifacts::tool(), super::registration::tool()]
-                .into_iter()
-                .map(|mut tool| {
-                    if let Some(tool) = tool.as_object_mut() {
-                        tool.remove("type");
-                    }
-                    tool
-                })
-                .collect::<Vec<_>>();
+            let tools = [
+                super::artifacts::tool(),
+                super::registration::tool(),
+                super::management::tool(),
+            ]
+            .into_iter()
+            .map(|mut tool| {
+                if let Some(tool) = tool.as_object_mut() {
+                    tool.remove("type");
+                }
+                tool
+            })
+            .collect::<Vec<_>>();
             json!({"tools":tools})
         }
         Some("tools/call") => {
@@ -110,6 +114,18 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
             let result = match name {
                 super::artifacts::TOOL => super::artifacts::register(&mut session, args)
                     .map(|()| "Artifact registered in difu"),
+                super::management::TOOL => (|| {
+                    super::management::validate(&session, args)?;
+                    session.deletion_requests.push(Pending {
+                        id: message.get("id").cloned().unwrap_or(Value::Null),
+                        method: "delete_session".into(),
+                        params: args.clone(),
+                        responded: true,
+                    });
+                    Ok(
+                        "Session deletion accepted. Stop here; difu will close and remove this session.",
+                    )
+                })(),
                 super::registration::TOOL => (|| {
                     ensure!(
                         session.registration_requests.is_empty(),
@@ -132,6 +148,7 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                 store.update(id, |s| {
                     s.artifacts = session.artifacts;
                     s.registration_requests = session.registration_requests;
+                    s.deletion_requests = session.deletion_requests;
                 })?;
                 store.save(id)?;
             }
@@ -503,10 +520,11 @@ fn command(
 
 fn connect(store: &Store, id: &str, session: &Session, cancel: &Cancel) -> Result<Connection> {
     let instructions = format!(
-        "{}\n\n{}\n\n{}",
+        "{}\n\n{}\n\n{}\n\n{}",
         super::WORKTREE_INSTRUCTIONS,
         super::artifacts::INSTRUCTIONS,
-        super::registration::INSTRUCTIONS
+        super::registration::INSTRUCTIONS,
+        super::management::INSTRUCTIONS
     );
     let mut rpc = Connection::open(Options {
         cwd: session.workspace.as_deref().context("Missing workspace")?,
@@ -698,6 +716,11 @@ pub(super) fn run(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if !store.get(id)?.deletion_requests.is_empty() {
+            store.update(id, |s| s.deletion_requests.clear())?;
+            super::management::schedule(store, id)?;
+            return Ok(());
         }
         if !store.get(id)?.registration_requests.is_empty() {
             transition(store, id, &mut rpc, &mut decoder, &controls, cancel)?;

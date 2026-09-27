@@ -102,10 +102,11 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
     let root = tmp.path();
     let repo = root.join("repo");
     fs::create_dir(&repo)?;
-    git(&repo, &["init"])?;
+    git(&repo, &["init", "-b", "main"])?;
     fs::write(repo.join("tracked.txt"), "original\n")?;
     git(&repo, &["add", "."])?;
     git(&repo, &["commit", "-m", "base"])?;
+    git(&repo, &["remote", "add", "origin", "."])?;
     let base = git(&repo, &["rev-parse", "HEAD"])?;
     git(&repo, &["update-ref", "refs/remotes/origin/main", &base])?;
     git(
@@ -846,8 +847,7 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
     assert!(!second_tree.exists());
     assert_eq!(git(&repo, &["rev-parse", &branch])?, committed);
 
-    // Deletion stops an active agent, removes only its clean managed worktree,
-    // and never destroys modified files when cleanup refuses.
+    // Explicit deletion stops the agent and discards dirty managed worktrees.
     let clean = launch(&storage, &repo, "wait for deletion")?;
     let current = wait(&storage, &clean, |s| s.status == Status::Running)?;
     let tree = current.workspace.context("Missing deletion worktree")?;
@@ -874,13 +874,6 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
     let current = wait(&storage, &dirty, |s| s.status == Status::Running)?;
     let tree = current.workspace.context("Missing protected worktree")?;
     fs::write(tree.join("precious.txt"), "preserve me")?;
-    assert!(client::request(&storage, Request::Delete { id: dirty.clone() }).is_err());
-    assert_eq!(
-        fs::read_to_string(tree.join("precious.txt"))?,
-        "preserve me"
-    );
-    assert_eq!(session(&storage, &dirty)?.status, Status::Interrupted);
-    fs::remove_file(tree.join("precious.txt"))?;
     git(&repo, &["worktree", "lock", tree.to_str().context("path")?])?;
     assert!(client::request(&storage, Request::Delete { id: dirty.clone() }).is_err());
     assert!(tree.exists());
@@ -888,7 +881,16 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
         &repo,
         &["worktree", "unlock", tree.to_str().context("path")?],
     )?;
-    client::request(&storage, Request::Delete { id: dirty })?;
+    fs::write(tree.join("tracked.txt"), "discard tracked edits")?;
+    fs::write(tree.join(".gitignore"), "ignored.txt\n")?;
+    fs::write(tree.join("ignored.txt"), "discard ignored files")?;
+    client::request(&storage, Request::Delete { id: dirty.clone() })?;
+    assert!(!tree.exists());
+    assert!(session(&storage, &dirty).is_err());
+    assert_eq!(
+        fs::read_to_string(repo.join("tracked.txt"))?,
+        "precious local edit\n"
+    );
     let artifact = launch(&storage, &repo, "artifact report")?;
     // Connecting briefly reports Idle before the initial turn starts. Only a
     // completed turn proves the artifact tool has had an opportunity to run.
@@ -945,10 +947,11 @@ fn new_sessions_accept_input_while_worktrees_are_preparing() -> Result<()> {
         let root = tmp.path();
         let repo = root.join("repo");
         fs::create_dir(&repo)?;
-        git(&repo, &["init"])?;
+        git(&repo, &["init", "-b", "main"])?;
         fs::write(repo.join("tracked.txt"), "committed\n")?;
         git(&repo, &["add", "."])?;
         git(&repo, &["commit", "-m", "base"])?;
+        git(&repo, &["remote", "add", "origin", "."])?;
         git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])?;
         git(
             &repo,
@@ -1168,10 +1171,11 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     let root = tmp.path();
     let repo = root.join("repo");
     fs::create_dir(&repo)?;
-    git(&repo, &["init"])?;
+    git(&repo, &["init", "-b", "main"])?;
     fs::write(repo.join("tracked.txt"), "original\n")?;
     git(&repo, &["add", "."])?;
     git(&repo, &["commit", "-m", "base"])?;
+    git(&repo, &["remote", "add", "origin", "."])?;
     git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])?;
     git(
         &repo,
@@ -1550,6 +1554,41 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     assert!(second.workspace_ready && second.thread_id.is_none());
     assert_ne!(second.workspace, Some(repo.canonicalize()?));
     assert_eq!(second.provider, difu::agents::provider::Provider::Claude);
+    for model in ["fixture-model", "claude/sonnet"] {
+        let Reply::Launched(deleting) = client::request(
+            &storage,
+            Request::Launch {
+                job: Box::new(Job::Coding(Launch {
+                    repository: repo.clone(),
+                    base: "HEAD".into(),
+                    isolated: true,
+                    prompt: "delete this session".into(),
+                    model: Some(model.into()),
+                    effort: None,
+                })),
+            },
+        )?
+        else {
+            anyhow::bail!("Missing deletion session");
+        };
+        let started = Instant::now();
+        loop {
+            let Reply::Sessions(sessions) = client::request(&storage, Request::List)? else {
+                anyhow::bail!("Missing sessions");
+            };
+            if !sessions.iter().any(|s| s.id == deleting) {
+                break;
+            }
+            ensure!(
+                started.elapsed() < Duration::from_secs(10),
+                "Self deletion did not finish for {model}"
+            );
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let home = difu::agents::server::home(&storage)?;
+        assert!(!home.join(format!("{deleting}.json")).exists());
+        assert!(!home.join("worktrees").join(&deleting).exists());
+    }
     daemon.stop()?;
     Ok(())
 }
@@ -1563,10 +1602,11 @@ fn guidance_wait_survives_frontend_reconnect_and_service_restart_without_permiss
     let root = tmp.path();
     let repo = root.join("repo");
     fs::create_dir(&repo)?;
-    git(&repo, &["init"])?;
+    git(&repo, &["init", "-b", "main"])?;
     fs::write(repo.join("tracked.txt"), "original\n")?;
     git(&repo, &["add", "."])?;
     git(&repo, &["commit", "-m", "base"])?;
+    git(&repo, &["remote", "add", "origin", "."])?;
     fs::write(repo.join("AGENTS.md"), "Untracked repository guidance\n")?;
     let bin = root.join("bin");
     fs::create_dir(&bin)?;

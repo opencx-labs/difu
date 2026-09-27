@@ -136,6 +136,7 @@ fn modal_uses_pinned_revisions_and_restores_review_in_all_diff_layouts() -> Resu
         updated: String::new(),
         stats: None,
         stats_error: false,
+        metadata: None,
         draft: false,
     });
     // No PR details: this fixture cannot trigger any GitHub requests while ticking.
