@@ -1097,6 +1097,7 @@ impl App {
         let pr = match output {
             Ok(pr) => pr,
             Err(error) => {
+                review.generation_requested = false;
                 self.notice = Notice::error(format!("Could not refresh PR: {error}"));
                 return;
             }
@@ -1563,6 +1564,7 @@ impl App {
                             if candidate.as_ref().is_none_or(|detail| {
                                 detail.head != snapshot.head || detail.base != snapshot.base
                             }) {
+                                r.generation_requested = false;
                                 r.guide_error = Some("PR details changed during preparation. Refresh and retry to load a matching snapshot.".into());
                                 return;
                             }
@@ -2290,6 +2292,11 @@ impl App {
     }
     fn modal_key(&mut self, key: KeyEvent) {
         if key.code == KeyCode::Esc {
+            if let Some(Modal::Clone { key: id, .. }) = &self.modal
+                && let Some(review) = self.reviews.get_mut(id)
+            {
+                review.generation_requested = false;
+            }
             self.modal = None;
             return;
         }

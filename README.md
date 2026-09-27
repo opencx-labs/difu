@@ -458,8 +458,8 @@ short-lived request cache. GitHub writes are never cached or automatically retri
 
 Select a PR to preview its description, chronological activity, inline review
 comments, and checks. **Enter** drills into that PR and selects **Overview** (the
-preview), while its guide is prepared or retrieved in the background. Inside the
-PR, the tabs are **Overview / Guide / Diff**; **[ / ]** switches to the previous/next tab.
+preview), while its diff is prepared and any matching cached guide is retrieved.
+Guide generation requires **g**. Inside the PR, the tabs are **Overview / Diff / Guide**; **[ / ]** switches to the previous/next tab.
 **Esc** returns home. Guide starts with code focused; Diff starts with files focused. The
 border highlights the focused pane, the footer names it, and **Tab** switches focus. You can also launch directly:
 

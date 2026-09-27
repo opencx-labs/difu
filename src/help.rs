@@ -44,7 +44,7 @@ pub fn entries(query: &str) -> Vec<(&'static str, &'static str)> {
             "Decrease / increase focused hunk context by one line per side",
         ),
         ("1 / 2", "Home: My PRs / Repositories"),
-        ("1 / 2 / 3", "Inside PR: Overview / Guide / Diff"),
+        ("1 / 2 / 3", "Inside PR: Overview / Diff / Guide"),
         ("[ / ]", "Inside PR: previous / next view"),
         (
             "[ / ] / s",
