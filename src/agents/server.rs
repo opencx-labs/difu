@@ -51,6 +51,66 @@ impl Store {
             .map_err(|_| anyhow::anyhow!("Persistence lock failed"))?;
         storage::atomic_json(&self.home.join(format!("{id}.json")), &self.get(id)?)
     }
+    fn queue_preparing(&self, id: &str, control: &Control) -> Result<bool> {
+        if !matches!(
+            control,
+            Control::Message { .. }
+                | Control::MessageWithAttachments { .. }
+                | Control::ReplaceQueued { .. }
+        ) {
+            return Ok(false);
+        }
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session lock failed"))?;
+        let session = sessions.get_mut(id).context("Session not found")?;
+        if !session.preparing() {
+            return Ok(false);
+        }
+        // Recheck and append atomically with setup completing or failing.
+        match control {
+            Control::Message {
+                text,
+                skills,
+                attachments,
+                ..
+            }
+            | Control::MessageWithAttachments {
+                text,
+                skills,
+                attachments,
+                ..
+            } => {
+                ensure!(!text.trim().is_empty(), "Message cannot be empty");
+                session.queue.push(Prompt::WithSkills {
+                    text: text.clone(),
+                    skills: skills.clone(),
+                    attachments: attachments.clone(),
+                });
+            }
+            Control::ReplaceQueued {
+                index,
+                expected,
+                replacement,
+            } => {
+                ensure!(
+                    session.queue.get(*index) == Some(expected),
+                    "That queued message changed or was already sent; refresh the queue. Your draft is retained."
+                );
+                if let Some(prompt) = replacement {
+                    if let Some(item) = session.queue.get_mut(*index) {
+                        *item = prompt.clone();
+                    }
+                } else {
+                    session.queue.remove(*index);
+                }
+            }
+            _ => return Ok(false),
+        }
+        session.touch();
+        Ok(true)
+    }
     pub(super) fn list(&self) -> Result<Vec<Summary>> {
         let mut list: Vec<_> = self
             .sessions
@@ -119,17 +179,27 @@ impl Service {
         let handle = thread::Builder::new()
             .name(format!("difu-agent-{id}"))
             .spawn(move || {
-                let output = match session.job {
-                    Job::Coding(_) => match session.provider {
-                        provider::Provider::Codex => {
-                            super::engine::run(&store, &id_owned, receiver, &token, initial)
-                        }
-                        provider::Provider::Claude => {
-                            super::claude::run(&store, &id_owned, receiver, &token, initial)
-                        }
-                    },
-                    _ => run_review(&store, &id_owned, &token),
-                };
+                let output = (|| -> Result<()> {
+                    let initial = if initial.is_none()
+                        && session.thread_id.is_none()
+                        && matches!(&session.job, Job::Coding(launch) if launch.prompt.is_empty())
+                    {
+                        super::startup::prepare(&store, &id_owned, &receiver, &token)?
+                    } else {
+                        initial
+                    };
+                    match session.job {
+                        Job::Coding(_) => match store.get(&id_owned)?.provider {
+                            provider::Provider::Codex => {
+                                super::engine::run(&store, &id_owned, receiver, &token, initial)
+                            }
+                            provider::Provider::Claude => {
+                                super::claude::run(&store, &id_owned, receiver, &token, initial)
+                            }
+                        },
+                        _ => run_review(&store, &id_owned, &token),
+                    }
+                })();
                 if let Err(error) = output {
                     let message = format!("{error:#}");
                     let _ = store.update(&id_owned, |s| {
@@ -193,19 +263,6 @@ impl Service {
         let mut session = Session::new(id.clone(), job);
         if empty {
             session.title = "New session".into();
-            session.status = Status::Idle;
-            if let Err(error) = super::workspace::prepare(
-                &mut session,
-                &self.store.home,
-                &Cancel::default(),
-                |prepared| {
-                    storage::atomic_json(&self.store.home.join(format!("{id}.json")), prepared)
-                },
-            ) {
-                session.status = Status::Failed;
-                session.error = Some(format!("{error:#}"));
-                session.note("error", format!("Cannot prepare worktree: {error:#}"));
-            }
         }
         storage::atomic_json(&self.store.home.join(format!("{id}.json")), &session)?;
         self.store
@@ -213,9 +270,7 @@ impl Service {
             .lock()
             .map_err(|_| anyhow::anyhow!("Session lock failed"))?
             .insert(id.clone(), session);
-        if !empty {
-            self.start(&id, None)?;
-        }
+        self.start(&id, None)?;
         Ok(id)
     }
     fn handle(&self, request: Request) -> Result<Reply> {
@@ -322,6 +377,11 @@ impl Service {
                     !session.archived || matches!(control, Control::Interrupt),
                     "Unarchive this session before continuing"
                 );
+                if self.store.queue_preparing(&id, &control)? {
+                    self.store.save(&id)?;
+                    return Ok(Reply::Ok);
+                }
+                let session = self.store.get(&id)?;
                 if !matches!(session.job, Job::Coding(_)) {
                     ensure!(
                         matches!(control, Control::Interrupt),

@@ -3,7 +3,7 @@ import json, os, sys
 from pathlib import Path
 root = Path(os.environ['DIFU_TEST_FIXTURE'])
 revs = json.loads((root / 'revisions.json').read_text())
-args = sys.argv[1:]
+args = [arg for arg in sys.argv[1:] if arg != "--include"]
 url = 'https://github.com/example/project/pull/1'
 if args[:2] == ['pr', 'list']:
     assert args[args.index('--head')+1] == 'session-branch'

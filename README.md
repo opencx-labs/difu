@@ -88,8 +88,9 @@ repository, branch, worktree, or PR number, and launch commands from both the
 Agents and Reviews `/` menus. PR results offer a preview alongside connected
 sessions. A bare number (or `#1524`) searches the local cache only;
 `opencx#1524` or `owner/opencx#1524` also looks up GitHub when absent locally.
-The background service refreshes authored and review-requested PRs every 30
-seconds, even with no terminal open. Failed refreshes retain cached results.
+The background service refreshes open authored and review-requested PRs every five
+minutes, even with no terminal open, and retains cached history. Failed refreshes
+retain cached results.
 
 Pin or unpin a session in its actions menu, or select it in Cmd+K and press
 **Cmd+P**. Pins persist across restarts and appear first in the session list,
@@ -151,8 +152,14 @@ and ignored files prevent deletion and retain the chat. Existing directories,
 Git branches and commits, and Codex’s own history are retained. Archive remains
 a separate action that keeps the chat and worktree.
 
-Press **n** (or `/new`) to open an empty session and create its isolated Git
-worktree. Repository, model, and reasoning defaults live in **/actions → Default
+Press **n** (or `/new`) to open an empty session immediately while its isolated Git
+worktree is created in the background. The composer stays enabled and shows the
+preparation state. Messages sent during setup are saved in the queue and sent in
+order once the worktree and provider are ready, after any required guidance
+approval. Failed or interrupted setup retains queued messages as unsent;
+restarting difu never automatically replays them.
+
+Repository, model, and reasoning defaults live in **/actions → Default
 repository, model, reasoning and worktree**. Without a saved repository, difu
 uses the current Git repository; outside one, it asks you to choose and remembers
 that choice. No model turn runs until your first message. Both Codex and Claude
@@ -209,9 +216,13 @@ explicit base or set `origin/HEAD`. The original checkout cannot be registered.
 Difu discovers multiple PRs per coding session and remembers them across restarts
 and worktree changes. Open PRs on the current worktree appear first, then other
 open session PRs, then merged/closed PRs. Within those groups, current-worktree
-relevance and the most recent update determine order. The background service and
-visible-session UI refresh every 30 seconds; network failures retain cached
-history. Badges show **Open**, **Draft**, **Merged**, **Closed**, or **Has conflicts**.
+relevance and the most recent update determine order. Visible open PRs refresh every
+30 seconds; other open session PRs refresh every five minutes. The service and UI
+share cached results and deduplicate concurrent requests. Archived sessions and
+closed/merged history refresh when opened or explicitly refreshed with **r**;
+they are not polled in the background. Network failures retain cached history and
+add **stale** to session PR badges. Badges show **Open**, **Draft**, **Merged**,
+**Closed**, or **Has conflicts**.
 The sidebar shows status below the diff counts, followed by the PR history.
 
 Select a bottom PR badge to open the existing PR viewer in the helper canvas,
@@ -412,9 +423,17 @@ The Reviews home screen keeps its two nested tabs:
 Each PR row shows its opened date, changed-file count, additions in green, and
 removals in red. Counts load in background batches; the list remains usable.
 PR lists are cached separately for each scope and state. Cached lists appear
-immediately and refresh in the background when opened and every 30 seconds while
-visible. Repository names are also cached, refreshing when you enter Repositories
-or press **r**. Failed refreshes keep cached data available.
+immediately and refresh when opened. While visible, open PRs refresh every 30
+seconds; closed/merged entries are refreshed only when opened or manually refreshed.
+Unchanged PRs reuse their cached file statistics. Repository names are also cached,
+refreshing when you enter Repositories or press **r**. Failed refreshes keep cached
+data available.
+
+GitHub requests are serialized across the service and terminal windows. Rate limits
+pause requests across difu until GitHub's retry/reset deadline; when no deadline is
+available, difu waits at least a minute and increases the delay on repeated limits.
+Other failed reads also back off. Manual refresh respects the shared cooldown and
+short-lived request cache. GitHub writes are never cached or automatically retried.
 
 Select a PR to preview its description, chronological activity, inline review
 comments, and checks. **Enter** drills into that PR and selects **Overview** (the
@@ -476,7 +495,7 @@ all its children. Guide chapter links are unchanged.
 
 - **Overview:** a centered column (up to 110 terminal columns) with bordered cards
   for the description, chronological comments/reviews/commits, and checks.
-  Check states and durations refresh every ten seconds for the selected PR.
+  Check states and durations refresh every 30 seconds for the selected open PR.
   Click a check to open its GitHub logs.
 - **Guide:** chapters connect explanations to changes across files. While
   generation runs, the file navigator and diff stay usable. Completed guides
@@ -604,7 +623,7 @@ Overview shows GitHub's live mergeability separately from the pinned review
 snapshot, including conflicts and required checks that have not reported yet.
 The preview's Open / Merged / Closed badge updates with live status even while the
 diff and guide stay pinned. An empty check rollup is a valid state. If GitHub is still calculating mergeability,
-difu says so. Check runs and merge status refresh every ten seconds.
+difu says so. Check runs and merge status refresh every 30 seconds.
 
 A **Failed tests** section appears beneath Checks when checks fail. Difu reads
 GitHub Actions job logs in the background and displays identifiable test names

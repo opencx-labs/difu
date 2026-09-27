@@ -1,10 +1,9 @@
-use crate::{
-    model::*,
-    process::{self, Cancel},
-};
+use crate::{model::*, process::Cancel};
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::process::Command;
+
+pub(crate) mod polling;
 
 pub(crate) fn command() -> Command {
     let mut cmd = Command::new("gh");
@@ -15,12 +14,28 @@ pub(crate) fn command() -> Command {
 }
 
 pub(crate) fn json(args: &[&str], cancel: &Cancel) -> Result<Value> {
-    let output = process::run(command().args(args), None, cancel)?;
+    read_json(args, cancel, 0)
+}
+
+fn cached_json(args: &[&str], cancel: &Cancel) -> Result<Value> {
+    read_json(args, cancel, 30)
+}
+
+fn read_json(args: &[&str], cancel: &Cancel, ttl: u64) -> Result<Value> {
+    let output = polling::run(command().args(args), None, cancel, ttl, false, None)?;
     if output.code != 0 {
         bail!("GitHub: {}", String::from_utf8_lossy(&output.stderr).trim());
     }
     serde_json::from_slice(&output.stdout).context("GitHub returned invalid JSON")
 }
+pub(crate) fn write(
+    command: &mut Command,
+    input: Option<Vec<u8>>,
+    cancel: &Cancel,
+) -> Result<crate::process::Output> {
+    polling::run(command, input, cancel, 0, true, None)
+}
+
 fn text(v: &Value, key: &str) -> String {
     v.get(key)
         .unwrap_or(&Value::Null)
@@ -89,7 +104,7 @@ fn search_prs(scope: &str, state: PrState, cancel: &Cancel) -> Result<Vec<PrSumm
         PrState::Closed => args.extend(["--state=closed", "--merged=false"]),
         PrState::All => {}
     }
-    let value = json(&args, cancel)?;
+    let value = cached_json(&args, cancel)?;
     value
         .as_array()
         .context("Invalid inbox response")?
@@ -140,7 +155,7 @@ pub fn stats(keys: &[PrKey], cancel: &Cancel) -> Result<Vec<Option<PrStats>>> {
         ));
     }
     query.push('}');
-    let value = json(&["api", "graphql", "-f", &format!("query={query}")], cancel)?;
+    let value = cached_json(&["api", "graphql", "-f", &format!("query={query}")], cancel)?;
     Ok(keys
         .iter()
         .enumerate()
@@ -233,7 +248,7 @@ pub fn session_pr(
         }
     }
     cmd.arg("--json=url,state,isDraft,mergeable,headRefName,headRefOid,updatedAt");
-    let output = process::run(&mut cmd, None, cancel)?;
+    let output = polling::run(&mut cmd, None, cancel, 30, false, None)?;
     anyhow::ensure!(
         output.code == 0,
         "GitHub: {}",
@@ -273,7 +288,7 @@ pub fn session_prs(
         !branch.is_empty() && branch != "HEAD" && !branch.starts_with('-'),
         "No named workspace branch"
     );
-    let output = process::run(
+    let output = polling::run(
         command().current_dir(workspace).args([
             "pr",
             "list",
@@ -287,6 +302,9 @@ pub fn session_prs(
         ]),
         None,
         cancel,
+        30,
+        false,
+        None,
     )?;
     anyhow::ensure!(
         output.code == 0,
@@ -320,7 +338,7 @@ pub fn updated_revision(pr: &PrDetail, cancel: &Cancel) -> Result<Option<PrDetai
         serde_json::to_string(&pr.key.repo)?,
         pr.key.number,
     );
-    let value = json(&["api", "graphql", "-f", &format!("query={query}")], cancel)?;
+    let value = cached_json(&["api", "graphql", "-f", &format!("query={query}")], cancel)?;
     let revision = value
         .pointer("/data/repository/pullRequest")
         .context("Missing PR revision response")?;
@@ -702,7 +720,7 @@ pub fn checks(key: &PrKey, cancel: &Cancel) -> Result<CheckReport> {
         if let Some(cursor) = &cursor {
             args.extend(["-f".into(), format!("cursor={cursor}")]);
         }
-        let value = json(&args.iter().map(String::as_str).collect::<Vec<_>>(), cancel)?;
+        let value = cached_json(&args.iter().map(String::as_str).collect::<Vec<_>>(), cancel)?;
         ensure_no_graphql_errors(&value)?;
         let pr = value
             .pointer("/data/repository/pullRequest")
@@ -772,7 +790,7 @@ pub fn checks(key: &PrKey, cancel: &Cancel) -> Result<CheckReport> {
                 "branches",
                 &base_branch,
             ]);
-        match json(
+        match cached_json(
             &[
                 "api",
                 "--paginate",

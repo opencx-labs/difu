@@ -605,6 +605,37 @@ fn transition(
     )
 }
 
+fn send_queued(
+    store: &Store,
+    id: &str,
+    rpc: &mut Connection,
+    decoder: &mut events::Decoder,
+) -> Result<()> {
+    let session = store.get(id)?;
+    if session.status != Status::Idle || session.queue.is_empty() {
+        return Ok(());
+    }
+    let mut next = None;
+    store.update(id, |s| {
+        if !s.queue.is_empty() {
+            next = Some(s.queue.remove(0));
+        }
+    })?;
+    if let Some(prompt) = next {
+        let before = store.get(id)?.entries.len();
+        if let Err(error) = send(store, id, rpc, decoder, &prompt) {
+            store.update(id, |s| {
+                if s.entries.len() == before {
+                    s.unsent(prompt);
+                }
+            })?;
+            store.save(id)?;
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn run(
     store: &Arc<Store>,
     id: &str,
@@ -641,6 +672,8 @@ pub(super) fn run(
             &Prompt::from(launch.prompt.clone()),
         )?;
     }
+    // Send accepted setup input before processing newer controls.
+    send_queued(store, id, &mut rpc, &mut decoder)?;
     let mut last_save = Instant::now();
     let mut dirty = false;
     loop {
@@ -669,27 +702,7 @@ pub(super) fn run(
         if !store.get(id)?.registration_requests.is_empty() {
             transition(store, id, &mut rpc, &mut decoder, &controls, cancel)?;
         }
-        let session = store.get(id)?;
-        if session.status == Status::Idle && !session.queue.is_empty() {
-            let mut next = None;
-            store.update(id, |s| {
-                if !s.queue.is_empty() {
-                    next = Some(s.queue.remove(0));
-                }
-            })?;
-            if let Some(prompt) = next {
-                let before = store.get(id)?.entries.len();
-                if let Err(error) = send(store, id, &mut rpc, &mut decoder, &prompt) {
-                    store.update(id, |s| {
-                        if s.entries.len() == before {
-                            s.unsent(prompt);
-                        }
-                    })?;
-                    store.save(id)?;
-                    return Err(error);
-                }
-            }
-        }
+        send_queued(store, id, &mut rpc, &mut decoder)?;
     }
     store.save(id)
 }

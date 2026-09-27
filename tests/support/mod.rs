@@ -18,6 +18,9 @@ impl Service {
             .arg(&storage.config)
             .arg("--agent-cache")
             .arg(&storage.cache)
+            .env("HOME", storage.cache.join("home"))
+            .env("XDG_CONFIG_HOME", storage.cache.join("home/config"))
+            .env("XDG_CACHE_HOME", storage.cache.join("home/cache"))
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit());

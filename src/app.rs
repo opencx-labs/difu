@@ -13,7 +13,7 @@ use crate::{
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc,
@@ -453,6 +453,9 @@ impl App {
         }
     }
     pub fn load_inbox(&mut self) {
+        self.load_inbox_with(false);
+    }
+    fn load_inbox_with(&mut self, periodic: bool) {
         if self.inbox_tab == InboxTab::Diffs {
             return;
         }
@@ -488,11 +491,21 @@ impl App {
         let cached: HashMap<_, _> = self
             .inbox
             .iter()
-            .map(|pr| (pr.key.id(), pr.stats.clone()))
+            .map(|pr| (pr.key.id(), (pr.updated.clone(), pr.stats.clone())))
             .collect();
         let storage = self.storage.clone();
+        let historical = if periodic && state == PrState::All {
+            self.inbox.clone()
+        } else {
+            Vec::new()
+        };
+        let query_state = if periodic && state == PrState::All {
+            PrState::Open
+        } else {
+            state
+        };
         self.inbox_cancel = Some(self.spawn(move |tx, cancel| {
-            let mut inbox = match github::inbox(tab, state, &repositories, &cancel) {
+            let mut inbox = match github::inbox(tab, query_state, &repositories, &cancel) {
                 Ok(inbox) => inbox,
                 Err(error) => {
                     let _ = tx.send(Message::Inbox(id, Err(format!("{error:#}"))));
@@ -502,8 +515,22 @@ impl App {
             if cancel.cancelled() {
                 return;
             }
+            let fetched: HashSet<_> = inbox.iter().map(|pr| pr.key.id()).collect();
+            for pr in historical {
+                if !inbox.iter().any(|current| current.key == pr.key) {
+                    inbox.push(pr);
+                }
+            }
+            inbox.sort_by(|a, b| {
+                b.updated
+                    .cmp(&a.updated)
+                    .then_with(|| a.key.id().cmp(&b.key.id()))
+            });
             for pr in &mut inbox {
-                pr.stats = cached.get(&pr.key.id()).cloned().flatten();
+                pr.stats = cached
+                    .get(&pr.key.id())
+                    .filter(|(updated, _)| *updated == pr.updated)
+                    .and_then(|(_, stats)| stats.clone());
             }
             let _ = tx.send(Message::Inbox(id, Ok(inbox.clone())));
             if let Err(error) = storage.save_inbox(&cache_key, &inbox) {
@@ -511,22 +538,41 @@ impl App {
                     "Could not cache PR list: {error:#}"
                 )));
             }
-            for batch in inbox.chunks_mut(25) {
+            let missing: Vec<_> = inbox
+                .iter()
+                .enumerate()
+                .filter(|(_, pr)| pr.stats.is_none() && fetched.contains(&pr.key.id()))
+                .map(|(index, _)| index)
+                .collect();
+            for batch in missing.chunks(25) {
                 if cancel.cancelled() {
                     return;
                 }
-                let keys: Vec<_> = batch.iter().map(|pr| pr.key.clone()).collect();
-                let stats = github::stats(&keys, &cancel).unwrap_or_default();
+                let keys: Vec<_> = batch
+                    .iter()
+                    .filter_map(|index| inbox.get(*index))
+                    .map(|pr| pr.key.clone())
+                    .collect();
+                let stats = match github::stats(&keys, &cancel) {
+                    Ok(stats) => stats,
+                    Err(error) => {
+                        let _ = tx.send(Message::Notice(format!(
+                            "PR counts may be stale: {error:#}"
+                        )));
+                        break;
+                    }
+                };
                 if cancel.cancelled() {
                     return;
                 }
                 let mut updates = Vec::new();
-                for (index, pr) in batch.iter_mut().enumerate() {
-                    let value = stats.get(index).cloned().flatten();
+                for (offset, index) in batch.iter().enumerate() {
+                    let Some(pr) = inbox.get_mut(*index) else {
+                        continue;
+                    };
+                    let value = stats.get(offset).cloned().flatten();
                     pr.stats_error = value.is_none();
-                    if value.is_some() {
-                        pr.stats = value.clone();
-                    }
+                    pr.stats = value.clone();
                     updates.push((pr.key.id(), value));
                 }
                 let _ = tx.send(Message::InboxStats(id, updates));
@@ -1169,13 +1215,14 @@ impl App {
             return;
         }
         if self.home
+            && matches!(self.state(), PrState::Open | PrState::All)
             && !self.repository_directory()
             && !self.inbox_loading
             && self
                 .inbox_refreshed
                 .is_some_and(|t| t.elapsed() >= Duration::from_secs(30))
         {
-            self.load_inbox();
+            self.load_inbox_with(true);
         }
         self.load_visible_bounds();
         if self.inbox_tab == InboxTab::Diffs {
@@ -1190,10 +1237,13 @@ impl App {
         };
         if review.loading
             || review.polling
-            || review.detail.is_none()
+            || review
+                .detail
+                .as_ref()
+                .is_none_or(|pr| !pr.state.eq_ignore_ascii_case("open"))
             || review
                 .poll_at
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(10))
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(30))
         {
             return;
         }
@@ -1227,6 +1277,9 @@ impl App {
         let Some(pr) = review.newer.as_ref().or(review.detail.as_deref()).cloned() else {
             return;
         };
+        if !pr.state.eq_ignore_ascii_case("open") {
+            return;
+        }
         review.revision_polling = true;
         review.revision_poll_at = Some(Instant::now());
         let snapshot_id = review.snapshot_id;

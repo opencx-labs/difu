@@ -1,10 +1,6 @@
 //! Personal PR metadata stays fresh even when no terminal UI is connected.
 use crate::{github, model::PrState, process::Cancel, storage::Storage};
-use std::{
-    sync::mpsc,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{sync::mpsc, thread, time::Duration};
 
 pub(crate) const PERSONAL: &str = "palette-personal";
 pub(crate) const LOOKUPS: &str = "palette-lookups";
@@ -76,19 +72,136 @@ pub(crate) fn sort_links(
     });
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Refresh {
+    Background,
+    Visible,
+    Open,
+}
+
+pub(crate) fn should_poll(session: &super::Summary, links: &[SessionLink]) -> bool {
+    !session.archived
+        && (links.iter().any(|link| link.pr.state == "OPEN")
+            || !links
+                .iter()
+                .any(|link| current(link, &session.workspace, session.branch.as_deref())))
+}
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct Snapshot {
+    pub links: Vec<SessionLink>,
+    pub checked_at: u64,
+    attempted_at: u64,
+    revision: u64,
+    history_at: u64,
+    pub error: Option<String>,
+}
+fn snapshot_path(storage: &Storage, id: &str) -> std::path::PathBuf {
+    storage
+        .cache
+        .join("session-pr-refresh")
+        .join(format!("{}.json", crate::storage::hash(id)))
+}
+pub(crate) fn snapshot(storage: &Storage, id: &str) -> Snapshot {
+    std::fs::read(snapshot_path(storage, id))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// The UI and service share both the result and the refresh lease. A failed
+/// attempt preserves known links and is explicitly marked stale for every UI.
 pub(crate) fn refresh_session(
+    storage: &Storage,
     session: &super::Summary,
-    mut links: Vec<SessionLink>,
+    links: Vec<SessionLink>,
+    refresh: Refresh,
     cancel: &Cancel,
 ) -> anyhow::Result<Vec<SessionLink>> {
-    // Refresh historical PRs by URL even if their worktree has been deleted.
-    for link in &mut links {
-        cancel.check()?;
-        if let Ok(pr) = github::session_pr(&link.workspace, None, Some(&link.pr.key), cancel) {
-            link.pr = pr;
+    if session.status == super::Status::Starting && !session.worktree {
+        return Ok(links);
+    }
+    let path = snapshot_path(storage, &session.id);
+    std::fs::create_dir_all(
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("Missing PR cache directory"))?,
+    )?;
+    let _lease = github::polling::lock(&path.with_extension("lock"), cancel)?;
+    let mut saved = snapshot(storage, &session.id);
+    let incoming = links
+        .into_iter()
+        .filter(|link| {
+            saved
+                .links
+                .iter()
+                .find(|old| old.pr.key == link.pr.key)
+                .is_none_or(|old| link.pr.updated > old.pr.updated)
+        })
+        .collect();
+    merge_links(&mut saved.links, incoming);
+    let at = github::polling::now();
+    let interval = if refresh == Refresh::Background {
+        300
+    } else {
+        30
+    };
+    let same_workspace = saved.revision == session.workspace_revision;
+    if same_workspace
+        && at.saturating_sub(saved.attempted_at) < interval
+        && (refresh != Refresh::Open || at.saturating_sub(saved.history_at) < 30)
+    {
+        if let Some(error) = &saved.error {
+            anyhow::bail!("{error}");
+        }
+        return Ok(saved.links);
+    }
+    if refresh != Refresh::Open && !should_poll(session, &saved.links) {
+        if let Some(error) = &saved.error {
+            anyhow::bail!("{error}");
+        }
+        return Ok(saved.links);
+    }
+    let history = refresh == Refresh::Open;
+    let result = update_session(session, &mut saved.links, history, cancel);
+    cancel.check()?;
+    saved.attempted_at = github::polling::now();
+    saved.revision = session.workspace_revision;
+    if result.is_ok() {
+        saved.checked_at = saved.attempted_at;
+        if history {
+            saved.history_at = saved.checked_at;
         }
     }
-    let mut workspaces = session.workspaces.clone();
+    saved.error = result.as_ref().err().map(|error| format!("{error:#}"));
+    sort_links(
+        &mut saved.links,
+        &session.workspace,
+        session.branch.as_deref(),
+    );
+    crate::storage::atomic_json(&path, &saved)?;
+    result?;
+    Ok(saved.links)
+}
+
+fn update_session(
+    session: &super::Summary,
+    links: &mut Vec<SessionLink>,
+    history: bool,
+    cancel: &Cancel,
+) -> anyhow::Result<()> {
+    // Closed/merged history is checked only on opening or manual refresh.
+    for link in links
+        .iter_mut()
+        .filter(|link| history || link.pr.state == "OPEN")
+    {
+        cancel.check()?;
+        link.pr = github::session_pr(&link.workspace, None, Some(&link.pr.key), cancel)?;
+    }
+    let mut workspaces = if history {
+        session.workspaces.clone()
+    } else {
+        Vec::new()
+    };
     workspaces.retain(|w| w.path != session.workspace || w.branch != session.branch);
     workspaces.push(super::workspace::Workspace {
         path: session.workspace.clone(),
@@ -97,24 +210,38 @@ pub(crate) fn refresh_session(
     });
     for workspace in workspaces {
         cancel.check()?;
-        let Some(branch) = workspace.branch.as_deref() else {
+        let Some(branch) = workspace
+            .branch
+            .as_deref()
+            .filter(|b| !b.is_empty() && *b != "HEAD")
+        else {
             continue;
         };
-        if let Ok(prs) = github::session_prs(&workspace.path, branch, cancel) {
-            merge_links(
-                &mut links,
-                prs.into_iter()
-                    .map(|pr| SessionLink {
-                        workspace: workspace.path.clone(),
-                        pr,
-                    })
-                    .collect(),
-            );
+        // A known PR already covers this workspace. Discover again when opened;
+        // otherwise only discover workspaces that do not yet have a PR.
+        if !history
+            && links
+                .iter()
+                .any(|link| current(link, &workspace.path, Some(branch)))
+        {
+            continue;
         }
+        // Historical worktrees may have been removed; their PR URLs still work.
+        if !workspace.path.is_dir() {
+            continue;
+        }
+        let prs = github::session_prs(&workspace.path, branch, cancel)?;
+        merge_links(
+            links,
+            prs.into_iter()
+                .map(|pr| SessionLink {
+                    workspace: workspace.path.clone(),
+                    pr,
+                })
+                .collect(),
+        );
     }
-    cancel.check()?;
-    sort_links(&mut links, &session.workspace, session.branch.as_deref());
-    Ok(links)
+    Ok(())
 }
 
 fn refresh_links(
@@ -130,9 +257,27 @@ fn refresh_links(
     }
     let sessions = store.list()?;
     links.retain(|id, _| sessions.iter().any(|s| &s.id == id));
-    for session in sessions.iter().filter(|s| s.kind == "Coding") {
+    for session in sessions
+        .iter()
+        .filter(|s| s.kind == "Coding" && !s.archived)
+    {
         let known = links.remove(&session.id).unwrap_or_default();
-        links.insert(session.id.clone(), refresh_session(session, known, cancel)?);
+        let refreshed =
+            refresh_session(storage, session, known.clone(), Refresh::Background, cancel);
+        links.insert(
+            session.id.clone(),
+            refreshed.as_ref().cloned().unwrap_or(known),
+        );
+        // Persist progress before returning an error (including a shared cooldown).
+        std::fs::create_dir_all(&storage.cache)?;
+        crate::storage::atomic_json(&path, &links)?;
+        if let Err(error) = refreshed {
+            cancel.check()?;
+            if github::polling::paused() {
+                return Err(error);
+            }
+            eprintln!("Cannot refresh session PRs: {error:#}");
+        }
     }
     cancel.check()?;
     std::fs::create_dir_all(&storage.cache)?;
@@ -148,9 +293,16 @@ impl Refresher {
         storage: Storage,
         store: std::sync::Arc<super::server::Store>,
     ) -> anyhow::Result<Self> {
-        let interval = Duration::from_secs(30);
-        let personal = Worker::start_with(storage.clone(), interval, |cancel| {
-            github::my_prs(PrState::All, cancel)
+        let interval = Duration::from_secs(300);
+        let personal_storage = storage.clone();
+        let personal = Worker::start_with(storage.clone(), interval, move |cancel| {
+            let mut prs = github::my_prs(PrState::Open, cancel)?;
+            // Retain historical entries without repeatedly searching closed PRs.
+            prs.extend(personal_storage.load_inbox(PERSONAL)?.unwrap_or_default());
+            prs.sort_by(|a, b| b.updated.cmp(&a.updated));
+            let mut seen = std::collections::HashSet::new();
+            prs.retain(|pr| seen.insert(pr.key.id()));
+            Ok(prs)
         })?;
         let links = Worker::spawn(interval, move |cancel| {
             refresh_links(&storage, &store, cancel)
@@ -189,7 +341,6 @@ impl Worker {
             .name("difu-pr-cache".into())
             .spawn(move || {
                 while !token.cancelled() {
-                    let started = Instant::now();
                     let result = refresh(&token);
                     if let Err(error) = result {
                         if token.cancelled() {
@@ -198,8 +349,7 @@ impl Worker {
                         // A failed refresh preserves the last successful snapshot.
                         eprintln!("Cannot refresh personal PR cache: {error:#}");
                     }
-                    let remaining = interval.saturating_sub(started.elapsed());
-                    if receiver.recv_timeout(remaining).is_ok() || token.cancelled() {
+                    if receiver.recv_timeout(interval).is_ok() || token.cancelled() {
                         break;
                     }
                 }
@@ -229,6 +379,132 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn shared_snapshot_preserves_fresh_conflict_status_and_reports_failures() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        let mut session = super::super::Session::new(
+            "shared".into(),
+            super::super::Job::Coding(super::super::Launch {
+                repository: dir.path().into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.status = super::super::Status::Idle;
+        let summary = session.summary();
+        let link = SessionLink {
+            workspace: summary.workspace.clone(),
+            pr: github::SessionPr {
+                key: PrKey {
+                    owner: "example".into(),
+                    repo: "project".into(),
+                    number: 1,
+                },
+                state: "OPEN".into(),
+                draft: false,
+                conflicts: false,
+                head_branch: String::new(),
+                head: String::new(),
+                updated: "same timestamp".into(),
+            },
+        };
+        let path = snapshot_path(&storage, &summary.id);
+        std::fs::create_dir_all(
+            path.parent()
+                .ok_or_else(|| anyhow::anyhow!("cache parent"))?,
+        )?;
+        let mut saved = Snapshot {
+            links: vec![link.clone()],
+            checked_at: github::polling::now(),
+            attempted_at: github::polling::now(),
+            revision: summary.workspace_revision,
+            history_at: github::polling::now(),
+            error: None,
+        };
+        crate::storage::atomic_json(&path, &saved)?;
+        let mut stale = link;
+        stale.pr.conflicts = true;
+        for refresh in [Refresh::Visible, Refresh::Background, Refresh::Open] {
+            let links = refresh_session(
+                &storage,
+                &summary,
+                vec![stale.clone()],
+                refresh,
+                &Cancel::default(),
+            )?;
+            assert_eq!(links.first().map(|link| link.pr.conflicts), Some(false));
+        }
+        saved.error = Some("GitHub rate limit; refresh paused".into());
+        crate::storage::atomic_json(&path, &saved)?;
+        assert!(
+            refresh_session(
+                &storage,
+                &summary,
+                Vec::new(),
+                Refresh::Visible,
+                &Cancel::default()
+            )
+            .is_err()
+        );
+        assert_eq!(snapshot(&storage, &summary.id).links.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn archived_sessions_do_not_request_github_in_the_background() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        let mut session = super::super::Session::new(
+            "archived".into(),
+            super::super::Job::Coding(super::super::Launch {
+                repository: dir.path().into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.status = super::super::Status::Idle;
+        session.archived = true;
+        let link = SessionLink {
+            workspace: dir.path().into(),
+            pr: github::SessionPr {
+                key: PrKey {
+                    owner: "example".into(),
+                    repo: "project".into(),
+                    number: 1,
+                },
+                state: "OPEN".into(),
+                draft: false,
+                conflicts: false,
+                head_branch: String::new(),
+                head: String::new(),
+                updated: String::new(),
+            },
+        };
+        let links = refresh_session(
+            &storage,
+            &session.summary(),
+            vec![link.clone()],
+            Refresh::Background,
+            &Cancel::default(),
+        )?;
+        assert_eq!(links, vec![link]);
+        Ok(())
+    }
 
     #[test]
     fn migrates_single_pr_cache_and_orders_retained_history() -> anyhow::Result<()> {

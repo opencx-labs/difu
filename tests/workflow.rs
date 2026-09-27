@@ -113,6 +113,9 @@ fn scripted_workflow() -> Result<()> {
     let output = Command::new(std::env::current_exe()?)
         .args(["--exact", "scripted_workflow", "--nocapture"])
         .env("DIFU_TEST_FIXTURE", root)
+        .env("HOME", root.join("home"))
+        .env("XDG_CONFIG_HOME", root.join("home/config"))
+        .env("XDG_CACHE_HOME", root.join("home/cache"))
         .env("DIFU_TEST_REAL_GIT", real_git)
         .env("PATH", path)
         .output()?;
@@ -132,6 +135,29 @@ fn scripted_workflow() -> Result<()> {
             .count(),
         1
     );
+    Ok(())
+}
+
+// Advance the shared request cache between simulated remote changes without
+// sleeping through real polling/backoff intervals. Only the subprocess's isolated
+// home is eligible; this never touches a developer's GitHub cache.
+fn expire_github_requests(root: &Path) -> Result<()> {
+    let cache = Storage::discover()?.cache.join("github-requests");
+    ensure!(
+        cache.starts_with(root.join("home")),
+        "Fixture cache must be isolated"
+    );
+    if cache.is_dir() {
+        for entry in fs::read_dir(cache)? {
+            let path = entry?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+            {
+                fs::remove_file(path)?;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -245,6 +271,7 @@ fn exercise(root: &Path) -> Result<()> {
     *changed.get_mut("head").context("Missing fixture head")? =
         serde_json::json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     fs::write(&revision_file, serde_json::to_vec(&changed)?)?;
+    expire_github_requests(root)?;
     app.reviews
         .get_mut("example/project#1")
         .context("Missing review")?
@@ -269,6 +296,7 @@ fn exercise(root: &Path) -> Result<()> {
     wait(&mut app, |a| a.review().is_some_and(|r| !r.preparing))?;
     assert_eq!(fs::read_to_string(root.join("turns"))?, "turn\n");
     fs::write(&revision_file, original_revisions)?;
+    expire_github_requests(root)?;
     let wide = render(&mut app, 180)?;
     assert!(!app.home);
     assert_eq!(app.view, View::Guide);
@@ -314,6 +342,14 @@ fn exercise(root: &Path) -> Result<()> {
         assert_eq!(app.state(), state);
         wait(&mut app, |a| !a.inbox_loading)?;
         assert!(app.inbox_error.is_none());
+        if matches!(state, PrState::Merged | PrState::Closed) {
+            app.inbox_refreshed = Instant::now().checked_sub(Duration::from_secs(600));
+            app.tick();
+            assert!(
+                !app.inbox_loading,
+                "closed history refreshes only on demand"
+            );
+        }
     }
     app.key_event(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
     assert_eq!(app.state(), PrState::All);
@@ -342,12 +378,18 @@ fn exercise(root: &Path) -> Result<()> {
     app.key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     // Periodic hydration preserves selection and loads no other state or repository.
     let selected = app.key();
+    let stats_before = fs::read_to_string(root.join("stats-batches"))?;
     app.inbox_refreshed = Some(Instant::now() - Duration::from_secs(31));
     app.tick();
     assert!(app.inbox_loading);
     assert_eq!(app.key(), selected);
     wait(&mut app, |a| !a.inbox_loading)?;
     assert_eq!(app.key(), selected);
+    assert_eq!(
+        fs::read_to_string(root.join("stats-batches"))?,
+        stats_before,
+        "unchanged PRs must not reload statistics"
+    );
     app.action(Action::SetInbox(InboxTab::Repositories));
     wait(&mut app, |a| !a.repositories_loading)?;
     assert!(app.repository_directory());
@@ -404,6 +446,7 @@ fn exercise(root: &Path) -> Result<()> {
     assert!(searches.contains("--merged\""));
     app.shutdown();
     fs::write(root.join("updated-title"), "")?;
+    expire_github_requests(root)?;
     let mut cached = App::new(storage.clone(), config.clone());
     cached.start(None);
     assert!(
@@ -424,6 +467,7 @@ fn exercise(root: &Path) -> Result<()> {
     cached.shutdown();
     fs::remove_file(root.join("updated-title"))?;
     fs::write(root.join("fail-search"), "")?;
+    expire_github_requests(root)?;
     let mut offline = App::new(storage.clone(), config.clone());
     offline.start(None);
     let cached_ids: Vec<_> = offline.inbox.iter().map(|p| p.key.id()).collect();
@@ -436,6 +480,7 @@ fn exercise(root: &Path) -> Result<()> {
     assert!(render(&mut offline, 160)?.contains("Refresh failed"));
     offline.shutdown();
     fs::remove_file(root.join("fail-search"))?;
+    expire_github_requests(root)?;
     // Old releases' cache entries migrate without another Codex turn.
     let review = app
         .reviews
@@ -860,15 +905,18 @@ fn exercise_checks(root: &Path) -> Result<()> {
     };
     let cancel = Cancel::default();
     fs::write(root.join("status-case"), "conflict")?;
+    expire_github_requests(root)?;
     let report = difu::github::checks(&key, &cancel)?;
     assert_eq!(report.mergeable, "CONFLICTING");
     assert_eq!(report.checks.len(), 2);
     assert!(report.checks.iter().all(|c| c.state == "expected"));
     fs::write(root.join("status-case"), "unknown")?;
+    expire_github_requests(root)?;
     let report = difu::github::checks(&key, &cancel)?;
     assert_eq!(report.mergeable, "UNKNOWN");
     assert!(report.checks.is_empty());
     fs::write(root.join("status-case"), "failure")?;
+    expire_github_requests(root)?;
     let report = difu::github::checks(&key, &cancel)?;
     let check = report.checks.first().context("Missing failed check")?;
     assert_eq!(check.state, "fail");
@@ -880,6 +928,7 @@ fn exercise_checks(root: &Path) -> Result<()> {
             .is_some_and(|t| t.name.contains("sends reply"))
     );
     fs::write(root.join("status-case"), "rules-denied")?;
+    expire_github_requests(root)?;
     let report = difu::github::checks(&key, &cancel)?;
     assert!(report.rules_error.is_some());
     assert_eq!(
@@ -887,6 +936,7 @@ fn exercise_checks(root: &Path) -> Result<()> {
         Some("fail")
     );
     fs::remove_file(root.join("status-case"))?;
+    expire_github_requests(root)?;
     fs::write(root.join("awaiting-workflows"), "yes")?;
     let report = difu::github::checks(&key, &cancel)?;
     assert!(report.workflows_error.is_none());
@@ -936,6 +986,7 @@ fn exercise_checks(root: &Path) -> Result<()> {
     let report = difu::github::checks(&key, &cancel)?;
     assert!(report.workflows_error.is_some() && report.awaiting_workflows.is_empty());
     fs::remove_file(root.join("workflow-read-error"))?;
+    expire_github_requests(root)?;
     fs::remove_file(root.join("awaiting-workflows"))?;
     fs::remove_file(root.join("writes.jsonl"))?;
     Ok(())
@@ -1021,11 +1072,13 @@ fn exercise_reviewer_picker_and_branch_lookup(root: &Path) -> Result<()> {
             .any(|pr| pr.key.number == 2 && pr.state == "OPEN")
     );
     fs::write(root.join("session-pr-error"), "offline")?;
+    expire_github_requests(root)?;
     assert!(
         difu::github::session_pr(&root.join("clone"), None, Some(&discovered.key), &cancel)
             .is_err()
     );
     fs::remove_file(root.join("session-pr-error"))?;
+    expire_github_requests(root)?;
     let key = difu::github::current_branch_pr(&cancel)?;
     assert_eq!(key.id(), "example/project#1");
     fs::write(root.join("no-branch-pr"), "yes")?;
@@ -1034,6 +1087,7 @@ fn exercise_reviewer_picker_and_branch_lookup(root: &Path) -> Result<()> {
         .context("missing PR should fail")?;
     assert!(format!("{failure:#}").contains("no pull requests found"));
     fs::remove_file(root.join("no-branch-pr"))?;
+    expire_github_requests(root)?;
     let detail = difu::github::detail(&key, &cancel)?;
     let mut app = App::new(
         Storage {

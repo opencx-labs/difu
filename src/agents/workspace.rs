@@ -241,7 +241,7 @@ pub fn changes(
         !session.workspace_removed,
         "This worktree was removed; its named branch and commits remain in the repository"
     );
-    if session.waiting_for_workspace() {
+    if !session.workspace_ready {
         return Ok(String::new());
     }
     let path = session
@@ -310,7 +310,7 @@ pub fn statistics(
     cancel: &Cancel,
 ) -> Result<super::DiffStatistics> {
     ensure!(!session.workspace_removed, "Session worktree was removed");
-    if session.waiting_for_workspace() {
+    if !session.workspace_ready {
         return Ok(super::DiffStatistics::default());
     }
     let path = session
@@ -390,6 +390,9 @@ fn add_statistics(stats: &mut super::DiffStatistics, output: &str) -> Result<()>
 
 pub fn paths(session: &Session, cancel: &Cancel) -> Result<Vec<String>> {
     ensure!(!session.workspace_removed, "Session worktree was removed");
+    if !session.workspace_ready && !session.waiting_for_workspace() {
+        return Ok(Vec::new());
+    }
     let root = session
         .workspace
         .as_deref()

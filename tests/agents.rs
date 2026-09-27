@@ -937,6 +937,224 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
 }
 
 #[test]
+fn new_sessions_accept_input_while_worktrees_are_preparing() -> Result<()> {
+    for model in [None, Some("claude/sonnet")] {
+        let tmp = tempfile::Builder::new()
+            .prefix("difu-startup-")
+            .tempdir_in("/tmp")?;
+        let root = tmp.path();
+        let repo = root.join("repo");
+        fs::create_dir(&repo)?;
+        git(&repo, &["init"])?;
+        fs::write(repo.join("tracked.txt"), "committed\n")?;
+        git(&repo, &["add", "."])?;
+        git(&repo, &["commit", "-m", "base"])?;
+        git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])?;
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        )?;
+        fs::write(repo.join("tracked.txt"), "preserve local edit\n")?;
+        let inherited_path = std::env::var_os("PATH").context("PATH")?;
+        let real_git = std::env::split_paths(&inherited_path)
+            .map(|p| p.join("git"))
+            .find(|p| p.is_file())
+            .context("Git executable")?
+            .canonicalize()?;
+        let bin = root.join("bin");
+        fs::create_dir(&bin)?;
+        for (name, source) in [
+            ("git", include_str!("fixtures/slow_worktree_git.py")),
+            ("codex", include_str!("fixtures/agent_codex.py")),
+            ("claude", include_str!("fixtures/agent_claude.py")),
+            ("gh", "#!/bin/sh\nprintf '[]\\n'\n"),
+        ] {
+            fs::write(bin.join(name), source)?;
+            fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o700))?;
+        }
+        let path = std::env::join_paths(
+            std::iter::once(bin).chain(std::env::split_paths(&inherited_path)),
+        )?;
+        let storage = Storage {
+            config: root.join("config.json"),
+            cache: root.join("cache"),
+        };
+        let start_service = || {
+            support::Service::start(&storage, |c| {
+                c.env("PATH", &path)
+                    .env("DIFU_AGENT_FIXTURE", root)
+                    .env("DIFU_REAL_GIT", &real_git);
+            })
+        };
+        let mut daemon = start_service()?;
+        let launch_empty = || -> Result<String> {
+            fs::write(root.join("hold-worktree"), "hold")?;
+            let Reply::Launched(id) = client::request(
+                &storage,
+                Request::NewAgent {
+                    defaults: difu::storage::AgentDefaults {
+                        repository: Some(repo.clone()),
+                        model: model.map(String::from),
+                        ..Default::default()
+                    },
+                    cwd: root.into(),
+                    remember_repository: false,
+                },
+            )?
+            else {
+                anyhow::bail!("Expected immediate session ID");
+            };
+            let preparing = wait(&storage, &id, |s| s.workspace.is_some())?;
+            assert_eq!(preparing.status, Status::Starting);
+            assert!(!preparing.workspace_ready);
+            assert!(!preparing.summary().can_read_changes);
+            assert!(preparing.thread_id.is_none());
+            assert!(matches!(
+                client::request(&storage, Request::Changes { id: id.clone() })?,
+                Reply::Changes(patch) if patch.is_empty()
+            ));
+            assert!(matches!(
+                client::request(&storage, Request::Statistics { id: id.clone() })?,
+                Reply::Statistics(stats) if stats == Default::default()
+            ));
+            Ok(id)
+        };
+        let send = |id: &str, text: &str| {
+            control(
+                &storage,
+                id,
+                Control::Message {
+                    text: text.into(),
+                    queue: false,
+                    skills: Vec::new(),
+                    attachments: Vec::new(),
+                },
+            )
+        };
+
+        let id = launch_empty()?;
+        // These requests must be acknowledged before Git is released.
+        send(&id, "chat only: first queued message")?;
+        send(&id, "chat only: second queued message")?;
+        send(&id, "discard this queued message")?;
+        let discard = session(&storage, &id)?
+            .queue
+            .last()
+            .context("queued message")?
+            .clone();
+        control(
+            &storage,
+            &id,
+            Control::ReplaceQueued {
+                index: 2,
+                expected: discard,
+                replacement: None,
+            },
+        )?;
+        let pending = session(&storage, &id)?;
+        assert_eq!(pending.queue.len(), 2);
+        assert!(!pending.can_send_waiting());
+        let saved: Session = serde_json::from_slice(&fs::read(
+            difu::agents::server::home(&storage)?.join(format!("{id}.json")),
+        )?)?;
+        assert_eq!(saved.queue, pending.queue);
+        assert!(!root.join("protocol.jsonl").exists());
+        assert!(!root.join("claude-starts.jsonl").exists());
+        fs::remove_file(root.join("hold-worktree"))?;
+        let ready = wait(&storage, &id, |s| {
+            s.workspace_ready
+                && s.status == Status::Idle
+                && s.queue.is_empty()
+                && s.entries.iter().filter(|e| e.kind == "userMessage").count() == 2
+        })?;
+        assert_eq!(
+            ready
+                .entries
+                .iter()
+                .filter(|e| e.kind == "userMessage")
+                .map(|e| e.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "chat only: first queued message",
+                "chat only: second queued message"
+            ]
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("tracked.txt"))?,
+            "preserve local edit\n"
+        );
+        send(&id, "chat only: normal send after setup")?;
+        wait(&storage, &id, |s| {
+            s.status == Status::Idle
+                && s.entries.iter().any(|e| {
+                    e.kind == "userMessage" && e.text == "chat only: normal send after setup"
+                })
+        })?;
+
+        // Failed setup preserves accepted input without running the provider.
+        let failed = launch_empty()?;
+        let image = root.join("attachment.png");
+        image::RgbaImage::new(1, 1).save(&image)?;
+        let difu::agents::media::Paste::Attachments(attachments) =
+            difu::agents::media::files(&storage, &failed, vec![image])?
+        else {
+            anyhow::bail!("Expected attachment");
+        };
+        control(
+            &storage,
+            &failed,
+            Control::MessageWithAttachments {
+                text: "chat only: preserve after failure".into(),
+                queue: false,
+                skills: Vec::new(),
+                attachments: attachments.clone(),
+            },
+        )?;
+        fs::write(root.join("fail-worktree"), "fail")?;
+        fs::remove_file(root.join("hold-worktree"))?;
+        let failed_state = wait(&storage, &failed, |s| s.status == Status::Failed)?;
+        assert!(failed_state.thread_id.is_none() && failed_state.queue.is_empty());
+        assert!(
+            failed_state
+                .entries
+                .iter()
+                .any(|e| e.kind == "unsent" && e.text == "chat only: preserve after failure")
+        );
+        let unsent = failed_state
+            .entries
+            .iter()
+            .find(|e| e.kind == "unsent")
+            .context("unsent prompt")?;
+        let prompt: difu::agents::Prompt = serde_json::from_value(unsent.data["prompt"].clone())?;
+        assert_eq!(prompt.attachments(), attachments);
+        fs::remove_file(root.join("fail-worktree"))?;
+
+        // Restart interrupts preparation and never replays its queued messages.
+        let interrupted = launch_empty()?;
+        send(&interrupted, "chat only: preserve after restart")?;
+        daemon.stop()?;
+        fs::remove_file(root.join("hold-worktree"))?;
+        let mut daemon = start_service()?;
+        let restored = session(&storage, &interrupted)?;
+        assert_eq!(restored.status, Status::Interrupted);
+        assert!(!restored.workspace_ready && restored.thread_id.is_none());
+        assert!(restored.queue.is_empty());
+        assert!(
+            restored
+                .entries
+                .iter()
+                .any(|e| e.kind == "unsent" && e.text == "chat only: preserve after restart")
+        );
+        daemon.stop()?;
+    }
+    Ok(())
+}
+
+#[test]
 fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_context() -> Result<()> {
     let tmp = tempfile::Builder::new()
         .prefix("difu-lazy-agent-")
@@ -1005,7 +1223,9 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     else {
         anyhow::bail!("Expected empty session");
     };
-    let empty = session(&storage, &id)?;
+    let empty = wait(&storage, &id, |s| {
+        s.status == Status::Idle && s.workspace_ready
+    })?;
     assert_eq!(empty.status, Status::Idle);
     assert!(empty.thread_id.is_none() && empty.workspace_ready);
     let workspace = empty.workspace.clone().context("worktree")?;
@@ -1318,7 +1538,9 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     else {
         anyhow::bail!("Expected Claude session");
     };
-    let second = session(&storage, &second)?;
+    let second = wait(&storage, &second, |s| {
+        s.status == Status::Idle && s.workspace_ready
+    })?;
     assert!(second.workspace_ready && second.thread_id.is_none());
     assert_ne!(second.workspace, Some(repo.canonicalize()?));
     assert_eq!(second.provider, difu::agents::provider::Provider::Claude);

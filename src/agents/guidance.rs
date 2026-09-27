@@ -223,7 +223,7 @@ pub fn confirm(
 
 // The Codex connection is paused during this transition. Persist input without
 // treating a chat message or unrelated answer as approval to copy guidance.
-fn queue_while_waiting(store: &Store, id: &str, control: Control) -> Result<()> {
+pub(super) fn queue_while_waiting(store: &Store, id: &str, control: Control) -> Result<()> {
     let session = store.get(id)?;
     match control {
         Control::Message {

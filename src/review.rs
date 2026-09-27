@@ -2,7 +2,7 @@
 use crate::{
     github,
     model::PrKey,
-    process::{self, Cancel},
+    process::Cancel,
     storage::{self, Storage},
 };
 use anyhow::{Context, Result, bail, ensure};
@@ -123,7 +123,7 @@ fn api(endpoint: &str, method: &str, body: Option<Value>, cancel: &Cancel) -> Re
     } else {
         None
     };
-    let output = process::run(&mut command, input, cancel)?;
+    let output = github::polling::run(&mut command, input, cancel, 0, method != "GET", None)?;
     ensure!(
         output.code == 0,
         "GitHub: {}",
@@ -269,7 +269,7 @@ pub fn execute(key: &PrKey, head: &str, operation: &Operation, cancel: &Cancel) 
             if *draft {
                 command.arg("--undo");
             }
-            process::checked(&mut command, cancel)?;
+            github::write(&mut command, None, cancel)?;
         }
         Operation::Merge { squash, admin } => {
             let mut command = github::command();
@@ -284,7 +284,7 @@ pub fn execute(key: &PrKey, head: &str, operation: &Operation, cancel: &Cancel) 
             if *admin {
                 command.arg("--admin");
             }
-            let output = process::checked(&mut command, cancel)?;
+            let output = String::from_utf8(github::write(&mut command, None, cancel)?.stdout)?;
             let current = github::detail(key, cancel)?;
             return Ok(format!("{} · {}", current.state, output.trim()));
         }
