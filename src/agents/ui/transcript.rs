@@ -872,15 +872,19 @@ mod tests {
         assert_eq!(shimmer(text, 0), shimmer(text, cycle));
         // Both sides of the wrap are fully dim; the halo has left the final glyph.
         for at in [cycle - 80, cycle] {
-            assert!(shimmer(text, at)
-                .spans
-                .iter()
-                .all(|span| span.style.fg == Some(DIM)));
+            assert!(
+                shimmer(text, at)
+                    .spans
+                    .iter()
+                    .all(|span| span.style.fg == Some(DIM))
+            );
         }
-        assert!(shimmer(text, cycle - 160)
-            .spans
-            .last()
-            .is_some_and(|span| span.style.fg != Some(DIM)));
+        assert!(
+            shimmer(text, cycle - 160)
+                .spans
+                .last()
+                .is_some_and(|span| span.style.fg != Some(DIM))
+        );
         assert_ne!(shimmer(text, cycle - 240), shimmer(text, cycle + 240));
     }
     #[test]

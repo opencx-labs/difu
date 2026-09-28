@@ -436,10 +436,11 @@ mod tests {
             .collect::<String>();
         assert!(screen.contains("example/project#42") && screen.contains("example/project#43"));
         assert!(screen.contains("cached diff may be stale"));
-        assert!(ui
-            .hits
-            .iter()
-            .any(|(_, action)| matches!(action, Action::ChangePr(1))));
+        assert!(
+            ui.hits
+                .iter()
+                .any(|(_, action)| matches!(action, Action::ChangePr(1)))
+        );
         ui.focus = Focus::Composer;
         ui.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
         ui.key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));

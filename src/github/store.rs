@@ -304,7 +304,9 @@ pub(crate) fn detail(storage: &Storage, value: &PrDetail, raw: &serde_json::Valu
         // REST details contain pending requests, but omit completed reviewers.
         if let Some(metadata) = &mut summary.metadata {
             if let Some(previous) = pr.summary.as_ref().and_then(|s| s.metadata.as_ref()) {
-                metadata.reviewers.extend(previous.reviewers.iter().cloned());
+                metadata
+                    .reviewers
+                    .extend(previous.reviewers.iter().cloned());
             }
             metadata.reviewers.sort();
             metadata.reviewers.dedup();
@@ -570,14 +572,16 @@ mod tests {
                 diff.at = 0;
             }
         })?;
-        assert!(refresh_in(
-            &storage,
-            &key(),
-            &cancel,
-            |p| p.diff,
-            || anyhow::bail!("offline")
-        )
-        .is_err());
+        assert!(
+            refresh_in(
+                &storage,
+                &key(),
+                &cancel,
+                |p| p.diff,
+                || anyhow::bail!("offline")
+            )
+            .is_err()
+        );
         assert_eq!(
             load(&storage, &key())
                 .context("PR")?

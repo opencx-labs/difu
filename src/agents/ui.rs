@@ -3710,7 +3710,7 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
 mod tests {
     use super::*;
     use anyhow::{Context, Result};
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{Terminal, backend::TestBackend};
     fn state(storage: Storage) -> Ui {
         let mut ui = Ui::new(storage, &Config::default());
         let mut session = Session::new(

@@ -206,10 +206,7 @@ fn archiving_and_deleting_stop_provider_shells_and_their_servers() -> Result<()>
                 let deleting_storage = storage.clone();
                 let deleting_id = id.clone();
                 let deleting = std::thread::spawn(move || {
-                    client::request(
-                        &deleting_storage,
-                        Request::Delete { id: deleting_id },
-                    )
+                    client::request(&deleting_storage, Request::Delete { id: deleting_id })
                 });
                 let progress = wait(&storage, &id, |s| {
                     s.deletion_progress == Some(difu::agents::DeletionStage::Worktree)
@@ -1416,24 +1413,28 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
         storage.load_config()?.agent_defaults.repository,
         Some(repo.canonicalize()?)
     );
-    assert!(client::request(
-        &storage,
-        Request::Repository {
-            id: id.clone(),
-            repository: root.join("missing-repository")
-        }
-    )
-    .is_err());
+    assert!(
+        client::request(
+            &storage,
+            Request::Repository {
+                id: id.clone(),
+                repository: root.join("missing-repository")
+            }
+        )
+        .is_err()
+    );
     assert!(workspace.exists());
     assert_eq!(session(&storage, &id)?.workspace, Some(workspace.clone()));
-    assert!(client::request(
-        &storage,
-        Request::Repository {
-            id: id.clone(),
-            repository: workspace.canonicalize()?,
-        }
-    )
-    .is_err());
+    assert!(
+        client::request(
+            &storage,
+            Request::Repository {
+                id: id.clone(),
+                repository: workspace.canonicalize()?,
+            }
+        )
+        .is_err()
+    );
     assert!(workspace.exists());
     let old_branch = empty.branch.context("Initial branch")?;
     fs::write(workspace.join("committed.txt"), "discard this work\n")?;
@@ -1453,14 +1454,16 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
         &repo,
         &["worktree", "lock", workspace.to_str().context("path")?],
     )?;
-    assert!(client::request(
-        &storage,
-        Request::Repository {
-            id: id.clone(),
-            repository: other.clone(),
-        }
-    )
-    .is_err());
+    assert!(
+        client::request(
+            &storage,
+            Request::Repository {
+                id: id.clone(),
+                repository: other.clone(),
+            }
+        )
+        .is_err()
+    );
     assert!(workspace.exists());
     assert_eq!(session(&storage, &id)?.job.root(), &repo.canonicalize()?);
     git(
@@ -1479,11 +1482,13 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     assert!(!changed.workspace_ready && changed.branch.is_none());
     assert_eq!(changed.job.root(), &other.canonicalize()?);
     assert_eq!(changed.baseline, Some(git(&other, &["rev-parse", "HEAD"])?));
-    assert!(git(
-        &repo,
-        &["show-ref", "--verify", &format!("refs/heads/{old_branch}")]
-    )
-    .is_err());
+    assert!(
+        git(
+            &repo,
+            &["show-ref", "--verify", &format!("refs/heads/{old_branch}")]
+        )
+        .is_err()
+    );
     assert_eq!(
         fs::read_to_string(repo.join("tracked.txt"))?,
         "precious local edit\n"
@@ -1539,22 +1544,26 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     )?;
     let reset = session(&storage, &id)?;
     assert_eq!(reset.thread_id, with_artifact.thread_id);
-    assert!(reset
-        .entries
-        .iter()
-        .any(|e| e.text.contains("explain this repository")));
+    assert!(
+        reset
+            .entries
+            .iter()
+            .any(|e| e.text.contains("explain this repository"))
+    );
     assert!(reset.artifacts.is_empty() && reset.workspaces.is_empty());
     assert!(reset.comparison_base.is_none() && reset.branch.is_none());
     assert!(!workspace.exists());
-    assert!(git(
-        &repo,
-        &[
-            "show-ref",
-            "--verify",
-            &format!("refs/heads/{artifact_branch}")
-        ]
-    )
-    .is_err());
+    assert!(
+        git(
+            &repo,
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{artifact_branch}")
+            ]
+        )
+        .is_err()
+    );
     let before_usage = session(&storage, &id)?.entries.len();
     let Reply::Usage(usage) = client::request(&storage, Request::Usage { id: id.clone() })? else {
         anyhow::bail!("usage response");

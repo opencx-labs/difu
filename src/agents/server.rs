@@ -845,7 +845,10 @@ impl Service {
                     matches!(self.store.get(&id)?.job, Job::Coding(_)),
                     "PR changes are available for coding sessions"
                 );
-                Ok(Reply::Changes(crate::github::pr_diff(&pr, &Cancel::default())?))
+                Ok(Reply::Changes(crate::github::pr_diff(
+                    &pr,
+                    &Cancel::default(),
+                )?))
             }
             Request::Statistics { id } => Ok(Reply::Statistics(super::workspace::statistics(
                 &self.store.get(&id)?,

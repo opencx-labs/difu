@@ -627,24 +627,28 @@ mod tests {
         }
         let old = session.summary();
         for refresh in [Refresh::Background, Refresh::Visible, Refresh::Open] {
-            assert!(refresh_session(
-                &storage,
-                &old,
-                vec![link.clone()],
-                refresh,
-                &Cancel::default()
-            )?
-            .is_empty());
+            assert!(
+                refresh_session(
+                    &storage,
+                    &old,
+                    vec![link.clone()],
+                    refresh,
+                    &Cancel::default()
+                )?
+                .is_empty()
+            );
         }
         session.workspace_revision = 1;
-        assert!(refresh_session(
-            &storage,
-            &session.summary(),
-            vec![link.clone()],
-            Refresh::Open,
-            &Cancel::default()
-        )?
-        .is_empty());
+        assert!(
+            refresh_session(
+                &storage,
+                &session.summary(),
+                vec![link.clone()],
+                Refresh::Open,
+                &Cancel::default()
+            )?
+            .is_empty()
+        );
         let mut current = link;
         current.workspace_revision = 1;
         let mut links = vec![current];
@@ -776,14 +780,16 @@ mod tests {
         saved.attempted_at = github::polling::now().saturating_sub(60);
         save_snapshot(&storage, &path, &saved)?;
         // Automatic visibility refresh must still use the shared five-minute lease.
-        assert!(refresh_session(
-            &storage,
-            &summary,
-            Vec::new(),
-            Refresh::Visible,
-            &Cancel::default()
-        )
-        .is_ok());
+        assert!(
+            refresh_session(
+                &storage,
+                &summary,
+                Vec::new(),
+                Refresh::Visible,
+                &Cancel::default()
+            )
+            .is_ok()
+        );
         let mut closed = saved.links.clone();
         for link in &mut closed {
             link.pr.state = "MERGED".into();
@@ -791,14 +797,16 @@ mod tests {
         assert!(should_poll(&summary, &closed));
         saved.error = Some("GitHub rate limit; refresh paused".into());
         save_snapshot(&storage, &path, &saved)?;
-        assert!(refresh_session(
-            &storage,
-            &summary,
-            Vec::new(),
-            Refresh::Visible,
-            &Cancel::default()
-        )
-        .is_err());
+        assert!(
+            refresh_session(
+                &storage,
+                &summary,
+                Vec::new(),
+                Refresh::Visible,
+                &Cancel::default()
+            )
+            .is_err()
+        );
         assert_eq!(snapshot(&storage, &summary.id).links.len(), 1);
         Ok(())
     }
