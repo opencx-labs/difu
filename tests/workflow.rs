@@ -148,13 +148,29 @@ fn expire_github_requests(root: &Path) -> Result<()> {
         "Fixture cache must be isolated"
     );
     if cache.is_dir() {
-        for entry in fs::read_dir(cache)? {
+        for entry in fs::read_dir(&cache)? {
             let path = entry?.path();
             if path
                 .extension()
                 .is_some_and(|extension| extension == "json")
             {
                 fs::remove_file(path)?;
+            }
+        }
+        let prs = cache.join("prs");
+        if prs.is_dir() {
+            for entry in fs::read_dir(prs)? {
+                let path = entry?.path();
+                if !path.extension().is_some_and(|extension| extension == "json") {
+                    continue;
+                }
+                let mut pr: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+                for field in ["detail", "timeline", "checks", "diff"] {
+                    if let Some(at) = pr.get_mut(field).and_then(|value| value.get_mut("at")) {
+                        *at = serde_json::json!(0);
+                    }
+                }
+                fs::write(path, serde_json::to_vec(&pr)?)?;
             }
         }
     }
@@ -661,6 +677,8 @@ fn exercise(root: &Path) -> Result<()> {
     *revisions.get_mut("head").context("Missing head")? = serde_json::json!(remote_commit);
     *revisions.get_mut("base").context("Missing base")? = serde_json::json!(remote_base);
     fs::write(root.join("revisions.json"), serde_json::to_vec(&revisions)?)?;
+    // Opening a PR refreshes stale records; advance the fixture past that window.
+    expire_github_requests(root)?;
     let fetches_before = fs::read_to_string(root.join("fetches.jsonl"))?
         .lines()
         .count();
