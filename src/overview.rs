@@ -164,6 +164,16 @@ pub(crate) fn rows_with_images(review: &Review, width: u16, images: bool) -> Vec
         );
     };
     let mut rows = vec![TextRow::default()];
+    if let Some(error) = &review.detail_error {
+        rows.extend(flow(
+            text(
+                format!("Refresh failed; saved PR details may be stale: {error}"),
+                RED,
+            ),
+            width,
+        ));
+        rows.push(TextRow::default());
+    }
     rows.extend(prose(&pr.title, width).into_iter().map(|mut row| {
         for span in &mut row.spans {
             span.style = span.style.add_modifier(ratatui::style::Modifier::BOLD);

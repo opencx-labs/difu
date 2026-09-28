@@ -187,6 +187,24 @@ impl Pending {
             && self.params.get("difuAsync").and_then(Value::as_bool) == Some(true)
     }
 }
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DeletionStage {
+    Stopping,
+    Worktree,
+    Attachments,
+    History,
+}
+impl DeletionStage {
+    pub fn progress(self) -> (u16, &'static str) {
+        match self {
+            Self::Stopping => (0, "1/4 · Stopping agent, shells, and servers"),
+            Self::Worktree => (25, "2/4 · Removing worktree and local files"),
+            Self::Attachments => (50, "3/4 · Deleting attachments"),
+            Self::History => (75, "4/4 · Removing saved chat"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
@@ -212,6 +230,8 @@ pub struct Session {
     pub provider_context: Option<String>,
     pub status: Status,
     pub archived: bool,
+    #[serde(default)]
+    pub deletion_progress: Option<DeletionStage>,
     pub updated: i64,
     pub version: u64,
     pub workspace: Option<PathBuf>,
@@ -297,6 +317,7 @@ impl Session {
             job,
             status: Status::Starting,
             archived: false,
+            deletion_progress: None,
             updated: chrono::Utc::now().timestamp_millis(),
             version: 0,
             workspace: None,
@@ -617,6 +638,10 @@ pub enum Request {
     },
     Changes {
         id: String,
+    },
+    PrChanges {
+        id: String,
+        pr: PrKey,
     },
     Statistics {
         id: String,

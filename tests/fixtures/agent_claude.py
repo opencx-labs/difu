@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Claude stream/control fixture. Never starts a model or validates a project."""
-import json, os, pathlib, sys, uuid
+import json, os, pathlib, subprocess, sys, uuid
 root = pathlib.Path(os.environ['DIFU_AGENT_FIXTURE'])
 connection = uuid.uuid4().hex[:8]
 turn = 0
@@ -58,6 +58,9 @@ for line in sys.stdin:
             pathlib.Path('discard.txt').write_text('dirty self-deletion fixture')
             pending = 'delete-session'
             emit(dict(type='control_request', request_id=pending, request=dict(subtype='mcp_message', server_name='difu', message=dict(jsonrpc='2.0', id=3, method='tools/call', params=dict(name='difu_delete_session', arguments={})))))
+        elif prompt.startswith('fixture shell: '):
+            subprocess.Popen([sys.executable, prompt.split(': ', 1)[1]], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            complete()
         elif 'claude tool' in prompt:
             tool = f'tool-{connection}-{turn}'
             emit(dict(type='assistant', message=dict(id=f'assistant-{connection}-{turn}', content=[dict(type='tool_use', id=tool, name='Bash', input=dict(command='echo fixture'))])))

@@ -168,7 +168,7 @@ pub struct PrDetail {
     pub changed_files: u64,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct TimelineItem {
     pub date: String,
     pub author: String,
@@ -177,7 +177,7 @@ pub struct TimelineItem {
     pub url: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Check {
     pub name: String,
     pub state: String,
@@ -186,7 +186,7 @@ pub struct Check {
     pub url: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkflowRun {
     pub id: u64,
     pub name: String,
@@ -194,7 +194,7 @@ pub struct WorkflowRun {
 }
 
 /// Live GitHub state, independent of the pinned review snapshot.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct CheckReport {
     pub awaiting_workflows: Vec<WorkflowRun>,
     pub workflows_error: Option<String>,

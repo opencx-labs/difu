@@ -11,7 +11,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("diff", "Show current session changes"),
     ("new", "Launch a new coding session"),
     ("rename", "Rename this session"),
-    ("repo", "Change repository before the first worktree"),
+    (
+        "repo",
+        "Change repository and discard previous workspace work",
+    ),
     (
         "worktree",
         "Register active worktree: /worktree <path> [base]",

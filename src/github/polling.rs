@@ -1,9 +1,10 @@
-//! One request gate and short-lived read cache shared by every difu process.
+//! One request gate and durable response store shared by every difu process.
 use crate::{
     process::{self, Cancel},
     storage,
 };
 use anyhow::{Result, bail};
+use base64::Engine as _;
 use nix::fcntl::{Flock, FlockArg};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -51,7 +52,10 @@ struct Gate {
 struct Cached {
     at: u64,
     generation: u64,
+    #[serde(default)]
     value: serde_json::Value,
+    #[serde(default)]
+    raw: Option<String>,
 }
 #[derive(Default, Serialize, Deserialize)]
 struct Failure {
@@ -71,6 +75,11 @@ pub(crate) fn paused() -> bool {
         let gate: Gate = load(&storage.cache.join("github-requests/cooldown.json"));
         gate.until > now()
     })
+}
+
+pub(crate) fn generation_in(storage: &storage::Storage) -> u64 {
+    let gate: Gate = load(&super::store::root(storage).join("cooldown.json"));
+    gate.generation
 }
 
 fn limited(text: &str) -> bool {
@@ -150,7 +159,7 @@ pub(crate) fn run(
     mutation: bool,
     limit: Option<usize>,
 ) -> Result<process::Output> {
-    let root = storage::Storage::discover()?.cache.join("github-requests");
+    let root = super::store::root(&storage::Storage::discover()?);
     fs::create_dir_all(&root)?;
     run_in(
         &root,
@@ -209,6 +218,9 @@ fn run_in(
         std::env::var_os("GH_HOST"),
         std::env::var_os("GH_CONFIG_DIR")
     ));
+    let key = input.as_ref().map_or(key.clone(), |body| {
+        storage::hash(format!("{key}:{}", storage::hash(body)))
+    });
     let cache_path = root.join(format!("{key}.json"));
     let failure_path = root.join(format!("{key}.failure.json"));
     if gate.until > at {
@@ -227,7 +239,10 @@ fn run_in(
         && at.saturating_sub(cached.at) < ttl
     {
         return Ok(process::Output {
-            stdout: serde_json::to_vec(&cached.value)?,
+            stdout: match cached.raw {
+                Some(raw) => base64::engine::general_purpose::STANDARD.decode(raw)?,
+                None => serde_json::to_vec(&cached.value)?,
+            },
             stderr: Vec::new(),
             code: 0,
         });
@@ -357,16 +372,18 @@ fn run_in(
         gate.generation = gate.generation.saturating_add(1);
     }
     storage::atomic_json(&gate_path, &gate)?;
-    if ttl > 0
-        && !mutation
-        && let Some(value) = value
-    {
+    // Persist every successful read, including fresh-only reads and raw patches.
+    // TTL controls reuse, not durability; mutation guards still demand fresh data.
+    if !mutation {
         storage::atomic_json(
             &cache_path,
             &Cached {
                 at: now(),
                 generation: gate.generation,
-                value,
+                raw: value
+                    .is_none()
+                    .then(|| base64::engine::general_purpose::STANDARD.encode(&output.stdout)),
+                value: value.unwrap_or_default(),
             },
         )?;
     }
@@ -412,6 +429,40 @@ mod tests {
                 limit: None,
             },
         )
+    }
+
+    #[test]
+    fn raw_and_fresh_only_reads_persist_without_replaying_mutations() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let executable = fake(dir.path(), "patch", "diff --git a/file b/file", 0)?;
+        let fetch = |ttl, mutation| {
+            run_in(
+                dir.path(),
+                Command::new(&executable).arg("pr"),
+                None,
+                &Cancel::default(),
+                Policy {
+                    ttl,
+                    mutation,
+                    limit: Some(1024),
+                },
+            )
+        };
+        let patch = fetch(0, false)?.stdout;
+        assert_eq!(
+            fetch(30, false)?.stdout,
+            patch,
+            "another reader reuses the persisted raw patch"
+        );
+        assert_eq!(calls(&executable), 1);
+        fetch(0, false)?;
+        assert_eq!(calls(&executable), 2, "fresh-only reads still run");
+        fetch(30, true)?;
+        fetch(30, true)?;
+        assert_eq!(calls(&executable), 4);
+        fetch(30, false)?;
+        assert_eq!(calls(&executable), 5, "writes invalidate cached reads");
+        Ok(())
     }
 
     #[test]

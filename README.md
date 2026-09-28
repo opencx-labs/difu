@@ -158,7 +158,8 @@ Deleting a chat removes its unlocked difu-owned worktree, including modified,
 untracked, and ignored files. Existing and externally registered worktrees,
 Git branches and commits, and native provider history are retained. The separate
 worktree-only cleanup action still requires a clean worktree. Archive keeps the
-chat and worktree.
+chat and worktree. While deleting, a progress bar shows shell shutdown, worktree
+removal, attachment deletion, and saved-chat cleanup.
 
 Agents can call **difu_delete_session** when explicitly asked to delete their own
 session and managed worktree. It deletes the chat and attachments and discards
@@ -191,10 +192,12 @@ since its last use. Provider selection does not run a task or repeat prior actio
 Codex uses your installed app-server; Claude uses the installed CLI's streaming
 protocol through an isolated Rust adapter, without Python or an SDK dependency.
 
-Use **/repo** (or `/repo /path/to/checkout`) to change an idle legacy session's
-repository before a worktree exists. New sessions already have a worktree, so
-choose their repository before opening them. The command preserves conversation
-and validates the new repository; it does not change the new-session default.
+Use **/repo** (or `/repo /path/to/checkout`) to change an idle session's repository.
+The command validates the new repository, stops the session's shells, and discards
+its managed worktree and local branches, including committed and uncommitted work.
+It clears artifact associations, workspace history, and connected PRs from the
+session. Remote branches and PRs are untouched. Conversation is preserved; the
+next message creates a fresh worktree. The new-session default is unchanged.
 
 Codex model and reasoning inherit your configuration unless overridden. Legacy
 read-only investigation sessions permit app/MCP approval prompts while blocking
@@ -243,6 +246,12 @@ they are not polled in the background. Network failures retain cached history an
 add **stale** to session PR badges. Badges show **Open**, **Draft**, **Merged**,
 **Closed**, or **Has conflicts**.
 The sidebar shows status below the diff counts, followed by the PR history.
+
+The session diff pane shows the selected PR's published diff whenever the session
+has linked PRs, including when its worktree has been removed. Multiple PRs appear
+as tabs above the diff; click a tab or use **[ / ]** while the diff pane is focused.
+Sessions without PRs show their current worktree changes. A failed refresh keeps
+the cached PR diff visible and reports the error.
 
 Select a bottom PR badge to open the existing PR viewer in the helper canvas,
 starting on **Preview**. **1 / 2 / 3** selects Preview / Guide / Diff while that
@@ -394,7 +403,8 @@ accepts it as editable text; **Tab** keeps its normal focus navigation; **Enter*
 suggestion sends nothing. Suggestions never replace a draft and are discarded
 when the conversation moves on. Generation runs in the background without tools;
 on failure the input shows “Ask anything…” instead. Activity shimmer moves
-in a slightly slower, repeating one-way sweep without moving the text.
+in a repeating one-way sweep without moving the text. The entire highlight clears
+the last character before the next sweep starts.
 
 #### Voice dictation (macOS)
 
@@ -419,7 +429,10 @@ appear with distinct labels and keep their existing workflow restrictions.
 After a service crash or machine restart, history is restored and interrupted work
 resumes when you send a new message or choose Continue. Pending queued prompts are retained as unsent text,
 not replayed. Completed publication actions are never automatically retried.
-Interrupting preserves edits; archiving hides the session and keeps its workspace.
+Interrupting preserves edits; archiving stops the session, hides it, and keeps its
+workspace. Archiving and deleting terminate the session's shells and their child
+servers, including shells in separate process groups. Unarchiving does not
+restart those processes.
 Cleanup is separate and refuses active, modified, untracked, ignored, or Git-locked
 worktrees. It never deletes an existing user directory. Removing a clean worktree
 retains its named branch and commits.
@@ -457,6 +470,14 @@ pause requests across difu until GitHub's retry/reset deadline; when no deadline
 available, difu waits at least a minute and increases the delay on repeated limits.
 Other failed reads also back off. Manual refresh respects the shared cooldown and
 short-lived request cache. GitHub writes are never cached or automatically retried.
+
+All GitHub reads feed one persisted store shared by Reviews, session PR badges,
+the session diff pane, and the PR picker. It retains full PR details and descriptions,
+activity and review comments, merge state, check results, workflow status, published
+patches, and raw responses across restarts. Lists and session links reference the
+same PR records. Opening a PR displays saved data immediately and refreshes data
+older than 30 seconds. Failed refreshes preserve the last successful data; mutation
+preconditions still request fresh GitHub state. Existing PR caches migrate when read.
 
 Select a PR to preview its description, chronological activity, inline review
 comments, and checks. **Enter** drills into that PR and selects **Overview** (the

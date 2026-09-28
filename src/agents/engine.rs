@@ -25,7 +25,7 @@ struct Connection {
 }
 impl Connection {
     fn open(cwd: &Path) -> Result<Self> {
-        let mut child = ChildGroup::spawn(
+        let mut child = ChildGroup::spawn_tree(
             Command::new("codex")
                 .arg("app-server")
                 .current_dir(cwd)

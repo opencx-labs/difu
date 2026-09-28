@@ -4,6 +4,17 @@ use serde_json::Value;
 use std::process::Command;
 
 pub(crate) mod polling;
+pub(crate) mod store;
+
+pub(crate) fn view_detail(key: &PrKey, cancel: &Cancel) -> Result<PrDetail> {
+    store::refresh(key, cancel, |pr| pr.detail, || detail(key, cancel))
+}
+pub(crate) fn view_timeline(key: &PrKey, cancel: &Cancel) -> Result<Vec<TimelineItem>> {
+    store::refresh(key, cancel, |pr| pr.timeline, || timeline(key, cancel))
+}
+pub(crate) fn view_checks(key: &PrKey, cancel: &Cancel) -> Result<CheckReport> {
+    store::refresh(key, cancel, |pr| pr.checks, || checks(key, cancel))
+}
 
 pub(crate) fn command() -> Command {
     let mut cmd = Command::new("gh");
@@ -137,7 +148,7 @@ fn pr_summary_value(v: &Value) -> Result<PrSummary> {
 
 pub(crate) fn pr_summary(key: &PrKey, cancel: &Cancel) -> Result<PrSummary> {
     key.validate()?;
-    pr_summary_value(&json(
+    let summary = pr_summary_value(&json(
         &[
             "pr",
             "view",
@@ -145,7 +156,9 @@ pub(crate) fn pr_summary(key: &PrKey, cancel: &Cancel) -> Result<PrSummary> {
             "--json=number,title,url,author,updatedAt,createdAt,isDraft,state,mergeable,reviewRequests,latestReviews",
         ],
         cancel,
-    )?)
+    )?)?;
+    store::summary(&crate::storage::Storage::discover()?, &summary)?;
+    Ok(summary)
 }
 
 fn pr_metadata(value: &Value) -> PrMetadata {
@@ -186,6 +199,13 @@ fn pr_metadata(value: &Value) -> PrMetadata {
 /// Fetch reviewer and lifecycle metadata in bounded batches, never from typing.
 /// Counts share this request so the inbox need not request them separately.
 pub(crate) fn enrich_prs(prs: &mut [PrSummary], cancel: &Cancel) -> Result<()> {
+    let storage = crate::storage::Storage::discover()?;
+    for pr in prs.iter_mut() {
+        store::summary(&storage, pr)?;
+        if let Some(summary) = store::load(&storage, &pr.key).and_then(|p| p.summary) {
+            *pr = summary;
+        }
+    }
     let mut missing = prs
         .iter()
         .enumerate()
@@ -245,6 +265,7 @@ pub(crate) fn enrich_prs(prs: &mut [PrSummary], cancel: &Cancel) -> Result<()> {
             if let Ok(stats) = serde_json::from_value(value.clone()) {
                 pr.stats = Some(stats);
             }
+            store::summary(&storage, pr)?;
         }
     }
     Ok(())
@@ -364,7 +385,9 @@ pub fn session_pr(
         String::from_utf8_lossy(&output.stderr).trim()
     );
     let value: Value = serde_json::from_slice(&output.stdout)?;
-    session_pr_value(&value)
+    let pr = session_pr_value(&value)?;
+    store::session(&crate::storage::Storage::discover()?, &pr)?;
+    Ok(pr)
 }
 
 fn session_pr_value(value: &Value) -> Result<SessionPr> {
@@ -386,6 +409,25 @@ fn session_pr_value(value: &Value) -> Result<SessionPr> {
         head: text(value, "headRefOid"),
         updated: text(value, "updatedAt"),
     })
+}
+
+/// The published PR patch, independent of local worktree state.
+pub fn pr_diff(key: &PrKey, cancel: &Cancel) -> Result<String> {
+    store::refresh(key, cancel, |pr| pr.diff, || fetch_pr_diff(key, cancel))
+}
+fn fetch_pr_diff(key: &PrKey, cancel: &Cancel) -> Result<String> {
+    key.validate()?;
+    let output = polling::run(
+        command().args(["pr", "diff", &key.url(), "--color=never"]),
+        None,
+        cancel,
+        0,
+        false,
+        Some(32 * 1024 * 1024),
+    )?;
+    let patch = String::from_utf8(output.stdout).context("PR diff is not UTF-8")?;
+    store::diff(&crate::storage::Storage::discover()?, key, &patch)?;
+    Ok(patch)
 }
 
 /// Discover new PRs independently of previously remembered PR URLs.
@@ -439,12 +481,17 @@ fn branch_prs(
         String::from_utf8_lossy(&output.stderr).trim()
     );
     let value: Value = serde_json::from_slice(&output.stdout)?;
-    value
+    let prs = value
         .as_array()
         .context("Invalid session PR response")?
         .iter()
         .map(session_pr_value)
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    let storage = crate::storage::Storage::discover()?;
+    for pr in &prs {
+        store::session(&storage, pr)?;
+    }
+    Ok(prs)
 }
 
 pub fn current_repository(cancel: &Cancel) -> Result<String> {
@@ -493,7 +540,9 @@ pub fn detail(key: &PrKey, cancel: &Cancel) -> Result<PrDetail> {
         ],
         cancel,
     )?;
-    parse_detail(key, &v)
+    let detail = parse_detail(key, &v)?;
+    store::detail(&crate::storage::Storage::discover()?, &detail, &v)?;
+    Ok(detail)
 }
 
 pub(crate) fn parse_detail(key: &PrKey, v: &Value) -> Result<PrDetail> {
@@ -664,6 +713,7 @@ pub fn timeline(key: &PrKey, cancel: &Cancel) -> Result<Vec<TimelineItem>> {
         }
     }
     items.sort_by(|a, b| a.date.cmp(&b.date));
+    store::timeline(&crate::storage::Storage::discover()?, key, &items)?;
     Ok(items)
 }
 
@@ -961,6 +1011,7 @@ pub fn checks(key: &PrKey, cancel: &Cancel) -> Result<CheckReport> {
             }
         }
     }
+    store::checks(&crate::storage::Storage::discover()?, key, &report)?;
     Ok(report)
 }
 

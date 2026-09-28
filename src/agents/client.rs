@@ -32,7 +32,14 @@ pub fn read_line(reader: &mut impl BufRead) -> Result<String> {
 pub fn request(storage: &Storage, request: Request) -> Result<Reply> {
     let mut stream = UnixStream::connect(super::server::socket(storage)?)
         .context("Agent service is disconnected; refresh to reconnect")?;
-    stream.set_read_timeout(Some(Duration::from_secs(65)))?;
+    // Large worktrees can take longer than an RPC timeout to remove. These
+    // actions run off the UI thread; deletion progress is read independently.
+    let timeout = if matches!(request, Request::Delete { .. } | Request::Repository { .. }) {
+        None
+    } else {
+        Some(Duration::from_secs(65))
+    };
+    stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     serde_json::to_writer(&mut stream, &request)?;
     stream.write_all(b"\n")?;

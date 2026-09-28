@@ -99,7 +99,7 @@ impl State {
     }
     fn save(&self, storage: &Storage) -> anyhow::Result<()> {
         std::fs::create_dir_all(&storage.cache)?;
-        crate::storage::atomic_json(&storage.cache.join("agent-prs.json"), &self.cache)
+        pr_cache::save_links(storage, &storage.cache.join("agent-prs.json"), &self.cache)
     }
 }
 impl Drop for State {
@@ -147,8 +147,16 @@ impl Ui {
                     changed = true;
                 }
             }
+            for links in self.prs.cache.values_mut() {
+                pr_cache::hydrate_links(&self.storage, links);
+            }
             for session in &self.summaries {
                 let saved = pr_cache::snapshot(&self.storage, &session.id);
+                if let Some(links) = self.prs.cache.get_mut(&session.id) {
+                    let before = links.len();
+                    saved.retain_connected(links);
+                    changed |= before != links.len();
+                }
                 self.prs
                     .branches
                     .insert(session.id.clone(), saved.branch.clone());
@@ -167,7 +175,14 @@ impl Ui {
                 );
             }
         }
-        while let Ok(update) = self.prs.receiver.try_recv() {
+        while let Ok(mut update) = self.prs.receiver.try_recv() {
+            let saved = pr_cache::snapshot(&self.storage, &update.id);
+            if update.revision < saved.disconnected_before {
+                continue;
+            }
+            if let Ok(links) = &mut update.result {
+                saved.retain_connected(links);
+            }
             if self.summaries.iter().any(|s| {
                 s.id == update.id
                     && s.workspace == update.workspace
@@ -330,6 +345,115 @@ mod tests {
         }
     }
     #[test]
+    fn published_diffs_have_stable_tabs_and_reject_late_responses() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = store(temp.path());
+        let mut ui = Ui::new(storage.clone(), &Config::default());
+        let mut session = Session::new(
+            "one".into(),
+            Job::Coding(Launch {
+                repository: temp.path().into(),
+                isolated: true,
+                base: "HEAD".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.workspace_removed = true;
+        ui.summaries.push(session.summary());
+        ui.sessions.insert("one".into(), session);
+        ui.selected = Some("one".into());
+        ui.drilled = true;
+        ui.changes_visible = true;
+        ui.focus = Focus::ChangeTree;
+        let first = pr();
+        let mut second = pr();
+        second.key.number = 43;
+        let patch = "diff --git a/published.rs b/published.rs\n--- a/published.rs\n+++ b/published.rs\n@@ -1 +1 @@\n-old\n+published\n";
+        crate::github::store::diff(&storage, &first.key, patch)?;
+        ui.prs.receive(Update {
+            id: "one".into(),
+            workspace: temp.path().into(),
+            branch: None,
+            revision: 0,
+            result: Ok(vec![first.clone(), second.clone()]
+                .into_iter()
+                .map(|pr| Cached {
+                    workspace_revision: 0,
+                    workspace: temp.path().into(),
+                    pr,
+                })
+                .collect()),
+        });
+        ui.sync_change_pr("one");
+        assert_eq!(ui.change_source("one").pr, Some(first.key.clone()));
+        assert_eq!(
+            ui.changes
+                .get("one")
+                .and_then(|d| d.files.first())
+                .map(|f| f.path.as_str()),
+            Some("published.rs")
+        );
+        for (key, expected) in [(']', &second.key), (']', &first.key), ('[', &second.key)] {
+            ui.key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+            assert_eq!(ui.change_source("one").pr.as_ref(), Some(expected));
+        }
+        ui.prs.cache.get_mut("one").context("links")?.reverse();
+        ui.sync_change_pr("one");
+        assert_eq!(
+            ui.change_source("one").pr,
+            Some(second.key.clone()),
+            "sorting must not change the selected PR"
+        );
+        let source = ui.change_source("one");
+        ui.changing = Some((source.clone(), 2));
+        ui.receive_change_result(&source, 1, Ok(Reply::Changes("obsolete".into())));
+        assert!(!ui.changes.contains_key("one"));
+        let mut obsolete = source.clone();
+        obsolete.pr = Some(first.key.clone());
+        ui.receive_change_result(&obsolete, 2, Ok(Reply::Changes("wrong PR".into())));
+        assert!(!ui.changes.contains_key("one"));
+        ui.receive_change_result(&source, 2, Ok(Reply::Changes(patch.into())));
+        assert!(ui.changes.contains_key("one"));
+        ui.changing = Some((source.clone(), 3));
+        ui.receive_change_result(&source, 3, Err("offline".into()));
+        assert!(
+            ui.changes.contains_key("one"),
+            "failed refresh retains the published patch"
+        );
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30))?;
+        terminal.draw(|frame| {
+            let area = frame.area();
+            ui.draw_changes(frame, area);
+        })?;
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("example/project#42") && screen.contains("example/project#43"));
+        assert!(screen.contains("cached diff may be stale"));
+        assert!(ui
+            .hits
+            .iter()
+            .any(|(_, action)| matches!(action, Action::ChangePr(1))));
+        ui.focus = Focus::Composer;
+        ui.key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
+        assert_eq!(
+            ui.positions.get("one").context("position")?.draft.text(),
+            "[]"
+        );
+        ui.prs.forget("one", &storage)?;
+        ui.sync_change_pr("one");
+        assert!(ui.change_source("one").pr.is_none());
+        assert!(!ui.changes.contains_key("one"));
+        Ok(())
+    }
+    #[test]
     fn statuses_persist_refresh_and_survive_network_failures() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let storage = store(temp.path());
@@ -357,6 +481,7 @@ mod tests {
             branch: None,
             revision: 0,
             result: Ok(vec![Cached {
+                workspace_revision: 0,
                 workspace: temp.path().into(),
                 pr: badge,
             }]),
@@ -420,6 +545,7 @@ mod tests {
             branch: None,
             revision: 0,
             result: Ok(vec![Cached {
+                workspace_revision: 0,
                 workspace: temp.path().into(),
                 pr: pr(),
             }]),

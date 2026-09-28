@@ -161,11 +161,61 @@ fn expire_github_requests(root: &Path) -> Result<()> {
     Ok(())
 }
 
+fn exercise_published_pr_diffs(root: &Path) -> Result<()> {
+    let cancel = Cancel::default();
+    let first = PrKey {
+        owner: "example".into(),
+        repo: "project".into(),
+        number: 9101,
+    };
+    let second = PrKey {
+        number: 9102,
+        ..first.clone()
+    };
+    let patch = difu::github::pr_diff(&first, &cancel)?;
+    assert!(patch.contains("+published-9101"));
+    assert!(difu::github::pr_diff(&second, &cancel)?.contains("+published-9102"));
+    assert_eq!(difu::github::pr_diff(&first, &cancel)?, patch);
+    assert_eq!(
+        fs::read_to_string(root.join("pr-diffs.jsonl"))?
+            .lines()
+            .count(),
+        2
+    );
+    fs::write(root.join("fail-pr-diff"), "offline")?;
+    let path = Storage::discover()?
+        .cache
+        .join("github-requests/prs")
+        .join(format!("{}.json", difu::storage::hash(first.id())));
+    let mut saved: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    *saved.pointer_mut("/diff/at").context("diff timestamp")? = serde_json::json!(0);
+    fs::write(&path, serde_json::to_vec(&saved)?)?;
+    assert!(difu::github::pr_diff(&first, &cancel).is_err());
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+    assert_eq!(
+        saved.pointer("/diff/value").and_then(|v| v.as_str()),
+        Some(patch.as_str())
+    );
+    fs::remove_file(root.join("fail-pr-diff"))?;
+    Ok(())
+}
+
 fn exercise(root: &Path) -> Result<()> {
     exercise_checks(root)?;
     exercise_mention_shortcut(root)?;
     exercise_writes(root)?;
     exercise_reviewer_picker_and_branch_lookup(root)?;
+    exercise_published_pr_diffs(root)?;
+    // The scenarios above reuse a fixture PR through incompatible lifecycles.
+    // Start the inbox scenario with its own records, as with its own UI cache.
+    let shared_prs = Storage::discover()?.cache.join("github-requests/prs");
+    ensure!(
+        shared_prs.starts_with(root.join("home")),
+        "Fixture cache must be isolated"
+    );
+    if shared_prs.is_dir() {
+        fs::remove_dir_all(shared_prs)?;
+    }
     let storage = Storage {
         config: root.join("config.json"),
         cache: root.to_owned(),
