@@ -161,7 +161,10 @@ fn expire_github_requests(root: &Path) -> Result<()> {
         if prs.is_dir() {
             for entry in fs::read_dir(prs)? {
                 let path = entry?.path();
-                if !path.extension().is_some_and(|extension| extension == "json") {
+                if !path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
                     continue;
                 }
                 let mut pr: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
