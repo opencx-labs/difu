@@ -148,7 +148,7 @@ fn expire_github_requests(root: &Path) -> Result<()> {
         "Fixture cache must be isolated"
     );
     if cache.is_dir() {
-        for entry in fs::read_dir(cache)? {
+        for entry in fs::read_dir(&cache)? {
             let path = entry?.path();
             if path
                 .extension()
@@ -157,7 +157,65 @@ fn expire_github_requests(root: &Path) -> Result<()> {
                 fs::remove_file(path)?;
             }
         }
+        let prs = cache.join("prs");
+        if prs.is_dir() {
+            for entry in fs::read_dir(prs)? {
+                let path = entry?.path();
+                if !path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
+                    continue;
+                }
+                let mut pr: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+                for field in ["detail", "timeline", "checks", "diff"] {
+                    if let Some(at) = pr.get_mut(field).and_then(|value| value.get_mut("at")) {
+                        *at = serde_json::json!(0);
+                    }
+                }
+                fs::write(path, serde_json::to_vec(&pr)?)?;
+            }
+        }
     }
+    Ok(())
+}
+
+fn exercise_published_pr_diffs(root: &Path) -> Result<()> {
+    let cancel = Cancel::default();
+    let first = PrKey {
+        owner: "example".into(),
+        repo: "project".into(),
+        number: 9101,
+    };
+    let second = PrKey {
+        number: 9102,
+        ..first.clone()
+    };
+    let patch = difu::github::pr_diff(&first, &cancel)?;
+    assert!(patch.contains("+published-9101"));
+    assert!(difu::github::pr_diff(&second, &cancel)?.contains("+published-9102"));
+    assert_eq!(difu::github::pr_diff(&first, &cancel)?, patch);
+    assert_eq!(
+        fs::read_to_string(root.join("pr-diffs.jsonl"))?
+            .lines()
+            .count(),
+        2
+    );
+    fs::write(root.join("fail-pr-diff"), "offline")?;
+    let path = Storage::discover()?
+        .cache
+        .join("github-requests/prs")
+        .join(format!("{}.json", difu::storage::hash(first.id())));
+    let mut saved: serde_json::Value = serde_json::from_slice(&fs::read(&path)?)?;
+    *saved.pointer_mut("/diff/at").context("diff timestamp")? = serde_json::json!(0);
+    fs::write(&path, serde_json::to_vec(&saved)?)?;
+    assert!(difu::github::pr_diff(&first, &cancel).is_err());
+    let saved: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+    assert_eq!(
+        saved.pointer("/diff/value").and_then(|v| v.as_str()),
+        Some(patch.as_str())
+    );
+    fs::remove_file(root.join("fail-pr-diff"))?;
     Ok(())
 }
 
@@ -166,6 +224,17 @@ fn exercise(root: &Path) -> Result<()> {
     exercise_mention_shortcut(root)?;
     exercise_writes(root)?;
     exercise_reviewer_picker_and_branch_lookup(root)?;
+    exercise_published_pr_diffs(root)?;
+    // The scenarios above reuse a fixture PR through incompatible lifecycles.
+    // Start the inbox scenario with its own records, as with its own UI cache.
+    let shared_prs = Storage::discover()?.cache.join("github-requests/prs");
+    ensure!(
+        shared_prs.starts_with(root.join("home")),
+        "Fixture cache must be isolated"
+    );
+    if shared_prs.is_dir() {
+        fs::remove_dir_all(shared_prs)?;
+    }
     let storage = Storage {
         config: root.join("config.json"),
         cache: root.to_owned(),
@@ -611,6 +680,8 @@ fn exercise(root: &Path) -> Result<()> {
     *revisions.get_mut("head").context("Missing head")? = serde_json::json!(remote_commit);
     *revisions.get_mut("base").context("Missing base")? = serde_json::json!(remote_base);
     fs::write(root.join("revisions.json"), serde_json::to_vec(&revisions)?)?;
+    // Opening a PR refreshes stale records; advance the fixture past that window.
+    expire_github_requests(root)?;
     let fetches_before = fs::read_to_string(root.join("fetches.jsonl"))?
         .lines()
         .count();

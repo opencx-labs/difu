@@ -29,7 +29,7 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap},
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -88,6 +88,7 @@ pub struct Position {
     pub change_tree: usize,
     pub change_directory: Option<String>,
     pub change_tree_horizontal: usize,
+    pub change_pr: Option<crate::model::PrKey>,
     pub horizontal: usize,
     pub selection: Option<usize>,
     pub draft: Editor,
@@ -124,6 +125,7 @@ enum Action {
     ToggleList,
     ToggleChanges,
     ChangeFile(usize),
+    ChangePr(usize),
     Approval(usize),
     MenuItem(usize),
     Command(usize),
@@ -225,6 +227,10 @@ pub enum Modal {
     },
     Cleanup,
     Delete,
+    Deleting {
+        id: String,
+        stage: DeletionStage,
+    },
     Help(crate::help::State),
 }
 struct ResultMessage {
@@ -235,7 +241,7 @@ struct ResultMessage {
 enum Task {
     List,
     Read(String),
-    Changes(String, u64),
+    Changes(changes::Source, u64),
     Statistics(String, u64),
     Shells(String),
     OpenArtifact,
@@ -264,6 +270,7 @@ pub struct Ui {
     pub sessions: HashMap<String, Session>,
     pub positions: HashMap<String, Position>,
     pub changes: HashMap<String, changes::Document>,
+    change_errors: HashMap<String, String>,
     pub focus: Focus,
     pub drilled: bool,
     pub list_visible: bool,
@@ -281,7 +288,8 @@ pub struct Ui {
     changes_at: Option<Instant>,
     listing: bool,
     reading: bool,
-    changing: bool,
+    changing: Option<(changes::Source, u64)>,
+    change_request: u64,
     pub busy: bool,
     interrupting: HashSet<String>,
     question_send: Option<(String, Value, String, usize)>,
@@ -322,6 +330,7 @@ impl Ui {
             sessions: HashMap::new(),
             positions: HashMap::new(),
             changes: HashMap::new(),
+            change_errors: HashMap::new(),
             focus: Focus::List,
             drilled: false,
             list_visible: config.agent_list_visible,
@@ -340,7 +349,8 @@ impl Ui {
             changes_at: None,
             listing: false,
             reading: false,
-            changing: false,
+            changing: None,
+            change_request: 0,
             busy: false,
             interrupting: HashSet::new(),
             question_send: None,
@@ -387,11 +397,18 @@ impl Ui {
         self.tick_selection_click();
         self.tick_panels(visible);
         self.tick_prs(visible);
+        if let Some(id) = self.selected.clone() {
+            self.sync_change_pr(&id);
+        }
         self.tick_models();
         self.tick_defaults();
         self.tick_media();
         self.tick_voice(visible);
         while let Ok(message) = self.receiver.try_recv() {
+            if let Task::Changes(source, request) = &message.kind {
+                self.receive_change_result(source, *request, message.result);
+                continue;
+            }
             match &message.kind {
                 Task::Shells(_) => {
                     self.panels.loading = false;
@@ -402,10 +419,7 @@ impl Ui {
                     self.refreshed = Some(Instant::now());
                 }
                 Task::Read(_) => self.reading = false,
-                Task::Changes(..) => {
-                    self.changing = false;
-                    self.changes_at = Some(Instant::now());
-                }
+                Task::Changes(..) => {}
                 Task::Launch
                 | Task::Repository(_)
                 | Task::Worktree(_)
@@ -486,6 +500,11 @@ impl Ui {
             }
             match message.result {
                 Err(error) => {
+                    if let Task::Delete(id) = &message.kind
+                        && matches!(&self.modal, Some(Modal::Deleting { id: deleting, .. }) if deleting == id)
+                    {
+                        self.modal = Some(Modal::Delete);
+                    }
                     if let Task::Send(id, text, ..) = &message.kind
                         && let Some(position) = self.positions.get_mut(id)
                         && let Some(index) = position.outgoing.iter().rposition(|p| &p.text == text)
@@ -579,6 +598,25 @@ impl Ui {
                         {
                             continue;
                         }
+                        if let Some(Modal::Deleting {
+                            id: deleting,
+                            stage,
+                        }) = &mut self.modal
+                            && deleting == &id
+                            && let Some(progress) = session.deletion_progress
+                        {
+                            *stage = progress;
+                        }
+                        if !session.workspace_ready
+                            && self.sessions.get(&id).is_some_and(|old| {
+                                old.workspace_revision != session.workspace_revision
+                            })
+                        {
+                            let _ = self.prs.forget(&id, &self.storage);
+                            if self.selected.as_ref() == Some(&id) {
+                                self.panels = panels::Panels::new(self.panels.right);
+                            }
+                        }
                         if let Some(position) = self.positions.get_mut(&id) {
                             position
                                 .outgoing
@@ -615,16 +653,6 @@ impl Ui {
                         }
                         self.sessions.insert(id.clone(), *session);
                         self.question_received(&id);
-                    }
-                    (Task::Changes(id, revision), Reply::Changes(patch)) => {
-                        if self
-                            .sessions
-                            .get(&id)
-                            .is_some_and(|s| s.workspace_revision != revision)
-                        {
-                            continue;
-                        }
-                        self.receive_changes(id, patch.into());
                     }
                     (
                         Task::Defaults(id),
@@ -744,6 +772,8 @@ impl Ui {
             self.refresh_statistics();
         }
         if visible && let Some(id) = self.selected.clone() {
+            self.sync_change_pr(&id);
+            let source = self.change_source(&id);
             let wanted = self
                 .summaries
                 .iter()
@@ -763,24 +793,26 @@ impl Ui {
             }
             if self.drilled
                 && self.changes_visible
-                && !self.changing
                 && self
-                    .changes_at
-                    .is_none_or(|at| at.elapsed() >= Duration::from_secs(2))
+                    .changing
+                    .as_ref()
+                    .is_none_or(|(pending, _)| pending != &source)
+                && self.changes_at.is_none_or(|at| {
+                    at.elapsed() >= Duration::from_secs(if source.pr.is_some() { 30 } else { 2 })
+                })
                 && self.sessions.get(&id).is_some_and(|s| {
                     matches!(s.job, Job::Coding(_))
-                        && s.workspace_ready
-                        && s.baseline.is_some()
-                        && !s.workspace_removed
+                        && (source.pr.is_some()
+                            || s.workspace_ready && s.baseline.is_some() && !s.workspace_removed)
                 })
             {
-                self.changing = true;
-                let revision = self.sessions.get(&id).map_or(0, |s| s.workspace_revision);
-                self.task(
-                    Task::Changes(id.clone(), revision),
-                    Request::Changes { id },
-                    false,
-                );
+                self.change_request = self.change_request.wrapping_add(1);
+                self.changing = Some((source.clone(), self.change_request));
+                let request = match &source.pr {
+                    Some(pr) => Request::PrChanges { id, pr: pr.clone() },
+                    None => Request::Changes { id },
+                };
+                self.task(Task::Changes(source, self.change_request), request, false);
             }
         }
     }
@@ -1289,6 +1321,9 @@ impl Ui {
         }
     }
     pub fn key(&mut self, key: KeyEvent) {
+        if matches!(self.modal, Some(Modal::Deleting { .. })) {
+            return;
+        }
         // Release events terminate hold-to-dictate, but never navigate or submit.
         if key.kind == crossterm::event::KeyEventKind::Release {
             self.voice_key(key);
@@ -1379,6 +1414,16 @@ impl Ui {
         }
         if self.changes_visible && self.drilled && key.code == KeyCode::Esc {
             self.toggle_changes();
+            return;
+        }
+        if self.changes_visible
+            && self.drilled
+            && !self.panels.focused
+            && matches!(self.focus, Focus::Changes | Focus::ChangeTree)
+            && key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Char('[' | ']'))
+        {
+            self.cycle_change_pr(key.code == KeyCode::Char(']'));
             return;
         }
         if key.code == KeyCode::Esc
@@ -1907,6 +1952,9 @@ impl Ui {
         }
     }
     fn modal_key(&mut self, key: KeyEvent) {
+        if matches!(self.modal, Some(Modal::Deleting { .. })) {
+            return;
+        }
         if matches!(self.modal, Some(Modal::Usage { .. })) {
             self.usage_key(key);
             return;
@@ -2013,6 +2061,10 @@ impl Ui {
             Some(Modal::Delete) if key.code == KeyCode::Enter => {
                 if let Some(id) = self.selected.clone() {
                     self.busy = true;
+                    self.modal = Some(Modal::Deleting {
+                        id: id.clone(),
+                        stage: DeletionStage::Stopping,
+                    });
                     self.task(Task::Delete(id.clone()), Request::Delete { id }, false);
                 }
             }
@@ -2123,6 +2175,7 @@ impl Ui {
             Action::ToggleList => self.toggle_list(),
             Action::ToggleChanges => self.toggle_changes(),
             Action::ChangeFile(index) => self.select_change(index),
+            Action::ChangePr(index) => self.select_change_pr(index),
             Action::Approval(index) => self.pending(index),
             Action::Pending => self.open_questions(),
             Action::InlineQuestion(index) => self.open_question(index),
@@ -3138,6 +3191,7 @@ impl Ui {
             Some(Modal::Resources { .. }) => "Open shells · Enter view",
             Some(Modal::Cleanup) => "Delete worktree",
             Some(Modal::Delete) => "Stop and delete chat",
+            Some(Modal::Deleting { .. }) => "Deleting session",
             Some(Modal::Help(_)) => "Search agent shortcuts",
             None => "",
         };
@@ -3243,6 +3297,16 @@ impl Ui {
                     Action::ChangeRepository,
                     true,
                 ));
+                frame.render_widget(
+                    Paragraph::new("Changing repositories discards the managed worktree and its local work, artifacts, and PR associations. Connected PRs stay open.")
+                        .wrap(Wrap { trim: false }),
+                    Rect::new(
+                        area.x,
+                        area.y.saturating_add(6),
+                        area.width,
+                        area.height.saturating_sub(6),
+                    ),
+                );
             }
             Some(Modal::Repository(value)) => {
                 let input = Rect::new(area.x, area.y, area.width, area.height.min(3));
@@ -3291,6 +3355,20 @@ impl Ui {
             }
             Some(Modal::Delete) => {
                 frame.render_widget(Paragraph::new("Stop this agent and permanently delete its difu chat, saved questions, queue, and attachments? Its unlocked difu-owned worktree will also be removed, including all uncommitted, untracked, and ignored files. Existing directories, named branches, commits, and native provider history are not deleted.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
+            }
+            Some(Modal::Deleting { stage, .. }) => {
+                let (percent, label) = stage.progress();
+                frame.render_widget(
+                    Paragraph::new(label).wrap(Wrap { trim: false }),
+                    Rect::new(area.x, area.y, area.width, area.height.min(2)),
+                );
+                frame.render_widget(
+                    Gauge::default()
+                        .gauge_style(Style::default().fg(GREEN).bg(BG))
+                        .percent(percent)
+                        .label(format!("{percent}%")),
+                    Rect::new(area.x, area.y.saturating_add(3), area.width, 1).intersection(area),
+                );
             }
             Some(Modal::Cleanup) => {
                 frame.render_widget(Paragraph::new("Delete this session’s clean, inactive worktree?\n\nModified, untracked, ignored, active and Git-locked worktrees are protected. Existing directories are never deleted. The named branch and its commits are retained.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
@@ -3653,6 +3731,62 @@ mod tests {
         ui.select("one".into());
         ui
     }
+    #[test]
+    fn deletion_modal_shows_server_progress_and_recovers_from_failure() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        ui.busy = true;
+        ui.modal = Some(Modal::Deleting {
+            id: "one".into(),
+            stage: DeletionStage::Stopping,
+        });
+        for stage in [
+            DeletionStage::Stopping,
+            DeletionStage::Worktree,
+            DeletionStage::Attachments,
+            DeletionStage::History,
+        ] {
+            let mut session = ui.sessions.get("one").context("session")?.clone();
+            session.deletion_progress = Some(stage);
+            session.touch();
+            ui.sender.send(ResultMessage {
+                kind: Task::Read("one".into()),
+                result: Ok(Reply::Session(Box::new(session))),
+            })?;
+            ui.tick(false);
+            let (screen, _) = draw(&mut ui, 120, 30)?;
+            let (percent, label) = stage.progress();
+            assert!(screen.contains(label));
+            assert!(screen.contains(&format!("{percent}%")));
+            assert!(!screen.contains("Enter confirms"));
+            for key in [KeyCode::Enter, KeyCode::Esc] {
+                ui.key(KeyEvent::new(key, KeyModifiers::NONE));
+                assert!(matches!(ui.modal, Some(Modal::Deleting { .. })));
+            }
+        }
+        ui.sender.send(ResultMessage {
+            kind: Task::Delete("one".into()),
+            result: Err("Worktree is locked".into()),
+        })?;
+        ui.tick(false);
+        assert!(!ui.busy && matches!(ui.modal, Some(Modal::Delete)));
+        assert_eq!(
+            ui.notice.as_ref().map(|n| n.0.as_str()),
+            Some("Worktree is locked")
+        );
+        assert!(ui.sessions.contains_key("one"));
+        ui.sender.send(ResultMessage {
+            kind: Task::Delete("one".into()),
+            result: Ok(Reply::Ok),
+        })?;
+        ui.tick(false);
+        assert!(ui.modal.is_none() && !ui.sessions.contains_key("one"));
+        Ok(())
+    }
+
     #[test]
     fn session_pins_persist_sort_first_and_obey_archive_filter() -> Result<()> {
         let dir = tempfile::tempdir()?;

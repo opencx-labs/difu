@@ -5,6 +5,14 @@ root = Path(os.environ['DIFU_TEST_FIXTURE'])
 revs = json.loads((root / 'revisions.json').read_text())
 args = [arg for arg in sys.argv[1:] if arg != "--include"]
 url = 'https://github.com/example/project/pull/1'
+if args[:2] == ['pr', 'diff']:
+    assert args[3:] == ['--color=never']
+    if (root / 'fail-pr-diff').exists():
+        print('GitHub unavailable', file=sys.stderr);sys.exit(1)
+    number = int(args[2].rsplit('/', 1)[-1])
+    with (root / 'pr-diffs.jsonl').open('a') as log: log.write(str(number)+'\n')
+    print(f'diff --git a/pr-{number}.rs b/pr-{number}.rs\n--- a/pr-{number}.rs\n+++ b/pr-{number}.rs\n@@ -1 +1 @@\n-old\n+published-{number}')
+    sys.exit(0)
 if args[:2] == ['pr', 'list']:
     assert args[args.index('--head')+1] == 'session-branch'
     assert args[args.index('--state')+1] == 'all'

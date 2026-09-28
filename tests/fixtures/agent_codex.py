@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Deterministic app-server fixture: never runs a model or project validation."""
-import json, os, pathlib, sys, uuid
+import json, os, pathlib, subprocess, sys, uuid
 root = pathlib.Path(os.environ['DIFU_AGENT_FIXTURE'])
 if sys.argv[1:3] == ['mcp', 'list']:
     print('[]')
@@ -80,6 +80,9 @@ for line in sys.stdin:
         elif text.startswith('artifact'):
             pathlib.Path('report.html').write_text('<h1>Fixture artifact</h1>')
             emit({'id':900+turn,'method':'item/tool/call','params':{'threadId':thread_id,'turnId':active,'tool':'difu_present_artifact','arguments':{'path':'report.html','title':'Fixture report'}}})
+        elif text.startswith('fixture shell: '):
+            subprocess.Popen([sys.executable, text.split(': ', 1)[1]], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            complete()
         elif text.startswith('chat only'):
             complete()
         elif text == 'fixture fail turn':

@@ -1,6 +1,6 @@
 use crate::{
     codex::Guide,
-    model::{ModelChoice, PrSummary},
+    model::{ModelChoice, PrKey, PrSummary},
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -130,7 +130,12 @@ impl Storage {
         Ok(config)
     }
     pub fn load_repositories(&self) -> Result<Option<Vec<String>>> {
-        let path = self.cache.join("repositories.json");
+        let current = crate::github::store::root(self).join("repositories.json");
+        let path = if current.exists() {
+            current
+        } else {
+            self.cache.join("repositories.json")
+        };
         if !path.exists() {
             return Ok(None);
         }
@@ -141,26 +146,52 @@ impl Storage {
         Ok(Some(repos))
     }
     pub fn save_repositories(&self, repos: &[String]) -> Result<()> {
-        atomic_json(&self.cache.join("repositories.json"), &repos)
+        let root = crate::github::store::root(self);
+        fs::create_dir_all(&root)?;
+        atomic_json(&root.join("repositories.json"), &repos)
     }
 
     pub fn save_config(&self, config: &Config) -> Result<()> {
         atomic_json(&self.config, config)
     }
     pub fn load_inbox(&self, key: &str) -> Result<Option<Vec<PrSummary>>> {
-        let path = self.cache.join(format!("inbox-{key}.json"));
-        if !path.exists() {
+        let path = crate::github::store::root(self)
+            .join("lists")
+            .join(format!("{}.json", hash(key)));
+        if path.exists() {
+            let keys: Vec<PrKey> = serde_json::from_slice(&fs::read(path)?)?;
+            let mut inbox = Vec::new();
+            for key in keys {
+                key.validate()?;
+                if let Some(summary) =
+                    crate::github::store::load(self, &key).and_then(|p| p.summary)
+                {
+                    inbox.push(summary);
+                }
+            }
+            return Ok(Some(inbox));
+        }
+        // Import old lists once. Subsequent reads resolve the shared PR records.
+        let legacy = self.cache.join(format!("inbox-{key}.json"));
+        if !legacy.exists() {
             return Ok(None);
         }
         let inbox: Vec<PrSummary> =
-            serde_json::from_slice(&fs::read(path)?).context("Cannot read cached PR list")?;
-        for pr in &inbox {
-            pr.key.validate()?;
-        }
-        Ok(Some(inbox))
+            serde_json::from_slice(&fs::read(&legacy)?).context("Cannot read cached PR list")?;
+        self.save_inbox(key, &inbox)?;
+        let _ = fs::remove_file(legacy);
+        self.load_inbox(key)
     }
     pub fn save_inbox(&self, key: &str, inbox: &[PrSummary]) -> Result<()> {
-        atomic_json(&self.cache.join(format!("inbox-{key}.json")), &inbox)
+        for pr in inbox {
+            crate::github::store::summary(self, pr)?;
+        }
+        let root = crate::github::store::root(self).join("lists");
+        fs::create_dir_all(&root)?;
+        atomic_json(
+            &root.join(format!("{}.json", hash(key))),
+            &inbox.iter().map(|p| &p.key).collect::<Vec<_>>(),
+        )
     }
     pub fn load_guide(&self, key: &str) -> Result<Option<Guide>> {
         let path = self.cache.join(format!("{key}.json"));

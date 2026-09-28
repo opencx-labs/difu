@@ -251,12 +251,14 @@ fn activity_text(session: &Session) -> (String, Option<String>, Option<i64>) {
 }
 fn shimmer(text: &str, now: i64) -> Line<'static> {
     let length = text.chars().count();
-    let phase = (now.max(0) as usize / 80) % length.max(1);
+    // Start and finish outside the text so the entire six-character halo clears
+    // the last character before the next sweep enters from the left.
+    let phase = ((now.max(0) as usize / 80) % (length + 12)) as isize - 6;
     Line::from(
         text.chars()
             .enumerate()
             .map(|(index, ch)| {
-                let distance = index.abs_diff(phase);
+                let distance = (index as isize).abs_diff(phase);
                 let color = match distance {
                     0..=1 => Color::Rgb(235, 240, 235),
                     2..=3 => Color::Rgb(190, 200, 190),
@@ -864,10 +866,25 @@ mod tests {
         assert_ne!(first, next);
         assert!(first.spans.iter().all(|span| span.style.bg.is_none()));
         let text = "0123456789abcdefghijk";
-        let cycle = text.chars().count() as i64 * 80;
+        let cycle = (text.chars().count() as i64 + 12) * 80;
         assert_eq!(shimmer(text, 0), shimmer(text, 79));
         assert_ne!(shimmer(text, 0), shimmer(text, 80));
         assert_eq!(shimmer(text, 0), shimmer(text, cycle));
+        // Both sides of the wrap are fully dim; the halo has left the final glyph.
+        for at in [cycle - 80, cycle] {
+            assert!(
+                shimmer(text, at)
+                    .spans
+                    .iter()
+                    .all(|span| span.style.fg == Some(DIM))
+            );
+        }
+        assert!(
+            shimmer(text, cycle - 160)
+                .spans
+                .last()
+                .is_some_and(|span| span.style.fg != Some(DIM))
+        );
         assert_ne!(shimmer(text, cycle - 240), shimmer(text, cycle + 240));
     }
     #[test]

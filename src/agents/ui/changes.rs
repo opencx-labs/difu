@@ -2,6 +2,13 @@ use super::*;
 use ratatui::style::Modifier;
 use std::sync::Arc;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Source {
+    pub id: String,
+    pub revision: u64,
+    pub pr: Option<crate::model::PrKey>,
+}
+
 pub struct File {
     pub path: String,
     pub patch: String,
@@ -264,6 +271,110 @@ impl Document {
 }
 
 impl Ui {
+    pub(super) fn change_source(&self, id: &str) -> Source {
+        let links = self.prs.all(id);
+        let selected = self.positions.get(id).and_then(|p| p.change_pr.as_ref());
+        Source {
+            id: id.into(),
+            revision: self.sessions.get(id).map_or(0, |s| s.workspace_revision),
+            pr: links
+                .iter()
+                .find(|link| Some(&link.pr.key) == selected)
+                .or_else(|| links.first())
+                .map(|link| link.pr.key.clone()),
+        }
+    }
+    pub(super) fn sync_change_pr(&mut self, id: &str) {
+        let source = self.change_source(id);
+        if self.positions.get(id).and_then(|p| p.change_pr.as_ref()) != source.pr.as_ref() {
+            self.reset_change_source(id, source.pr);
+        }
+    }
+    fn reset_change_source(&mut self, id: &str, pr: Option<crate::model::PrKey>) {
+        let cached = pr
+            .as_ref()
+            .and_then(|key| crate::github::store::load(&self.storage, key))
+            .and_then(|pr| pr.diff);
+        let position = self.positions.entry(id.into()).or_default();
+        position.change_pr = pr;
+        position.change_file = 0;
+        position.change_tree = 0;
+        position.change_directory = None;
+        position.change_tree_horizontal = 0;
+        position.changes = 0;
+        position.horizontal = 0;
+        position.selection = None;
+        self.changes.remove(id);
+        if let Some(cached) = cached {
+            self.changes.insert(id.into(), cached.value.into());
+        }
+        self.change_errors.remove(id);
+        self.changes_at = None;
+        self.changing = None;
+        self.change_rows = Default::default();
+        self.change_lines = 0;
+    }
+    pub(super) fn select_change_pr(&mut self, index: usize) {
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        let Some(key) = self.prs.all(&id).get(index).map(|link| link.pr.key.clone()) else {
+            return;
+        };
+        if self.positions.get(&id).and_then(|p| p.change_pr.as_ref()) != Some(&key) {
+            self.reset_change_source(&id, Some(key));
+        }
+        self.focus = Focus::ChangeTree;
+        self.panels.focused = false;
+    }
+    pub(super) fn cycle_change_pr(&mut self, forward: bool) {
+        let Some(id) = self.selected.as_ref() else {
+            return;
+        };
+        let links = self.prs.all(id);
+        if links.len() < 2 {
+            return;
+        }
+        let source = self.change_source(id);
+        let index = links
+            .iter()
+            .position(|link| Some(&link.pr.key) == source.pr.as_ref())
+            .unwrap_or(0);
+        let next = if forward {
+            (index + 1) % links.len()
+        } else {
+            (index + links.len() - 1) % links.len()
+        };
+        self.select_change_pr(next);
+    }
+    pub(super) fn receive_change_result(
+        &mut self,
+        source: &Source,
+        request: u64,
+        result: Result<Reply, String>,
+    ) {
+        if self
+            .changing
+            .as_ref()
+            .is_none_or(|(pending, serial)| pending != source || *serial != request)
+            || self.selected.as_deref() != Some(source.id.as_str())
+            || self.change_source(&source.id) != *source
+        {
+            return;
+        }
+        self.changing = None;
+        self.changes_at = Some(Instant::now());
+        match result {
+            Ok(Reply::Changes(patch)) => {
+                self.change_errors.remove(&source.id);
+                self.receive_changes(source.id.clone(), patch.into());
+            }
+            Err(error) => {
+                self.change_errors.insert(source.id.clone(), error);
+            }
+            _ => {}
+        }
+    }
     pub(super) fn receive_changes(&mut self, id: String, document: Document) {
         if self.changes.get(&id).is_some_and(|old| {
             old.files.len() == document.files.len()
@@ -375,7 +486,57 @@ impl Ui {
         };
         true
     }
-    pub(super) fn draw_changes(&mut self, frame: &mut Frame, rect: Rect) {
+    pub(super) fn draw_changes(&mut self, frame: &mut Frame, mut rect: Rect) {
+        let pr = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.change_source(id).pr);
+        if let Some(id) = self.selected.clone() {
+            let keys = self
+                .prs
+                .all(&id)
+                .iter()
+                .map(|link| link.pr.key.clone())
+                .collect::<Vec<_>>();
+            if keys.len() > 1 && rect.height > 0 {
+                let selected = keys
+                    .iter()
+                    .position(|key| Some(key) == pr.as_ref())
+                    .unwrap_or(0);
+                // Scroll the tab strip to keep the selected PR visible on narrow terminals.
+                let labels = keys
+                    .iter()
+                    .map(|key| format!(" {}#{} ", key.repository(), key.number))
+                    .collect::<Vec<_>>();
+                let mut start = 0;
+                let mut used = labels
+                    .iter()
+                    .take(selected + 1)
+                    .map(|s| s.len())
+                    .sum::<usize>();
+                while used > usize::from(rect.width.saturating_sub(10)) && start < selected {
+                    used = used.saturating_sub(labels.get(start).map_or(0, String::len));
+                    start += 1;
+                }
+                let mut x = rect.x;
+                for (index, label) in labels.iter().enumerate().skip(start) {
+                    let width = (label.len() as u16).min(rect.right().saturating_sub(x));
+                    if width == 0 {
+                        break;
+                    }
+                    self.button(
+                        frame,
+                        Rect::new(x, rect.y, width, 1),
+                        label,
+                        Action::ChangePr(index),
+                        index == selected,
+                    );
+                    x = x.saturating_add(width);
+                }
+                rect.y = rect.y.saturating_add(1);
+                rect.height = rect.height.saturating_sub(1);
+            }
+        }
         let width = (rect.width / 4)
             .clamp(20, 34)
             .min(rect.width.saturating_sub(12));
@@ -385,7 +546,7 @@ impl Ui {
             "Files",
             !self.panels.focused && self.focus == Focus::ChangeTree,
         );
-        let content = panel(
+        let mut content = panel(
             frame,
             Rect::new(
                 rect.x + width,
@@ -393,7 +554,20 @@ impl Ui {
                 rect.width.saturating_sub(width),
                 rect.height,
             ),
-            "Current worktree changes",
+            &pr.as_ref().map_or_else(
+                || "Current worktree changes".into(),
+                |key| {
+                    let multiple = self
+                        .selected
+                        .as_ref()
+                        .is_some_and(|id| self.prs.all(id).len() > 1);
+                    format!(
+                        "PR {}{}",
+                        key.id(),
+                        if multiple { " · [ / ] switch PR" } else { "" }
+                    )
+                },
+            ),
             !self.panels.focused && self.focus == Focus::Changes,
         );
         self.hits.push((tree, Action::Focus(Focus::ChangeTree)));
@@ -403,9 +577,27 @@ impl Ui {
         let Some(id) = self.selected.clone() else {
             return;
         };
+        if let Some(error) = self.change_errors.get(&id) {
+            frame.render_widget(
+                Paragraph::new(if self.changes.contains_key(&id) {
+                    format!("Refresh failed; cached diff may be stale: {error}")
+                } else {
+                    format!("Cannot load diff: {error}")
+                })
+                .style(Style::default().fg(RED)),
+                Rect::new(content.x, content.y, content.width, content.height.min(1)),
+            );
+            if !self.changes.contains_key(&id) {
+                return;
+            }
+            content.y = content.y.saturating_add(1);
+            content.height = content.height.saturating_sub(1);
+        }
         let Some(document) = self.changes.get_mut(&id) else {
             frame.render_widget(
-                Paragraph::new(if self.changing {
+                Paragraph::new(if pr.is_some() {
+                    "Loading PR diff…"
+                } else if self.changing.is_some() {
                     "Reading local changes…"
                 } else {
                     "Changes are available for coding sessions."
@@ -417,7 +609,11 @@ impl Ui {
         };
         if document.files.is_empty() {
             frame.render_widget(
-                Paragraph::new("No changes in the current worktree"),
+                Paragraph::new(if pr.is_some() {
+                    "This PR has no diff changes"
+                } else {
+                    "No changes in the current worktree"
+                }),
                 content,
             );
             return;

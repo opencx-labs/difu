@@ -117,13 +117,20 @@ fn field<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
 fn api(endpoint: &str, method: &str, body: Option<Value>, cancel: &Cancel) -> Result<Value> {
     let mut command = github::command();
     command.args(["api", "--method", method, endpoint]);
+    let mutation = method != "GET"
+        && !(endpoint == "graphql"
+            && body
+                .as_ref()
+                .and_then(|b| b.get("query"))
+                .and_then(Value::as_str)
+                .is_some_and(|query| query.trim_start().starts_with("query")));
     let input = if let Some(body) = body {
         command.args(["--input", "-"]);
         Some(serde_json::to_vec(&body)?)
     } else {
         None
     };
-    let output = github::polling::run(&mut command, input, cancel, 0, method != "GET", None)?;
+    let output = github::polling::run(&mut command, input, cancel, 0, mutation, None)?;
     ensure!(
         output.code == 0,
         "GitHub: {}",

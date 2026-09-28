@@ -107,6 +107,8 @@ pub struct Review {
     pub guide_error: Option<String>,
     pub newer: Option<PrDetail>,
     pub loading: bool,
+    pub github_revision: u64,
+    pub github_refreshed: Option<Instant>,
     pub preparing: bool,
     pub refreshing_revision: bool,
     pub preparation_failed: bool,
@@ -252,6 +254,7 @@ pub struct App {
     pub repository: Option<String>,
     pub repo_selected: Option<String>,
     pub inbox_refreshed: Option<Instant>,
+    github_loaded: Option<Instant>,
     pub images: crate::images::State,
     pub workflow: crate::workflow::State,
     pub local: local::State,
@@ -339,6 +342,7 @@ impl App {
             clipboard_id: 0,
             clipboard: None,
             inbox_refreshed: None,
+            github_loaded: None,
             home: true,
             inbox_tab: InboxTab::MyPrs,
             my_prs_state: PrState::Open,
@@ -645,29 +649,124 @@ impl App {
         let Some(key) = self.inbox.get(index).map(|pr| pr.key.clone()) else {
             return;
         };
+        self.load_cached_pr(&key);
+        self.refresh_pr(key);
+    }
+    fn refresh_pr(&mut self, key: PrKey) {
         let id = key.id();
         let entry = self.reviews.entry(id.clone()).or_default();
-        if entry.detail.is_some() || entry.loading {
+        if entry.local.is_some()
+            || entry.loading
+            || entry
+                .github_refreshed
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(30))
+        {
             return;
         }
         entry.loading = true;
+        entry.github_refreshed = Some(Instant::now());
         self.spawn(move |tx, cancel| {
             let _ = tx.send(Message::Detail(
                 id.clone(),
-                result(github::detail(&key, &cancel)),
+                result(github::view_detail(&key, &cancel)),
             ));
             if cancel.cancelled() {
                 return;
             }
             let _ = tx.send(Message::Timeline(
                 id.clone(),
-                result(github::timeline(&key, &cancel)),
+                result(github::view_timeline(&key, &cancel)),
             ));
             if cancel.cancelled() {
                 return;
             }
-            let _ = tx.send(Message::Checks(id, result(github::checks(&key, &cancel))));
+            let _ = tx.send(Message::Checks(
+                id,
+                result(github::view_checks(&key, &cancel)),
+            ));
         });
+    }
+    fn load_cached_pr(&mut self, key: &PrKey) {
+        let Some(cached) = github::store::load(&self.storage, key) else {
+            return;
+        };
+        let id = key.id();
+        let review = self.reviews.entry(id.clone()).or_default();
+        if review.local.is_some() || review.github_revision == cached.revision {
+            return;
+        }
+        review.github_revision = cached.revision;
+        let loading = review.loading;
+        let poll_at = review.poll_at;
+        let revision_poll_at = review.revision_poll_at;
+        let detail_error = review.detail_error.clone();
+        // Applying disk data must not complete a pending network request/open.
+        let pending = self.pending_open.take();
+        if let Some(detail) = cached.detail {
+            self.receive(Message::Detail(id.clone(), Ok(detail.value)));
+        }
+        self.pending_open = pending;
+        let review = self.reviews.entry(id).or_default();
+        review.loading = loading;
+        review.poll_at = poll_at;
+        review.revision_poll_at = revision_poll_at;
+        review.detail_error = detail_error;
+        if let Some(timeline) = cached.timeline {
+            review.timeline = timeline.value;
+        }
+        if let Some(checks) = cached.checks {
+            review.update_state(&checks.value.state);
+            review.checks = checks.value.checks.clone();
+            if review.checks_error.is_none() {
+                review.checks_error = checks.value.rules_error.clone();
+            }
+            review.check_report = Some(checks.value);
+        }
+        if let Some(summary) = cached.summary
+            && let Some(pr) = self.inbox.iter_mut().find(|pr| pr.key == *key)
+        {
+            *pr = summary;
+        }
+        self.invalidate();
+    }
+    fn sync_github_store(&mut self) {
+        if self
+            .github_loaded
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(5))
+        {
+            return;
+        }
+        self.github_loaded = Some(Instant::now());
+        let mut changed = false;
+        for summary in &mut self.inbox {
+            if let Some(cached) =
+                github::store::load(&self.storage, &summary.key).and_then(|pr| pr.summary)
+                && *summary != cached
+            {
+                *summary = cached;
+                changed = true;
+            }
+        }
+        if let Some(key) = self.key().and_then(|id| {
+            if self.reviews.get(&id).is_some_and(|r| r.local.is_some()) {
+                return None;
+            }
+            self.inbox
+                .iter()
+                .find(|pr| pr.key.id() == id)
+                .map(|pr| pr.key.clone())
+                .or_else(|| {
+                    self.reviews
+                        .get(&id)
+                        .and_then(|r| r.detail.as_ref())
+                        .map(|pr| pr.key.clone())
+                })
+        }) {
+            self.load_cached_pr(&key);
+        }
+        if changed {
+            self.invalidate();
+        }
     }
     pub fn open(&mut self) {
         if self.review().is_some_and(|r| r.local.is_some()) {
@@ -693,6 +792,7 @@ impl App {
             .root
             .clone()
             .or_else(|| self.config.repositories.get(&pr.key.repository()).cloned());
+        self.refresh_pr(pr.key.clone());
         self.workflow.cursor = None;
         self.workflow.selection = None;
         self.workflow.nav = 0;
@@ -1224,6 +1324,7 @@ impl App {
         if !visible {
             return;
         }
+        self.sync_github_store();
         if self.home
             && matches!(self.state(), PrState::Open | PrState::All)
             && !self.repository_directory()
@@ -3036,6 +3137,64 @@ mod tests {
             deletions: 1,
             changed_files: 1,
         }
+    }
+    #[test]
+    fn shared_pr_data_survives_reopening_and_refresh_failures() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        let pr = detail("head");
+        let raw = serde_json::json!({"updated_at":"2026-09-28T00:00:00Z"});
+        github::store::detail(&storage, &pr, &raw)?;
+        github::store::timeline(
+            &storage,
+            &pr.key,
+            &[TimelineItem {
+                kind: "commented".into(),
+                body: "Persisted comment".into(),
+                ..Default::default()
+            }],
+        )?;
+        github::store::checks(
+            &storage,
+            &pr.key,
+            &CheckReport {
+                state: "OPEN".into(),
+                merge_state: "CLEAN".into(),
+                checks: vec![Check {
+                    name: "CI".into(),
+                    state: "pass".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        )?;
+        for _ in 0..2 {
+            let mut app = App::new(storage.clone(), Config::default());
+            app.load_cached_pr(&pr.key);
+            let review = app.reviews.get(&pr.key.id()).context("review")?;
+            assert_eq!(review.detail.as_ref().context("details")?.body, "Body");
+            assert_eq!(
+                review.timeline.first().context("comment")?.body,
+                "Persisted comment"
+            );
+            assert_eq!(review.checks.first().context("check")?.state, "pass");
+            assert!(
+                app.jobs.is_empty(),
+                "reading persisted data starts no background work"
+            );
+            app.receive(Message::Detail(pr.key.id(), Err("offline".into())));
+            app.receive(Message::Timeline(pr.key.id(), Err("offline".into())));
+            app.receive(Message::Checks(pr.key.id(), Err("offline".into())));
+            let review = app.reviews.get(&pr.key.id()).context("review")?;
+            assert!(
+                review.detail.is_some() && !review.timeline.is_empty() && !review.checks.is_empty()
+            );
+            assert_eq!(review.detail_error.as_deref(), Some("offline"));
+        }
+        Ok(())
     }
     #[test]
     fn live_pr_state_updates_without_replacing_pinned_code_or_guide() -> Result<()> {

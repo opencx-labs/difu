@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, bail};
 use nix::{
-    sys::signal::{Signal, killpg},
+    sys::signal::{Signal, kill, killpg},
     unistd::Pid,
 };
 use std::os::unix::process::CommandExt;
@@ -44,6 +44,7 @@ pub struct ChildGroup {
     pub child: Child,
     pid: Pid,
     stopped: bool,
+    descendants: bool,
 }
 impl ChildGroup {
     pub fn spawn(command: &mut Command) -> Result<Self> {
@@ -60,19 +61,91 @@ impl ChildGroup {
             child,
             pid: Pid::from_raw(raw),
             stopped: false,
+            descendants: false,
         })
+    }
+    /// Provider shells can create their own process groups (including PTYs).
+    pub fn spawn_tree(command: &mut Command) -> Result<Self> {
+        let mut child = Self::spawn(command)?;
+        child.descendants = true;
+        Ok(child)
     }
     pub fn stop(&mut self) -> Result<()> {
         if !self.stopped {
+            let descendants = if self.descendants {
+                stop_descendants(self.pid)
+            } else {
+                Ok(())
+            };
             match killpg(self.pid, Signal::SIGKILL) {
                 Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
                 Err(error) => return Err(error.into()),
             }
             self.child.wait()?;
             self.stopped = true;
+            descendants?;
         }
         Ok(())
     }
+}
+
+/// Freeze the provider and its descendants before killing them, so terminating
+/// a shell cannot orphan a server in a separate process group. Only processes
+/// descended from this live child are selected; cwd and cached PIDs are unused.
+fn stop_descendants(root: Pid) -> Result<()> {
+    match kill(root, Signal::SIGSTOP) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::ESRCH) => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let mut owned = std::collections::BTreeSet::from([root.as_raw()]);
+    let mut children = Vec::new();
+    let discovered = (|| -> Result<()> {
+        loop {
+            let output = Command::new("ps")
+                .args(["-A", "-o", "pid=,ppid="])
+                .output()
+                .context("Cannot discover session shell processes")?;
+            anyhow::ensure!(
+                output.status.success(),
+                "Cannot list session shell processes"
+            );
+            let mut added = false;
+            for row in String::from_utf8(output.stdout)?.lines() {
+                let mut columns = row.split_whitespace();
+                let pid: i32 = columns.next().context("Missing process ID")?.parse()?;
+                let parent: i32 = columns
+                    .next()
+                    .context("Missing parent process ID")?
+                    .parse()?;
+                if pid <= 1 || owned.contains(&pid) || !owned.contains(&parent) {
+                    continue;
+                }
+                let child = Pid::from_raw(pid);
+                match kill(child, Signal::SIGSTOP) {
+                    Ok(()) => {
+                        owned.insert(pid);
+                        children.push(child);
+                        added = true;
+                    }
+                    Err(nix::errno::Errno::ESRCH) => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if !added {
+                return Ok(());
+            }
+        }
+    })();
+    // Always release stopped descendants, including after a discovery error.
+    let mut terminated = Ok(());
+    for child in children.into_iter().rev() {
+        match kill(child, Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => terminated = Err(error.into()),
+        }
+    }
+    discovered.and(terminated)
 }
 impl Drop for ChildGroup {
     fn drop(&mut self) {

@@ -81,7 +81,7 @@ impl Connection {
                 .arg("--mcp-config")
                 .arg(json!({"mcpServers":{"difu":{"type":"sdk","name":"difu"}}}).to_string());
         }
-        let mut child = ChildGroup::spawn(&mut command)
+        let mut child = ChildGroup::spawn_tree(&mut command)
             .context("Cannot start Claude Code; install and authenticate the claude CLI")?;
         let input = child.child.stdin.take().context("Missing Claude stdin")?;
         let output = child.child.stdout.take().context("Missing Claude stdout")?;

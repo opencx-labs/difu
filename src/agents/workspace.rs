@@ -20,6 +20,14 @@ pub struct Workspace {
     pub base: Option<String>,
 }
 
+fn managed_branch(session: &Session) -> String {
+    if session.workspace_revision == 0 {
+        format!("difu/agent-{}", session.id)
+    } else {
+        format!("difu/agent-{}-{}", session.id, session.workspace_revision)
+    }
+}
+
 fn read(root: &Path, args: &[&str], cancel: &Cancel) -> Result<String> {
     Ok(process::checked(
         repo::git(root).env("GIT_OPTIONAL_LOCKS", "0").args(args),
@@ -175,7 +183,11 @@ pub fn prepare(
         let trees = home.join("worktrees");
         fs::create_dir_all(&trees)?;
         let destination = trees.join(&session.id);
-        let branch = format!("difu/agent-{}", session.id);
+        // Do not rediscover a disconnected remote PR when revisiting a repository.
+        let branch = session
+            .branch
+            .clone()
+            .unwrap_or_else(|| managed_branch(session));
         session.workspace = Some(destination.clone());
         session.branch = Some(branch.clone());
         // Record ownership and the pinned base before Git creates any worktree.
@@ -224,7 +236,7 @@ pub fn prepare(
     persist(session)
 }
 
-/// Both diff consumers resolve the current workspace against the same cached PR history.
+/// Local patches and statistics use the same baseline from cached PR history.
 fn comparison(
     session: &Session,
     storage: &crate::storage::Storage,
@@ -539,6 +551,60 @@ pub(super) fn delete(session: &Session, home: &Path, cancel: &Cancel) -> Result<
     remove(session, home, cancel, true)
 }
 
+/// Repository changes discard local work, while leaving remote branches and PRs alone.
+pub(super) fn discard(session: &Session, home: &Path, cancel: &Cancel) -> Result<()> {
+    let Job::Coding(launch) = &session.job else {
+        anyhow::bail!("Not a coding workspace");
+    };
+    if !launch.isolated {
+        return Ok(());
+    }
+    let owned = home.join("worktrees").join(&session.id);
+    let mut branches = std::collections::BTreeSet::new();
+    // Include the saved managed branch when retrying after worktree removal.
+    for workspace in &session.workspaces {
+        if workspace.path == owned
+            && let Some(branch) = &workspace.branch
+        {
+            branches.insert(branch.clone());
+        }
+    }
+    if session.workspace.as_ref() == Some(&owned)
+        && let Some(branch) = &session.branch
+    {
+        branches.insert(branch.clone());
+    }
+    if owned.try_exists()? {
+        let mut managed = session.clone();
+        managed.workspace = Some(owned.clone());
+        validate_removal(&managed, home, cancel, true)?;
+        let branch = read(&owned, &["branch", "--show-current"], cancel)?;
+        if !branch.is_empty() {
+            branches.insert(branch);
+        }
+        delete(&managed, home, cancel)?;
+    }
+    for branch in branches {
+        let reference = format!("refs/heads/{branch}");
+        let exists = process::run(
+            repo::git(&launch.repository).args(["show-ref", "--verify", "--quiet", &reference]),
+            None,
+            cancel,
+        )?;
+        ensure!(
+            exists.code == 0 || exists.code == 1,
+            "Cannot inspect previous worktree branch"
+        );
+        if exists.code == 0 {
+            process::checked(
+                repo::git(&launch.repository).args(["branch", "-D", "--", &branch]),
+                cancel,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn remove(session: &Session, home: &Path, cancel: &Cancel, discard_changes: bool) -> Result<()> {
     validate_removal(session, home, cancel, discard_changes)?;
     let Job::Coding(launch) = &session.job else {
@@ -738,6 +804,7 @@ mod tests {
         assert_eq!(statistics(&session, &storage, &cancel)?.added, 4);
         assert!(changes(&session, &storage, &cancel)?.contains("+committed"));
         let mut link = SessionLink {
+            workspace_revision: 0,
             workspace: workspace.clone(),
             pr: SessionPr {
                 summary: None,
@@ -756,10 +823,11 @@ mod tests {
         };
         let cache = storage.cache.join(super::super::pr_cache::SESSION_LINKS);
         let save = |link: &SessionLink| -> Result<()> {
+            crate::github::store::session(&storage, &link.pr)?;
             let links: SessionLinks = [(session.id.clone(), vec![link.clone()])]
                 .into_iter()
                 .collect();
-            crate::storage::atomic_json(&cache, &links)
+            super::super::pr_cache::save_links(&storage, &cache, &links)
         };
         save(&link)?;
         assert_eq!(statistics(&session, &storage, &cancel)?.added, 3);

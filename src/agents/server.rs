@@ -49,7 +49,18 @@ impl Store {
             .save_lock
             .lock()
             .map_err(|_| anyhow::anyhow!("Persistence lock failed"))?;
-        storage::atomic_json(&self.home.join(format!("{id}.json")), &self.get(id)?)
+        // A background flush may have listed this session just before deletion.
+        // The save lock prevents recreating a file after Delete has removed it.
+        let session = self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session store lock failed"))?
+            .get(id)
+            .cloned();
+        if let Some(session) = session {
+            storage::atomic_json(&self.home.join(format!("{id}.json")), &session)?;
+        }
+        Ok(())
     }
     fn queue_preparing(&self, id: &str, control: &Control) -> Result<bool> {
         if !matches!(
@@ -164,6 +175,22 @@ pub fn socket(storage: &Storage) -> Result<PathBuf> {
 }
 
 impl Service {
+    fn stop_worker(&self, id: &str) -> Result<()> {
+        let worker = self
+            .workers
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Worker lock failed"))?
+            .remove(id);
+        if let Some(worker) = worker {
+            worker.cancel.cancel();
+            worker
+                .handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("Session worker stopped unexpectedly"))?;
+        }
+        self.store.update(id, |s| s.shells.clear())
+    }
+
     fn start(&self, id: &str, initial: Option<Control>) -> Result<()> {
         let session = self.store.get(id)?;
         let mut workers = self
@@ -636,11 +663,8 @@ impl Service {
                 Ok(Reply::Session(Box::new(self.store.get(&id)?)))
             }
             Request::Repository { id, repository } => {
-                let mut candidate = self.store.get(&id)?;
-                ensure!(
-                    candidate.waiting_for_workspace(),
-                    "Repository can only change before the first worktree is created"
-                );
+                let previous = self.store.get(&id)?;
+                let mut candidate = previous.clone();
                 ensure!(
                     candidate.status == Status::Idle
                         && candidate.turn_id.is_none()
@@ -656,29 +680,37 @@ impl Service {
                 launch.repository = repository;
                 candidate.baseline = None;
                 super::workspace::inspect(&mut candidate, &Cancel::default())?;
-                // Validate first so an invalid path leaves the current connection intact.
-                if let Some(worker) = self
-                    .workers
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Worker lock failed"))?
-                    .remove(&id)
-                {
-                    worker.cancel.cancel();
-                    worker
-                        .handle
-                        .join()
-                        .map_err(|_| anyhow::anyhow!("Session worker stopped unexpectedly"))?;
+                let owned = self.store.home.join("worktrees").join(&id);
+                if owned.try_exists()? {
+                    ensure!(
+                        !candidate.job.root().starts_with(owned.canonicalize()?),
+                        "Select a repository outside the worktree being discarded"
+                    );
                 }
+                // Validate first so an invalid path leaves the current connection intact.
+                self.stop_worker(&id)?;
+                super::workspace::discard(&previous, &self.store.home, &Cancel::default())?;
+                let revision = previous.workspace_revision.saturating_add(1);
+                super::pr_cache::disconnect(&self.store.storage, &id, revision)?;
                 self.store.update(&id, |s| {
                     s.job = candidate.job;
                     s.workspace = candidate.workspace;
                     s.baseline = candidate.baseline;
+                    s.workspace_ready = false;
+                    s.workspace_removed = false;
+                    s.deferred_workspace = false;
+                    s.workspaces.clear();
+                    s.workspace_revision = revision;
                     s.branch = None;
+                    s.comparison_base = None;
+                    s.artifacts.clear();
                     s.guidance_checked = false;
                     s.shells.clear();
                     s.suggestion = None;
                     s.suggestion_attempted = None;
-                    s.note("system", format!("Repository changed to {}. Re-read repository instructions before continuing.", s.job.root().display()));
+                    s.result = None;
+                    s.error = None;
+                    s.note("system", format!("Repository changed to {}. Previous local work, artifacts, and PR associations were discarded. Re-read repository instructions before continuing.", s.job.root().display()));
                 })?;
                 self.store.save(&id)?;
                 Ok(Reply::Session(Box::new(self.store.get(&id)?)))
@@ -693,6 +725,9 @@ impl Service {
                 Ok(Reply::Ok)
             }
             Request::Archive { id, archived } => {
+                if archived {
+                    self.stop_worker(&id)?;
+                }
                 self.store.update(&id, |s| s.archived = archived)?;
                 self.store.save(&id)?;
                 Ok(Reply::Ok)
@@ -723,50 +758,55 @@ impl Service {
                     matches!(session.job, Job::Coding(_)),
                     "Only coding chats can be deleted here"
                 );
-                // Confirmation explicitly authorizes stopping the session before cleanup.
-                if let Some(worker) = self
-                    .workers
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Worker lock failed"))?
-                    .remove(&id)
-                {
-                    worker.cancel.cancel();
-                    worker
-                        .handle
-                        .join()
-                        .map_err(|_| anyhow::anyhow!("Session worker stopped unexpectedly"))?;
-                }
-                self.store.update(&id, |s| {
-                    if s.status.active() {
-                        s.status = Status::Interrupted;
+                let result = (|| -> Result<Reply> {
+                    self.store
+                        .update(&id, |s| s.deletion_progress = Some(DeletionStage::Stopping))?;
+                    // Confirmation explicitly authorizes stopping the session before cleanup.
+                    self.stop_worker(&id)?;
+                    self.store.update(&id, |s| {
+                        if s.status.active() {
+                            s.status = Status::Interrupted;
+                        }
+                        s.turn_id = None;
+                        s.deletion_requests.clear();
+                    })?;
+                    self.store
+                        .update(&id, |s| s.deletion_progress = Some(DeletionStage::Worktree))?;
+                    let session = self.store.get(&id)?;
+                    let owned = self.store.home.join("worktrees").join(&id);
+                    if owned.try_exists()?
+                        && matches!(&session.job, Job::Coding(launch) if launch.isolated)
+                    {
+                        // Registered external worktrees are retained. The session's
+                        // original managed worktree remains owned after switching.
+                        let mut managed = session.clone();
+                        managed.workspace = Some(owned);
+                        super::workspace::delete(&managed, &self.store.home, &Cancel::default())?;
                     }
-                    s.turn_id = None;
-                    s.deletion_requests.clear();
-                })?;
-                let session = self.store.get(&id)?;
-                let owned = self.store.home.join("worktrees").join(&id);
-                if owned.try_exists()?
-                    && matches!(&session.job, Job::Coding(launch) if launch.isolated)
-                {
-                    // Registered external worktrees are retained. The session's
-                    // original managed worktree remains owned after switching.
-                    let mut managed = session.clone();
-                    managed.workspace = Some(owned);
-                    super::workspace::delete(&managed, &self.store.home, &Cancel::default())?;
+                    self.store.update(&id, |s| {
+                        s.deletion_progress = Some(DeletionStage::Attachments)
+                    })?;
+                    super::media::cleanup(&self.store.storage, &id)?;
+                    self.store
+                        .update(&id, |s| s.deletion_progress = Some(DeletionStage::History))?;
+                    let _guard = self
+                        .store
+                        .save_lock
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Persistence lock failed"))?;
+                    fs::remove_file(self.store.home.join(format!("{id}.json")))?;
+                    self.store
+                        .sessions
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Session lock failed"))?
+                        .remove(&id);
+                    Ok(Reply::Ok)
+                })();
+                if result.is_err() {
+                    self.store.update(&id, |s| s.deletion_progress = None)?;
+                    self.store.save(&id)?;
                 }
-                super::media::cleanup(&self.store.storage, &id)?;
-                let _guard = self
-                    .store
-                    .save_lock
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Persistence lock failed"))?;
-                fs::remove_file(self.store.home.join(format!("{id}.json")))?;
-                self.store
-                    .sessions
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Session lock failed"))?
-                    .remove(&id);
-                Ok(Reply::Ok)
+                result
             }
             Request::Cleanup { id } => {
                 let session = self.store.get(&id)?;
@@ -800,6 +840,16 @@ impl Service {
                 &self.store.storage,
                 &Cancel::default(),
             )?)),
+            Request::PrChanges { id, pr } => {
+                ensure!(
+                    matches!(self.store.get(&id)?.job, Job::Coding(_)),
+                    "PR changes are available for coding sessions"
+                );
+                Ok(Reply::Changes(crate::github::pr_diff(
+                    &pr,
+                    &Cancel::default(),
+                )?))
+            }
             Request::Statistics { id } => Ok(Reply::Statistics(super::workspace::statistics(
                 &self.store.get(&id)?,
                 &self.store.storage,
@@ -906,6 +956,7 @@ pub fn run(storage: Storage) -> Result<()> {
         }
         let mut session: Session = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("Cannot restore session {}", path.display()))?;
+        session.deletion_progress = None;
         ensure!(
             path.file_stem().and_then(|s| s.to_str()) == Some(&session.id),
             "Invalid session storage identity"

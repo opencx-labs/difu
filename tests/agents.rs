@@ -95,6 +95,169 @@ fn launch(storage: &Storage, root: &Path, prompt: &str) -> Result<String> {
     Ok(id)
 }
 #[test]
+fn archiving_and_deleting_stop_provider_shells_and_their_servers() -> Result<()> {
+    let tmp = tempfile::Builder::new()
+        .prefix("difu-shell-cleanup-")
+        .tempdir_in("/tmp")?;
+    let root = tmp.path();
+    let repo = root.join("repo");
+    fs::create_dir(&repo)?;
+    git(&repo, &["init", "-b", "main"])?;
+    fs::write(repo.join("tracked.txt"), "original\n")?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-m", "base"])?;
+    git(&repo, &["remote", "add", "origin", "."])?;
+    let bin = root.join("bin");
+    fs::create_dir(&bin)?;
+    for (name, source) in [
+        ("codex", include_str!("fixtures/agent_codex.py")),
+        ("claude", include_str!("fixtures/agent_claude.py")),
+        ("git", include_str!("fixtures/slow_worktree_git.py")),
+        ("gh", "#!/bin/sh\nprintf '[]\\n'\n"),
+    ] {
+        let file = bin.join(name);
+        fs::write(&file, source)?;
+        fs::set_permissions(file, fs::Permissions::from_mode(0o700))?;
+    }
+    let shell = root.join("session_shell.py");
+    fs::write(&shell, include_str!("fixtures/session_shell.py"))?;
+    let real_git = std::env::split_paths(&std::env::var_os("PATH").context("PATH")?)
+        .map(|p| p.join("git"))
+        .find(|p| p.is_file())
+        .context("Git executable")?;
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").context("PATH")?,
+    )))?;
+    let storage = Storage {
+        config: root.join("config.json"),
+        cache: root.join("cache"),
+    };
+    let mut daemon = support::Service::start(&storage, |c| {
+        c.env("PATH", &path)
+            .env("DIFU_AGENT_FIXTURE", root)
+            .env("DIFU_REAL_GIT", &real_git);
+    })?;
+    let unrelated = std::net::TcpListener::bind("127.0.0.1:0")?;
+    for model in ["fixture-model", "claude/sonnet"] {
+        for archive in [true, false] {
+            let Reply::Launched(id) = client::request(
+                &storage,
+                Request::Launch {
+                    job: Box::new(Job::Coding(Launch {
+                        repository: repo.clone(),
+                        base: "HEAD".into(),
+                        isolated: true,
+                        prompt: format!("fixture shell: {}", shell.display()),
+                        model: Some(model.into()),
+                        effort: None,
+                    })),
+                },
+            )?
+            else {
+                anyhow::bail!("Missing shell session");
+            };
+            let current = wait(&storage, &id, |s| {
+                s.status == Status::Idle
+                    && s.workspace
+                        .as_ref()
+                        .is_some_and(|w| w.join("shell-server.json").is_file())
+            })?;
+            let workspace = current.workspace.context("Missing shell workspace")?;
+            let server: serde_json::Value =
+                serde_json::from_slice(&fs::read(workspace.join("shell-server.json"))?)?;
+            let port = server
+                .get("port")
+                .and_then(|v| v.as_u64())
+                .context("Missing port")?;
+            let address = format!("127.0.0.1:{port}").parse()?;
+            let serving = || {
+                std::net::TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
+            };
+            assert!(serving());
+            // Exercise shutdown both between turns and during a running tool.
+            if !archive {
+                control(
+                    &storage,
+                    &id,
+                    Control::Message {
+                        text: if model.starts_with("claude") {
+                            "claude wait"
+                        } else {
+                            "wait"
+                        }
+                        .into(),
+                        queue: false,
+                        skills: Vec::new(),
+                        attachments: Vec::new(),
+                    },
+                )?;
+                wait(&storage, &id, |s| s.status == Status::Running)?;
+            }
+            if archive {
+                client::request(
+                    &storage,
+                    Request::Archive {
+                        id: id.clone(),
+                        archived: true,
+                    },
+                )?;
+            } else {
+                fs::write(root.join("hold-removal"), "hold")?;
+                let deleting_storage = storage.clone();
+                let deleting_id = id.clone();
+                let deleting = std::thread::spawn(move || {
+                    client::request(&deleting_storage, Request::Delete { id: deleting_id })
+                });
+                let progress = wait(&storage, &id, |s| {
+                    s.deletion_progress == Some(difu::agents::DeletionStage::Worktree)
+                })?;
+                assert!(workspace.exists());
+                assert!(progress.shells.is_empty());
+                let stopped = Instant::now();
+                while serving() {
+                    ensure!(
+                        stopped.elapsed() < Duration::from_secs(5),
+                        "Server survived the shell shutdown stage"
+                    );
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+                fs::remove_file(root.join("hold-removal"))?;
+                deleting
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Deletion thread failed"))??;
+            }
+            let started = Instant::now();
+            while serving() {
+                ensure!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "Session server survived shutdown"
+                );
+                std::thread::sleep(Duration::from_millis(30));
+            }
+            assert!(std::net::TcpStream::connect(unrelated.local_addr()?).is_ok());
+            if archive {
+                let archived = session(&storage, &id)?;
+                assert!(archived.archived && archived.shells.is_empty());
+                assert!(workspace.exists());
+                client::request(
+                    &storage,
+                    Request::Archive {
+                        id: id.clone(),
+                        archived: false,
+                    },
+                )?;
+                assert!(!serving());
+                client::request(&storage, Request::Delete { id })?;
+            } else {
+                assert!(!workspace.exists());
+            }
+        }
+    }
+    daemon.stop()?;
+    Ok(())
+}
+
+#[test]
 fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Result<()> {
     let tmp = tempfile::Builder::new()
         .prefix("difu-agent-test-")
@@ -877,6 +1040,7 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
     git(&repo, &["worktree", "lock", tree.to_str().context("path")?])?;
     assert!(client::request(&storage, Request::Delete { id: dirty.clone() }).is_err());
     assert!(tree.exists());
+    assert!(session(&storage, &dirty)?.deletion_progress.is_none());
     git(
         &repo,
         &["worktree", "unlock", tree.to_str().context("path")?],
@@ -1254,11 +1418,89 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
             &storage,
             Request::Repository {
                 id: id.clone(),
-                repository: repo.clone()
+                repository: root.join("missing-repository")
             }
         )
         .is_err()
     );
+    assert!(workspace.exists());
+    assert_eq!(session(&storage, &id)?.workspace, Some(workspace.clone()));
+    assert!(
+        client::request(
+            &storage,
+            Request::Repository {
+                id: id.clone(),
+                repository: workspace.canonicalize()?,
+            }
+        )
+        .is_err()
+    );
+    assert!(workspace.exists());
+    let old_branch = empty.branch.context("Initial branch")?;
+    fs::write(workspace.join("committed.txt"), "discard this work\n")?;
+    git(&workspace, &["add", "."])?;
+    git(&workspace, &["commit", "-m", "Discarded session work"])?;
+    fs::write(workspace.join("tracked.txt"), "discard dirty edit\n")?;
+    fs::write(workspace.join(".gitignore"), "ignored.txt\n")?;
+    fs::write(workspace.join("ignored.txt"), "discard ignored file\n")?;
+    let other = root.join("other-repository");
+    fs::create_dir(&other)?;
+    git(&other, &["init", "-b", "main"])?;
+    fs::write(other.join("other.txt"), "other repository\n")?;
+    git(&other, &["add", "."])?;
+    git(&other, &["commit", "-m", "Other base"])?;
+    git(&other, &["remote", "add", "origin", "."])?;
+    git(
+        &repo,
+        &["worktree", "lock", workspace.to_str().context("path")?],
+    )?;
+    assert!(
+        client::request(
+            &storage,
+            Request::Repository {
+                id: id.clone(),
+                repository: other.clone(),
+            }
+        )
+        .is_err()
+    );
+    assert!(workspace.exists());
+    assert_eq!(session(&storage, &id)?.job.root(), &repo.canonicalize()?);
+    git(
+        &repo,
+        &["worktree", "unlock", workspace.to_str().context("path")?],
+    )?;
+    client::request(
+        &storage,
+        Request::Repository {
+            id: id.clone(),
+            repository: other.clone(),
+        },
+    )?;
+    let changed = session(&storage, &id)?;
+    assert!(!workspace.exists());
+    assert!(!changed.workspace_ready && changed.branch.is_none());
+    assert_eq!(changed.job.root(), &other.canonicalize()?);
+    assert_eq!(changed.baseline, Some(git(&other, &["rev-parse", "HEAD"])?));
+    assert!(
+        git(
+            &repo,
+            &["show-ref", "--verify", &format!("refs/heads/{old_branch}")]
+        )
+        .is_err()
+    );
+    assert_eq!(
+        fs::read_to_string(repo.join("tracked.txt"))?,
+        "precious local edit\n"
+    );
+    // Returning to a repository must not reuse its old work or PR branch.
+    client::request(
+        &storage,
+        Request::Repository {
+            id: id.clone(),
+            repository: repo.clone(),
+        },
+    )?;
     let Reply::Changes(patch) = client::request(&storage, Request::Changes { id: id.clone() })?
     else {
         anyhow::bail!("Changes");
@@ -1284,6 +1526,43 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
             .pointer("/sandbox/type")
             .and_then(|v| v.as_str()),
         Some("workspaceWrite")
+    );
+    assert_ne!(codex.branch.as_ref(), Some(&old_branch));
+    assert!(!workspace.join("committed.txt").exists());
+    assert!(!workspace.join("ignored.txt").exists());
+    control(&storage, &id, message("artifact report"))?;
+    let with_artifact = wait(&storage, &id, |s| {
+        s.status == Status::Idle && !s.artifacts.is_empty()
+    })?;
+    let artifact_branch = with_artifact.branch.clone().context("Artifact branch")?;
+    client::request(
+        &storage,
+        Request::Repository {
+            id: id.clone(),
+            repository: repo.clone(),
+        },
+    )?;
+    let reset = session(&storage, &id)?;
+    assert_eq!(reset.thread_id, with_artifact.thread_id);
+    assert!(
+        reset
+            .entries
+            .iter()
+            .any(|e| e.text.contains("explain this repository"))
+    );
+    assert!(reset.artifacts.is_empty() && reset.workspaces.is_empty());
+    assert!(reset.comparison_base.is_none() && reset.branch.is_none());
+    assert!(!workspace.exists());
+    assert!(
+        git(
+            &repo,
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{artifact_branch}")
+            ]
+        )
+        .is_err()
     );
     let before_usage = session(&storage, &id)?.entries.len();
     let Reply::Usage(usage) = client::request(&storage, Request::Usage { id: id.clone() })? else {
