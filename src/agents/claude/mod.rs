@@ -93,6 +93,7 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                 super::artifacts::tool(),
                 super::registration::tool(),
                 super::management::tool(),
+                super::questions::tool(),
             ]
             .into_iter()
             .map(|mut tool| {
@@ -112,8 +113,11 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
             let args = message.pointer("/params/arguments").unwrap_or(&Value::Null);
             let mut session = store.get(id)?;
             let result = match name {
+                super::questions::TOOL => {
+                    super::questions::handle(store, id, args).map(|value| value.to_string())
+                }
                 super::artifacts::TOOL => super::artifacts::register(&mut session, args)
-                    .map(|()| "Artifact registered in difu"),
+                    .map(|()| "Artifact registered in difu".to_owned()),
                 super::management::TOOL => (|| {
                     super::management::validate(&session, args)?;
                     session.deletion_requests.push(Pending {
@@ -123,7 +127,7 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                         responded: true,
                     });
                     Ok(
-                        "Session deletion accepted. Stop here; difu will close and remove this session.",
+                        "Session deletion accepted. Stop here; difu will close and remove this session.".to_owned(),
                     )
                 })(),
                 super::registration::TOOL => (|| {
@@ -139,12 +143,12 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                         responded: false,
                     });
                     Ok(
-                        "Worktree registration accepted. Stop here; difu will resume this conversation in the registered workspace.",
+                        "Worktree registration accepted. Stop here; difu will resume this conversation in the registered workspace.".to_owned(),
                     )
                 })(),
                 _ => anyhow::bail!("Unknown difu tool"),
             };
-            if result.is_ok() {
+            if result.is_ok() && name != super::questions::TOOL {
                 store.update(id, |s| {
                     s.artifacts = session.artifacts;
                     s.registration_requests = session.registration_requests;
@@ -153,7 +157,7 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                 store.save(id)?;
             }
             let text = match &result {
-                Ok(text) => (*text).to_owned(),
+                Ok(text) => text.clone(),
                 Err(error) => format!("{error:#}"),
             };
             json!({"isError":result.is_err(),"content":[{"type":"text","text":text}]})
@@ -520,12 +524,14 @@ fn command(
 
 fn connect(store: &Store, id: &str, session: &Session, cancel: &Cancel) -> Result<Connection> {
     let instructions = format!(
-        "{}\n\n{}\n\n{}\n\n{}",
+        "{}\n\n{}\n\n{}\n\n{}\n\n{}",
         super::WORKTREE_INSTRUCTIONS,
         super::artifacts::INSTRUCTIONS,
         super::registration::INSTRUCTIONS,
-        super::management::INSTRUCTIONS
+        super::management::INSTRUCTIONS,
+        super::questions::INSTRUCTIONS
     );
+    let instructions = super::rules::instructions(session, instructions);
     let mut rpc = Connection::open(Options {
         cwd: session.workspace.as_deref().context("Missing workspace")?,
         model: session
@@ -557,6 +563,7 @@ fn connect(store: &Store, id: &str, session: &Session, cancel: &Cancel) -> Resul
         s.status = Status::Idle;
         s.artifact_tools = true;
         s.registration_tools = true;
+        s.question_tools = true;
     })?;
     Ok(rpc)
 }

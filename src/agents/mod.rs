@@ -10,6 +10,7 @@ pub(crate) mod pr_cache;
 pub mod provider;
 mod questions;
 mod registration;
+mod rules;
 pub mod server;
 mod startup;
 mod suggestions;
@@ -228,6 +229,8 @@ pub struct Session {
     pub provider_threads: std::collections::BTreeMap<String, provider::NativeSession>,
     #[serde(default)]
     pub provider_context: Option<String>,
+    #[serde(default)]
+    pub repository_rules: String,
     pub status: Status,
     pub archived: bool,
     #[serde(default)]
@@ -280,8 +283,12 @@ pub struct Session {
     pub artifacts: Vec<artifacts::Artifact>,
     #[serde(default)]
     pub artifact_tools: bool,
+    #[serde(default)]
+    pub question_tools: bool,
     #[serde(skip)]
     pub artifact_requests: Vec<Pending>,
+    #[serde(skip)]
+    pub question_requests: Vec<Pending>,
     #[serde(skip)]
     pub shells: Vec<Value>,
     pub entries: Vec<Entry>,
@@ -314,6 +321,7 @@ impl Session {
             },
             provider_threads: Default::default(),
             provider_context: None,
+            repository_rules: String::new(),
             job,
             status: Status::Starting,
             archived: false,
@@ -347,7 +355,9 @@ impl Session {
             permissions: Value::Null,
             artifacts: Vec::new(),
             artifact_tools: false,
+            question_tools: false,
             artifact_requests: Vec::new(),
+            question_requests: Vec::new(),
             shells: Vec::new(),
             entries: Vec::new(),
             pending: Vec::new(),

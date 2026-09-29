@@ -42,6 +42,8 @@ pub struct Config {
     #[serde(default)]
     pub agent_defaults: AgentDefaults,
     #[serde(default)]
+    pub repository_rules: BTreeMap<PathBuf, String>,
+    #[serde(default)]
     pub repositories: BTreeMap<String, PathBuf>,
     #[serde(default)]
     pub pinned_repositories: BTreeSet<String>,
@@ -74,6 +76,7 @@ impl Default for Config {
             local_diff_repositories: BTreeSet::new(),
             last_tab_agents: true,
             agent_defaults: AgentDefaults::default(),
+            repository_rules: BTreeMap::new(),
             repositories: BTreeMap::new(),
             pinned_repositories: BTreeSet::new(),
             pinned_sessions: BTreeSet::new(),

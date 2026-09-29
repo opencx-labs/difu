@@ -198,6 +198,10 @@ impl Ui {
         }
     }
     pub(super) fn defaults_key(&mut self, key: KeyEvent) {
+        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.default_rules();
+            return;
+        }
         let Some(Modal::AgentDefaults(form)) = &mut self.modal else {
             return;
         };
@@ -246,6 +250,13 @@ impl Ui {
             form.poll();
         }
     }
+    pub(super) fn default_rules(&mut self) {
+        let path = match &self.modal {
+            Some(Modal::AgentDefaults(form)) => form.value(0).map(std::path::PathBuf::from),
+            _ => None,
+        };
+        self.open_rules(path);
+    }
     pub(super) fn default_option(&mut self, index: usize) {
         if let Some(Modal::AgentDefaults(form)) = &mut self.modal {
             form.selected = index;
@@ -272,6 +283,13 @@ impl Ui {
             buttons.push((rect, Action::DefaultField(i)));
         }
         let toggle = Rect::new(area.x, area.y + 12, area.width, 1).intersection(area);
+        let rules = Rect::new(area.x, area.y + 3, area.width, 1).intersection(area);
+        frame.render_widget(
+            Paragraph::new("[ Edit repository rules · Ctrl+R ]")
+                .style(crate::ui::option_style(false)),
+            rules,
+        );
+        buttons.push((rules, Action::DefaultRules));
         frame.render_widget(
             Paragraph::new("New sessions always use an isolated worktree")
                 .style(Style::default().fg(TEXT)),

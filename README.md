@@ -90,7 +90,11 @@ cached guide may load automatically without starting a model run.
 **Cmd+K** opens global search from either tab. Search sessions by title,
 repository, branch, worktree, or PR number, and launch commands from both the
 Agents and Reviews `/` menus. PR results offer a preview alongside connected
-sessions. PR search also matches cached authors and reviewers (including requested
+sessions. Start the query with `/` to put commands before search results. Session
+and PR controls appear directly in the palette. Slash commands follow focus:
+the selected session in the Agents list or conversation, the PR in Reviews, or
+the focused PR pane inside a coding session.
+PR search also matches cached authors and reviewers (including requested
 reviewers); typing a name never sends a GitHub request. Matching open PRs appear
 first, then other results by relevance, with Open, Merged, Closed, or Has conflicts
 badges. A bare number (or `#1524`) searches the local cache only;
@@ -182,6 +186,17 @@ uses the current Git repository; outside one, it asks you to choose and remember
 that choice. No model turn runs until your first message. Both Codex and Claude
 use this worktree from the start. Existing local changes are never copied, and
 missing local guidance requires your approval before copying.
+
+Use **Cmd+K → /rules**, **Session controls → Repository rules**, or **Edit
+repository rules** beside the repository field in defaults (**Ctrl+R**) to edit
+instructions for a repository. Choose a known repository or enter its local
+path, then edit the multiline rules. **Cmd+Enter** or **Ctrl+Enter** saves;
+**Esc** cancels. Saving an empty editor clears the rules. Difu stores these
+settings locally and shares them across the repository's worktrees. Each new
+coding session captures the saved rules in its initial Codex or Claude
+instructions; editing the settings does not change that session's snapshot.
+Changing a session's repository loads the destination's saved rules for its next
+turn. A destination with no rules clears the previous repository's rules.
 
 Use **/model** to choose a Codex or Claude Code model (for example,
 `/model claude/sonnet`). Changing provider requires a stopped or idle session with no
@@ -278,7 +293,7 @@ With an empty composer, **Up** recalls sent prompts from the current session.
 Recalled prompts are editable and never sent automatically.
 
 Type **/** in an empty composer for native commands: `/compact`, `/model`, `/effort`,
-`/skills`, `/status`, `/usage`, `/diff`, `/new`, `/rename`, `/repo`, `/worktree`,
+`/skills`, `/status`, `/rules`, `/usage`, `/diff`, `/new`, `/rename`, `/repo`, `/worktree`,
 `/help`, `/voice`, and `/actions`.
 Opening a session keeps the composer focused; pending questions remain available
 through the questions control.
@@ -329,6 +344,13 @@ when idle, using the normal chat delivery path. The chat shows the question,
 chosen answer, and any additional note. Each answer also sends the agent the
 remaining pending questions as application context, instructing it not to repeat
 or rephrase questions already awaiting answers. Answers still send individually.
+Agents can remove stale asynchronous questions with `difu_remove_questions`.
+The tool is available to new Codex conversations and Claude sessions after
+connecting with the updated difu service. Existing Codex conversations retain
+the tool set they started with.
+An empty `questions` array lists pending IDs; supplying `request_id` and
+`question_id` pairs removes those questions without submitting answers. Removal
+persists across restarts and leaves other questions and saved answers intact.
 Outgoing queued messages have a separate editable queue. Down from the final
 transcript entry focuses the composer. Up in an empty composer recalls this
 session’s previous prompts; Down walks forward and restores your draft.

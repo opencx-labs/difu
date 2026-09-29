@@ -288,6 +288,7 @@ impl Service {
             launch.isolated = true;
         }
         let mut session = Session::new(id.clone(), job);
+        super::rules::capture(&self.store.storage, &mut session)?;
         if empty {
             session.title = "New session".into();
         }
@@ -675,6 +676,7 @@ impl Service {
                 launch.repository = repository;
                 candidate.baseline = None;
                 super::workspace::inspect(&mut candidate, &Cancel::default())?;
+                super::rules::capture(&self.store.storage, &mut candidate)?;
                 let owned = self.store.home.join("worktrees").join(&id);
                 if owned.try_exists()? {
                     ensure!(
@@ -702,8 +704,10 @@ impl Service {
                     s.workspace_requests.clear();
                     s.registration_requests.clear();
                     s.artifact_requests.clear();
+                    s.question_requests.clear();
                     s.deletion_requests.clear();
                     s.job = candidate.job;
+                    s.repository_rules = candidate.repository_rules;
                     s.workspace = candidate.workspace;
                     s.baseline = candidate.baseline;
                     s.workspace_ready = false;

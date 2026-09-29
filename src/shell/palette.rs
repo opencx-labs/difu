@@ -368,6 +368,8 @@ impl Shell {
             return Vec::new();
         };
         let query = palette.query.text();
+        let commands_first = query.trim_start().starts_with('/');
+        let session_context = self.agents_active && self.agents.palette_review().is_none();
         let reference = Reference::parse(&query);
         let mut items = Vec::new();
         for session in self.agents.summaries.iter().filter(|s| s.kind != "Guide") {
@@ -446,6 +448,9 @@ impl Shell {
             });
         }
         for (name, description, _) in self.agents.palette_commands() {
+            if name == "/actions" {
+                continue;
+            }
             items.push(Item {
                 title: name.clone(),
                 search: format!("{name} {description}"),
@@ -467,7 +472,7 @@ impl Shell {
                     .and_then(|id| self.agents.summaries.iter().find(|s| &s.id == id))
                     .map(|session| session.title.clone())
                     .unwrap_or_else(|| "Select an agent session first".into()),
-                search: label.into(),
+                search: format!("{label} session controls actions"),
                 category: "Agents",
                 action: Action::AgentMenu(index),
                 prs: Vec::new(),
@@ -476,18 +481,14 @@ impl Shell {
             });
         }
         for (index, label) in [
-            "PR controls",
-            "Memory management · worktrees",
-            "Default guide model",
-            "Default conflict resolve model",
-        ]
-        .iter()
-        .enumerate()
-        {
+            (1, "Memory management · worktrees"),
+            (2, "Default guide model"),
+            (3, "Default conflict resolve model"),
+        ] {
             items.push(Item {
-                title: (*label).into(),
+                title: label.into(),
                 detail: "Review action".into(),
-                search: (*label).into(),
+                search: label.into(),
                 category: "Reviews",
                 action: Action::ReviewHome(index),
                 prs: Vec::new(),
@@ -504,7 +505,7 @@ impl Shell {
                 detail: detail
                     .map(|pr| pr.key.id())
                     .unwrap_or_else(|| "Open a PR first".into()),
-                search: label.into(),
+                search: format!("{label} PR controls actions"),
                 category: "Reviews",
                 action: Action::ReviewCommand(index),
                 prs: Vec::new(),
@@ -513,10 +514,18 @@ impl Shell {
             });
         }
         let mut matched = items.into_iter().filter_map(|item| {
+            if commands_first {
+                match &item.action {
+                    Action::AgentCommand(name) if !session_context || !name.starts_with('/') => return None,
+                    Action::AgentMenu(_) if !session_context => return None,
+                    Action::ReviewHome(_) | Action::ReviewCommand(_) if session_context => return None,
+                    _ => {}
+                }
+            }
             let rank = if let Some(reference) = &reference {
                 if !item.prs.iter().any(|pr| reference.matches(pr)) { return None; }
                 0
-            } else if query.trim_start().starts_with('/') {
+            } else if commands_first {
                 let name = query.split_whitespace().next().unwrap_or_default();
                 if matches!(&item.action, Action::AgentCommand(command) if command.eq_ignore_ascii_case(name)) {
                     0
@@ -532,6 +541,7 @@ impl Shell {
         }).collect::<Vec<_>>();
         matched.sort_by_key(|(score, category, item)| {
             (
+                commands_first && matches!(item.action, Action::Session(_) | Action::Preview(_)),
                 !item.badge.as_ref().is_some_and(|m| m.state == "OPEN"),
                 *score,
                 *category,
@@ -717,7 +727,6 @@ impl Shell {
                     &mut self.reviews
                 };
                 match action {
-                    Action::ReviewHome(0) => app.workflow_action(WAction::Controls),
                     Action::ReviewHome(1) => app.workflow_action(WAction::Trees),
                     Action::ReviewHome(2) => app.load_models_for(ModelPurpose::Guide),
                     Action::ReviewHome(3) => app.load_models_for(ModelPurpose::Conflicts),
@@ -1067,6 +1076,86 @@ mod tests {
     }
 
     #[test]
+    fn slash_prioritizes_flat_controls_for_the_active_context() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut shell = fixture(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        })?;
+        shell.agents_active = true;
+        shell.agents.selected = Some("one".into());
+        shell.agents.focus = crate::agents::ui::Focus::List;
+        let pr = shell
+            .palette
+            .as_mut()
+            .context("palette")?
+            .prs
+            .first_mut()
+            .context("PR")?;
+        pr.metadata = Some(crate::model::PrMetadata {
+            state: "OPEN".into(),
+            ..Default::default()
+        });
+        query(&mut shell, "/");
+        let items = shell.palette_items();
+        let first_search = items
+            .iter()
+            .position(|item| matches!(item.action, Action::Preview(_) | Action::Session(_)))
+            .context("search results")?;
+        assert!(first_search > 0);
+        let all_session_controls = items
+            .iter()
+            .take(first_search)
+            .all(|item| matches!(item.action, Action::AgentCommand(_) | Action::AgentMenu(_)));
+        assert!(all_session_controls);
+        let has_review_controls = items.iter().any(|item| {
+            matches!(
+                item.action,
+                Action::ReviewHome(_) | Action::ReviewCommand(_)
+            )
+        });
+        assert!(!has_review_controls);
+        let has_wrapper = items
+            .iter()
+            .any(|item| matches!(&item.action, Action::AgentCommand(name) if name == "/actions"));
+        assert!(!has_wrapper);
+        query(&mut shell, "/session controls");
+        assert!(matches!(
+            shell.palette_items().first().map(|item| &item.action),
+            Some(Action::AgentMenu(_))
+        ));
+        query(&mut shell, "/pin session");
+        let index = shell
+            .palette_items()
+            .iter()
+            .position(|item| matches!(item.action, Action::AgentMenu(18)))
+            .context("pin control")?;
+        shell.activate_palette(index);
+        assert!(shell.agents.pinned_sessions.contains("one"));
+
+        shell.agents_active = false;
+        shell.palette = Some(Palette::new(shell.reviews.storage.clone()));
+        query(&mut shell, "/");
+        let items = shell.palette_items();
+        assert!(matches!(
+            items.first().map(|item| &item.action),
+            Some(Action::ReviewHome(_) | Action::ReviewCommand(_))
+        ));
+        let has_unrelated_controls = items.iter().any(|item| {
+            matches!(
+                item.action,
+                Action::AgentMenu(_) | Action::AgentCommand(_) | Action::ReviewHome(0)
+            )
+        });
+        assert!(!has_unrelated_controls);
+        query(&mut shell, "/PR controls");
+        assert!(matches!(
+            shell.palette_items().first().map(|item| &item.action),
+            Some(Action::ReviewCommand(_))
+        ));
+        Ok(())
+    }
+    #[test]
     fn commands_from_both_tabs_and_session_switch_preserve_composer() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut shell = fixture(Storage {
@@ -1079,7 +1168,11 @@ mod tests {
             .entry("one".into())
             .or_default()
             .draft = Editor::from("Unsent draft");
+        shell.agents_active = true;
         for (name, _, _) in shell.agents.palette_commands() {
+            if name == "/actions" {
+                continue;
+            }
             query(&mut shell, &name);
             assert!(shell.palette_items().iter().any(
                 |item| matches!(&item.action, Action::AgentCommand(command) if command == &name)
