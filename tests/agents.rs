@@ -1372,8 +1372,11 @@ fn new_sessions_accept_input_while_worktrees_are_preparing() -> Result<()> {
             }));
             if let Some(branch) = prepared.branch {
                 assert!(
-                    git(&repo, &["show-ref", "--verify", &format!("refs/heads/{branch}")])
-                        .is_err()
+                    git(
+                        &repo,
+                        &["show-ref", "--verify", &format!("refs/heads/{branch}")]
+                    )
+                    .is_err()
                 );
             }
             fs::remove_file(root.join(if after_creation {

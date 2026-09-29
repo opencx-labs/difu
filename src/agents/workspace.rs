@@ -762,8 +762,11 @@ mod tests {
             discard(&session, &home, &Cancel::default())?;
             assert!(!owned.exists());
             assert!(
-                git(&repo, &["show-ref", "--verify", &format!("refs/heads/{branch}")])
-                    .is_err()
+                git(
+                    &repo,
+                    &["show-ref", "--verify", &format!("refs/heads/{branch}")]
+                )
+                .is_err()
             );
             assert!(!git(&repo, &["worktree", "list", "--porcelain"])?.contains(path));
         }
