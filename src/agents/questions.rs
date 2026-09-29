@@ -294,10 +294,14 @@ mod tests {
             apply_event(&mut session, &question_event(id, "item/completed"));
         }
         let listing = remove(&mut session, &json!({"questions":[]}))?;
-        assert_eq!(listing["remaining_questions"].as_array().unwrap().len(), 4);
+        let remaining = listing
+            .get("remaining_questions")
+            .and_then(Value::as_array)
+            .context("questions")?;
+        assert_eq!(remaining.len(), 4);
         assert_eq!(
-            listing["remaining_questions"][0]["request_id"],
-            "difu-async:q"
+            remaining.first().and_then(|q| q.get("request_id")),
+            Some(&json!("difu-async:q"))
         );
         let request = json!("difu-async:q");
         let (answer, _) = prepare_answer(&session, &request, "0", Some("Small"))?;
@@ -316,7 +320,10 @@ mod tests {
         restored.restore_async_questions();
         apply_event(&mut restored, &question_event("q", "item/completed"));
         assert_eq!(restored.pending_question_count(), 2);
-        assert_eq!(restored.pending[0].id, "difu-async:other");
+        assert_eq!(
+            restored.pending.first().context("pending")?.id,
+            "difu-async:other"
+        );
         remove(
             &mut restored,
             &json!({"questions":[
@@ -345,15 +352,20 @@ mod tests {
             assert!(remove(&mut session, &args).is_err());
             assert_eq!(serde_json::to_value(&session)?, before);
         }
-        session.pending[0].responded = true;
+        session.pending.first_mut().context("pending")?.responded = true;
         let result = remove(
             &mut session,
             &json!({"questions":[{"request_id":"difu-async:q","question_id":"0"}]}),
         );
         assert!(result.is_err());
         assert_eq!(session.pending_question_count(), 2);
-        session.pending[0].responded = false;
-        session.pending[0].params["difuAsync"] = json!(false);
+        let pending = session.pending.first_mut().context("pending")?;
+        pending.responded = false;
+        pending
+            .params
+            .as_object_mut()
+            .context("params")?
+            .insert("difuAsync".into(), json!(false));
         let result = remove(
             &mut session,
             &json!({"questions":[{"request_id":"difu-async:q","question_id":"0"}]}),

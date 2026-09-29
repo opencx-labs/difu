@@ -115,14 +115,12 @@ enum Action {
     Select(String),
     Open,
     Focus(Focus),
-    Menu,
     Resources(bool),
     PullRequest(usize),
     Resource(bool, usize),
     RefreshArtifact,
     ExternalArtifact,
     BrowserChoice(usize),
-    New,
     ChangeFile(usize),
     ChangePr(usize),
     Approval(usize),
@@ -1072,9 +1070,7 @@ impl Ui {
         }
     }
     pub(crate) fn palette_review_mut(&mut self) -> Option<&mut crate::app::App> {
-        if self.palette_review().is_none() {
-            return None;
-        }
+        self.palette_review()?;
         match &mut self.panels.view {
             Some(panels::View::PullRequest { app }) => Some(app),
             _ => None,
@@ -2195,13 +2191,6 @@ impl Ui {
                 self.focus = Focus::Composer;
             }
             Action::Focus(focus) => self.focus = focus,
-            Action::Menu => {
-                self.modal = Some(Modal::Menu {
-                    query: Editor::default(),
-                    selected: 0,
-                })
-            }
-            Action::New => self.launch(),
             Action::ChangeFile(index) => self.select_change(index),
             Action::ChangePr(index) => self.select_change_pr(index),
             Action::Approval(index) => self.pending(index),

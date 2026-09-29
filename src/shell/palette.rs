@@ -1103,8 +1103,9 @@ mod tests {
             .position(|item| matches!(item.action, Action::Preview(_) | Action::Session(_)))
             .context("search results")?;
         assert!(first_search > 0);
-        let all_session_controls = items[..first_search]
+        let all_session_controls = items
             .iter()
+            .take(first_search)
             .all(|item| matches!(item.action, Action::AgentCommand(_) | Action::AgentMenu(_)));
         assert!(all_session_controls);
         let has_review_controls = items.iter().any(|item| {
