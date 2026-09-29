@@ -195,6 +195,8 @@ path, then edit the multiline rules. **Cmd+Enter** or **Ctrl+Enter** saves;
 settings locally and shares them across the repository's worktrees. Each new
 coding session captures the saved rules in its initial Codex or Claude
 instructions; editing the settings does not change that session's snapshot.
+Changing a session's repository loads the destination's saved rules for its next
+turn. A destination with no rules clears the previous repository's rules.
 
 Use **/model** to choose a Codex or Claude Code model (for example,
 `/model claude/sonnet`). Changing provider requires a stopped or idle session with no

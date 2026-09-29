@@ -598,6 +598,65 @@ mod tests {
         assert_eq!(ui.focus, Focus::PullRequest(0));
         ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(ui.focus, Focus::Composer);
+        ui.prs.receive(Update {
+            id: "one".into(),
+            workspace: temp.path().into(),
+            branch: None,
+            revision: 0,
+            result: Ok([41, 40]
+                .into_iter()
+                .map(|number| {
+                    let mut pr = pr();
+                    pr.key.number = number;
+                    Cached {
+                        workspace_revision: 0,
+                        workspace: temp.path().into(),
+                        pr,
+                    }
+                })
+                .collect()),
+        });
+        terminal.draw(|f| ui.draw(f))?;
+        let badges = |ui: &Ui| {
+            ui.hits
+                .iter()
+                .filter_map(|(rect, action)| {
+                    if let Action::PullRequest(index) = action {
+                        Some((*index, *rect))
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let original = badges(&ui);
+        assert_eq!(original.len(), 3);
+        ui.focus = Focus::PullRequest(0);
+        for key in [
+            KeyCode::Right,
+            KeyCode::Right,
+            KeyCode::Right,
+            KeyCode::Left,
+            KeyCode::Left,
+        ] {
+            ui.key(KeyEvent::new(key, KeyModifiers::NONE));
+            terminal.draw(|f| ui.draw(f))?;
+            assert_eq!(badges(&ui), original);
+            for (index, rect) in &original {
+                let cell = terminal
+                    .backend()
+                    .buffer()
+                    .cell((rect.x, rect.y))
+                    .context("badge cell")?;
+                let expected = if ui.focus == Focus::PullRequest(*index) {
+                    color(&pr())
+                } else {
+                    BG
+                };
+                assert_eq!(cell.bg, expected);
+            }
+        }
+        ui.focus = Focus::Composer;
         // A loading fixture prevents any network or model work in this UI test.
         let mut app = App::new(storage.clone(), Config::default());
         app.reviews.insert(

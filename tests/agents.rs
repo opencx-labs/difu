@@ -1076,9 +1076,10 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .any(|frame| {
-                frame["method"] == "thread/start"
-                    && frame["params"]["developerInstructions"]
-                        .as_str()
+                frame.get("method").and_then(serde_json::Value::as_str) == Some("thread/start")
+                    && frame
+                        .pointer("/params/developerInstructions")
+                        .and_then(serde_json::Value::as_str)
                         .is_some_and(|text| {
                             text.contains("Keep repository rule fixture in initial instructions.")
                         })
@@ -1091,8 +1092,8 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
     let pending = durable.pending.first().context("remaining question")?;
     assert_eq!(pending.unanswered_questions().len(), 1);
     assert_eq!(
-        pending.params["difuAnswers"]["1"],
-        serde_json::json!({"answers":[]})
+        pending.params.pointer("/difuAnswers/1"),
+        Some(&serde_json::json!({"answers":[]}))
     );
     let artifact = launch(&storage, &repo, "artifact report")?;
     // Connecting briefly reports Idle before the initial turn starts. Only a
@@ -1583,6 +1584,12 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     git(&other, &["add", "."])?;
     git(&other, &["commit", "-m", "Other base"])?;
     git(&other, &["remote", "add", "origin", "."])?;
+    let mut config = storage.load_config()?;
+    config.repository_rules.insert(
+        other.canonicalize()?,
+        "Use the destination repository rules.".into(),
+    );
+    storage.save_config(&config)?;
     git(
         &repo,
         &["worktree", "lock", workspace.to_str().context("path")?],
@@ -1612,6 +1619,10 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     )?;
     let changed = session(&storage, &id)?;
     assert!(!workspace.exists());
+    assert_eq!(
+        changed.repository_rules,
+        "Use the destination repository rules."
+    );
     assert!(!changed.workspace_ready && changed.branch.is_none());
     assert_eq!(changed.job.root(), &other.canonicalize()?);
     assert_eq!(changed.baseline, Some(git(&other, &["rev-parse", "HEAD"])?));
@@ -1639,6 +1650,7 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
         anyhow::bail!("Changes");
     };
     assert!(patch.is_empty());
+    assert!(session(&storage, &id)?.repository_rules.is_empty());
     let message = |text: &str| Control::Message {
         text: text.into(),
         queue: false,

@@ -2573,11 +2573,7 @@ impl Ui {
             );
             x = x.saturating_add(width + 1);
         }
-        let start = match self.focus {
-            Focus::PullRequest(index) => index.min(session_prs.len().saturating_sub(1)),
-            _ => 0,
-        };
-        for (index, link) in session_prs.iter().enumerate().skip(start) {
+        for (index, link) in session_prs.iter().enumerate() {
             let pr = &link.pr;
             let stale = self.selected.as_ref().is_some_and(|id| self.prs.stale(id));
             let label = format!(
