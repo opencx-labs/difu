@@ -1175,7 +1175,7 @@ fn new_sessions_accept_input_while_worktrees_are_preparing() -> Result<()> {
             else {
                 anyhow::bail!("Expected immediate session ID");
             };
-            let preparing = wait(&storage, &id, |s| s.workspace.is_some())?;
+            let preparing = wait(&storage, &id, Session::preparing)?;
             assert_eq!(preparing.status, Status::Starting);
             assert!(!preparing.workspace_ready);
             assert!(!preparing.summary().can_read_changes);
@@ -1305,6 +1305,97 @@ fn new_sessions_accept_input_while_worktrees_are_preparing() -> Result<()> {
         )?;
         assert_eq!(prompt.attachments(), attachments);
         fs::remove_file(root.join("fail-worktree"))?;
+
+        let other = root.join("other");
+        fs::create_dir(&other)?;
+        git(&other, &["init", "-b", "main"])?;
+        fs::write(other.join("other.txt"), "new repository\n")?;
+        git(&other, &["add", "."])?;
+        git(&other, &["commit", "-m", "other base"])?;
+        git(&other, &["remote", "add", "origin", "."])?;
+        for stage in ["fetch", "add", "created"] {
+            let after_creation = stage == "created";
+            if stage == "fetch" {
+                fs::write(root.join("hold-fetch"), "hold")?;
+            }
+            if after_creation {
+                fs::write(root.join("hold-after-worktree"), "hold")?;
+            }
+            let switching = launch_empty()?;
+            let prepared = wait(&storage, &switching, |s| {
+                if stage == "fetch" {
+                    root.join("fetch-started").exists()
+                } else {
+                    s.branch.is_some()
+                }
+            })?;
+            if after_creation {
+                fs::remove_file(root.join("hold-worktree"))?;
+                wait(&storage, &switching, |_| {
+                    root.join("worktree-created").exists()
+                })?;
+            }
+            send(&switching, "chat only: retain cancelled setup input")?;
+            assert!(
+                client::request(
+                    &storage,
+                    Request::Repository {
+                        id: switching.clone(),
+                        repository: root.join("missing-repository"),
+                    },
+                )
+                .is_err()
+            );
+            assert!(session(&storage, &switching)?.preparing());
+            let started = Instant::now();
+            client::request(
+                &storage,
+                Request::Repository {
+                    id: switching.clone(),
+                    repository: other.clone(),
+                },
+            )?;
+            assert!(started.elapsed() < Duration::from_secs(5));
+            let changed = session(&storage, &switching)?;
+            assert_eq!(changed.status, Status::Idle);
+            assert_eq!(changed.job.root(), &other.canonicalize()?);
+            assert!(!changed.workspace_ready && changed.branch.is_none());
+            assert!(
+                !difu::agents::server::home(&storage)?
+                    .join("worktrees")
+                    .join(&switching)
+                    .exists()
+            );
+            assert!(changed.queue.is_empty());
+            assert!(changed.entries.iter().any(|entry| {
+                entry.kind == "unsent" && entry.text == "chat only: retain cancelled setup input"
+            }));
+            if let Some(branch) = prepared.branch {
+                assert!(
+                    git(&repo, &["show-ref", "--verify", &format!("refs/heads/{branch}")])
+                        .is_err()
+                );
+            }
+            fs::remove_file(root.join(if after_creation {
+                "hold-after-worktree"
+            } else {
+                "hold-worktree"
+            }))?;
+            if stage == "fetch" {
+                fs::remove_file(root.join("hold-fetch"))?;
+            }
+            send(&switching, "chat only: continue in selected repository")?;
+            let resumed = wait(&storage, &switching, |s| {
+                s.status == Status::Idle && s.thread_id.is_some() && s.workspace_ready
+            })?;
+            assert!(
+                resumed
+                    .workspace
+                    .context("New workspace")?
+                    .join("other.txt")
+                    .exists()
+            );
+        }
 
         // Restart interrupts preparation and never replays its queued messages.
         let interrupted = launch_empty()?;

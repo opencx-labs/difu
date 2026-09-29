@@ -2469,11 +2469,7 @@ impl Ui {
         selected: bool,
     ) {
         frame.render_widget(
-            Paragraph::new(label.to_owned()).style(if selected {
-                Style::default().bg(ACCENT).fg(crate::ui::INK)
-            } else {
-                Style::default().fg(ACCENT).bg(PANEL)
-            }),
+            Paragraph::new(label.to_owned()).style(crate::ui::option_style(selected)),
             rect,
         );
         self.hits.push((rect, action));
@@ -3298,7 +3294,7 @@ impl Ui {
                     true,
                 ));
                 frame.render_widget(
-                    Paragraph::new("Changing repositories discards the managed worktree and its local work, artifacts, and PR associations. Connected PRs stay open.")
+                    Paragraph::new("Changing repositories cancels current work and preparation, then discards the managed worktree and its local work, artifacts, and PR associations. Connected PRs stay open.")
                         .wrap(Wrap { trim: false }),
                     Rect::new(
                         area.x,

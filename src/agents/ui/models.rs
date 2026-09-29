@@ -269,7 +269,7 @@ impl Ui {
                     if selected { "›" } else { " " },
                     crate::model::clean(value)
                 ))
-                .style(Style::default().fg(if selected { ACCENT } else { TEXT })),
+                .style(crate::ui::option_style(selected)),
                 rect,
             );
             self.hits.push((rect, Action::ModelOption(index)));
