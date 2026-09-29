@@ -666,13 +666,8 @@ impl Service {
                 let previous = self.store.get(&id)?;
                 let mut candidate = previous.clone();
                 ensure!(
-                    candidate.status == Status::Idle
-                        && candidate.turn_id.is_none()
-                        && candidate.pending.is_empty()
-                        && candidate.queue.is_empty()
-                        && !candidate.switching_workspace
-                        && !candidate.archived,
-                    "Wait for an idle session with no pending requests before changing repository"
+                    !candidate.archived,
+                    "Unarchive the session before changing repository"
                 );
                 let Job::Coding(launch) = &mut candidate.job else {
                     anyhow::bail!("Only coding sessions can change repository");
@@ -689,10 +684,25 @@ impl Service {
                 }
                 // Validate first so an invalid path leaves the current connection intact.
                 self.stop_worker(&id)?;
+                // Preparation can record a branch/worktree while the new path is being
+                // validated. Join the cancelled worker before reading cleanup ownership.
+                let previous = self.store.get(&id)?;
                 super::workspace::discard(&previous, &self.store.home, &Cancel::default())?;
                 let revision = previous.workspace_revision.saturating_add(1);
                 super::pr_cache::disconnect(&self.store.storage, &id, revision)?;
                 self.store.update(&id, |s| {
+                    s.status = Status::Idle;
+                    s.turn_id = None;
+                    s.turn_started_at = None;
+                    s.switching_workspace = false;
+                    for prompt in std::mem::take(&mut s.queue) {
+                        s.unsent(prompt);
+                    }
+                    s.pending.clear();
+                    s.workspace_requests.clear();
+                    s.registration_requests.clear();
+                    s.artifact_requests.clear();
+                    s.deletion_requests.clear();
                     s.job = candidate.job;
                     s.workspace = candidate.workspace;
                     s.baseline = candidate.baseline;

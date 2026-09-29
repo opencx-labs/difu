@@ -37,6 +37,7 @@ pub(crate) const REMOVE_BG: Color = Color::Rgb(49, 25, 31);
 
 #[derive(Clone, Default)]
 pub struct TextRow {
+    pub style: Style,
     pub hunk: Option<String>,
     pub image: Option<crate::images::PreviewRow>,
     pub spans: Vec<Span<'static>>,
@@ -157,6 +158,7 @@ pub(crate) fn text(value: impl Into<String>, color: Color) -> TextRow {
         code_links: Vec::new(),
         image: None,
         hunk: None,
+        style: Style::default(),
     }
 }
 pub(crate) fn bold(value: impl Into<String>, color: Color) -> TextRow {
@@ -170,6 +172,7 @@ pub(crate) fn bold(value: impl Into<String>, color: Color) -> TextRow {
         code_links: Vec::new(),
         image: None,
         hunk: None,
+        style: Style::default(),
     }
 }
 pub(crate) fn link(value: impl Into<String>, action: Action) -> TextRow {
@@ -185,6 +188,23 @@ pub(crate) fn link(value: impl Into<String>, action: Action) -> TextRow {
         code_links: Vec::new(),
         image: None,
         hunk: None,
+        style: Style::default(),
+    }
+}
+/// Shared appearance for focused options in modal lists.
+pub(crate) fn option_style(selected: bool) -> Style {
+    if selected {
+        Style::default().bg(ACCENT).fg(INK)
+    } else {
+        Style::default().bg(PANEL).fg(ACCENT)
+    }
+}
+pub(crate) fn option(value: impl Into<String>, action: Action, selected: bool) -> TextRow {
+    TextRow {
+        style: option_style(selected),
+        spans: vec![Span::raw(value.into())],
+        action: Some(action),
+        ..Default::default()
     }
 }
 fn append(rows: &mut Vec<Row>, right: TextRow) {
@@ -610,6 +630,7 @@ pub(crate) fn code_rows(
                     code_links: links,
                     image: None,
                     hunk: None,
+                    style: Style::default(),
                     action: None,
                     target: Some(crate::workflow::Target::Code {
                         path: path.into(),
@@ -628,6 +649,7 @@ pub(crate) fn code_rows(
                     code_links: code_links(path, Some(line), old, width, offset, 0),
                     image: None,
                     hunk: None,
+                    style: Style::default(),
                     action: None,
                     target: Some(crate::workflow::Target::Code {
                         path: path.into(),
@@ -1136,7 +1158,7 @@ pub(crate) fn paint(frame: &mut Frame, rect: Rect, row: &TextRow, app: &mut App)
             span.style = span.style.bg(PANEL).add_modifier(Modifier::BOLD);
         }
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), rect);
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(row.style), rect);
     if let Some(action) = &row.action {
         app.hits.push((rect, action.clone()));
     }
@@ -2602,9 +2624,11 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
                     choice,
                     if recommended { "★ Recommended" } else { "" }
                 );
-                let mut row = text(label, if index == selected { ACCENT } else { TEXT });
-                row.action = Some(Action::ApplyModel(choice.clone()));
-                rows.push(row);
+                rows.push(option(
+                    label,
+                    Action::ApplyModel(choice.clone()),
+                    index == selected,
+                ));
             }
             rows
         }

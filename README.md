@@ -192,12 +192,15 @@ since its last use. Provider selection does not run a task or repeat prior actio
 Codex uses your installed app-server; Claude uses the installed CLI's streaming
 protocol through an isolated Rust adapter, without Python or an SDK dependency.
 
-Use **/repo** (or `/repo /path/to/checkout`) to change an idle session's repository.
-The command validates the new repository, stops the session's shells, and discards
-its managed worktree and local branches, including committed and uncommitted work.
+Use **/repo** (or `/repo /path/to/checkout`) to change a session's repository,
+including while its worktree is being prepared. The command validates the new
+repository, cancels current preparation or agent work, stops the session's shells,
+and discards its managed worktree and local branches, including committed and
+uncommitted work.
 It clears artifact associations, workspace history, and connected PRs from the
 session. Remote branches and PRs are untouched. Conversation is preserved; the
-next message creates a fresh worktree. The new-session default is unchanged.
+next message creates a fresh worktree. Queued messages are retained as unsent
+messages. The new-session default is unchanged.
 
 Codex model and reasoning inherit your configuration unless overridden. Legacy
 read-only investigation sessions permit app/MCP approval prompts while blocking

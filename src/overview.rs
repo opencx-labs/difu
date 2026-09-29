@@ -48,6 +48,7 @@ fn flow(row: TextRow, width: usize) -> Vec<TextRow> {
                     code_links: Vec::new(),
                     image: None,
                     hunk: None,
+                    style: row.style,
                 });
                 used = 0;
                 if ch == '\n' {
@@ -73,6 +74,7 @@ fn flow(row: TextRow, width: usize) -> Vec<TextRow> {
         code_links: Vec::new(),
         image: None,
         hunk: None,
+        style: row.style,
     });
     rows
 }
@@ -108,6 +110,7 @@ fn padded(mut row: TextRow, width: usize, background: Color) -> TextRow {
         code_links: Vec::new(),
         image: row.image,
         hunk: row.hunk,
+        style: row.style,
     }
 }
 fn card(width: usize, header: Vec<TextRow>, body: Vec<TextRow>) -> Vec<TextRow> {

@@ -553,11 +553,7 @@ impl Ui {
                     "{} {name:12} {description}",
                     if index == selected { "›" } else { " " }
                 ))
-                .style(Style::default().fg(if index == selected {
-                    ACCENT
-                } else {
-                    TEXT
-                })),
+                .style(crate::ui::option_style(index == selected)),
                 rect,
             );
             self.hits.push((rect, Action::Command(index)));

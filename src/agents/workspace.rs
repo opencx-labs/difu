@@ -213,6 +213,7 @@ pub fn prepare(
                 );
                 process::checked(
                     repo::checkout_git(&root, cancel)?
+                        .env("LC_ALL", "C")
                         .args(["worktree", "add"])
                         .arg(&destination)
                         .arg(&branch),
@@ -221,6 +222,7 @@ pub fn prepare(
             } else {
                 process::checked(
                     repo::checkout_git(&root, cancel)?
+                        .env("LC_ALL", "C")
                         .args(["worktree", "add", "-b", &branch])
                         .arg(&destination)
                         .arg(&sha),
@@ -574,7 +576,9 @@ pub(super) fn discard(session: &Session, home: &Path, cancel: &Cancel) -> Result
     {
         branches.insert(branch.clone());
     }
-    if owned.try_exists()? {
+    if !session.workspace_ready && session.workspace.as_ref() == Some(&owned) {
+        discard_preparation(session, home, cancel)?;
+    } else if owned.try_exists()? {
         let mut managed = session.clone();
         managed.workspace = Some(owned.clone());
         validate_removal(&managed, home, cancel, true)?;
@@ -601,6 +605,59 @@ pub(super) fn discard(session: &Session, home: &Path, cancel: &Cancel) -> Result
                 cancel,
             )?;
         }
+    }
+    Ok(())
+}
+
+/// Git can leave an initializing registration or an incomplete directory when
+/// worktree add is cancelled. Remove only this session's recorded destination.
+fn discard_preparation(session: &Session, home: &Path, cancel: &Cancel) -> Result<()> {
+    ensure!(!session.status.active(), "Stop workspace preparation first");
+    let owned = home.join("worktrees").join(&session.id);
+    // Git reports canonical paths, including /private/tmp for /tmp on macOS.
+    // Resolve the existing parent even if cancellation left no destination.
+    let canonical = owned
+        .parent()
+        .context("Missing worktree parent")?
+        .canonicalize()?
+        .join(&session.id);
+    if owned.try_exists()? {
+        validate_removal(session, home, cancel, true)?;
+    }
+    let listing = read(
+        session.job.root(),
+        &["worktree", "list", "--porcelain", "-z"],
+        cancel,
+    )?;
+    let registered = listing.split("\0\0").find(|record| {
+        record
+            .split('\0')
+            .next()
+            .and_then(|line| line.strip_prefix("worktree "))
+            .is_some_and(|path| Path::new(path) == canonical.as_path())
+    });
+    if let Some(record) = registered {
+        let lock = record
+            .split('\0')
+            .find(|line| *line == "locked" || line.starts_with("locked "));
+        ensure!(
+            lock.is_none() || lock == Some("locked initializing"),
+            "The previous worktree is explicitly locked; unlock it before changing repository"
+        );
+        let mut command = repo::checkout_git(session.job.root(), cancel)?;
+        command.args(["worktree", "remove", "--force"]);
+        // Git itself locks an unfinished add. Explicit user locks stay protected.
+        if lock.is_some() {
+            command.arg("--force");
+        }
+        // A cancelled add may not have written a valid .git file yet. Git accepts
+        // a missing destination, so discard the owned files before its registration.
+        if owned.try_exists()? {
+            fs::remove_dir_all(&owned)?;
+        }
+        process::checked(command.arg(&canonical), cancel)?;
+    } else if owned.try_exists()? {
+        fs::remove_dir_all(&owned)?;
     }
     Ok(())
 }
@@ -654,6 +711,76 @@ mod tests {
         )
         .map(|s| s.trim().to_owned())
     }
+    #[test]
+    fn discard_cancelled_preparation_removes_partial_worktrees() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().canonicalize()?;
+        let repo = home.join("repo");
+        fs::create_dir(&repo)?;
+        git(&repo, &["init", "-b", "main"])?;
+        fs::write(repo.join("tracked.txt"), "base\n")?;
+        git(&repo, &["add", "."])?;
+        git(&repo, &["commit", "-m", "base"])?;
+        for state in ["initializing", "missing", "unregistered", "user-lock"] {
+            let mut session = Session::new(
+                state.into(),
+                Job::Coding(Launch {
+                    repository: repo.clone(),
+                    isolated: true,
+                    base: "HEAD".into(),
+                    prompt: String::new(),
+                    model: None,
+                    effort: None,
+                }),
+            );
+            let owned = home.join("worktrees").join(state);
+            let branch = managed_branch(&session);
+            let path = owned.to_str().context("Workspace path")?;
+            session.workspace = Some(owned.clone());
+            session.branch = Some(branch.clone());
+            session.status = Status::Interrupted;
+            if state == "unregistered" {
+                fs::create_dir_all(&owned)?;
+                fs::write(owned.join("partial"), "discard")?;
+                git(&repo, &["branch", &branch])?;
+            } else {
+                git(
+                    &repo,
+                    &["worktree", "add", "--no-checkout", "-b", &branch, path],
+                )?;
+                match state {
+                    "missing" => fs::remove_dir_all(&owned)?,
+                    "initializing" => {
+                        git(
+                            &repo,
+                            &["worktree", "lock", "--reason", "initializing", path],
+                        )?;
+                        fs::remove_file(owned.join(".git"))?;
+                    }
+                    "user-lock" => {
+                        git(&repo, &["worktree", "lock", "--reason", "keep", path])?;
+                        assert!(discard(&session, &home, &Cancel::default()).is_err());
+                        assert!(owned.exists());
+                        git(&repo, &["worktree", "unlock", path])?;
+                    }
+                    _ => {}
+                }
+            }
+            discard(&session, &home, &Cancel::default())?;
+            assert!(!owned.exists());
+            assert!(
+                git(
+                    &repo,
+                    &["show-ref", "--verify", &format!("refs/heads/{branch}")]
+                )
+                .is_err()
+            );
+            assert!(!git(&repo, &["worktree", "list", "--porcelain"])?.contains(path));
+        }
+        assert_eq!(fs::read_to_string(repo.join("tracked.txt"))?, "base\n");
+        Ok(())
+    }
+
     #[test]
     fn new_worktrees_fetch_main_without_changing_dirty_checkout_or_resumed_work() -> Result<()> {
         let temp = tempfile::tempdir()?;

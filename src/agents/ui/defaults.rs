@@ -309,11 +309,7 @@ impl Ui {
                         if index == selected { "›" } else { " " },
                         crate::model::clean(option)
                     ))
-                    .style(Style::default().fg(if index == selected {
-                        ACCENT
-                    } else {
-                        TEXT
-                    })),
+                    .style(crate::ui::option_style(index == selected)),
                     rect,
                 );
                 buttons.push((rect, Action::DefaultOption(index)));

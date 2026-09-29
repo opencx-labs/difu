@@ -12,6 +12,9 @@ use ratatui::{
 fn action(label: impl Into<String>, action: WAction) -> ui::TextRow {
     ui::link(label, Action::Workflow(action))
 }
+fn choice(label: impl Into<String>, action: WAction, selected: bool) -> ui::TextRow {
+    ui::option(label, Action::Workflow(action), selected)
+}
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let Some(Modal::Workflow(modal)) = app.modal.take() else {
         return;
@@ -89,7 +92,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .take(available)
             {
                 if let Some(option) = picker.options.get(*index) {
-                    rows.push(action(
+                    rows.push(choice(
                         format!(
                             "{} [{}] {}",
                             if position == picker.selected {
@@ -105,6 +108,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                             option.label(&picker.key.owner)
                         ),
                         WAction::ToggleReviewer(*index),
+                        position == picker.selected,
                     ));
                 }
             }
@@ -140,9 +144,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .iter()
             .enumerate()
             {
-                rows.push(action(
+                rows.push(choice(
                     format!("{} {label}", if i == *selected { ">" } else { " " }),
                     WAction::Choose(i),
+                    i == *selected,
                 ));
             }
         }
@@ -183,9 +188,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 rows.push(ui::text("No matching commands.", DIM));
             }
             for (position, (id, label)) in commands.iter().enumerate().skip(start).take(available) {
-                rows.push(action(
+                rows.push(choice(
                     format!("{} {label}", if position == *selected { ">" } else { " " }),
                     WAction::Choose(*id),
+                    position == *selected,
                 ));
             }
             if let Some(r) = app.review() {
@@ -271,7 +277,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 rows.push(ui::text("", DIM));
             }
             for (i, label) in draft.choices().iter().enumerate() {
-                rows.push(action(
+                rows.push(choice(
                     format!(
                         "{} {} {label}",
                         if draft.focus == 1 && draft.choice == i {
@@ -282,15 +288,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                         if draft.choice == i { "[x]" } else { "[ ]" }
                     ),
                     WAction::Choose(i),
+                    draft.focus == 1 && draft.choice == i,
                 ));
             }
             rows.push(ui::text("", DIM));
-            rows.push(action(
+            rows.push(choice(
                 format!(
                     "{} [ Next: confirm ]",
                     if draft.focus == 2 { ">" } else { " " }
                 ),
                 WAction::Next,
+                draft.focus == 2,
             ));
             rows.push(ui::text("", DIM));
             let options = app.mention_options(draft);
@@ -302,9 +310,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     .skip(draft.mention.saturating_sub(room.saturating_sub(1)))
                     .take(room)
                 {
-                    rows.push(action(
+                    rows.push(choice(
                         format!("{} @{login}", if i == draft.mention { ">" } else { " " }),
                         WAction::Complete(login.clone()),
+                        i == draft.mention,
                     ));
                 }
             } else {
@@ -396,13 +405,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .skip(selected.saturating_sub(count.saturating_sub(1)))
                 .take(count)
             {
-                rows.push(action(
+                rows.push(choice(
                     format!(
                         "{} {}",
                         if *selected == i { ">" } else { " " },
                         entry.path.display()
                     ),
                     WAction::Choose(i),
+                    *selected == i,
                 ));
                 rows.push(ui::text(
                     entry
