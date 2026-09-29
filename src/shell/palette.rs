@@ -1107,9 +1107,12 @@ mod tests {
             .iter()
             .all(|item| matches!(item.action, Action::AgentCommand(_) | Action::AgentMenu(_)));
         assert!(all_session_controls);
-        let has_review_controls = items
-            .iter()
-            .any(|item| matches!(item.action, Action::ReviewHome(_) | Action::ReviewCommand(_)));
+        let has_review_controls = items.iter().any(|item| {
+            matches!(
+                item.action,
+                Action::ReviewHome(_) | Action::ReviewCommand(_)
+            )
+        });
         assert!(!has_review_controls);
         let has_wrapper = items
             .iter()

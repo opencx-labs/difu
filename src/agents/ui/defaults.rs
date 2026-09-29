@@ -285,7 +285,8 @@ impl Ui {
         let toggle = Rect::new(area.x, area.y + 12, area.width, 1).intersection(area);
         let rules = Rect::new(area.x, area.y + 3, area.width, 1).intersection(area);
         frame.render_widget(
-            Paragraph::new("[ Edit repository rules · Ctrl+R ]").style(crate::ui::option_style(false)),
+            Paragraph::new("[ Edit repository rules · Ctrl+R ]")
+                .style(crate::ui::option_style(false)),
             rules,
         );
         buttons.push((rules, Action::DefaultRules));
