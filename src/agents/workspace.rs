@@ -614,6 +614,13 @@ pub(super) fn discard(session: &Session, home: &Path, cancel: &Cancel) -> Result
 fn discard_preparation(session: &Session, home: &Path, cancel: &Cancel) -> Result<()> {
     ensure!(!session.status.active(), "Stop workspace preparation first");
     let owned = home.join("worktrees").join(&session.id);
+    // Git reports canonical paths, including /private/tmp for /tmp on macOS.
+    // Resolve the existing parent even if cancellation left no destination.
+    let canonical = owned
+        .parent()
+        .context("Missing worktree parent")?
+        .canonicalize()?
+        .join(&session.id);
     if owned.try_exists()? {
         validate_removal(session, home, cancel, true)?;
     }
@@ -627,7 +634,7 @@ fn discard_preparation(session: &Session, home: &Path, cancel: &Cancel) -> Resul
             .split('\0')
             .next()
             .and_then(|line| line.strip_prefix("worktree "))
-            .is_some_and(|path| Path::new(path) == owned.as_path())
+            .is_some_and(|path| Path::new(path) == canonical.as_path())
     });
     if let Some(record) = registered {
         let lock = record
@@ -648,7 +655,7 @@ fn discard_preparation(session: &Session, home: &Path, cancel: &Cancel) -> Resul
         if owned.try_exists()? {
             fs::remove_dir_all(&owned)?;
         }
-        process::checked(command.arg(&owned), cancel)?;
+        process::checked(command.arg(&canonical), cancel)?;
     } else if owned.try_exists()? {
         fs::remove_dir_all(&owned)?;
     }
