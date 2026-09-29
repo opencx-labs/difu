@@ -7,6 +7,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("effort", "Choose the reasoning level"),
     ("skills", "Browse skills for this workspace"),
     ("status", "Show session, workspace and permissions"),
+    ("rules", "Edit repository rules for new sessions"),
     ("usage", "Show provider usage and rate limits"),
     ("diff", "Show current session changes"),
     ("new", "Launch a new coding session"),
@@ -348,6 +349,7 @@ impl Ui {
             "/effort" => self.open_model(1),
             "/skills" => self.open_commands(true),
             "/status" => self.modal = Some(Modal::Status),
+            "/rules" => self.open_rules(None),
             "/usage" => self.open_usage(),
             "/worktree" => {
                 self.modal = Some(Modal::Commands {
@@ -386,6 +388,7 @@ impl Ui {
     }
     fn run_command_arguments(&mut self, name: &str, args: &str) {
         match name {
+            "/rules" => self.open_rules(Some(args.into())),
             "/repo" => self.change_repository(args),
             "/worktree" => self.register_worktree(args),
             "/rename" => {

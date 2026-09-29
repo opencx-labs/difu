@@ -3,6 +3,69 @@ use super::{Pending, Prompt, Session};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
+pub(super) const TOOL: &str = "difu_remove_questions";
+pub(super) const INSTRUCTIONS: &str = "Use difu_remove_questions to remove stale unanswered questions from this session's question panel. Pass questions: [] to list pending question IDs, then pass the request_id and question_id of each question to remove. Removal does not answer a question or grant approval.";
+
+pub(super) fn tool() -> Value {
+    json!({"type":"function","name":TOOL,"description":"Remove specific stale, unanswered asynchronous questions from this session's question panel. Pass an empty questions array to inspect pending questions and their IDs. Returns the remaining questions. Removal persists across restarts and does not submit answers or grant approval.","inputSchema":{"type":"object","properties":{"questions":{"type":"array","items":{"type":"object","properties":{"request_id":{"type":"string"},"question_id":{"type":"string"}},"required":["request_id","question_id"],"additionalProperties":false}}},"required":["questions"],"additionalProperties":false}})
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Removal {
+    questions: Vec<QuestionId>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QuestionId {
+    request_id: String,
+    question_id: String,
+}
+
+fn remove(session: &mut Session, args: &Value) -> Result<Value> {
+    let removal: Removal = serde_json::from_value(args.clone())?;
+    // Validate the entire batch before changing anything. Reuse skip tracking so
+    // event replay cannot restore removed questions or overwrite saved answers.
+    let mut updates = Vec::new();
+    for question in &removal.questions {
+        let request = json!(question.request_id);
+        ensure!(
+            session
+                .pending
+                .iter()
+                .any(|pending| pending.id == request && pending.is_async_question()),
+            "No asynchronous question request {} is pending",
+            question.request_id
+        );
+        let (updated, _) = prepare_answer(session, &request, &question.question_id, None)?;
+        updates.push(updated);
+    }
+    for updated in updates {
+        record_answer(session, updated);
+    }
+    let remaining: Vec<_> = session
+        .pending
+        .iter()
+        .filter(|pending| pending.is_async_question())
+        .flat_map(|pending| {
+            pending.unanswered_questions().into_iter().map(move |(_, q)| {
+                json!({"request_id":pending.id,"question_id":q.get("id"),"question":q.get("question")})
+            })
+        })
+        .collect();
+    Ok(json!({"remaining_questions":remaining}))
+}
+
+pub(super) fn handle(store: &super::server::Store, id: &str, args: &Value) -> Result<Value> {
+    let mut result = Ok(Value::Null);
+    // Keep validation and removal under the same lock as user answers.
+    store.update(id, |session| result = remove(session, args))?;
+    let result = result?;
+    store.save(id)?;
+    Ok(result)
+}
+
 // Build at delivery time, including for answers queued during a workspace move.
 // The display text stays the user's answer; this is a separate model input item.
 pub(super) fn pending_context(session: &Session, prompt: &Prompt) -> Option<String> {
@@ -222,6 +285,82 @@ mod tests {
             "id":id,"type":"agentMessage","delivery":"async","text":"Choose scope",
             "questions":[{"title":"Scope?","options":["Small","Large"]},{"title":"Any notes?"}]
         }}})
+    }
+
+    #[test]
+    fn removed_questions_stay_removed_without_losing_answers_or_other_batches() -> Result<()> {
+        let mut session = session();
+        for id in ["q", "other"] {
+            apply_event(&mut session, &question_event(id, "item/completed"));
+        }
+        let listing = remove(&mut session, &json!({"questions":[]}))?;
+        assert_eq!(listing["remaining_questions"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            listing["remaining_questions"][0]["request_id"],
+            "difu-async:q"
+        );
+        let request = json!("difu-async:q");
+        let (answer, _) = prepare_answer(&session, &request, "0", Some("Small"))?;
+        let before_entries = session.entries.len();
+        remove(
+            &mut session,
+            &json!({"questions":[{"request_id":"difu-async:q","question_id":"1"}]}),
+        )?;
+        // An answer prepared before removal can still arrive without restoring it.
+        record_answer(&mut session, answer);
+        assert_eq!(session.pending_question_count(), 2);
+        assert_eq!(session.entries.len(), before_entries);
+        assert!(session.queue.is_empty());
+        assert!(session.answered_questions.contains("difu-async:q"));
+        let mut restored: Session = serde_json::from_value(serde_json::to_value(session)?)?;
+        restored.restore_async_questions();
+        apply_event(&mut restored, &question_event("q", "item/completed"));
+        assert_eq!(restored.pending_question_count(), 2);
+        assert_eq!(restored.pending[0].id, "difu-async:other");
+        remove(
+            &mut restored,
+            &json!({"questions":[
+                {"request_id":"difu-async:other","question_id":"0"},
+                {"request_id":"difu-async:other","question_id":"1"}
+            ]}),
+        )?;
+        restored.restore_async_questions();
+        assert_eq!(restored.pending_question_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn removal_validates_the_whole_batch_and_preserves_in_flight_answers() -> Result<()> {
+        let mut session = session();
+        apply_event(&mut session, &question_event("q", "item/completed"));
+        let before = serde_json::to_value(&session)?;
+        for args in [
+            json!({"questions":[
+                {"request_id":"difu-async:q","question_id":"0"},
+                {"request_id":"difu-async:q","question_id":"missing"}
+            ]}),
+            json!({"questions":[{"request_id":"another-session","question_id":"0"}]}),
+            json!({"questions":[],"session_id":"another-session"}),
+        ] {
+            assert!(remove(&mut session, &args).is_err());
+            assert_eq!(serde_json::to_value(&session)?, before);
+        }
+        session.pending[0].responded = true;
+        let result = remove(
+            &mut session,
+            &json!({"questions":[{"request_id":"difu-async:q","question_id":"0"}]}),
+        );
+        assert!(result.is_err());
+        assert_eq!(session.pending_question_count(), 2);
+        session.pending[0].responded = false;
+        session.pending[0].params["difuAsync"] = json!(false);
+        let result = remove(
+            &mut session,
+            &json!({"questions":[{"request_id":"difu-async:q","question_id":"0"}]}),
+        );
+        assert!(result.is_err());
+        assert_eq!(session.pending_question_count(), 2);
+        Ok(())
     }
 
     #[test]

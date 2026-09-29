@@ -12,6 +12,7 @@ mod patch;
 mod prompt;
 mod prs;
 mod questions;
+mod rules;
 mod selection;
 mod sidebar;
 mod transcript;
@@ -122,8 +123,6 @@ enum Action {
     ExternalArtifact,
     BrowserChoice(usize),
     New,
-    ToggleList,
-    ToggleChanges,
     ChangeFile(usize),
     ChangePr(usize),
     Approval(usize),
@@ -148,6 +147,11 @@ enum Action {
     ModelField(usize),
     ModelOption(usize),
     DefaultSave,
+    DefaultRules,
+    RulesField(usize),
+    RulesOption(usize),
+    RulesSave,
+    RulesCancel,
     Approve(usize),
     Answer(usize, String),
     InlineQuestion(usize),
@@ -175,6 +179,7 @@ pub enum Modal {
         selected: usize,
     },
     AgentDefaults(Box<defaults::Settings>),
+    RepositoryRules(Box<rules::Settings>),
     Voice {
         key: Editor,
         field: usize,
@@ -402,6 +407,7 @@ impl Ui {
         }
         self.tick_models();
         self.tick_defaults();
+        self.tick_rules();
         self.tick_media();
         self.tick_voice(visible);
         while let Ok(message) = self.receiver.try_recv() {
@@ -960,10 +966,12 @@ impl Ui {
             } else {
                 "Pin session"
             },
+            "Repository rules",
         ]
     }
     pub(crate) fn menu_action(&mut self, index: usize) {
         match index {
+            19 => self.open_rules(None),
             18 => {
                 if let Some(id) = self.selected.clone() {
                     self.toggle_pin(&id);
@@ -1055,13 +1063,16 @@ impl Ui {
         self.prs.all(id).iter().map(|link| &link.pr).collect()
     }
     pub(crate) fn palette_review(&self) -> Option<&crate::app::App> {
+        if !self.panels.focused || self.panels.session != self.selected {
+            return None;
+        }
         match &self.panels.view {
             Some(panels::View::PullRequest { app }) if self.panels.visible() => Some(app),
             _ => None,
         }
     }
     pub(crate) fn palette_review_mut(&mut self) -> Option<&mut crate::app::App> {
-        if !self.panels.visible() {
+        if self.palette_review().is_none() {
             return None;
         }
         match &mut self.panels.view {
@@ -1289,6 +1300,11 @@ impl Ui {
         match &self.modal {
             Some(Modal::Repository(editor) | Modal::ChangeRepository(editor)) => Some(editor),
             Some(Modal::AgentDefaults(form)) => form.fields.get(form.field),
+            Some(Modal::RepositoryRules(form)) => match form.field {
+                0 => Some(&form.repository),
+                1 => Some(&form.text),
+                _ => None,
+            },
             Some(Modal::Menu { query, .. } | Modal::Commands { query, .. }) => Some(query),
             Some(Modal::Help(state)) => Some(&state.query),
             Some(Modal::Rename(editor) | Modal::QueuedEdit { editor, .. }) => Some(editor),
@@ -1907,6 +1923,7 @@ impl Ui {
             return;
         }
         match &mut self.modal {
+            Some(Modal::RepositoryRules(_)) => self.rules_paste(text),
             Some(Modal::AgentDefaults(form)) => {
                 if let Some(editor) = form.fields.get_mut(form.field) {
                     editor.insert(text);
@@ -1965,6 +1982,10 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::AgentDefaults(_))) {
             self.defaults_key(key);
+            return;
+        }
+        if matches!(self.modal, Some(Modal::RepositoryRules(_))) {
+            self.rules_key(key);
             return;
         }
         if matches!(self.modal, Some(Modal::Voice { .. })) {
@@ -2155,6 +2176,15 @@ impl Ui {
                 }
             }
             Action::DefaultSave => self.save_defaults(),
+            Action::DefaultRules => self.default_rules(),
+            Action::RulesField(field) => {
+                if let Some(Modal::RepositoryRules(form)) = &mut self.modal {
+                    form.field = field;
+                }
+            }
+            Action::RulesOption(index) => self.rules_option(index),
+            Action::RulesSave => self.save_rules(),
+            Action::RulesCancel => self.close_rules(),
             Action::Select(id) => {
                 self.select(id);
                 self.focus = Focus::List;
@@ -2172,8 +2202,6 @@ impl Ui {
                 })
             }
             Action::New => self.launch(),
-            Action::ToggleList => self.toggle_list(),
-            Action::ToggleChanges => self.toggle_changes(),
             Action::ChangeFile(index) => self.select_change(index),
             Action::ChangePr(index) => self.select_change_pr(index),
             Action::Approval(index) => self.pending(index),
@@ -2486,37 +2514,6 @@ impl Ui {
             frame.render_widget(Paragraph::new("Resize to at least 40 × 12"), area);
             return;
         }
-        let toolbar = Rect::new(1, 2, area.width.saturating_sub(2), 1);
-        self.button(
-            frame,
-            Rect::new(toolbar.x, toolbar.y, 14, 1),
-            " n New agent ",
-            Action::New,
-            false,
-        );
-        self.button(
-            frame,
-            Rect::new(toolbar.x + 15, toolbar.y, 12, 1),
-            " / Actions ",
-            Action::Menu,
-            false,
-        );
-        if toolbar.width >= 65 {
-            self.button(
-                frame,
-                Rect::new(toolbar.x + 28, toolbar.y, 17, 1),
-                " Alt+[ Agents ",
-                Action::ToggleList,
-                self.list_visible,
-            );
-            self.button(
-                frame,
-                Rect::new(toolbar.x + 46, toolbar.y, 18, 1),
-                " Alt+D Changes ",
-                Action::ToggleChanges,
-                self.changes_visible,
-            );
-        }
         let resources = self.visible_resources();
         let session_prs = self
             .selected
@@ -2526,9 +2523,9 @@ impl Ui {
         let resource_height = u16::from(!resources.is_empty() || !session_prs.is_empty());
         let content = Rect::new(
             1,
-            4,
+            2,
             area.width.saturating_sub(2),
-            area.height.saturating_sub(4 + resource_height),
+            area.height.saturating_sub(2 + resource_height),
         );
         self.viewport = content.height.saturating_sub(2) as usize;
         let list_width = if self.list_visible {
@@ -3168,6 +3165,7 @@ impl Ui {
             Some(Modal::Transcript { .. }) => "Message · ↑/↓ Scroll · PgUp/PgDn Page · Esc Close",
             Some(Modal::InstallBrowser { .. }) => "Optional HTML preview · Esc cancels",
             Some(Modal::AgentDefaults(_)) => "New agent defaults · Tab fields · Esc cancels",
+            Some(Modal::RepositoryRules(_)) => "Repository rules · Tab fields",
             Some(Modal::Voice { .. }) => "Voice settings",
             Some(Modal::Repository(_)) => "Choose and remember your default repository",
             Some(Modal::ChangeRepository(_)) => "Change session repository",
@@ -3242,6 +3240,10 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::AgentDefaults(_))) {
             self.draw_defaults(frame, area);
+            return;
+        }
+        if matches!(self.modal, Some(Modal::RepositoryRules(_))) {
+            self.draw_rules(frame, area);
             return;
         }
         if matches!(self.modal, Some(Modal::Commands { .. })) {
@@ -3562,6 +3564,7 @@ impl Ui {
             }
             Some(
                 Modal::AgentDefaults(_)
+                | Modal::RepositoryRules(_)
                 | Modal::Voice { .. }
                 | Modal::Commands { .. }
                 | Modal::Status
@@ -3726,6 +3729,36 @@ mod tests {
         ui.sessions.insert(session.id.clone(), session);
         ui.select("one".into());
         ui
+    }
+    #[test]
+    fn palette_review_follows_focus_and_selected_session() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let mut ui = state(storage.clone());
+        ui.drilled = true;
+        ui.panels.session = ui.selected.clone();
+        ui.panels.view = Some(panels::View::PullRequest {
+            app: Box::new(crate::app::App::new(storage, Config::default())),
+        });
+        ui.panels.focused = true;
+        assert!(ui.palette_review().is_some());
+        assert!(ui.palette_review_mut().is_some());
+        ui.cycle_focus(false);
+        assert!(!ui.panels.focused);
+        assert!(ui.palette_review().is_none());
+        assert!(ui.palette_review_mut().is_none());
+        ui.panels.focused = true;
+        ui.panels.hidden = true;
+        assert!(ui.palette_review().is_none());
+        assert!(ui.palette_review_mut().is_none());
+        ui.panels.hidden = false;
+        ui.selected = Some("another-session".into());
+        assert!(ui.palette_review().is_none());
+        assert!(ui.palette_review_mut().is_none());
+        Ok(())
     }
     #[test]
     fn deletion_modal_shows_server_progress_and_recovers_from_failure() -> Result<()> {

@@ -51,6 +51,8 @@ pub struct NativeSession {
     pub artifact_tools: bool,
     #[serde(default)]
     pub registration_tools: bool,
+    #[serde(default)]
+    pub question_tools: bool,
 }
 
 pub fn switch(
@@ -89,6 +91,7 @@ pub fn switch(
             inherited_permissions: session.inherited_permissions.clone(),
             artifact_tools: session.artifact_tools,
             registration_tools: session.registration_tools,
+            question_tools: session.question_tools,
         },
     );
     let target = session
@@ -118,6 +121,7 @@ pub fn switch(
     session.inherited_permissions = target.inherited_permissions;
     session.artifact_tools = target.artifact_tools;
     session.registration_tools = target.registration_tools;
+    session.question_tools = target.question_tools;
     session.usage = Value::Null;
     session.token_usage = Value::Null;
     session.completed_turn = None;
@@ -161,6 +165,7 @@ mod tests {
     #[test]
     fn an_unused_provider_still_receives_full_context_on_return() -> Result<()> {
         let mut session = session();
+        session.question_tools = true;
         switch(
             &mut session,
             Provider::Claude,
@@ -168,6 +173,7 @@ mod tests {
             None,
         )?;
         assert!(session.thread_id.is_none());
+        assert!(!session.question_tools);
         switch(
             &mut session,
             Provider::Codex,
@@ -175,6 +181,7 @@ mod tests {
             None,
         )?;
         assert_eq!(session.thread_id.as_deref(), Some("codex-thread"));
+        assert!(session.question_tools);
         switch(
             &mut session,
             Provider::Claude,

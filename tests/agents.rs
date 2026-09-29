@@ -1055,6 +1055,29 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
         fs::read_to_string(repo.join("tracked.txt"))?,
         "precious local edit\n"
     );
+    let mut config = storage.load_config()?;
+    config.repository_rules.insert(repo.canonicalize()?, "Keep repository rule fixture in initial instructions.".into());
+    storage.save_config(&config)?;
+    let removal = launch(&storage, &repo, "remove stale questions")?;
+    let current = wait(&storage, &removal, |s| {
+        s.status == Status::Idle && s.completed_turn.is_some()
+    })?;
+    assert!(current.question_tools);
+    assert_eq!(current.repository_rules, "Keep repository rule fixture in initial instructions.");
+    let protocol = fs::read_to_string(root.join("protocol.jsonl"))?;
+    assert!(protocol.lines().filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok()).any(|frame| {
+        frame["method"] == "thread/start" && frame["params"]["developerInstructions"].as_str().is_some_and(|text| text.contains("Keep repository rule fixture in initial instructions."))
+    }));
+    assert_eq!(current.pending_question_count(), 1);
+    let durable: Session = serde_json::from_slice(&fs::read(
+        difu::agents::server::home(&storage)?.join(format!("{removal}.json")),
+    )?)?;
+    let pending = durable.pending.first().context("remaining question")?;
+    assert_eq!(pending.unanswered_questions().len(), 1);
+    assert_eq!(
+        pending.params["difuAnswers"]["1"],
+        serde_json::json!({"answers":[]})
+    );
     let artifact = launch(&storage, &repo, "artifact report")?;
     // Connecting briefly reports Idle before the initial turn starts. Only a
     // completed turn proves the artifact tool has had an opportunity to run.

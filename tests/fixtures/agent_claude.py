@@ -75,6 +75,7 @@ for line in sys.stdin:
         if frame['response']['request_id'] == 'difu-tools':
             tools = frame['response']['response']['mcp_response']['result']['tools']
             assert tools[0]['name'] == 'difu_present_artifact' and 'inputSchema' in tools[0]
+            assert any(tool['name'] == 'difu_remove_questions' for tool in tools)
             reply(initializing, dict(models=[dict(value='sonnet', displayName='Sonnet', supportedEffortLevels=['high'])]))
             initializing = None
             continue

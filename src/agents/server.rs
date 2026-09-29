@@ -288,6 +288,7 @@ impl Service {
             launch.isolated = true;
         }
         let mut session = Session::new(id.clone(), job);
+        super::rules::capture(&self.store.storage, &mut session)?;
         if empty {
             session.title = "New session".into();
         }
@@ -702,6 +703,7 @@ impl Service {
                     s.workspace_requests.clear();
                     s.registration_requests.clear();
                     s.artifact_requests.clear();
+                    s.question_requests.clear();
                     s.deletion_requests.clear();
                     s.job = candidate.job;
                     s.workspace = candidate.workspace;

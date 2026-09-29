@@ -54,6 +54,8 @@ for line in sys.stdin:
         active = None
     elif method == 'model/list': reply(request, {'data':[{'model':'fixture-model','isDefault':True,'defaultReasoningEffort':'high'}], 'nextCursor':None})
     elif method in ('thread/start','thread/resume'):
+        if method == 'thread/start':
+            assert any(tool['name'] == 'difu_remove_questions' for tool in params['dynamicTools'])
         sandbox = params.get('sandbox', sandbox)
         reply(request, {'thread':{'id':thread_id},'model':params.get('model','fixture-model'),'reasoningEffort':params.get('config',{}).get('model_reasoning_effort','high'),'sandbox':{'type':'readOnly' if sandbox == 'read-only' else 'workspaceWrite'},'approvalPolicy':params.get('approvalPolicy','on-request'),'approvalsReviewer':'user'})
     elif method == 'turn/start':
@@ -97,6 +99,14 @@ for line in sys.stdin:
             emit({'id':900+turn,'method':'mcpServer/elicitation/request','params':{'threadId':thread_id,'turnId':active,'serverName':'fixture-app','message':'Approve the explicitly requested app action','requestedSchema':{'type':'object','properties':{}}}})
         elif text.startswith('wait'):
             event('item/started', {'threadId':thread_id,'turnId':active,'item':{'id':'waiting-'+active,'type':'commandExecution','command':'fixture long-running tool','status':'inProgress'}})
+        elif text == 'remove stale questions':
+            question_id = 'stale-'+connection+'-'+str(turn)
+            event('item/completed', {'threadId':thread_id,'turnId':active,'item':{
+                'id':question_id,'type':'agentMessage','delivery':'async','text':'Two questions',
+                'questions':[{'title':'Keep this question?'},{'title':'Stale question?'}]}})
+            emit({'id':900+turn,'method':'item/tool/call','params':{'threadId':thread_id,'turnId':active,
+                'tool':'difu_remove_questions','arguments':json.dumps({'questions':[
+                    {'request_id':'difu-async:'+question_id,'question_id':'1'}]})}})
         elif text.startswith('async questions'):
             event('item/completed', {'threadId':thread_id,'turnId':active,'item':{
                 'id':'questions-'+connection+'-'+str(turn),'type':'agentMessage','delivery':'async','text':'Three questions',
@@ -124,6 +134,11 @@ for line in sys.stdin:
         if request['result'].get('decision') in ('accept','acceptForSession') or 'answers' in request['result']:
             pathlib.Path('approved.txt').write_text('approved change\n')
         if any(item.get('text') == 'Artifact registered in difu' for item in request['result'].get('contentItems', [])):
+            complete()
+        elif any('remaining_questions' in item.get('text', '') for item in request['result'].get('contentItems', [])):
+            assert request['result']['success']
+            remaining = json.loads(request['result']['contentItems'][0]['text'])['remaining_questions']
+            assert len(remaining) == 1 and remaining[0]['question_id'] == '0'
             complete()
         elif 'contentItems' not in request['result']:
             complete()
