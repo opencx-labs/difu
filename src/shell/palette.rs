@@ -1128,7 +1128,7 @@ mod tests {
         let index = shell
             .palette_items()
             .iter()
-            .position(|item| matches!(item.action, Action::AgentMenu(18)))
+            .position(|item| matches!(item.action, Action::AgentMenu(17)))
             .context("pin control")?;
         shell.activate_palette(index);
         assert!(shell.agents.pinned_sessions.contains("one"));

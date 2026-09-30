@@ -320,7 +320,11 @@ pub(crate) fn refresh_session(
     };
     let session = &current;
     let at = github::polling::now();
-    let interval = if refresh != Refresh::Open { 300 } else { 30 };
+    let interval = if refresh != Refresh::Open {
+        github::PR_REFRESH_SECONDS
+    } else {
+        30
+    };
     let same_workspace =
         saved.revision == session.workspace_revision && saved.branch == session.branch;
     if same_workspace
@@ -467,7 +471,7 @@ impl Refresher {
         storage: Storage,
         store: std::sync::Arc<super::server::Store>,
     ) -> anyhow::Result<Self> {
-        let interval = Duration::from_secs(300);
+        let interval = Duration::from_secs(github::PR_REFRESH_SECONDS);
         let personal_storage = storage.clone();
         let personal = Worker::start_with(storage.clone(), interval, move |cancel| {
             let mut prs = github::my_prs(PrState::Open, cancel)?;
@@ -779,7 +783,7 @@ mod tests {
         }
         saved.attempted_at = github::polling::now().saturating_sub(60);
         save_snapshot(&storage, &path, &saved)?;
-        // Automatic visibility refresh must still use the shared five-minute lease.
+        // Automatic visibility refresh must still use the shared two-minute lease.
         assert!(
             refresh_session(
                 &storage,

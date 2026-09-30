@@ -76,10 +76,9 @@ impl State {
     }
     fn due(&self, id: &str) -> bool {
         !self.pending.contains_key(id)
-            && self
-                .refreshed
-                .get(id)
-                .is_none_or(|t| t.elapsed() >= Duration::from_secs(300))
+            && self.refreshed.get(id).is_none_or(|t| {
+                t.elapsed() >= Duration::from_secs(crate::github::PR_REFRESH_SECONDS)
+            })
     }
     fn receive(&mut self, update: Update) -> bool {
         self.pending.remove(&update.id);
@@ -118,6 +117,14 @@ pub(super) fn color(pr: &SessionPr) -> ratatui::style::Color {
     }
 }
 impl Ui {
+    pub(crate) fn configure_pr_images(&mut self, images: &crate::images::State) {
+        if let Some(panels::View::PullRequest { app }) = &mut self.panels.view
+            && app.images.supported() != images.supported()
+        {
+            app.images.picker = images.picker.clone();
+            app.invalidate();
+        }
+    }
     pub(super) fn tick_prs(&mut self, visible: bool) {
         for session in &self.summaries {
             if self
@@ -491,7 +498,7 @@ mod tests {
         state.refreshed.insert(
             "one".into(),
             Instant::now()
-                .checked_sub(Duration::from_secs(301))
+                .checked_sub(Duration::from_secs(121))
                 .context("time")?,
         );
         assert!(state.due("one"));
@@ -671,6 +678,13 @@ mod tests {
         assert_eq!(app.view, PrView::Overview);
         ui.panels.view = Some(panels::View::PullRequest { app: Box::new(app) });
         ui.panels.focused = true;
+        let mut reviews = App::new(storage.clone(), Config::default());
+        reviews.images.picker = Some(ratatui_image::picker::Picker::halfblocks());
+        ui.configure_pr_images(&reviews.images);
+        let Some(panels::View::PullRequest { app }) = &ui.panels.view else {
+            anyhow::bail!("Missing embedded PR");
+        };
+        assert!(app.images.supported());
         terminal.draw(|f| ui.draw(f))?;
         let right = ui.panels.rect;
         assert!(right.x > 80);

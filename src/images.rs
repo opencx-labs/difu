@@ -438,7 +438,7 @@ pub struct RenderKey {
 }
 #[derive(Default)]
 pub struct State {
-    picker: Option<Picker>,
+    pub(crate) picker: Option<Picker>,
     entries: HashMap<RenderKey, Result<SlicedProtocol, String>>,
     order: VecDeque<RenderKey>,
     pending: HashSet<RenderKey>,
