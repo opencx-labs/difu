@@ -313,7 +313,7 @@ Up/Down to select, Enter to fill, and Enter again to apply.
 The skills picker discovers enabled skills for the session's actual directory;
 selecting one attaches it to the draft without sending. `/actions` (or Esc then /)
 opens searchable session controls: continue, interrupt, rename, change model,
-archive/unarchive, toggle panes, and delete a clean inactive worktree.
+archive/unarchive, toggle panes, and delete a chat with its worktree.
 
 In Agents, `/` commands, `$` workspace skills, and `@` workspace files and folders
 appear above the message input. Choose a suggestion with arrows and Enter;
@@ -484,8 +484,10 @@ The Reviews home screen keeps its two nested tabs:
 Each PR row shows its opened date, changed-file count, additions in green, and
 removals in red. Counts load in background batches; the list remains usable.
 PR lists are cached separately for each scope and state. Cached lists appear
-immediately and refresh when opened. While visible, open PRs refresh every 30
-seconds; closed/merged entries are refreshed only when opened or manually refreshed.
+immediately and refresh when opened. The background service refreshes My PRs and
+active sessions’ PR links every two minutes, even when Reviews is hidden or the
+terminal UI is closed. Visible open PRs also refresh every two minutes;
+closed/merged entries are refreshed only when opened or manually refreshed.
 Unchanged PRs reuse their cached file statistics. Repository names are also cached,
 refreshing when you enter Repositories or press **r**. Failed refreshes keep cached
 data available.
@@ -564,7 +566,7 @@ all its children. Guide chapter links are unchanged.
 
 - **Overview:** a centered column (up to 110 terminal columns) with bordered cards
   for the description, chronological comments/reviews/commits, and checks.
-  Check states and durations refresh every five minutes for the selected open PR.
+  Check states and durations refresh every two minutes for the selected open PR.
   Click a check to open its GitHub logs.
 - **Guide:** chapters connect explanations to changes across files. While
   generation runs, the file navigator and diff stay usable. Completed guides
@@ -621,7 +623,7 @@ units. A hunk may support multiple chapters; repeated references within one
 chapter are collapsed in their original order. Unknown or missing references
 reject the guide.
 
-Difu checks the open PR's head and base commit IDs through GitHub every five minutes.
+Difu checks the open PR's head and base commit IDs through GitHub every two minutes.
 This metadata check does not fetch Git objects. Remote updates are announced
 without replacing your current diff or guide. **r** syncs missing revisions and
 refreshes the review; a failed sync keeps your current review usable. If guide
@@ -692,7 +694,7 @@ Overview shows GitHub's live mergeability separately from the pinned review
 snapshot, including conflicts and required checks that have not reported yet.
 The preview's Open / Merged / Closed badge updates with live status even while the
 diff and guide stay pinned. An empty check rollup is a valid state. If GitHub is still calculating mergeability,
-difu says so. Check runs and merge status refresh every five minutes.
+difu says so. Check runs and merge status refresh every two minutes.
 
 A **Failed tests** section appears beneath Checks when checks fail. Difu reads
 GitHub Actions job logs in the background and displays identifiable test names

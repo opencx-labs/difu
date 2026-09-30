@@ -228,7 +228,6 @@ pub enum Modal {
         field: usize,
         scroll: usize,
     },
-    Cleanup,
     Delete,
     Deleting {
         id: String,
@@ -946,7 +945,6 @@ impl Ui {
             "Show active / archived sessions",
             "Toggle agents list · Alt+[",
             "Toggle Changes · Alt+D",
-            "Delete clean inactive worktree",
             "Open Reviews",
             "Queued outgoing messages",
             "Pending questions · Alt+↑",
@@ -969,21 +967,21 @@ impl Ui {
     }
     pub(crate) fn menu_action(&mut self, index: usize) {
         match index {
-            19 => self.open_rules(None),
-            18 => {
+            18 => self.open_rules(None),
+            17 => {
                 if let Some(id) = self.selected.clone() {
                     self.toggle_pin(&id);
                     self.modal = None;
                 }
             }
-            15 => self.open_resources(false),
-            16 => self.open_resources(true),
-            17 => {
+            14 => self.open_resources(false),
+            15 => self.open_resources(true),
+            16 => {
                 self.modal = None;
                 self.panel_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
             }
-            14 => self.modal = Some(Modal::Delete),
-            13 => self.open_defaults(),
+            13 => self.modal = Some(Modal::Delete),
+            12 => self.open_defaults(),
             0 => self.launch(),
             1 => self.control(Control::Resume),
             2 => self.control(Control::Interrupt),
@@ -1019,10 +1017,9 @@ impl Ui {
                 self.toggle_changes();
                 self.modal = None;
             }
-            11 => self.modal = Some(Modal::Queue { selected: 0 }),
-            12 => self.modal = Some(Modal::Pending { selected: 0 }),
-            9 => self.modal = Some(Modal::Cleanup),
-            10 => {
+            10 => self.modal = Some(Modal::Queue { selected: 0 }),
+            11 => self.modal = Some(Modal::Pending { selected: 0 }),
+            9 => {
                 self.review_requested = true;
                 self.modal = None;
             }
@@ -2083,12 +2080,6 @@ impl Ui {
                         stage: DeletionStage::Stopping,
                     });
                     self.task(Task::Delete(id.clone()), Request::Delete { id }, false);
-                }
-            }
-            Some(Modal::Cleanup) if key.code == KeyCode::Enter => {
-                if let Some(id) = self.selected.clone() {
-                    self.busy = true;
-                    self.task(Task::Action, Request::Cleanup { id }, false);
                 }
             }
             Some(Modal::Approval {
@@ -3168,7 +3159,6 @@ impl Ui {
                 artifacts: true, ..
             }) => "HTML artifacts · Enter open",
             Some(Modal::Resources { .. }) => "Open shells · Enter view",
-            Some(Modal::Cleanup) => "Delete worktree",
             Some(Modal::Delete) => "Stop and delete chat",
             Some(Modal::Deleting { .. }) => "Deleting session",
             Some(Modal::Help(_)) => "Search agent shortcuts",
@@ -3352,9 +3342,6 @@ impl Ui {
                         .label(format!("{percent}%")),
                     Rect::new(area.x, area.y.saturating_add(3), area.width, 1).intersection(area),
                 );
-            }
-            Some(Modal::Cleanup) => {
-                frame.render_widget(Paragraph::new("Delete this session’s clean, inactive worktree?\n\nModified, untracked, ignored, active and Git-locked worktrees are protected. Existing directories are never deleted. The named branch and its commits are retained.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
             }
             Some(Modal::Help(state)) => {
                 let search = Rect::new(area.x, area.y, area.width, 3.min(area.height));
@@ -5534,7 +5521,7 @@ mod tests {
         );
         let (text, _) = draw(&mut ui, 120, 40)?;
         assert!(text.contains("Current worktree changes"));
-        ui.menu_action(14);
+        ui.menu_action(13);
         let (text, _) = draw(&mut ui, 120, 40)?;
         assert!(text.contains("Stop this agent"));
         ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));

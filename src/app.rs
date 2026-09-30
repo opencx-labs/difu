@@ -1331,7 +1331,7 @@ impl App {
             && !self.inbox_loading
             && self
                 .inbox_refreshed
-                .is_some_and(|t| t.elapsed() >= Duration::from_secs(300))
+                .is_some_and(|t| t.elapsed() >= Duration::from_secs(github::PR_REFRESH_SECONDS))
         {
             self.load_inbox_with(true);
         }
@@ -1354,7 +1354,7 @@ impl App {
                 .is_none_or(|pr| !pr.state.eq_ignore_ascii_case("open"))
             || review
                 .poll_at
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(300))
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(github::PR_REFRESH_SECONDS))
         {
             return;
         }
@@ -1381,7 +1381,7 @@ impl App {
             || review.revision_polling
             || review
                 .revision_poll_at
-                .is_some_and(|t| t.elapsed() < Duration::from_secs(300))
+                .is_some_and(|t| t.elapsed() < Duration::from_secs(github::PR_REFRESH_SECONDS))
         {
             return;
         }

@@ -178,6 +178,7 @@ impl Shell {
         }
     }
     pub fn draw(&mut self, frame: &mut Frame) {
+        self.agents.configure_pr_images(&self.reviews.images);
         if self.agents_active {
             self.agents.draw(frame);
         } else {

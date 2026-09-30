@@ -6,6 +6,8 @@ use std::process::Command;
 pub(crate) mod polling;
 pub(crate) mod store;
 
+pub(crate) const PR_REFRESH_SECONDS: u64 = 120;
+
 pub(crate) fn view_detail(key: &PrKey, cancel: &Cancel) -> Result<PrDetail> {
     store::refresh(key, cancel, |pr| pr.detail, || detail(key, cancel))
 }
@@ -212,7 +214,7 @@ pub(crate) fn enrich_prs(prs: &mut [PrSummary], cancel: &Cancel) -> Result<()> {
         .filter(|(_, pr)| {
             pr.metadata
                 .as_ref()
-                .is_none_or(|m| polling::now().saturating_sub(m.checked_at) >= 300)
+                .is_none_or(|m| polling::now().saturating_sub(m.checked_at) >= PR_REFRESH_SECONDS)
         })
         .map(|(i, _)| i)
         .collect::<Vec<_>>();
