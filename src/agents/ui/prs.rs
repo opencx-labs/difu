@@ -76,10 +76,9 @@ impl State {
     }
     fn due(&self, id: &str) -> bool {
         !self.pending.contains_key(id)
-            && self
-                .refreshed
-                .get(id)
-                .is_none_or(|t| t.elapsed() >= Duration::from_secs(crate::github::PR_REFRESH_SECONDS))
+            && self.refreshed.get(id).is_none_or(|t| {
+                t.elapsed() >= Duration::from_secs(crate::github::PR_REFRESH_SECONDS)
+            })
     }
     fn receive(&mut self, update: Update) -> bool {
         self.pending.remove(&update.id);
