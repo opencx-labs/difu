@@ -4225,14 +4225,18 @@ mod tests {
         assert_eq!(p.draft.text(), "Keep typing");
         let failed = p.outgoing.first().context("failed message")?;
         let entry = failed.entry_id();
-        assert!(matches!(&failed.failed, Some(Control::MessageWithAttachments {
+        assert!(
+            matches!(&failed.failed, Some(Control::MessageWithAttachments {
             attachments, skills, queue: true, ..
-        }) if attachments == std::slice::from_ref(&attachment) && skills == std::slice::from_ref(&skill)));
+        }) if attachments == std::slice::from_ref(&attachment) && skills == std::slice::from_ref(&skill))
+        );
         let (screen, _) = draw(&mut ui, 150, 40)?;
         assert!(screen.contains("Not sent · Enter/click to retry"));
-        assert!(ui.hits.iter().any(
-            |(_, action)| matches!(action, Action::ToggleEntry(id) if id == &entry)
-        ));
+        assert!(
+            ui.hits
+                .iter()
+                .any(|(_, action)| matches!(action, Action::ToggleEntry(id) if id == &entry))
+        );
         ui.action(Action::ToggleEntry(entry));
         assert_eq!(
             ui.positions.get("one").context("position")?.draft.text(),
@@ -4317,7 +4321,8 @@ mod tests {
     }
 
     #[test]
-    fn queue_snapshots_reconcile_repeated_messages_and_failures_preserve_new_drafts() -> Result<()> {
+    fn queue_snapshots_reconcile_repeated_messages_and_failures_preserve_new_drafts() -> Result<()>
+    {
         let dir = tempfile::tempdir()?;
         let mut ui = state(Storage {
             config: dir.path().join("config.json"),
@@ -4418,7 +4423,11 @@ mod tests {
         ui.tick(false);
         let p = ui.positions.get("one").context("position")?;
         assert_eq!(p.outgoing.len(), 1);
-        assert!(p.outgoing.first().is_some_and(|pending| pending.token == 2 && pending.failed.is_some()));
+        assert!(
+            p.outgoing
+                .first()
+                .is_some_and(|pending| pending.token == 2 && pending.failed.is_some())
+        );
         Ok(())
     }
 
@@ -5982,10 +5991,7 @@ mod tests {
         let prompt = rows.get(start).context("prompt row")?;
         assert_eq!(prompt.width(), 60);
         assert_eq!(prompt.style, crate::ui::user_message_style());
-        assert_eq!(
-            prompt.to_string().trim_end(),
-            "› Keep this prompt in place"
-        );
+        assert_eq!(prompt.to_string().trim_end(), "› Keep this prompt in place");
         let separator = rows.get(start + 1).context("message separator")?;
         assert!(separator.to_string().is_empty());
         assert_eq!(separator.style.bg, None);
@@ -6674,7 +6680,8 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn question_send_ignores_unrelated_busy_work_and_keeps_failed_answers_retryable() -> Result<()> {
+    fn question_send_ignores_unrelated_busy_work_and_keeps_failed_answers_retryable() -> Result<()>
+    {
         use std::io::{BufRead, BufReader, Write};
         use std::os::unix::net::UnixListener;
         let dir = tempfile::tempdir()?;
@@ -6697,14 +6704,18 @@ mod tests {
         });
         let mut ui = state(storage);
         ui.drilled = true;
-        ui.sessions.get_mut("one").context("session")?.pending.push(Pending {
-            id: serde_json::json!("retry"),
-            method: "item/tool/requestUserInput".into(),
-            responded: true,
-            params: serde_json::json!({"difuAsync":true,"questions":[
-                {"id":"q","question":"Choose scope","options":[{"label":"Small"}]}
-            ]}),
-        });
+        ui.sessions
+            .get_mut("one")
+            .context("session")?
+            .pending
+            .push(Pending {
+                id: serde_json::json!("retry"),
+                method: "item/tool/requestUserInput".into(),
+                responded: true,
+                params: serde_json::json!({"difuAsync":true,"questions":[
+                    {"id":"q","question":"Choose scope","options":[{"label":"Small"}]}
+                ]}),
+            });
         ui.open_question(0);
         let mut requests = Vec::new();
         for busy in [true, false] {
@@ -6719,9 +6730,11 @@ mod tests {
             assert!(ui.question_send.is_none());
             assert_eq!(ui.busy, busy);
             assert_eq!(ui.selected_question_answer().as_deref(), Some("Small"));
-            assert!(ui.notice.as_ref().is_some_and(|(text, error)| {
-                *error && text.contains("Disconnected")
-            }));
+            assert!(
+                ui.notice
+                    .as_ref()
+                    .is_some_and(|(text, error)| { *error && text.contains("Disconnected") })
+            );
         }
         assert_eq!(requests.first(), requests.last());
         worker

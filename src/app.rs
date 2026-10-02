@@ -1689,7 +1689,8 @@ impl App {
                 review.generation_requested = false;
                 review.preparing_detail = None;
                 review.guide_error = Some(
-                    "No matching local clone is available. Press l to locate the repository.".into(),
+                    "No matching local clone is available. Press l to locate the repository."
+                        .into(),
                 );
                 if !self.home && self.key().as_ref() == Some(&id) && self.modal.is_none() {
                     self.modal = Some(Modal::Clone {

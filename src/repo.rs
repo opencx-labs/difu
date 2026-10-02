@@ -532,7 +532,9 @@ mod tests {
         }
         let cancel = Cancel::default();
         process::checked(
-            git(&root).args(["worktree", "add", "--detach"]).arg(&linked),
+            git(&root)
+                .args(["worktree", "add", "--detach"])
+                .arg(&linked),
             &cancel,
         )?;
         let key = PrKey {

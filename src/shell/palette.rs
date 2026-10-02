@@ -1137,9 +1137,11 @@ mod tests {
         assert!(
             matches!(items.first().map(|item| &item.action), Some(Action::Session(id)) if id == "one")
         );
-        assert!(items.iter().any(
-            |item| matches!(&item.action, Action::Preview(pr) if pr.key.number == 99)
-        ));
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(&item.action, Action::Preview(pr) if pr.key.number == 99))
+        );
         query(&mut shell, "1524");
         assert!(matches!(
             shell.palette_items().first().map(|item| &item.action),
