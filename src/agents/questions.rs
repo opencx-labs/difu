@@ -410,7 +410,11 @@ mod tests {
         apply_event(&mut session, &question_event("q", "item/completed"));
         let pending = session.pending.first_mut().context("pending")?;
         pending.responded = true;
-        pending.params["difuAsync"] = json!(false);
+        pending
+            .params
+            .as_object_mut()
+            .context("params")?
+            .insert("difuAsync".into(), json!(false));
         assert!(prepare_answer(&session, &json!("difu-async:q"), "0", Some("Small")).is_err());
         Ok(())
     }
