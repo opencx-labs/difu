@@ -299,7 +299,8 @@ impl Ui {
         let mut app = crate::app::App::new(self.storage.clone(), config);
         let key = pr.key.clone();
         app.start_embedded(key.clone());
-        // Reuse the session checkout for reads without changing saved repository settings.
+        // Seed discovery from the session checkout. PR preparation resolves and
+        // remembers its main clone so deleting this worktree cannot break reviews.
         if let Some(root) = self
             .prs
             .cache

@@ -145,7 +145,10 @@ fn main() -> Result<()> {
         )?;
         app.reviews.images.detect();
         while !app.reviews.quit && !terminated.load(std::sync::atomic::Ordering::Relaxed) {
-            app.tick();
+            // Show optimistic sends before the next background/persistence tick.
+            if !app.agents.take_send_repaint() {
+                app.tick();
+            }
             app.clipboard(&mut io::stdout().lock());
             let frame = terminal.draw(|frame| app.draw(frame))?;
             app.reviews

@@ -52,17 +52,20 @@ struct Item {
     badge: Option<crate::model::PrMetadata>,
 }
 enum Update {
-    Cache(Result<Vec<PrSummary>, String>),
+    Cache(Result<(String, Vec<PrSummary>), String>),
     Lookup(String, Result<Vec<PrSummary>, String>),
 }
 pub(super) struct Palette {
     query: Editor,
     selected: usize,
     prs: Vec<PrSummary>,
+    viewer: Option<String>,
     storage: Storage,
     sender: mpsc::Sender<Update>,
     receiver: mpsc::Receiver<Update>,
     loaded: bool,
+    cache_loading: bool,
+    cache_cancel: Cancel,
     refreshed: Instant,
     changed: Instant,
     attempted: Option<String>,
@@ -73,15 +76,23 @@ pub(super) struct Palette {
 }
 impl Palette {
     pub fn new(storage: Storage) -> Self {
+        let mut palette = Self::unloaded(storage);
+        palette.load_cache();
+        palette
+    }
+    fn unloaded(storage: Storage) -> Self {
         let (sender, receiver) = mpsc::channel();
-        let mut palette = Self {
+        Self {
             query: Editor::default(),
             selected: 0,
             prs: Vec::new(),
+            viewer: None,
             storage,
             sender,
             receiver,
             loaded: false,
+            cache_loading: false,
+            cache_cancel: Cancel::default(),
             refreshed: Instant::now(),
             changed: Instant::now(),
             attempted: None,
@@ -89,22 +100,25 @@ impl Palette {
             error: None,
             hits: Vec::new(),
             viewport: 1,
-        };
-        palette.load_cache();
-        palette
+        }
     }
     fn load_cache(&mut self) {
+        self.cache_loading = true;
         self.refreshed = Instant::now();
         let storage = self.storage.clone();
         let sender = self.sender.clone();
+        let cancel = self.cache_cancel.clone();
         thread::spawn(move || {
-            let result = (|| -> Result<Vec<PrSummary>> {
+            let result = (|| -> Result<(String, Vec<PrSummary>)> {
+                let viewer = crate::github::viewer_login(&cancel)?;
                 let mut prs = storage.load_inbox(pr_cache::PERSONAL)?.unwrap_or_default();
                 prs.extend(storage.load_inbox(pr_cache::LOOKUPS)?.unwrap_or_default());
-                Ok(prs)
+                Ok((viewer, prs))
             })()
             .map_err(|e| format!("{e:#}"));
-            let _ = sender.send(Update::Cache(result));
+            if !cancel.cancelled() {
+                let _ = sender.send(Update::Cache(result));
+            }
         });
     }
     fn changed(&mut self) {
@@ -123,6 +137,7 @@ impl Palette {
 }
 impl Drop for Palette {
     fn drop(&mut self) {
+        self.cache_cancel.cancel();
         if let Some(cancel) = &self.lookup {
             cancel.cancel();
         }
@@ -296,6 +311,9 @@ impl Shell {
         }
     }
     fn palette_prs(&self) -> Vec<PrSummary> {
+        let Some(viewer) = self.palette.as_ref().and_then(|p| p.viewer.as_deref()) else {
+            return Vec::new();
+        };
         let mut prs: BTreeMap<String, PrSummary> = BTreeMap::new();
         for pr in self
             .palette
@@ -353,7 +371,14 @@ impl Shell {
                 }
             }
         }
-        prs.into_values().collect()
+        // Apply scope after merging every source, including explicit number lookups
+        // and session-linked PRs. Missing identity or lifecycle data is not a match.
+        prs.into_values()
+            .filter(|pr| {
+                pr.author.eq_ignore_ascii_case(viewer)
+                    && pr.metadata.as_ref().is_some_and(|m| m.state == "OPEN")
+            })
+            .collect()
     }
     fn palette_review(&self) -> &App {
         if self.agents_active
@@ -542,7 +567,7 @@ impl Shell {
         matched.sort_by_key(|(score, category, item)| {
             (
                 commands_first && matches!(item.action, Action::Session(_) | Action::Preview(_)),
-                !item.badge.as_ref().is_some_and(|m| m.state == "OPEN"),
+                !matches!(item.action, Action::Session(_)),
                 *score,
                 *category,
                 !item.pinned,
@@ -557,9 +582,11 @@ impl Shell {
         while let Ok(update) = palette.receiver.try_recv() {
             match update {
                 Update::Cache(result) => {
+                    palette.cache_loading = false;
                     palette.loaded = true;
                     match result {
-                        Ok(prs) => {
+                        Ok((viewer, prs)) => {
+                            palette.viewer = Some(viewer);
                             for pr in prs {
                                 if let Some(old) =
                                     palette.prs.iter_mut().find(|old| old.key == pr.key)
@@ -572,7 +599,10 @@ impl Shell {
                                 }
                             }
                         }
-                        Err(error) => palette.error = Some(error),
+                        Err(error) => {
+                            palette.viewer = None;
+                            palette.error = Some(error);
+                        }
                     }
                 }
                 Update::Lookup(query, result) if palette.query.text().trim() == query => {
@@ -590,11 +620,12 @@ impl Shell {
                 _ => {}
             }
         }
-        if palette.refreshed.elapsed() >= Duration::from_secs(30) {
+        if !palette.cache_loading && palette.refreshed.elapsed() >= Duration::from_secs(30) {
             palette.load_cache();
         }
         let query = palette.query.text().trim().to_owned();
         if !palette.loaded
+            || palette.viewer.is_none()
             || palette.changed.elapsed() < Duration::from_millis(300)
             || palette.attempted.as_ref() == Some(&query)
         {
@@ -802,7 +833,7 @@ impl Shell {
         );
         if palette.query.chars.is_empty() {
             frame.render_widget(
-                Paragraph::new("Search sessions, PRs, authors, reviewers or commands…")
+                Paragraph::new("Search sessions, your open PRs or commands…")
                     .style(Style::default().fg(DIM)),
                 input,
             );
@@ -884,7 +915,7 @@ impl Shell {
         if items.is_empty() {
             frame.render_widget(
                 Paragraph::new(if !palette.loaded {
-                    "Loading cached PRs…"
+                    "Loading your open PRs…"
                 } else {
                     "No matching results"
                 })
@@ -957,7 +988,8 @@ mod tests {
         session.branch = Some("fix/invoices".into());
         shell.agents.summaries.push(session.summary());
         shell.agents.sessions.insert(session.id.clone(), session);
-        let mut palette = Palette::new(storage);
+        let mut palette = Palette::unloaded(storage);
+        palette.viewer = Some("me".into());
         palette.prs.push(pr);
         palette.loaded = true;
         shell.palette = Some(palette);
@@ -1021,7 +1053,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn people_search_ranks_open_prs_first_and_keeps_status_badges() -> Result<()> {
+    fn people_search_only_returns_the_viewers_open_prs() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut shell = fixture(Storage {
             config: dir.path().join("config.json"),
@@ -1030,10 +1062,12 @@ mod tests {
         let palette = shell.palette.as_mut().context("palette")?;
         let template = palette.prs.first().context("pr")?.clone();
         for (number, author, reviewer, state, conflicts) in [
-            (1, "faltawy", "someone", "MERGED", false),
-            (2, "someone", "faltawy", "OPEN", true),
-            (3, "someone", "faltawy-helper", "OPEN", false),
-            (4, "someone", "faltawy", "CLOSED", false),
+            (1, "me", "faltawy", "MERGED", false),
+            (2, "me", "faltawy", "OPEN", true),
+            (3, "ME", "faltawy-helper", "OPEN", false),
+            (4, "me", "faltawy", "CLOSED", false),
+            (5, "someone", "faltawy", "OPEN", false),
+            (6, "me", "faltawy", "", false),
         ] {
             let mut pr = template.clone();
             pr.key.number = number;
@@ -1055,7 +1089,7 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        assert_eq!(results, vec![2, 3, 1, 4]);
+        assert_eq!(results, vec![2, 3]);
         assert_eq!(
             items
                 .first()
@@ -1063,15 +1097,115 @@ mod tests {
                 .map(|m| m.label()),
             Some("Has conflicts")
         );
-        assert!(
-            items
-                .iter()
-                .any(|item| item.badge.as_ref().is_some_and(|m| m.label() == "Merged"))
-        );
         shell.palette.as_mut().context("palette")?.changed =
             Instant::now() - Duration::from_secs(1);
         shell.tick_palette();
         assert!(shell.palette.as_ref().context("palette")?.lookup.is_none());
+        for number in [1, 4, 5, 6] {
+            query(&mut shell, &format!("example/opencx#{number}"));
+            assert!(shell.palette_items().is_empty());
+        }
+        shell.palette.as_mut().context("palette")?.viewer = None;
+        query(&mut shell, "faltawy");
+        assert!(
+            !shell
+                .palette_items()
+                .iter()
+                .any(|item| matches!(item.action, Action::Preview(_)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn matching_sessions_precede_stronger_pr_matches() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut shell = fixture(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        })?;
+        let palette = shell.palette.as_mut().context("palette")?;
+        let mut pr = palette.prs.first().context("PR")?.clone();
+        pr.key.number = 99;
+        pr.title = "billing-edit".into();
+        pr.metadata = Some(crate::model::PrMetadata {
+            state: "OPEN".into(),
+            ..Default::default()
+        });
+        palette.prs.push(pr);
+        query(&mut shell, "billing-edit");
+        let items = shell.palette_items();
+        assert!(
+            matches!(items.first().map(|item| &item.action), Some(Action::Session(id)) if id == "one")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(&item.action, Action::Preview(pr) if pr.key.number == 99))
+        );
+        query(&mut shell, "1524");
+        assert!(matches!(
+            shell.palette_items().first().map(|item| &item.action),
+            Some(Action::Session(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn lookup_and_review_inbox_cannot_bypass_palette_pr_scope() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut shell = fixture(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        })?;
+        let template = shell
+            .palette
+            .as_ref()
+            .context("palette")?
+            .prs
+            .first()
+            .context("PR")?
+            .clone();
+        for (number, author, state) in [
+            (7, "someone", "OPEN"),
+            (8, "me", "MERGED"),
+            (9, "me", "CLOSED"),
+        ] {
+            let mut pr = template.clone();
+            pr.key.number = number;
+            pr.author = author.into();
+            pr.metadata = Some(crate::model::PrMetadata {
+                state: state.into(),
+                ..Default::default()
+            });
+            shell.reviews.inbox.push(pr.clone());
+            let reference = format!("example/opencx#{number}");
+            query(&mut shell, &reference);
+            shell.palette.as_mut().context("palette")?.attempted = Some(reference.clone());
+            shell
+                .palette
+                .as_ref()
+                .context("palette")?
+                .sender
+                .send(Update::Lookup(reference, Ok(vec![pr])))?;
+            shell.tick_palette();
+            assert!(shell.palette_items().is_empty());
+        }
+        // A PR linked to a matching session is subject to the same author filter.
+        shell
+            .palette
+            .as_mut()
+            .context("palette")?
+            .prs
+            .first_mut()
+            .context("PR")?
+            .author = "someone".into();
+        query(&mut shell, "1524");
+        let items = shell.palette_items();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            items.first().map(|item| &item.action),
+            Some(Action::Session(_))
+        ));
         Ok(())
     }
 

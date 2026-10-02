@@ -110,7 +110,7 @@ pub(super) fn prepare_answer(
         "Expected a question"
     );
     ensure!(
-        !pending.responded,
+        pending.is_async_question() || !pending.responded,
         "A response was already sent; inspect the session before retrying"
     );
     let question_text = pending
@@ -130,6 +130,11 @@ pub(super) fn prepare_answer(
         String::new()
     };
     let mut updated = pending.clone();
+    // Async answers are independent messages. Older versions could leave this
+    // batch-wide flag set after a failed send; it must not prevent a user retry.
+    if updated.is_async_question() {
+        updated.responded = false;
+    }
     let params = updated
         .params
         .as_object_mut()
@@ -337,7 +342,7 @@ mod tests {
     }
 
     #[test]
-    fn removal_validates_the_whole_batch_and_preserves_in_flight_answers() -> Result<()> {
+    fn removal_validates_the_whole_batch_and_recovers_stale_async_flags() -> Result<()> {
         let mut session = session();
         apply_event(&mut session, &question_event("q", "item/completed"));
         let before = serde_json::to_value(&session)?;
@@ -357,8 +362,8 @@ mod tests {
             &mut session,
             &json!({"questions":[{"request_id":"difu-async:q","question_id":"0"}]}),
         );
-        assert!(result.is_err());
-        assert_eq!(session.pending_question_count(), 2);
+        result?;
+        assert_eq!(session.pending_question_count(), 1);
         let pending = session.pending.first_mut().context("pending")?;
         pending.responded = false;
         pending
@@ -371,7 +376,46 @@ mod tests {
             &json!({"questions":[{"request_id":"difu-async:q","question_id":"0"}]}),
         );
         assert!(result.is_err());
-        assert_eq!(session.pending_question_count(), 2);
+        assert_eq!(session.pending_question_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn unanswered_async_questions_allow_retry_after_a_persisted_send_failure() -> Result<()> {
+        let mut session = session();
+        apply_event(&mut session, &question_event("q", "item/completed"));
+        session.pending.first_mut().context("pending")?.responded = true;
+        let mut restored: Session = serde_json::from_value(serde_json::to_value(session)?)?;
+        restored.restore_async_questions();
+        let request = json!("difu-async:q");
+        // Preparing an answer does not consume it if delivery subsequently fails.
+        let _ = prepare_answer(&restored, &request, "0", Some("Small"))?;
+        assert_eq!(restored.pending_question_count(), 2);
+        let (updated, text) = prepare_answer(&restored, &request, "0", Some("Small"))?;
+        assert!(!updated.responded);
+        assert_eq!(text, "> Scope?\n\nSmall");
+        record_answer(&mut restored, updated);
+        assert!(prepare_answer(&restored, &request, "0", Some("Small")).is_err());
+        let (updated, _) = prepare_answer(&restored, &request, "1", Some("Keep the draft"))?;
+        record_answer(&mut restored, updated);
+        restored.restore_async_questions();
+        assert_eq!(restored.pending_question_count(), 0);
+        assert!(restored.answered_questions.contains("difu-async:q"));
+        Ok(())
+    }
+
+    #[test]
+    fn native_question_responses_keep_the_duplicate_guard() -> Result<()> {
+        let mut session = session();
+        apply_event(&mut session, &question_event("q", "item/completed"));
+        let pending = session.pending.first_mut().context("pending")?;
+        pending.responded = true;
+        pending
+            .params
+            .as_object_mut()
+            .context("params")?
+            .insert("difuAsync".into(), json!(false));
+        assert!(prepare_answer(&session, &json!("difu-async:q"), "0", Some("Small")).is_err());
         Ok(())
     }
 

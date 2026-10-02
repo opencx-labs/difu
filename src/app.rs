@@ -177,6 +177,7 @@ pub enum Message {
     Poll(String, u64, Result<Option<PrDetail>, String>),
     Snapshot(String, u64, Result<(PathBuf, Snapshot), String>),
     SnapshotProgress(String, u64, repo::SnapshotProgress),
+    LocateClone(String, u64, PathBuf),
     Progress(String, u64, String),
     Guide(String, u64, ModelChoice, Result<Guide, String>),
     Context(String, Arc<Snapshot>, String, Result<FileContext, String>),
@@ -814,7 +815,7 @@ impl App {
             return;
         }
         if let Some(root) = root {
-            self.prepare(root);
+            self.prepare(root, true);
         } else {
             self.modal = Some(Modal::Clone {
                 value: std::env::current_dir()
@@ -825,16 +826,16 @@ impl App {
             });
         }
     }
-    fn prepare(&mut self, path: PathBuf) {
+    fn prepare(&mut self, path: PathBuf, recover: bool) {
         let Some(id) = self.key() else {
             return;
         };
         let Some(pr) = self.reviews.get(&id).and_then(|r| r.detail.clone()) else {
             return;
         };
-        self.prepare_revision(path, pr);
+        self.prepare_revision(path, pr, recover);
     }
-    fn prepare_revision(&mut self, path: PathBuf, pr: Arc<PrDetail>) {
+    fn prepare_revision(&mut self, path: PathBuf, pr: Arc<PrDetail>, recover: bool) {
         let Some(id) = self.key() else {
             return;
         };
@@ -853,10 +854,33 @@ impl App {
         review.preparing_detail = Some(pr.clone());
         review.guide_error = None;
         review.snapshot_id = sequence;
+        let mut candidates = vec![path.clone()];
+        if recover {
+            // Only try known locations; never scan the filesystem or accept an
+            // unrelated repository just because a remembered checkout disappeared.
+            candidates.extend(self.config.repositories.values().cloned());
+            candidates.extend(self.config.agent_defaults.repository.iter().cloned());
+            candidates.extend(self.config.local_diff_repositories.iter().cloned());
+            candidates.extend(std::env::current_dir().ok());
+        }
         let job_id = id.clone();
         let cancel = self.spawn(move |tx, cancel| {
+            let root = match repo::review_root(&candidates, &pr.key, &cancel) {
+                Ok(Some(root)) => root,
+                Ok(None) => {
+                    let _ = tx.send(Message::LocateClone(job_id, sequence, path));
+                    return;
+                }
+                Err(error) => {
+                    let _ = tx.send(Message::Snapshot(
+                        job_id,
+                        sequence,
+                        Err(format!("{error:#}")),
+                    ));
+                    return;
+                }
+            };
             let output = (|| {
-                let root = repo::validate(&path, &pr.key, &cancel)?;
                 let progress_tx = tx.clone();
                 let progress_id = job_id.clone();
                 let snapshot = repo::snapshot_with_progress(
@@ -1222,7 +1246,7 @@ impl App {
                     .cloned()
             });
             if let Some(root) = root {
-                self.prepare_revision(root, Arc::new(newer));
+                self.prepare_revision(root, Arc::new(newer), true);
             } else {
                 self.notice =
                     Notice::info("Locate this repository's local clone before refreshing");
@@ -1651,6 +1675,29 @@ impl App {
                     r.preparation_progress = Some(progress);
                 }
                 return;
+            }
+            Message::LocateClone(id, sequence, path) => {
+                let Some(review) = self.reviews.get_mut(&id) else {
+                    return;
+                };
+                if review.snapshot_id != sequence {
+                    return;
+                }
+                review.preparing = false;
+                review.preparation = None;
+                review.preparation_failed = true;
+                review.generation_requested = false;
+                review.preparing_detail = None;
+                review.guide_error = Some(
+                    "No matching local clone is available. Press l to locate the repository."
+                        .into(),
+                );
+                if !self.home && self.key().as_ref() == Some(&id) && self.modal.is_none() {
+                    self.modal = Some(Modal::Clone {
+                        value: path.display().to_string().into(),
+                        key: id,
+                    });
+                }
             }
             Message::Snapshot(id, sequence, output) => {
                 if let Some(r) = self.reviews.get_mut(&id) {
@@ -2471,7 +2518,7 @@ impl App {
                 match key.code {
                     KeyCode::Enter => {
                         if !value.text().trim().is_empty() {
-                            self.prepare(PathBuf::from(value.text().trim()));
+                            self.prepare(PathBuf::from(value.text().trim()), false);
                         }
                         return;
                     }
@@ -3339,6 +3386,53 @@ mod tests {
         app.receive(Message::RefreshDetail(id.clone(), 2, Ok(detail("latest"))));
         assert!(!app.reviews.get(&id).context("Missing review")?.preparing);
         assert!(!app.reviews.contains_key("example/other#2"));
+        Ok(())
+    }
+
+    #[test]
+    fn missing_review_clone_prompts_only_for_the_current_preparation() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = App::new(
+            Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().into(),
+            },
+            Config::default(),
+        );
+        let pr = detail("pinned");
+        let id = pr.key.id();
+        app.reviews.insert(
+            id.clone(),
+            Review {
+                detail: Some(Arc::new(pr)),
+                preparing: true,
+                generation_requested: true,
+                snapshot_id: 2,
+                ..Review::default()
+            },
+        );
+        app.opened = Some(id.clone());
+        app.home = false;
+        let missing = dir.path().join("removed worktree");
+        app.receive(Message::LocateClone(id.clone(), 1, missing.clone()));
+        assert!(app.modal.is_none());
+        assert!(app.reviews.get(&id).context("review")?.preparing);
+        app.receive(Message::LocateClone(id.clone(), 2, missing.clone()));
+        assert!(matches!(&app.modal, Some(Modal::Clone { key, value })
+            if key == &id && value.text() == missing.display().to_string()));
+        let review = app.reviews.get(&id).context("review")?;
+        assert!(!review.preparing && !review.generation_requested);
+        assert!(review.preparation_failed);
+        assert!(
+            review
+                .guide_error
+                .as_ref()
+                .is_some_and(|error| error.contains("Press l"))
+        );
+        app.modal = None;
+        app.opened = Some("example/other#2".into());
+        app.receive(Message::LocateClone(id, 2, missing));
+        assert!(app.modal.is_none());
         Ok(())
     }
 
