@@ -78,6 +78,36 @@ fn remote_repository(remote: &str) -> Option<String> {
     )
 }
 
+/// PR diffs read immutable revisions, so they can use the main checkout even
+/// when opened from a disposable linked worktree. Validate every candidate.
+pub(crate) fn review_root(
+    candidates: &[PathBuf],
+    key: &PrKey,
+    cancel: &Cancel,
+) -> Result<Option<PathBuf>> {
+    let mut checked = std::collections::HashSet::new();
+    for candidate in candidates {
+        cancel.check()?;
+        if !checked.insert(candidate) {
+            continue;
+        }
+        let Ok(root) = validate(candidate, key, cancel) else {
+            continue;
+        };
+        let worktrees = read(&root, &["worktree", "list", "--porcelain", "-z"], cancel)?;
+        // Git lists the main working tree first, independent of the current branch.
+        if let Some(main) = worktrees
+            .split('\0')
+            .find_map(|field| field.strip_prefix("worktree "))
+            && let Ok(main) = validate(Path::new(main), key, cancel)
+        {
+            return Ok(Some(main));
+        }
+    }
+    cancel.check()?;
+    Ok(None)
+}
+
 fn sha(value: &str) -> Result<()> {
     ensure!(
         value.len() == 40 && value.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -481,6 +511,62 @@ mod tests {
         read(root, args, &Cancel::default())?;
         Ok(())
     }
+    #[test]
+    fn review_roots_survive_deleted_worktrees_and_reject_unrelated_clones() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("main clone");
+        let linked = dir.path().join("temporary worktree");
+        let unrelated = dir.path().join("other clone");
+        std::fs::create_dir(&root)?;
+        std::fs::create_dir(&unrelated)?;
+        for (path, remote) in [
+            (&root, "https://github.com/example/project.git"),
+            (&unrelated, "https://github.com/example/other.git"),
+        ] {
+            ok(path, &["init"])?;
+            ok(path, &["config", "user.name", "Test"])?;
+            ok(path, &["config", "user.email", "test@example.invalid"])?;
+            ok(path, &["config", "commit.gpgsign", "false"])?;
+            ok(path, &["commit", "--allow-empty", "-m", "initial"])?;
+            ok(path, &["remote", "add", "origin", remote])?;
+        }
+        let cancel = Cancel::default();
+        process::checked(
+            git(&root).args(["worktree", "add", "--detach"]).arg(&linked),
+            &cancel,
+        )?;
+        let key = PrKey {
+            owner: "example".into(),
+            repo: "project".into(),
+            number: 1,
+        };
+        std::fs::write(root.join("keep.txt"), "uncommitted work")?;
+        let head = read(&root, &["rev-parse", "HEAD"], &cancel)?;
+        assert_eq!(
+            review_root(std::slice::from_ref(&linked), &key, &cancel)?,
+            Some(root.canonicalize()?)
+        );
+        std::fs::remove_dir_all(&linked)?;
+        assert!(review_root(std::slice::from_ref(&linked), &key, &cancel)?.is_none());
+        assert_eq!(
+            review_root(
+                &[linked.clone(), unrelated.clone(), root.clone()],
+                &key,
+                &cancel,
+            )?,
+            Some(root.canonicalize()?)
+        );
+        assert!(review_root(&[unrelated, linked], &key, &cancel)?.is_none());
+        assert_eq!(
+            std::fs::read_to_string(root.join("keep.txt"))?,
+            "uncommitted work"
+        );
+        assert_eq!(read(&root, &["rev-parse", "HEAD"], &cancel)?, head);
+        cancel.cancel();
+        assert!(review_root(&[root], &key, &cancel).is_err());
+        Ok(())
+    }
+
     #[test]
     fn file_context_uses_pinned_revisions_and_literal_renamed_paths() -> Result<()> {
         let dir = tempfile::tempdir()?;

@@ -491,7 +491,7 @@ impl Service {
                     }
                 }
                 let async_response = matches!(&control, Control::Respond { request, .. } | Control::AnswerQuestion { request, .. }
-                    if session.pending.iter().any(|p| p.id == *request && p.is_async_question() && !p.responded));
+                    if session.pending.iter().any(|p| p.id == *request && p.is_async_question()));
                 let sends_message = matches!(
                     control,
                     Control::Message { .. } | Control::MessageWithAttachments { .. }

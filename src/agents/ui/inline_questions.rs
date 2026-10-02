@@ -271,7 +271,7 @@ impl Ui {
         true
     }
     pub(super) fn submit_question(&mut self, skip: bool) {
-        if self.busy {
+        if self.question_send.is_some() {
             return;
         }
         let Some(id) = self.selected.clone() else {
@@ -303,7 +303,6 @@ impl Ui {
         let question_id = question_id.to_owned();
         let index = self.question_index().unwrap_or(0);
         self.remember_answers();
-        self.busy = true;
         self.question_send = Some((id.clone(), request.clone(), question_id.clone(), index));
         self.task(
             Task::Question,
@@ -337,7 +336,6 @@ impl Ui {
         if unresolved && !matches!(session.status, Status::Failed | Status::Interrupted) {
             return;
         }
-        self.busy = false;
         self.question_send = None;
         if unresolved {
             self.notice = Some((
@@ -630,7 +628,7 @@ impl Ui {
         self.button(
             frame,
             Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
-            if self.busy {
+            if self.question_send.is_some() {
                 "Sending answer…"
             } else {
                 if self.question_note_focused {

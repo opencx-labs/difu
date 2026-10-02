@@ -34,6 +34,16 @@ fn cached_json(args: &[&str], cancel: &Cancel) -> Result<Value> {
     read_json(args, cancel, 30)
 }
 
+pub(crate) fn viewer_login(cancel: &Cancel) -> Result<String> {
+    let viewer = cached_json(&["api", "user"], cancel)?;
+    viewer
+        .get("login")
+        .and_then(Value::as_str)
+        .filter(|login| !login.is_empty())
+        .map(str::to_owned)
+        .context("Cannot identify the signed-in GitHub account")
+}
+
 fn read_json(args: &[&str], cancel: &Cancel, ttl: u64) -> Result<Value> {
     let output = polling::run(command().args(args), None, cancel, ttl, false, None)?;
     if output.code != 0 {

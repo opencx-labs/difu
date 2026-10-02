@@ -94,11 +94,13 @@ sessions. Start the query with `/` to put commands before search results. Sessio
 and PR controls appear directly in the palette. Slash commands follow focus:
 the selected session in the Agents list or conversation, the PR in Reviews, or
 the focused PR pane inside a coding session.
-PR search also matches cached authors and reviewers (including requested
-reviewers); typing a name never sends a GitHub request. Matching open PRs appear
-first, then other results by relevance, with Open, Merged, Closed, or Has conflicts
-badges. A bare number (or `#1524`) searches the local cache only;
-`opencx#1524` or `owner/opencx#1524` also looks up GitHub when absent locally.
+Matching agent sessions appear before PR results, with relevance used within each
+group. PR results are limited to open PRs authored by the signed-in GitHub user;
+merged, closed, and other authors' PRs are excluded, including explicit number
+lookups. PR search also matches cached reviewers (including requested reviewers).
+A bare number (or `#1524`) searches the local cache only; `opencx#1524` or
+`owner/opencx#1524` also looks up GitHub when absent locally. Account identity is
+resolved in the background; sessions and commands remain available while it loads.
 The background service refreshes open authored and review-requested PRs every five
 minutes, even with no terminal open, and retains cached history. Failed refreshes
 retain cached results.
@@ -281,8 +283,11 @@ between Shells, Artifacts, and the PR badges, and **Enter** opens the selection.
 In the composer, **Enter** sends a message and steers an active turn immediately.
 **Ctrl+Enter** explicitly queues it for the next turn; **Shift+Enter** inserts a
 newline. Sent messages appear immediately; while a tool is running, they appear
-in the waiting queue and move into the chat after that tool finishes. Drafts
-remain until delivery is acknowledged. Shift+arrows selects text;
+in the waiting queue and move into the chat after that tool finishes. The input
+clears immediately, and rapid sends are delivered in order within each chat.
+Delivery failures show a toast and retain the message in the chat; click it or
+select it and press **Enter** to retry, including its attachments and skills.
+Acknowledgements and retries leave any newer draft untouched. Shift+arrows selects text;
 typing replaces the selection, and Command+C copies it. **Shift+Alt+Left/Right**
 extends the selection by a word; **Alt+Backspace** deletes the previous word.
 **Cmd+Backspace** deletes the entire current line; **Cmd+Left/Right** moves to its
@@ -519,7 +524,10 @@ difu 123 # uses the GitHub repository in your current directory
 ```
 
 The first time you open a repository, supply its existing local clone path.
-Difu remembers it. It uses local commits first and automatically fetches missing
+Difu remembers the main clone when a linked worktree is selected. If a saved
+checkout disappears, it tries known repository locations, accepting only a clone
+with a matching GitHub remote, and asks you to locate one if recovery fails.
+It uses local commits first and automatically fetches missing
 PR revisions using your `gh` login. Fetched revisions are recorded under
 `refs/difu/` so later fetches can reuse their history. Your checked-out branch and
 uncommitted files are preserved. Diffs are computed locally from the merge base

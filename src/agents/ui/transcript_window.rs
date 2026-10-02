@@ -75,16 +75,21 @@ impl Window {
         let outgoing = position
             .outgoing
             .iter()
-            .enumerate()
-            .filter(|(_, pending)| pending.in_chat(session))
-            .map(|(index, pending)| Entry {
-                id: format!("difu-outgoing-{index}"),
-                kind: "sending".into(),
+            .filter(|pending| pending.in_chat(session))
+            .map(|pending| Entry {
+                id: pending.entry_id(),
+                kind: if pending.failed.is_some() {
+                    "unsent"
+                } else {
+                    "sending"
+                }
+                .into(),
                 text: pending.text.clone(),
+                data: serde_json::json!({"difuRetry":pending.failed.is_some()}),
                 ..Entry::default()
             })
             .collect::<Vec<_>>();
-        // Outgoing slots can be reused without a new session revision.
+        // Local send status can change without a new session revision.
         for entry in &outgoing {
             self.rows.remove(&entry.id);
             self.links.remove(&entry.id);

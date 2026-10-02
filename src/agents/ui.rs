@@ -14,6 +14,7 @@ mod prs;
 mod questions;
 mod rules;
 mod selection;
+mod sends;
 mod sidebar;
 mod transcript;
 mod transcript_window;
@@ -33,7 +34,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap},
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -50,13 +51,18 @@ pub enum Focus {
     PullRequest(usize),
 }
 pub(super) struct PendingSend {
+    token: u64,
     text: String,
     queued: bool,
     observed_before: usize,
+    failed: Option<Control>,
 }
 impl PendingSend {
+    fn entry_id(&self) -> String {
+        format!("difu-outgoing-{}", self.token)
+    }
     fn in_chat(&self, session: &Session) -> bool {
-        !self.queued && !session.tool_running()
+        self.failed.is_some() || (!self.queued && !session.tool_running())
     }
     fn matching(session: &Session, text: &str) -> usize {
         session
@@ -77,7 +83,7 @@ impl PendingSend {
             + session.queue.iter().filter(|p| p.text() == text).count()
     }
     fn observed(&self, session: &Session) -> bool {
-        Self::matching(session, &self.text) > self.observed_before
+        self.failed.is_none() && Self::matching(session, &self.text) > self.observed_before
     }
 }
 #[derive(Default)]
@@ -260,7 +266,7 @@ enum Task {
     Interrupt(String),
     Question,
     Delete(String),
-    Send(String, String, Vec<super::media::Attachment>),
+    Send(String, u64),
 }
 
 pub struct Ui {
@@ -293,6 +299,9 @@ pub struct Ui {
     changing: Option<(changes::Source, u64)>,
     change_request: u64,
     pub busy: bool,
+    send_sequence: u64,
+    send_repaint: bool,
+    send_queues: HashMap<String, VecDeque<(u64, Control)>>,
     interrupting: HashSet<String>,
     question_send: Option<(String, Value, String, usize)>,
     question_reveal: bool,
@@ -354,6 +363,9 @@ impl Ui {
             changing: None,
             change_request: 0,
             busy: false,
+            send_sequence: 0,
+            send_repaint: false,
+            send_queues: HashMap::new(),
             interrupting: HashSet::new(),
             question_send: None,
             question_reveal: true,
@@ -408,6 +420,10 @@ impl Ui {
         self.tick_media();
         self.tick_voice(visible);
         while let Ok(message) = self.receiver.try_recv() {
+            if let Task::Send(id, token) = &message.kind {
+                self.finish_send(id, *token, message.result);
+                continue;
+            }
             if let Task::Changes(source, request) = &message.kind {
                 self.receive_change_result(source, *request, message.result);
                 continue;
@@ -427,12 +443,12 @@ impl Ui {
                 | Task::Repository(_)
                 | Task::Worktree(_)
                 | Task::Action
-                | Task::Delete(_)
-                | Task::Send(..) => self.busy = false,
+                | Task::Delete(_) => self.busy = false,
                 Task::Interrupt(id) => {
                     self.interrupting.remove(id);
                 }
                 Task::Defaults(_)
+                | Task::Send(..)
                 | Task::Question
                 | Task::OpenArtifact
                 | Task::OpenLink
@@ -508,14 +524,7 @@ impl Ui {
                     {
                         self.modal = Some(Modal::Delete);
                     }
-                    if let Task::Send(id, text, ..) = &message.kind
-                        && let Some(position) = self.positions.get_mut(id)
-                        && let Some(index) = position.outgoing.iter().rposition(|p| &p.text == text)
-                    {
-                        position.outgoing.remove(index);
-                    }
                     if matches!(message.kind, Task::Question) {
-                        self.busy = false;
                         self.question_send = None;
                     }
                     self.notice = Some((error, true));
@@ -559,6 +568,7 @@ impl Ui {
                             && !sessions.iter().any(|s| s.id == id)
                         {
                             self.sessions.remove(&id);
+                            self.send_queues.remove(&id);
                             self.positions.remove(&id);
                             self.changes.remove(&id);
                             self.sidebar.counts.remove(&id);
@@ -702,31 +712,6 @@ impl Ui {
                             self.defaults = config.agent_defaults;
                         }
                     }
-                    (Task::Send(id, text, _attachments), Reply::Ok) => {
-                        if let Some(position) = self.positions.get_mut(&id) {
-                            if position.draft.text() == text {
-                                position.draft = Editor::default();
-                                position.history = None;
-                                position.skills.clear();
-                                position.attachments.clear();
-                                position.saved_attachments.clear();
-                                if let Err(error) = super::media::save_draft(
-                                    &self.storage,
-                                    &id,
-                                    &position.attachments,
-                                ) {
-                                    self.notice = Some((
-                                        format!("Cannot save attachment draft: {error:#}"),
-                                        true,
-                                    ));
-                                }
-                            }
-                            position.follow = true;
-                            position.keep_transcript_position = false;
-                            position.transcript_viewport = None;
-                        }
-                        self.refreshed = None;
-                    }
                     (Task::Question, Reply::Ok) => {
                         self.refreshed = None;
                     }
@@ -738,6 +723,7 @@ impl Ui {
                         self.sidebar.counts.remove(&id);
                         let _ = self.sidebar.save(&self.storage);
                         self.sessions.remove(&id);
+                        self.send_queues.remove(&id);
                         self.positions.remove(&id);
                         self.changes.remove(&id);
                         self.summaries.retain(|s| s.id != id);
@@ -1121,73 +1107,6 @@ impl Ui {
             .as_ref()
             .filter(|suggestion| suggestion.current(session))
             .map(|suggestion| suggestion.text.as_str())
-    }
-    fn send(&mut self, queue: bool) {
-        if self.busy || self.media_pending.is_some() {
-            return;
-        }
-        if self.command_draft() {
-            return;
-        }
-        if let Some(id) = self.selected.clone() {
-            let draft = self.positions.entry(id.clone()).or_default().draft.text();
-            let attachments = self
-                .positions
-                .get(&id)
-                .map(Position::active_attachments)
-                .unwrap_or_default();
-            let text = draft.clone();
-            if !text.trim().is_empty() {
-                if let Some(session) = self.sessions.get(&id) {
-                    let position = self.positions.entry(id.clone()).or_default();
-                    let earlier = position.outgoing.iter().filter(|p| p.text == text).count();
-                    position.outgoing.push(PendingSend {
-                        text: text.clone(),
-                        queued: (queue && session.turn_id.is_some())
-                            || session.preparing()
-                            || session
-                                .pending
-                                .iter()
-                                .any(|p| p.id == "difu-missing-guidance"),
-                        observed_before: PendingSend::matching(session, &text) + earlier,
-                    });
-                    position.follow = true;
-                    position.keep_transcript_position = false;
-                    position.transcript_viewport = None;
-                }
-                self.busy = true;
-                self.task(
-                    Task::Send(id.clone(), draft, attachments.clone()),
-                    Request::Control {
-                        id: id.clone(),
-                        control: if attachments.is_empty() {
-                            Control::Message {
-                                text,
-                                queue,
-                                skills: self
-                                    .positions
-                                    .get(&id)
-                                    .map(|p| p.skills.clone())
-                                    .unwrap_or_default(),
-                                attachments,
-                            }
-                        } else {
-                            Control::MessageWithAttachments {
-                                text,
-                                queue,
-                                skills: self
-                                    .positions
-                                    .get(&id)
-                                    .map(|p| p.skills.clone())
-                                    .unwrap_or_default(),
-                                attachments,
-                            }
-                        },
-                    },
-                    false,
-                );
-            }
-        }
     }
     fn pending(&mut self, index: usize) {
         self.remember_answers();
@@ -2267,6 +2186,9 @@ impl Ui {
                 });
             }
             Action::ToggleEntry(entry) => {
+                if self.retry_send(&entry) {
+                    return;
+                }
                 self.text_selection.clear();
                 self.modal = Some(Modal::Transcript {
                     entry,
@@ -2969,7 +2891,11 @@ impl Ui {
                     .conversation
                     .saturating_add(usize::from(body.height)),
             );
-            if section.tool && first < last {
+            let retry = position
+                .outgoing
+                .iter()
+                .any(|pending| pending.failed.is_some() && pending.entry_id() == section.id);
+            if (section.tool || retry) && first < last {
                 self.hits.push((
                     Rect::new(
                         body.x,
@@ -4010,6 +3936,7 @@ mod tests {
         ui.send(false);
         // No service reply has been permitted yet.
         let position = ui.positions.get("one").context("position")?;
+        assert!(position.draft.text().is_empty());
         assert!(!position.outgoing.is_empty());
         let session = ui.sessions.get("one").context("session")?;
         let rows = transcript::waiting_messages(session, 150, &position.outgoing);
@@ -4119,6 +4046,7 @@ mod tests {
             Editor::from("Show this immediately");
         ui.send(false);
         let (screen, _) = draw(&mut ui, 150, 40)?;
+        assert_eq!(screen.matches("Show this immediately").count(), 1);
         assert!(screen.contains("› Show this immediately"));
         assert!(!screen.contains("Preparing session…"));
         assert!(!screen.contains("Messages to be submitted"));
@@ -4165,6 +4093,170 @@ mod tests {
     }
 
     #[test]
+    fn rapid_sends_clear_immediately_deliver_in_order_and_leave_new_drafts_alone() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let listener = UnixListener::bind(super::super::server::socket(&storage)?)?;
+        let (sent, received) = mpsc::channel();
+        let (release, hold) = mpsc::channel();
+        let worker = thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                let mut line = String::new();
+                BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+                let request: Request = serde_json::from_str(&line)?;
+                sent.send(request)?;
+                hold.recv_timeout(Duration::from_secs(5))?;
+                serde_json::to_writer(&mut stream, &Reply::Ok)?;
+                stream.write_all(b"\n")?;
+            }
+            Ok(())
+        });
+        let mut ui = state(storage);
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        ui.positions.get_mut("one").context("position")?.draft = Editor::from("first");
+        ui.send(false);
+        ui.positions.get_mut("one").context("position")?.draft = Editor::from("second");
+        ui.send(false);
+        assert!(!ui.busy);
+        assert!(ui.take_send_repaint());
+        assert!(!ui.take_send_repaint());
+        assert!(
+            ui.positions
+                .get("one")
+                .context("position")?
+                .draft
+                .text()
+                .is_empty()
+        );
+        assert_eq!(ui.send_queues.get("one").context("send queue")?.len(), 2);
+        let (screen, _) = draw(&mut ui, 150, 40)?;
+        assert!(screen.contains("› first"));
+        assert!(screen.contains("› second"));
+        // Even an identical new draft must survive the earlier send's acknowledgement.
+        ui.positions.get_mut("one").context("position")?.draft = Editor::from("second");
+        for text in ["first", "second"] {
+            let request = received.recv_timeout(Duration::from_secs(5))?;
+            assert!(matches!(request, Request::Control {
+                control: Control::Message { text: actual, .. }, ..
+            } if actual == text));
+            release.send(())?;
+            let response = ui.receiver.recv_timeout(Duration::from_secs(5))?;
+            ui.sender.send(response)?;
+            ui.tick(false);
+            assert_eq!(
+                ui.positions.get("one").context("position")?.draft.text(),
+                "second"
+            );
+        }
+        assert!(!ui.send_queues.contains_key("one"));
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
+        Ok(())
+    }
+
+    #[test]
+    fn failed_sends_offer_retry_with_original_attachments_and_skills() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let listener = UnixListener::bind(super::super::server::socket(&storage)?)?;
+        let (sent, received) = mpsc::channel();
+        let worker = thread::spawn(move || -> Result<()> {
+            for reply in [Reply::Error("Disconnected".into()), Reply::Ok] {
+                let (mut stream, _) = listener.accept()?;
+                let mut line = String::new();
+                BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+                sent.send(serde_json::from_str::<Value>(&line)?)?;
+                serde_json::to_writer(&mut stream, &reply)?;
+                stream.write_all(b"\n")?;
+            }
+            Ok(())
+        });
+        let mut ui = state(storage.clone());
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        let attachment = super::super::media::Attachment {
+            label: "image 1".into(),
+            path: "image.png".into(),
+            kind: super::super::media::Kind::Image,
+            hash: "image".into(),
+        };
+        let skill = Skill {
+            name: "review".into(),
+            path: "review/SKILL.md".into(),
+            description: String::new(),
+            enabled: true,
+        };
+        let p = ui.positions.get_mut("one").context("position")?;
+        p.draft = Editor::from("Review ");
+        p.draft.insert_attachment(&attachment.token());
+        p.attachments = vec![attachment.clone()];
+        p.saved_attachments = p.attachments.clone();
+        p.skills = vec![skill.clone()];
+        super::super::media::save_draft(&storage, "one", &p.attachments)?;
+        ui.send(true);
+        let p = ui.positions.get("one").context("position")?;
+        assert!(p.draft.text().is_empty());
+        assert!(p.attachments.is_empty() && p.skills.is_empty());
+        ui.positions.get_mut("one").context("position")?.draft = Editor::from("Keep typing");
+        let original = received.recv_timeout(Duration::from_secs(5))?;
+        let response = ui.receiver.recv_timeout(Duration::from_secs(5))?;
+        ui.sender.send(response)?;
+        ui.tick(false);
+        assert!(super::super::media::load_draft(&storage, "one")?.is_empty());
+        assert!(
+            ui.notice
+                .as_ref()
+                .is_some_and(|(text, error)| *error && text.contains("Disconnected"))
+        );
+        let p = ui.positions.get("one").context("position")?;
+        assert_eq!(p.draft.text(), "Keep typing");
+        let failed = p.outgoing.first().context("failed message")?;
+        let entry = failed.entry_id();
+        assert!(matches!(&failed.failed, Some(Control::MessageWithAttachments {
+            attachments, skills, queue: true, ..
+        }) if attachments == std::slice::from_ref(&attachment) && skills == std::slice::from_ref(&skill)));
+        let (screen, _) = draw(&mut ui, 150, 40)?;
+        assert!(screen.contains("Not sent · Enter/click to retry"));
+        assert!(ui.hits.iter().any(
+            |(_, action)| matches!(action, Action::ToggleEntry(id) if id == &entry)
+        ));
+        ui.action(Action::ToggleEntry(entry));
+        assert_eq!(
+            ui.positions.get("one").context("position")?.draft.text(),
+            "Keep typing"
+        );
+        assert_eq!(received.recv_timeout(Duration::from_secs(5))?, original);
+        let response = ui.receiver.recv_timeout(Duration::from_secs(5))?;
+        ui.sender.send(response)?;
+        ui.tick(false);
+        assert!(
+            ui.positions
+                .get("one")
+                .context("position")?
+                .outgoing
+                .iter()
+                .all(|p| p.failed.is_none())
+        );
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
+        Ok(())
+    }
+
+    #[test]
     fn optimistic_steering_moves_to_chat_when_tools_finish_before_send_ack() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut ui = state(Storage {
@@ -4185,14 +4277,18 @@ mod tests {
         position.follow = true;
         position.outgoing = vec![
             PendingSend {
+                token: 0,
                 text: "Follow up".into(),
                 queued: false,
                 observed_before: 0,
+                failed: None,
             },
             PendingSend {
+                token: 1,
                 text: "Next turn".into(),
                 queued: true,
                 observed_before: 0,
+                failed: None,
             },
         ];
         let (screen, _) = draw(&mut ui, 150, 40)?;
@@ -4221,7 +4317,7 @@ mod tests {
     }
 
     #[test]
-    fn queue_snapshots_reconcile_repeated_messages_and_failed_sends_keep_the_draft() -> Result<()> {
+    fn queue_snapshots_reconcile_repeated_messages_and_failures_preserve_new_drafts() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut ui = state(Storage {
             config: dir.path().join("config.json"),
@@ -4230,14 +4326,18 @@ mod tests {
         let p = ui.positions.get_mut("one").context("position")?;
         p.outgoing = vec![
             PendingSend {
+                token: 0,
                 text: "again".into(),
                 queued: true,
                 observed_before: 0,
+                failed: None,
             },
             PendingSend {
+                token: 1,
                 text: "again".into(),
                 queued: false,
                 observed_before: 1,
+                failed: None,
             },
         ];
         let mut snapshot = ui.sessions.get("one").context("session")?.clone();
@@ -4265,27 +4365,60 @@ mod tests {
                 .is_empty()
         );
         let p = ui.positions.get_mut("one").context("position")?;
-        p.draft = Editor::from("retry this");
+        p.draft = Editor::from("a newer draft");
         p.outgoing.push(PendingSend {
+            token: 2,
             text: "retry this".into(),
             queued: false,
             observed_before: 0,
+            failed: None,
         });
+        p.outgoing.push(PendingSend {
+            token: 3,
+            text: "retry this".into(),
+            queued: false,
+            observed_before: 1,
+            failed: None,
+        });
+        ui.send_queues.insert(
+            "one".into(),
+            VecDeque::from([(
+                2,
+                Control::Message {
+                    text: "retry this".into(),
+                    queue: false,
+                    skills: vec![],
+                    attachments: vec![],
+                },
+            )]),
+        );
+        // A send result must not unlock an unrelated action.
         ui.busy = true;
         ui.sender.send(ResultMessage {
-            kind: Task::Send("one".into(), "retry this".into(), vec![]),
+            kind: Task::Send("one".into(), 2),
             result: Err("Disconnected".into()),
         })?;
         ui.tick(false);
         let p = ui.positions.get("one").context("position")?;
-        assert!(p.outgoing.is_empty());
-        assert_eq!(p.draft.text(), "retry this");
-        assert!(!ui.busy);
+        assert!(p.outgoing.first().is_some_and(|p| p.failed.is_some()));
+        assert_eq!(p.draft.text(), "a newer draft");
+        assert!(ui.busy);
         assert!(
             ui.notice
                 .as_ref()
-                .is_some_and(|(text, error)| *error && text == "Disconnected")
+                .is_some_and(|(text, error)| *error && text.contains("Disconnected"))
         );
+        // A later successful copy reconciles without discarding the failed one.
+        let mut snapshot = ui.sessions.get("one").context("session")?.clone();
+        snapshot.note("userMessage", "retry this");
+        ui.sender.send(ResultMessage {
+            kind: Task::Read("one".into()),
+            result: Ok(Reply::Session(Box::new(snapshot))),
+        })?;
+        ui.tick(false);
+        let p = ui.positions.get("one").context("position")?;
+        assert_eq!(p.outgoing.len(), 1);
+        assert!(p.outgoing.first().is_some_and(|pending| pending.token == 2 && pending.failed.is_some()));
         Ok(())
     }
 
@@ -4463,6 +4596,9 @@ mod tests {
             assert_eq!(text, "compare [image 1] please");
             assert_eq!(attachments, [attachment]);
             assert_eq!(actual_queue, queue);
+            let response = ui.receiver.recv_timeout(Duration::from_secs(5))?;
+            ui.sender.send(response)?;
+            ui.tick(false);
         }
         worker
             .join()
@@ -5816,7 +5952,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn user_prompt_remains_inline_with_full_width_padding() -> Result<()> {
+    fn user_prompt_remains_inline_with_compact_full_width_bar() -> Result<()> {
         let tmp = tempfile::tempdir()?;
         let mut ui = state(Storage {
             config: tmp.path().join("config.json"),
@@ -5843,23 +5979,22 @@ mod tests {
             .find(|section| section.id == id)
             .context("section")?
             .row;
-        for row in rows.iter().skip(start).take(3) {
-            assert_eq!(row.width(), 60);
-            assert_eq!(row.style, crate::ui::user_message_style());
-        }
-        assert!(
-            rows.get(start)
-                .context("top padding")?
-                .to_string()
-                .trim()
-                .is_empty()
+        let prompt = rows.get(start).context("prompt row")?;
+        assert_eq!(prompt.width(), 60);
+        assert_eq!(prompt.style, crate::ui::user_message_style());
+        assert_eq!(
+            prompt.to_string().trim_end(),
+            "› Keep this prompt in place"
         );
-        assert!(
+        let separator = rows.get(start + 1).context("message separator")?;
+        assert!(separator.to_string().is_empty());
+        assert_eq!(separator.style.bg, None);
+        assert_eq!(
             rows.get(start + 2)
-                .context("bottom padding")?
+                .context("following response")?
                 .to_string()
-                .trim()
-                .is_empty()
+                .trim(),
+            "Following response"
         );
         Ok(())
     }
@@ -6536,6 +6671,62 @@ mod tests {
                 .context("position")?
                 .keep_transcript_position
         );
+        Ok(())
+    }
+    #[test]
+    fn question_send_ignores_unrelated_busy_work_and_keeps_failed_answers_retryable() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let listener = UnixListener::bind(super::super::server::socket(&storage)?)?;
+        let (sent, received) = mpsc::channel();
+        let worker = thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                let mut line = String::new();
+                BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+                sent.send(serde_json::from_str::<Value>(&line)?)?;
+                serde_json::to_writer(&mut stream, &Reply::Error("Disconnected".into()))?;
+                stream.write_all(b"\n")?;
+            }
+            Ok(())
+        });
+        let mut ui = state(storage);
+        ui.drilled = true;
+        ui.sessions.get_mut("one").context("session")?.pending.push(Pending {
+            id: serde_json::json!("retry"),
+            method: "item/tool/requestUserInput".into(),
+            responded: true,
+            params: serde_json::json!({"difuAsync":true,"questions":[
+                {"id":"q","question":"Choose scope","options":[{"label":"Small"}]}
+            ]}),
+        });
+        ui.open_question(0);
+        let mut requests = Vec::new();
+        for busy in [true, false] {
+            ui.busy = busy;
+            ui.submit_question(false);
+            assert!(ui.question_send.is_some());
+            assert_eq!(ui.busy, busy);
+            requests.push(received.recv_timeout(Duration::from_secs(5))?);
+            let response = ui.receiver.recv_timeout(Duration::from_secs(5))?;
+            ui.sender.send(response)?;
+            ui.tick(false);
+            assert!(ui.question_send.is_none());
+            assert_eq!(ui.busy, busy);
+            assert_eq!(ui.selected_question_answer().as_deref(), Some("Small"));
+            assert!(ui.notice.as_ref().is_some_and(|(text, error)| {
+                *error && text.contains("Disconnected")
+            }));
+        }
+        assert_eq!(requests.first(), requests.last());
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
         Ok(())
     }
     #[test]

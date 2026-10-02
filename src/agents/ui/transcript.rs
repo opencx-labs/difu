@@ -357,6 +357,9 @@ pub(super) fn waiting_messages(
         .collect::<Vec<_>>();
     let mut queue = session.queue.iter().map(Prompt::text).collect::<Vec<_>>();
     for outgoing in outgoing {
+        if outgoing.failed.is_some() {
+            continue;
+        }
         if outgoing.queued {
             queue.push(&outgoing.text);
         } else if !outgoing.in_chat(session) {
@@ -507,15 +510,14 @@ pub(super) fn render_entries(
             | "unsent or unacknowledged" => {
                 if entry.kind.starts_with("unsent") {
                     lines.push(Line::from(Span::styled(
-                        "Not sent",
+                        if entry.data.get("difuRetry").and_then(Value::as_bool) == Some(true) {
+                            "Not sent · Enter/click to retry"
+                        } else {
+                            "Not sent"
+                        },
                         Style::default().fg(RED),
                     )));
                 }
-                let padding = || {
-                    Line::from(" ".repeat(usize::from(width)))
-                        .style(crate::ui::user_message_style())
-                };
-                lines.push(padding());
                 for (index, text) in wrapped(&entry.text, width.saturating_sub(2))
                     .into_iter()
                     .enumerate()
@@ -530,7 +532,6 @@ pub(super) fn render_entries(
                     line.spans.push(Span::styled(" ".repeat(padding), style));
                     lines.push(line);
                 }
-                lines.push(padding());
             }
             "agentMessage" | "result" => append_prose(&mut lines, &mut links, &entry.text, width),
             "reasoning" => {
@@ -779,10 +780,11 @@ pub(super) fn render_entries(
             && !is_tool
             && position.focused_entry.as_ref() == Some(&entry.id)
             && let Some(section) = sections.last()
-            && let Some(line) = lines.get_mut(section.row.saturating_add(usize::from(matches!(
-                entry.kind.as_str(),
-                "userMessage" | "awaiting connection" | "sending"
-            ))))
+            && let Some(line) = lines.get_mut(
+                section
+                    .row
+                    .saturating_add(usize::from(entry.kind.starts_with("unsent"))),
+            )
         {
             if matches!(
                 entry.kind.as_str(),

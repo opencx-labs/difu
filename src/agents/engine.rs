@@ -965,12 +965,8 @@ fn command(
                     if matches!(session.status, Status::Interrupted | Status::Failed) {
                         resume_thread(rpc, store, id, &session, cancel)?;
                     }
-                    store.update(id, |s| {
-                        if let Some(pending) = s.pending.iter_mut().find(|p| p.id == request) {
-                            pending.responded = true;
-                        }
-                    })?;
-                    store.save(id)?;
+                    // Record this question's answer only after delivery succeeds.
+                    // A failed attempt must leave every unanswered question retryable.
                     start_turn(
                         rpc,
                         store,
@@ -1001,7 +997,7 @@ fn command(
                 .find(|p| p.id == request)
                 .context("This request is no longer pending")?;
             ensure!(
-                !pending.responded,
+                pending.is_async_question() || !pending.responded,
                 "A response was already sent; waiting for Codex acknowledgement"
             );
             if session.waiting_for_workspace() {
@@ -1031,13 +1027,7 @@ fn command(
                 if matches!(session.status, Status::Interrupted | Status::Failed) {
                     resume_thread(rpc, store, id, &session, cancel)?;
                 }
-                // Persist intent before sending; never replay answers after an uncertain reply.
-                store.update(id, |s| {
-                    if let Some(pending) = s.pending.iter_mut().find(|p| p.id == request) {
-                        pending.responded = true;
-                    }
-                })?;
-                store.save(id)?;
+                // A failed async delivery remains available for an explicit user retry.
                 start_turn(
                     rpc,
                     store,
