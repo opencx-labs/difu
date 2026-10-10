@@ -2063,9 +2063,9 @@ fn guidance_wait_survives_frontend_reconnect_and_service_restart_without_permiss
         .as_object_mut()
         .context("session")?
         .remove("native_setup");
-    difu::storage::atomic_json(
+    fs::write(
         &difu::agents::server::home(&storage)?.join(format!("{id}.json")),
-        &saved,
+        serde_json::to_vec(&saved)?,
     )?;
     let mut daemon = start()?;
     control(&storage, &id, Control::Resume)?;
