@@ -524,7 +524,11 @@ mod tests {
             ui.tick_voice(true);
             let finished = screen(&mut ui)?;
             assert!(!finished.contains("Transcribing…"));
-            assert!(finished.contains("keep this draftspoken words"));
+            // The completion toast can cover the composer on narrow terminals.
+            assert_eq!(
+                ui.positions.get("voice-test").context("draft")?.draft.text(),
+                "keep this draftspoken words"
+            );
         }
         Ok(())
     }
