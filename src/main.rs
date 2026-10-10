@@ -176,7 +176,6 @@ fn main() -> Result<()> {
                     Event::Mouse(mouse) => app.mouse(mouse),
                     Event::Paste(text) => app.paste(text),
                     Event::Resize(..) => app.reviews.invalidate(),
-                    _ => {}
                 }
             }
         }
