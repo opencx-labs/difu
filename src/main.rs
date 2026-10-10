@@ -12,7 +12,7 @@ use crossterm::{
 use difu::{github, model::PrKey, process::Cancel, shell::Shell, storage::Storage};
 use std::{
     io::{self, IsTerminal},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Parser)]
@@ -144,27 +144,38 @@ fn main() -> Result<()> {
             EnableBracketedPaste
         )?;
         app.reviews.images.detect();
+        let mut focused = true;
+        let mut redraw = difu::repaint::Schedule::new(Instant::now());
         while !app.reviews.quit && !terminated.load(std::sync::atomic::Ordering::Relaxed) {
             // Show optimistic sends before the next background/persistence tick.
             if !app.agents.take_send_repaint() {
-                app.tick();
+                app.tick_focused(focused);
             }
             app.clipboard(&mut io::stdout().lock());
-            let frame = terminal.draw(|frame| app.draw(frame))?;
-            app.reviews
-                .hover
-                .render(&mut io::stdout().lock(), frame.buffer)?;
+            if redraw.due(
+                Instant::now(),
+                difu::repaint::revision(),
+                focused,
+                app.redraw_interval(),
+            ) {
+                let frame = terminal.draw(|frame| app.draw(frame))?;
+                app.reviews
+                    .hover
+                    .render(&mut io::stdout().lock(), frame.buffer)?;
+            }
             if event::poll(Duration::from_millis(50))? {
+                redraw.invalidate();
                 match event::read()? {
                     Event::Key(key) => app.key(key),
+                    Event::FocusGained => focused = true,
                     Event::FocusLost => {
+                        focused = false;
                         app.reviews.hover = Default::default();
                         app.agents.cancel_voice();
                     }
                     Event::Mouse(mouse) => app.mouse(mouse),
                     Event::Paste(text) => app.paste(text),
                     Event::Resize(..) => app.reviews.invalidate(),
-                    _ => {}
                 }
             }
         }

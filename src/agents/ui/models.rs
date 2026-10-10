@@ -118,6 +118,7 @@ impl Ui {
                 }
             });
         if let Some(output) = output {
+            crate::repaint::request();
             self.model_completion.receiver = None;
             self.model_completion.cancel = None;
             match output {

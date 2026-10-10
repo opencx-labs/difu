@@ -90,7 +90,7 @@ pub(super) fn transition(
         rpc,
         store,
         id,
-        &Prompt::from(registry::CONTINUE),
+        &Prompt::from(registry::continuation(&session)),
         false,
         cancel,
         true,

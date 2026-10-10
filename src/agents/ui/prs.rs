@@ -213,6 +213,7 @@ impl Ui {
             if previous.get(&session.id) != self.prs.cache.get(&session.id)
                 || previous_stale.contains(&session.id) != self.prs.stale(&session.id)
             {
+                crate::repaint::request();
                 self.sidebar.invalidate(&session.id);
                 if self.selected.as_ref() == Some(&session.id) {
                     self.changes_at = None;

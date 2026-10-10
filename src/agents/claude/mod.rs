@@ -17,14 +17,17 @@ use std::{
 
 pub(super) fn models(cancel: &Cancel) -> Result<Vec<ModelInfo>> {
     let directory = tempfile::tempdir()?;
-    let mut connection = Connection::open(Options {
-        cwd: directory.path(),
-        model: None,
-        effort: None,
-        resume: None,
-        instructions: "",
-        discovery: true,
-    })?;
+    let mut connection = Connection::open(
+        Options {
+            cwd: directory.path(),
+            model: None,
+            effort: None,
+            resume: None,
+            instructions: "",
+            discovery: true,
+        },
+        cancel,
+    )?;
     let response = connection.call(json!({"subtype":"initialize"}), cancel, |_| {
         anyhow::bail!("Unexpected request during model discovery")
     })?;
@@ -58,14 +61,17 @@ pub(super) fn models(cancel: &Cancel) -> Result<Vec<ModelInfo>> {
         .collect())
 }
 pub(super) fn usage(store: &Store, id: &str, session: &Session, cancel: &Cancel) -> Result<Value> {
-    let mut rpc = Connection::open(Options {
-        cwd: session.workspace.as_deref().unwrap_or(session.job.root()),
-        model: None,
-        effort: None,
-        resume: session.thread_id.as_deref(),
-        instructions: "",
-        discovery: false,
-    })?;
+    let mut rpc = Connection::open(
+        Options {
+            cwd: session.workspace.as_deref().unwrap_or(session.job.root()),
+            model: None,
+            effort: None,
+            resume: session.thread_id.as_deref(),
+            instructions: "",
+            discovery: false,
+        },
+        cancel,
+    )?;
     rpc.call(json!({"subtype":"initialize"}), cancel, |frame| {
         mcp(store, id, frame)
     })?;
@@ -522,40 +528,51 @@ fn command(
     store.save(id)
 }
 
-fn connect(store: &Store, id: &str, session: &Session, cancel: &Cancel) -> Result<Connection> {
+pub(super) fn instructions(session: &Session) -> String {
     let instructions = format!(
-        "{}\n\n{}\n\n{}\n\n{}\n\n{}",
-        super::WORKTREE_INSTRUCTIONS,
+        "{}\n\n{}\n\n{}\n\n{}",
         super::artifacts::INSTRUCTIONS,
         super::registration::INSTRUCTIONS,
         super::management::INSTRUCTIONS,
         super::questions::INSTRUCTIONS
     );
-    let instructions = super::rules::instructions(session, instructions);
-    let mut rpc = Connection::open(Options {
-        cwd: session.workspace.as_deref().context("Missing workspace")?,
-        model: session
-            .model
-            .as_deref()
-            .or({
+    let instructions = if session.native_setup {
+        instructions
+    } else {
+        format!("{}\n\n{instructions}", super::WORKTREE_INSTRUCTIONS)
+    };
+    super::rules::instructions(session, instructions)
+}
+
+fn connect(store: &Store, id: &str, session: &Session, cancel: &Cancel) -> Result<Connection> {
+    let instructions = instructions(session);
+    let mut rpc = Connection::open(
+        Options {
+            cwd: session.workspace.as_deref().context("Missing workspace")?,
+            model: session
+                .model
+                .as_deref()
+                .or({
+                    if let Job::Coding(launch) = &session.job {
+                        launch.model.as_deref()
+                    } else {
+                        None
+                    }
+                })
+                .map(Provider::native_model),
+            effort: session.effort.as_deref().or({
                 if let Job::Coding(launch) = &session.job {
-                    launch.model.as_deref()
+                    launch.effort.as_deref()
                 } else {
                     None
                 }
-            })
-            .map(Provider::native_model),
-        effort: session.effort.as_deref().or({
-            if let Job::Coding(launch) = &session.job {
-                launch.effort.as_deref()
-            } else {
-                None
-            }
-        }),
-        resume: session.thread_id.as_deref(),
-        instructions: &instructions,
-        discovery: false,
-    })?;
+            }),
+            resume: session.thread_id.as_deref(),
+            instructions: &instructions,
+            discovery: false,
+        },
+        cancel,
+    )?;
     rpc.call(json!({"subtype":"initialize"}), cancel, |frame| {
         mcp(store, id, frame)
     })?;
@@ -626,7 +643,7 @@ fn transition(
         id,
         rpc,
         decoder,
-        &Prompt::from(super::registration::CONTINUE),
+        &Prompt::from(super::registration::continuation(&session)),
     )
 }
 
@@ -636,8 +653,7 @@ fn send_queued(
     rpc: &mut Connection,
     decoder: &mut events::Decoder,
 ) -> Result<()> {
-    let session = store.get(id)?;
-    if session.status != Status::Idle || session.queue.is_empty() {
+    if !store.inspect(id, |s| s.status == Status::Idle && !s.queue.is_empty())? {
         return Ok(());
     }
     let mut next = None;
@@ -701,9 +717,12 @@ pub(super) fn run(
     send_queued(store, id, &mut rpc, &mut decoder)?;
     let mut last_save = Instant::now();
     let mut dirty = false;
+    let mut initial_work = true;
     loop {
         cancel.check()?;
+        let mut changed = std::mem::take(&mut initial_work);
         while let Some(frame) = rpc.next_frame()? {
+            changed = true;
             if frame.get("type").and_then(Value::as_str) == Some("control_request") {
                 request(store, id, &mut rpc, &frame)?;
             } else {
@@ -716,20 +735,32 @@ pub(super) fn run(
             last_save = Instant::now();
             dirty = false;
         }
-        match controls.recv_timeout(Duration::from_millis(40)) {
+        match controls.try_recv() {
             Ok(request) => {
+                changed = true;
                 let result = command(store, id, &mut rpc, &mut decoder, request.control, cancel);
                 let _ = request.reply.send(result);
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {}
         }
-        if !store.get(id)?.deletion_requests.is_empty() {
+        if !changed {
+            cancel.check()?;
+            if dirty {
+                cancel
+                    .wake()
+                    .wait_timeout(Duration::from_millis(200).saturating_sub(last_save.elapsed()));
+            } else {
+                cancel.wake().wait();
+            }
+            continue;
+        }
+        if store.inspect(id, |s| !s.deletion_requests.is_empty())? {
             store.update(id, |s| s.deletion_requests.clear())?;
             super::management::schedule(store, id)?;
             return Ok(());
         }
-        if !store.get(id)?.registration_requests.is_empty() {
+        if store.inspect(id, |s| !s.registration_requests.is_empty())? {
             transition(store, id, &mut rpc, &mut decoder, &controls, cancel)?;
         }
         send_queued(store, id, &mut rpc, &mut decoder)?;

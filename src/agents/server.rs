@@ -27,12 +27,15 @@ pub struct Store {
 }
 impl Store {
     pub fn get(&self, id: &str) -> Result<Session> {
-        self.sessions
+        self.inspect(id, Clone::clone)
+    }
+    /// Read only the needed fields; idle checks must not copy conversation history.
+    pub(super) fn inspect<T>(&self, id: &str, read: impl FnOnce(&Session) -> T) -> Result<T> {
+        let sessions = self
+            .sessions
             .lock()
-            .map_err(|_| anyhow::anyhow!("Session store lock failed"))?
-            .get(id)
-            .cloned()
-            .context("Session not found")
+            .map_err(|_| anyhow::anyhow!("Session store lock failed"))?;
+        Ok(read(sessions.get(id).context("Session not found")?))
     }
     pub fn update(&self, id: &str, f: impl FnOnce(&mut Session)) -> Result<()> {
         let mut sessions = self
@@ -145,7 +148,7 @@ pub struct Command {
     pub reply: mpsc::Sender<Result<()>>,
 }
 struct Worker {
-    sender: mpsc::Sender<Command>,
+    sender: crate::wake::Sender<Command>,
     cancel: Cancel,
     handle: thread::JoinHandle<()>,
 }
@@ -197,8 +200,8 @@ impl Service {
             .workers
             .lock()
             .map_err(|_| anyhow::anyhow!("Worker lock failed"))?;
-        let (sender, receiver) = mpsc::channel();
         let cancel = Cancel::default();
+        let (sender, receiver) = crate::wake::channel(cancel.wake());
         let token = cancel.clone();
         let store = self.store.clone();
         let id_owned = id.to_owned();

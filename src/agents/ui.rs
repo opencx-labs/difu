@@ -407,6 +407,18 @@ impl Ui {
             let _ = tx.send(ResultMessage { kind, result });
         });
     }
+    pub fn redraw_interval(&self) -> Option<Duration> {
+        if self.voice_active() {
+            return Some(Duration::from_millis(50));
+        }
+        if self.busy || self.notice.is_some() || self.summaries.iter().any(|s| s.status.active()) {
+            return Some(Duration::from_secs(1));
+        }
+        if let Some(panels::View::PullRequest { app }) = &self.panels.view {
+            return app.redraw_interval();
+        }
+        None
+    }
     pub fn tick(&mut self, visible: bool) {
         self.tick_selection_click();
         self.tick_panels(visible);
@@ -420,6 +432,20 @@ impl Ui {
         self.tick_media();
         self.tick_voice(visible);
         while let Ok(message) = self.receiver.try_recv() {
+            let unchanged = match (&message.kind, &message.result) {
+                (Task::List, Ok(Reply::Sessions(sessions))) => {
+                    sessions.len() == self.summaries.len()
+                        && sessions
+                            .iter()
+                            .zip(&self.summaries)
+                            .all(|(a, b)| a.id == b.id && a.version == b.version)
+                }
+                (_, Ok(Reply::Unchanged)) => true,
+                _ => false,
+            };
+            if !unchanged {
+                crate::repaint::request();
+            }
             if let Task::Send(id, token) = &message.kind {
                 self.finish_send(id, *token, message.result);
                 continue;
@@ -3011,7 +3037,7 @@ impl Ui {
             editor(
                 frame,
                 composer,
-                "",
+                voice_status.as_deref().unwrap_or(""),
                 &position.draft,
                 self.focus == Focus::Composer && !self.panels.focused && self.modal.is_none(),
             );

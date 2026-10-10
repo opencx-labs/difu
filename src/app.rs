@@ -448,6 +448,7 @@ impl App {
         self.key().and_then(|key| self.reviews.get(&key))
     }
     pub fn invalidate(&mut self) {
+        crate::repaint::request();
         self.epoch = self.epoch.wrapping_add(1);
     }
     fn next_id(&mut self) -> u64 {
@@ -1321,11 +1322,19 @@ impl App {
         self.notice = Notice::success(format!("{} saved", self.model_purpose.label()));
         self.invalidate();
     }
+    pub fn redraw_interval(&self) -> Option<Duration> {
+        (self.inbox_loading
+            || self
+                .review()
+                .is_some_and(|r| r.preparing || r.generation.is_some() || r.loading))
+        .then_some(Duration::from_secs(1))
+    }
     pub fn tick(&mut self) {
         self.tick_visible(true);
     }
     pub fn tick_visible(&mut self, visible: bool) {
         while let Ok(message) = self.receiver.try_recv() {
+            crate::repaint::request();
             self.receive(message);
         }
         let mut index = 0;
@@ -1337,6 +1346,7 @@ impl App {
             {
                 let (_, handle) = self.jobs.swap_remove(index);
                 if handle.join().is_err() {
+                    crate::repaint::request();
                     self.notice = Notice::error("A background worker stopped unexpectedly");
                 }
             } else {

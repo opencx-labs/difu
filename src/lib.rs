@@ -16,6 +16,7 @@ pub mod model;
 pub mod navigation;
 mod overview;
 pub mod process;
+pub mod repaint;
 pub mod repo;
 pub mod review;
 pub mod storage;
@@ -33,3 +34,4 @@ pub mod shell;
 pub mod voice;
 
 mod markdown;
+mod wake;

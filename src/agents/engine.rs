@@ -24,7 +24,7 @@ struct Connection {
     inherited: String,
 }
 impl Connection {
-    fn open(cwd: &Path) -> Result<Self> {
+    fn open(cwd: &Path, cancel: &Cancel) -> Result<Self> {
         let mut child = ChildGroup::spawn_tree(
             Command::new("codex")
                 .arg("app-server")
@@ -36,7 +36,7 @@ impl Connection {
         .context("Cannot start Codex app-server; install and authenticate the Codex CLI")?;
         let input = child.child.stdin.take().context("Missing Codex stdin")?;
         let output = child.child.stdout.take().context("Missing Codex stdout")?;
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = crate::wake::channel(cancel.wake());
         thread::spawn(move || {
             let mut reader = BufReader::new(output);
             loop {
@@ -106,7 +106,7 @@ impl Connection {
 
 pub(super) fn usage(session: &Session, cancel: &Cancel) -> Result<Value> {
     let cwd = session.workspace.as_deref().unwrap_or(session.job.root());
-    let mut rpc = Connection::open(cwd)?;
+    let mut rpc = Connection::open(cwd, cancel)?;
     rpc.initialize(cancel)?;
     usage_with(&mut rpc, session, cancel, |_| Ok(()))
 }
@@ -134,7 +134,7 @@ pub fn defaults(cwd: &Path) -> Result<Reply> {
         .canonicalize()
         .context("Select an existing local repository directory")?;
     let cancel = Cancel::default();
-    let mut rpc = Connection::open(&cwd)?;
+    let mut rpc = Connection::open(&cwd, &cancel)?;
     rpc.initialize(&cancel)?;
     let config = rpc.call(
         "config/read",
@@ -281,7 +281,8 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
             return;
         }
 
-        if session.deferred_workspace
+        if !session.native_setup
+            && session.deferred_workspace
             && method == "item/tool/call"
             && params.get("tool").and_then(Value::as_str) == Some(isolation::TOOL)
         {
@@ -513,7 +514,7 @@ fn event(store: &Store, id: &str, value: Value) -> Result<()> {
 
 pub fn skills(cwd: &Path, force: bool) -> Result<Reply> {
     let cancel = Cancel::default();
-    let mut rpc = Connection::open(cwd)?;
+    let mut rpc = Connection::open(cwd, &cancel)?;
     rpc.initialize(&cancel)?;
     let value = rpc.call(
         "skills/list",
@@ -1096,18 +1097,22 @@ fn command(
     Ok(())
 }
 fn instructions(session: &Session) -> String {
-    let base = if session.waiting_for_workspace() {
-        isolation::INSTRUCTIONS
-    } else if matches!(&session.job, Job::Coding(s) if s.isolated) {
-        super::WORKTREE_INSTRUCTIONS
+    let base = if session.native_setup {
+        super::management::INSTRUCTIONS.to_owned()
     } else {
-        super::CODING_INSTRUCTIONS
+        let policy = if session.waiting_for_workspace() {
+            isolation::INSTRUCTIONS
+        } else if matches!(&session.job, Job::Coding(s) if s.isolated) {
+            super::WORKTREE_INSTRUCTIONS
+        } else {
+            super::CODING_INSTRUCTIONS
+        };
+        format!(
+            "{policy}\n\nCurrent repository: {}. Read instructions in the current repository before continuing; earlier conversation may refer to a different repository.\n\n{}",
+            session.job.root().display(),
+            super::management::INSTRUCTIONS
+        )
     };
-    let base = format!(
-        "{base}\n\nCurrent repository: {}. Read instructions in the current repository before continuing; earlier conversation may refer to a different repository.",
-        session.job.root().display()
-    );
-    let base = format!("{base}\n\n{}", super::management::INSTRUCTIONS);
     let base = super::rules::instructions(session, base);
     let base = if session.question_tools {
         format!("{base}\n\n{}", super::questions::INSTRUCTIONS)
@@ -1138,7 +1143,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
         .workspace
         .as_deref()
         .context("Missing session workspace")?;
-    let mut rpc = Connection::open(cwd)?;
+    let mut rpc = Connection::open(cwd, cancel)?;
     rpc.initialize(cancel)?;
     let effective = rpc.call(
         "config/read",
@@ -1182,7 +1187,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
             super::management::tool(),
             super::questions::tool(),
         ];
-        if session.deferred_workspace && launch.isolated {
+        if !session.native_setup && session.deferred_workspace && launch.isolated {
             tools.extend(isolation::tools().as_array().cloned().unwrap_or_default());
         }
         put(&mut params, "dynamicTools", json!(tools))?;
@@ -1231,8 +1236,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
     Ok((rpc, resuming))
 }
 fn send_queued(rpc: &mut Connection, store: &Store, id: &str, cancel: &Cancel) -> Result<()> {
-    let current = store.get(id)?;
-    if current.status != Status::Idle || current.queue.is_empty() {
+    if !store.inspect(id, |s| s.status == Status::Idle && !s.queue.is_empty())? {
         return Ok(());
     }
     let mut next = None;
@@ -1300,13 +1304,23 @@ pub fn run(
     }
     // Send accepted setup input before processing newer controls.
     send_queued(&mut rpc, store, id, cancel)?;
+    let mut housekeeping_due = true;
     loop {
         cancel.check()?;
-        while let Ok(value) = rpc.output.try_recv() {
-            event(store, id, value.map_err(anyhow::Error::msg)?)?;
+        let mut changed = std::mem::take(&mut housekeeping_due);
+        loop {
+            match rpc.output.try_recv() {
+                Ok(value) => {
+                    event(store, id, value.map_err(anyhow::Error::msg)?)?;
+                    changed = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => anyhow::bail!("Codex disconnected"),
+            }
         }
-        match controls.recv_timeout(Duration::from_millis(40)) {
+        match controls.try_recv() {
             Ok(command_request) => {
+                changed = true;
                 let read_only = matches!(
                     command_request.control,
                     Control::RefreshShells | Control::ReadUsage
@@ -1319,10 +1333,18 @@ pub fn run(
                 }
                 let _ = command_request.reply.send(result);
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {}
         }
-        let requests = store.get(id)?.deletion_requests;
+        if !changed {
+            // Notification tokens survive the drain-to-wait race. Commands,
+            // provider output (including EOF), and cancellation all wake us.
+            cancel.check()?;
+            cancel.wake().wait();
+            housekeeping_due = true;
+            continue;
+        }
+        let requests = store.inspect(id, |s| s.deletion_requests.clone())?;
         if !requests.is_empty() {
             store.update(id, |s| s.deletion_requests.clear())?;
             let session = store.get(id)?;
@@ -1358,7 +1380,7 @@ pub fn run(
                 }
             }
         }
-        let requests = store.get(id)?.question_requests;
+        let requests = store.inspect(id, |s| s.question_requests.clone())?;
         if !requests.is_empty() {
             store.update(id, |s| s.question_requests.clear())?;
             for request in requests {
@@ -1390,7 +1412,7 @@ pub fn run(
                 rpc.write(json!({"id":request.id,"result":{"success":result.is_ok(),"contentItems":[{"type":"inputText","text":text}]}}))?;
             }
         }
-        let requests = store.get(id)?.artifact_requests;
+        let requests = store.inspect(id, |s| s.artifact_requests.clone())?;
         if !requests.is_empty() {
             store.update(id, |s| s.artifact_requests.clear())?;
             for request in requests {
@@ -1417,11 +1439,11 @@ pub fn run(
                 rpc.write(json!({"id":request.id,"result":{"success":result.is_ok(),"contentItems":[{"type":"inputText","text":text}]}}))?;
             }
         }
-        let requests = store.get(id)?.workspace_requests;
+        let requests = store.inspect(id, |s| s.workspace_requests.clone())?;
         if !requests.is_empty() {
             isolation::transition(&mut rpc, store, id, requests, &controls, cancel)?;
         }
-        let requests = store.get(id)?.registration_requests;
+        let requests = store.inspect(id, |s| s.registration_requests.clone())?;
         if !requests.is_empty() {
             registration::transition(&mut rpc, store, id, requests, &controls, cancel)?;
         }
@@ -1477,6 +1499,73 @@ fn validate_response(pending: &Pending, response: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn new_sessions_keep_rules_and_tools_while_old_sessions_keep_their_policy() -> Result<()> {
+        let mut session = Session::new(
+            "policy".into(),
+            Job::Coding(super::super::Launch {
+                repository: ".".into(),
+                isolated: true,
+                base: "HEAD".into(),
+                prompt: "task".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.repository_rules = "Use the repository service layer.".into();
+        session.artifact_tools = true;
+        session.registration_tools = true;
+        session.question_tools = true;
+        let saved = serde_json::to_value(&session)?;
+        let restored: Session = serde_json::from_value(saved.clone())?;
+        assert!(restored.native_setup);
+        for prompt in [
+            instructions(&restored),
+            super::super::claude::instructions(&restored),
+        ] {
+            assert!(prompt.contains("Use the repository service layer."));
+            for tool in [
+                "difu_present_artifact",
+                "difu_remove_questions",
+                "difu_register_worktree",
+                "difu_delete_session",
+            ] {
+                assert!(prompt.contains(tool));
+            }
+            assert!(!prompt.contains("Do not run local tests"));
+            assert!(!prompt.contains("Do not commit, push"));
+            assert!(!prompt.contains("Current repository:"));
+        }
+        assert!(!super::super::registration::continuation(&restored).contains("PR CI"));
+
+        let mut old = saved;
+        old.as_object_mut()
+            .context("session")?
+            .remove("native_setup");
+        let mut legacy: Session = serde_json::from_value(old)?;
+        assert!(!legacy.native_setup);
+        for prompt in [
+            instructions(&legacy),
+            super::super::claude::instructions(&legacy),
+        ] {
+            assert!(prompt.contains("Use the repository service layer."));
+            assert!(prompt.contains(super::super::WORKTREE_INSTRUCTIONS));
+        }
+        assert!(super::super::registration::continuation(&legacy).contains("PR CI"));
+
+        legacy.deferred_workspace = true;
+        assert!(legacy.waiting_for_workspace());
+        let mut params = json!({});
+        isolation::settings(&mut params, &legacy)?;
+        assert_eq!(params.get("sandbox"), Some(&json!("read-only")));
+        session.deferred_workspace = true;
+        assert!(!session.waiting_for_workspace());
+        let mut params = json!({});
+        isolation::settings(&mut params, &session)?;
+        assert_eq!(params, json!({}));
+        Ok(())
+    }
+
     #[test]
     fn delayed_user_echoes_preserve_prompt_order_and_do_not_duplicate() -> Result<()> {
         let mut session = Session::new(

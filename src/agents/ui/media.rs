@@ -99,6 +99,7 @@ impl Ui {
         else {
             return;
         };
+        crate::repaint::request();
         let Some((id, _)) = self.media_pending.take() else {
             return;
         };

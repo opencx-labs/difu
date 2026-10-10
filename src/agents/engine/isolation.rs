@@ -26,6 +26,9 @@ pub(super) fn read_only_policy(session: &Session) -> Value {
 }
 
 pub(super) fn settings(params: &mut Value, session: &Session) -> Result<()> {
+    if session.native_setup {
+        return Ok(());
+    }
     if session.waiting_for_workspace() {
         put(params, "sandbox", json!("read-only"))?;
         put(params, "approvalPolicy", investigation_approvals())?;

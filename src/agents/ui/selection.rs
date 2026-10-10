@@ -209,6 +209,7 @@ impl Selection {
 impl Ui {
     pub(super) fn tick_selection_click(&mut self) {
         if let Some(action) = self.text_selection.ready_click(Instant::now()) {
+            crate::repaint::request();
             self.action(action);
         }
     }

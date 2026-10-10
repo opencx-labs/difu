@@ -63,18 +63,20 @@ impl State {
 
 impl Ui {
     pub(super) fn refresh_statistics(&mut self) {
-        for session in self.summaries.clone() {
-            if self.sidebar.due(&session) {
-                self.sidebar.pending.insert(session.id.clone());
-                self.sidebar.dirty.remove(&session.id);
-                self.task(
-                    Task::Statistics(session.id.clone(), session.workspace_revision),
-                    Request::Statistics {
-                        id: session.id.clone(),
-                    },
-                    false,
-                );
-            }
+        let due: Vec<_> = self
+            .summaries
+            .iter()
+            .filter(|session| self.sidebar.due(session))
+            .map(|session| (session.id.clone(), session.workspace_revision))
+            .collect();
+        for (id, revision) in due {
+            self.sidebar.pending.insert(id.clone());
+            self.sidebar.dirty.remove(&id);
+            self.task(
+                Task::Statistics(id.clone(), revision),
+                Request::Statistics { id },
+                false,
+            );
         }
     }
 }
