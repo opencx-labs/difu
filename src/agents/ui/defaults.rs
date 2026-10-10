@@ -97,6 +97,7 @@ impl Settings {
             }
         }
         if let Some(result) = self.directory_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            crate::repaint::request();
             self.directory_rx = None;
             match result {
                 Ok(names) => self.directories = names,
@@ -125,6 +126,7 @@ impl Settings {
             }
         }
         if let Some(result) = self.inherited_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            crate::repaint::request();
             self.inherited_rx = None;
             match result {
                 Ok(model) => self.inherited = Some(model),

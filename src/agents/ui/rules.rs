@@ -106,6 +106,7 @@ impl Ui {
         let Some(result) = form.loading.as_ref().and_then(|rx| rx.try_recv().ok()) else {
             return;
         };
+        crate::repaint::request();
         form.loading = None;
         match result {
             Ok((root, text)) => {

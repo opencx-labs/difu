@@ -178,16 +178,16 @@ worktree is created in the background. The composer stays enabled and shows the
 preparation state. Each new worktree fetches `origin/main` and branches from that
 fresh commit, leaving the local checkout unchanged. A failed fetch stops setup
 rather than using a stale base. Messages sent during setup are saved in the queue and sent in
-order once the worktree and provider are ready, after any required guidance
-approval. Failed or interrupted setup retains queued messages as unsent;
+order once the worktree and provider are ready. New sessions automatically copy
+missing repository guidance before starting the provider. Failed or interrupted setup retains queued messages as unsent;
 restarting difu never automatically replays them.
 
 Repository, model, and reasoning defaults live in **/actions → Default
 repository, model, reasoning and worktree**. Without a saved repository, difu
 uses the current Git repository; outside one, it asks you to choose and remembers
 that choice. No model turn runs until your first message. Both Codex and Claude
-use this worktree from the start. Existing local changes are never copied, and
-missing local guidance requires your approval before copying.
+use this worktree from the start. Application-code changes in the source checkout
+are not copied. Missing repository instruction files and skills are copied automatically.
 
 Use **Cmd+K → /rules**, **Session controls → Repository rules**, or **Edit
 repository rules** beside the repository field in defaults (**Ctrl+R**) to edit
@@ -361,11 +361,13 @@ transcript entry focuses the composer. Up in an empty composer recalls this
 session’s previous prompts; Down walks forward and restores your draft.
 
 Codex keeps its normal global configuration and memory settings and reads
-AGENTS.md and skills from the session workspace. Before launching an isolated
-session, difu asks before copying any missing untracked or ignored guidance from
-the source clone. It copies only the listed guidance files after agreement.
-Installed dependencies inside `node_modules` are excluded at every directory
-depth, including nested package-manager stores and skill dependencies.
+AGENTS.md and skills from the session workspace. New sessions automatically copy
+missing untracked or ignored guidance from the source clone: AGENTS.md,
+AGENTS.override.md, CLAUDE.md, CLAUDE.local.md, Claude rules and commands, and
+Codex/Claude skills, including nested repository directories. Existing destination
+files are preserved. Installed dependencies inside `node_modules` are excluded
+at every depth, including nested package-manager stores and skill dependencies.
+Sessions created before v0.17.3 retain their existing guidance-copy approval flow.
 
  **?** opens
 searchable shortcut help. **Tab / Shift+Tab** cycle through the visible sessions list, chat input or
@@ -392,7 +394,7 @@ service replies, and stay out of the transcript until Codex echoes them or accep
 them and the running tools finish. Each message appears in only one place.
 **Esc** in the chat interrupts and sends waiting messages immediately;
 accepted steering is retained in the conversation without being resent. While a
-repository-guidance permission is unanswered, messages remain queued until it is
+legacy repository-guidance permission is unanswered, messages remain queued until it is
 answered. With no waiting messages, Esc interrupts an active agent; when idle,
 it returns to the session list.
 
@@ -467,12 +469,16 @@ Cleanup is separate and refuses active, modified, untracked, ignored, or Git-loc
 worktrees. It never deletes an existing user directory. Removing a clean worktree
 retains its named branch and commits.
 
-Every isolated coding session receives a mandatory instruction at start and resume:
-**do not run local tests, linting, typechecks, builds, CI scripts, or validation
-suites; rely on PR CI.** Git inspection and diff checks remain allowed. This is
-agent guidance, not an operating-system command block. Coding agents commit, push,
-or open a PR only when explicitly requested by the task. Review conflict jobs retain
-their separately authorized automatic, validated push behavior.
+New coding sessions inherit Codex/Claude permissions and approval settings. Difu
+adds the saved repository rules and tool-use instructions for artifacts, question
+cleanup, session deletion, and worktree switching. It does not add bans on local
+validation or publication. Sessions created before v0.17.3 retain their original
+instructions and permission behavior, including on reconnect. Review guide and
+conflict jobs keep their separate workflows.
+
+Connected idle coding workers sleep until provider output, user input, or
+cancellation arrives instead of repeatedly cloning conversation history. The UI
+redraws for input, results, and visible timers, and skips drawing while unfocused.
 
 Session history and managed coding worktrees live in an `agents` directory beside
 `config.json`, with owner-only directory/socket access. The service uses Codex's app-server or Claude Code's streaming CLI and their existing logins. No additional daemon package is required.
@@ -998,7 +1004,7 @@ validates complete coverage before accepting or caching the guide.
 
 Agent activity stays above the composer with a shimmering status, the current tool
 or approval review, and pending steering messages underneath. Explicit next-turn
-messages remain a separate editable queue. During a worktree guidance prompt,
+messages remain a separate editable queue. During a legacy worktree guidance prompt,
 messages and answers are saved until you choose whether to copy the guidance;
 the existing conversation is retained. Ghostty's Option+Left/Right word shortcuts
 work in text inputs, including its translated Alt+b/f key events.

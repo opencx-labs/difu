@@ -29,6 +29,9 @@ impl State {
     }
 }
 impl Ui {
+    pub(super) fn voice_active(&self) -> bool {
+        self.voice.hold.is_some()
+    }
     pub fn voice_enabled(&self) -> bool {
         self.voice.enabled
     }
@@ -150,6 +153,7 @@ impl Ui {
     }
     pub(super) fn tick_voice(&mut self, visible: bool) {
         if let Some(result) = self.voice.saving.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            crate::repaint::request();
             self.voice.saving = None;
             match result {
                 Ok(key) => {
@@ -198,6 +202,7 @@ impl Ui {
         }
         let mut done = None;
         while let Ok(event) = recording.events.try_recv() {
+            crate::repaint::request();
             match event {
                 Event::Listening => hold.listening = true,
                 Event::Level(level) => hold.level = level,
@@ -238,7 +243,7 @@ impl Ui {
                 if h.finishing {
                     "Transcribing… · Esc cancels".into()
                 } else if !h.listening {
-                    "Warming up microphone… · keep holding Space · Esc cancels".into()
+                    "Initializing voice… · keep holding Space · Esc cancels".into()
                 } else {
                     let bars = (h.level * 80.0).clamp(0.0, 12.0) as usize;
                     format!(
@@ -453,6 +458,74 @@ mod tests {
                 .text(),
             "keep this draft"
         );
+        Ok(())
+    }
+    #[test]
+    fn composer_renders_voice_setup_live_meter_and_transcribing_states() -> Result<()> {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for width in [48, 100] {
+            let (mut ui, _tmp) = fixture()?;
+            ui.list_visible = false;
+            let session = Session::new(
+                "voice-test".into(),
+                Job::Coding(Launch {
+                    repository: "/tmp/project".into(),
+                    isolated: true,
+                    base: "HEAD".into(),
+                    prompt: "Task".into(),
+                    model: None,
+                    effort: None,
+                }),
+            );
+            ui.sessions.insert(session.id.clone(), session);
+            let tx = recording(&mut ui)?;
+            ui.voice.hold.as_mut().context("hold")?.listening = false;
+            let screen = |ui: &mut Ui| -> Result<String> {
+                let mut terminal = Terminal::new(TestBackend::new(width, 24))?;
+                terminal.draw(|frame| ui.draw(frame))?;
+                Ok(terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect())
+            };
+            let initializing = screen(&mut ui)?;
+            assert!(initializing.contains("Initializing voice…"));
+            assert!(!initializing.contains("Listening"));
+
+            tx.send(Event::Listening)?;
+            tx.send(Event::Level(0.075))?;
+            tx.send(Event::Partial("spoken words".into()))?;
+            ui.voice.hold.as_mut().context("hold")?.last = Instant::now();
+            ui.tick_voice(true);
+            let listening = screen(&mut ui)?;
+            assert!(listening.contains("Listening ▰▰▰▰▰▰▱▱▱▱▱▱"));
+            assert!(listening.contains("spoken words"));
+            assert!(!listening.contains("Initializing voice"));
+
+            tx.send(Event::Level(0.0))?;
+            ui.voice.hold.as_mut().context("hold")?.last = Instant::now();
+            ui.tick_voice(true);
+            assert!(screen(&mut ui)?.contains("Listening ▱▱▱▱▱▱▱▱▱▱▱▱"));
+
+            ui.voice_key(KeyEvent::new_with_kind(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ));
+            let transcribing = screen(&mut ui)?;
+            assert!(transcribing.contains("Transcribing…"));
+            assert!(!transcribing.contains("Listening"));
+
+            tx.send(Event::Done("spoken words".into()))?;
+            ui.tick_voice(true);
+            let finished = screen(&mut ui)?;
+            assert!(!finished.contains("Transcribing…"));
+            assert!(finished.contains("keep this draftspoken words"));
+        }
         Ok(())
     }
     #[test]

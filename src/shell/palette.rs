@@ -580,6 +580,7 @@ impl Shell {
             return;
         };
         while let Ok(update) = palette.receiver.try_recv() {
+            crate::repaint::request();
             match update {
                 Update::Cache(result) => {
                     palette.cache_loading = false;

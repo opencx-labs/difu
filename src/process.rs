@@ -16,13 +16,20 @@ use std::{
 };
 
 #[derive(Clone, Default, Debug)]
-pub struct Cancel(pub Arc<AtomicBool>);
+pub struct Cancel {
+    flag: Arc<AtomicBool>,
+    wake: crate::wake::Signal,
+}
 impl Cancel {
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.flag.store(true, Ordering::SeqCst);
+        self.wake.notify();
     }
     pub fn cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.flag.load(Ordering::SeqCst)
+    }
+    pub(crate) fn wake(&self) -> crate::wake::Signal {
+        self.wake.clone()
     }
     pub fn check(&self) -> Result<()> {
         if self.cancelled() {

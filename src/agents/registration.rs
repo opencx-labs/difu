@@ -13,7 +13,13 @@ use std::path::{Path, PathBuf};
 
 pub(super) const TOOL: &str = "difu_register_worktree";
 pub(super) const INSTRUCTIONS: &str = "Before switching to another worktree, call difu_register_worktree with its absolute path and, optionally, its comparison base branch. The worktree must already exist and belong to this repository. Call this tool alone, after other tool calls finish, then stop: difu will resume the same conversation in the registered workspace. Do not merely change shell directories; difu needs this registration to follow changes and PRs. Previous worktrees and PR history are retained.";
-pub(super) const CONTINUE: &str = "The registered worktree is now your working directory. Continue the user's task from the existing conversation. Re-read relevant files in this workspace. Do not repeat completed actions or publish unless requested. Do not run local validation suites; rely on PR CI.";
+pub(super) fn continuation(session: &Session) -> &'static str {
+    if session.native_setup {
+        "The registered worktree is now your working directory. Continue the user's task from the existing conversation."
+    } else {
+        "The registered worktree is now your working directory. Continue the user's task from the existing conversation. Re-read relevant files in this workspace. Do not repeat completed actions or publish unless requested. Do not run local validation suites; rely on PR CI."
+    }
+}
 
 pub(super) fn tool() -> Value {
     json!({"type":"function","name":TOOL,"description":"Register an existing worktree as this session's active workspace. Call alone, then stop; difu resumes this conversation there. Retains previous worktrees and PRs.","inputSchema":{"type":"object","properties":{"path":{"type":"string","description":"Absolute path to an existing worktree in the same repository"},"base":{"type":"string","description":"Optional local comparison branch/ref; defaults to the repository default branch"}},"required":["path"],"additionalProperties":false}})

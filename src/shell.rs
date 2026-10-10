@@ -70,10 +70,20 @@ impl Shell {
             self.reviews_started = true;
         }
     }
+    pub fn redraw_interval(&self) -> Option<std::time::Duration> {
+        if self.agents_active {
+            self.agents.redraw_interval()
+        } else {
+            self.reviews.redraw_interval()
+        }
+    }
     pub fn tick(&mut self) {
+        self.tick_focused(true);
+    }
+    pub fn tick_focused(&mut self, focused: bool) {
         let selected = self.palette_selection();
         self.agents
-            .tick(self.agents_active || self.palette.is_some());
+            .tick(focused && (self.agents_active || self.palette.is_some()));
         self.tick_palette();
         self.restore_palette_selection(selected);
         self.reviews.config.agent_defaults = self.agents.defaults.clone();
@@ -83,7 +93,7 @@ impl Shell {
         self.reviews.config.pinned_sessions = self.agents.pinned_sessions.clone();
         self.reviews.config.voice_enabled = self.agents.voice_enabled();
         if self.reviews_started {
-            self.reviews.tick_visible(!self.agents_active);
+            self.reviews.tick_visible(focused && !self.agents_active);
         }
         if self.agents.review_requested {
             self.agents.review_requested = false;

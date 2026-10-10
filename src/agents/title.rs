@@ -28,15 +28,18 @@ impl Task {
         if self.handle.is_some() {
             return Ok(());
         }
-        let session = store.get(id)?;
-        if !session.title_ready || session.title_attempted || session.title_manual {
-            return Ok(());
-        }
-        let Job::Coding(launch) = &session.job else {
+        let input = store.inspect(id, |session| {
+            if !session.title_ready || session.title_attempted || session.title_manual {
+                return None;
+            }
+            let Job::Coding(launch) = &session.job else {
+                return None;
+            };
+            Some((launch.prompt.clone(), session.title_response.clone()))
+        })?;
+        let Some((task, response)) = input else {
             return Ok(());
         };
-        let task = launch.prompt.clone();
-        let response = session.title_response.clone();
         let mut claimed = false;
         store.update(id, |s| {
             if !s.title_attempted && !s.title_manual {

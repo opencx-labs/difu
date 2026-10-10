@@ -34,7 +34,7 @@ impl Connection {
     pub fn stop(&mut self) -> Result<()> {
         self._child.stop()
     }
-    pub fn open(options: Options<'_>) -> Result<Self> {
+    pub fn open(options: Options<'_>, cancel: &Cancel) -> Result<Self> {
         let mut command = Command::new("claude");
         command
             .args([
@@ -104,7 +104,7 @@ impl Connection {
                 }
             });
         }
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = crate::wake::channel(cancel.wake());
         thread::spawn(move || {
             let mut reader = BufReader::new(output);
             loop {

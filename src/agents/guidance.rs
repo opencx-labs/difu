@@ -1,4 +1,4 @@
-//! Copy only explicitly approved missing local guidance into an isolated worktree.
+//! Copy missing local guidance automatically for new sessions; preserve legacy consent.
 use super::{
     Control, Job, Pending, Prompt, Session, Status,
     server::{Command, Store},
@@ -43,29 +43,42 @@ fn regular_path(root: &Path, relative: &Path, missing: bool) -> Result<PathBuf> 
     }
     Ok(result)
 }
-fn discover(source: &Path, destination: &Path, cancel: &Cancel) -> Result<Vec<File>> {
+fn discover(
+    source: &Path,
+    destination: &Path,
+    cancel: &Cancel,
+    native_setup: bool,
+) -> Result<Vec<File>> {
     // Include ignored repository guidance, but prune installed dependencies at every depth.
-    let result = process::run(
-        repo::git(source).args([
-            "ls-files",
-            "--others",
-            "--exclude=node_modules/",
-            "-z",
-            "--",
-            "CLAUDE.md",
-            ":(glob)**/CLAUDE.md",
-            ".claude/skills/",
-            ".claude/commands/",
-            "AGENTS.md",
-            "AGENTS.override.md",
-            ":(glob)**/AGENTS.md",
-            ":(glob)**/AGENTS.override.md",
-            ".agents/skills/",
-            ".codex/skills/",
-        ]),
-        None,
-        cancel,
-    )?;
+    let mut command = repo::git(source);
+    command.args([
+        "ls-files",
+        "--others",
+        "--exclude=node_modules/",
+        "-z",
+        "--",
+        "CLAUDE.md",
+        ":(glob)**/CLAUDE.md",
+        ".claude/skills/",
+        ".claude/commands/",
+        "AGENTS.md",
+        "AGENTS.override.md",
+        ":(glob)**/AGENTS.md",
+        ":(glob)**/AGENTS.override.md",
+        ".agents/skills/",
+        ".codex/skills/",
+    ]);
+    if native_setup {
+        command.args([
+            ":(glob)**/CLAUDE.local.md",
+            ":(glob)**/.claude/rules/**",
+            ":(glob)**/.claude/skills/**",
+            ":(glob)**/.claude/commands/**",
+            ":(glob)**/.agents/skills/**",
+            ":(glob)**/.codex/skills/**",
+        ]);
+    }
+    let result = process::run(&mut command, None, cancel)?;
     ensure!(result.code == 0, "Cannot enumerate local guidance");
     let paths = String::from_utf8(result.stdout).context("Guidance paths must be UTF-8")?;
     let mut files = Vec::new();
@@ -138,8 +151,10 @@ pub fn confirm(
         return Ok(());
     }
     let destination = session.workspace.as_deref().context("Missing worktree")?;
-    let files = discover(&launch.repository, destination, cancel)?;
-    if !files.is_empty() {
+    let files = discover(&launch.repository, destination, cancel, session.native_setup)?;
+    if session.native_setup {
+        copy(&launch.repository, destination, &files)?;
+    } else if !files.is_empty() {
         let request = json!("difu-missing-guidance");
         let paths = files
             .iter()
@@ -314,20 +329,30 @@ mod tests {
             "frontend/node_modules/package/AGENTS.override.md",
             ".agents/skills/example/node_modules/package/AGENTS.md",
             ".codex/skills/example/node_modules/package/SKILL.md",
+            ".claude/rules/node_modules/package/instructions.md",
+            "backend/node_modules/package/CLAUDE.local.md",
         ] {
             let path = source.join(relative);
             fs::create_dir_all(path.parent().context("parent")?)?;
             fs::write(path, "Dependency instructions must not be copied")?;
         }
-        assert!(discover(&source, &destination, &cancel)?.is_empty());
+        assert!(discover(&source, &destination, &cancel, true)?.is_empty());
         fs::write(
             source.join(".gitignore"),
             "AGENTS.md\nAGENTS.override.md\n.agents/\n.codex/\nnode_modules/\n",
         )?;
         let expected = [
             ".agents/skills/example/SKILL.md",
+            ".claude/CLAUDE.md",
+            ".claude/rules/backend.md",
             ".codex/skills/example/SKILL.md",
             "AGENTS.md",
+            "CLAUDE.local.md",
+            "backend/.agents/skills/example/SKILL.md",
+            "backend/.claude/commands/review.md",
+            "backend/.claude/rules/api.md",
+            "backend/.claude/skills/example/SKILL.md",
+            "backend/.codex/skills/example/SKILL.md",
             "backend/AGENTS.md",
             "frontend/AGENTS.override.md",
             "node_modules_notes/AGENTS.md",
@@ -337,13 +362,13 @@ mod tests {
             fs::create_dir_all(path.parent().context("parent")?)?;
             fs::write(path, "Repository instructions")?;
         }
-        let files = discover(&source, &destination, &cancel)?;
+        let files = discover(&source, &destination, &cancel, true)?;
         assert_eq!(
             files.iter().map(|f| f.relative.clone()).collect::<Vec<_>>(),
             expected.map(PathBuf::from)
         );
         copy(&source, &destination, &files)?;
-        assert!(discover(&source, &destination, &cancel)?.is_empty());
+        assert!(discover(&source, &destination, &cancel, true)?.is_empty());
         assert!(!destination.join("node_modules").exists());
         assert!(!destination.join("backend/node_modules").exists());
         assert!(

@@ -629,20 +629,13 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
         "Follow native repository guidance.\n",
     )?;
     let guided = launch(&storage, &repo, "finish guided task")?;
-    let awaiting = wait(&storage, &guided, |s| s.status == Status::Waiting)?;
-    assert!(awaiting.thread_id.is_none());
-    let guided_path = awaiting.workspace.as_ref().context("guided workspace")?;
-    assert!(!guided_path.join("AGENTS.md").exists());
-    control(
-        &storage,
-        &guided,
-        Control::AnswerQuestion {
-            request: serde_json::json!("difu-missing-guidance"),
-            question: "copy_guidance".into(),
-            answer: Some("Copy missing guidance".into()),
-        },
-    )?;
-    wait(&storage, &guided, |s| s.status == Status::Idle)?;
+    let ready = wait(&storage, &guided, |s| {
+        s.status == Status::Idle && s.thread_id.is_some()
+    })?;
+    assert!(ready.native_setup);
+    assert!(ready.guidance_checked);
+    assert_eq!(ready.pending_question_count(), 0);
+    let guided_path = ready.workspace.as_ref().context("guided workspace")?;
     assert_eq!(
         fs::read(guided_path.join("AGENTS.md"))?,
         fs::read(repo.join("AGENTS.md"))?
@@ -961,10 +954,9 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
             .pointer("/params/developerInstructions")
             .and_then(|v| v.as_str())
             .context("Missing policy")?;
-        assert!(
-            instructions.contains("Preserve inherited guidance")
-                && instructions.contains("Do not run local tests")
-        );
+        assert!(instructions.contains("Preserve inherited guidance"));
+        assert!(!instructions.contains("Do not run local tests"));
+        assert!(!instructions.contains("Do not commit, push"));
         assert!(
             call.pointer("/params/approvalPolicy").is_none()
                 && call.pointer("/params/sandbox").is_none()
@@ -2052,9 +2044,33 @@ fn guidance_wait_survives_frontend_reconnect_and_service_restart_without_permiss
             c.env("PATH", &path).env("DIFU_AGENT_FIXTURE", root);
         })
     };
+    // Persist an old-format session to exercise the unchanged legacy setup.
+    let id = "legacy-guidance".to_owned();
+    let mut legacy = Session::new(
+        id.clone(),
+        Job::Coding(Launch {
+            repository: repo.clone(),
+            base: "HEAD".into(),
+            isolated: true,
+            prompt: "finish guided task".into(),
+            model: None,
+            effort: None,
+        }),
+    );
+    legacy.status = Status::Interrupted;
+    let mut saved = serde_json::to_value(legacy)?;
+    saved
+        .as_object_mut()
+        .context("session")?
+        .remove("native_setup");
+    difu::storage::atomic_json(
+        &difu::agents::server::home(&storage)?.join(format!("{id}.json")),
+        &saved,
+    )?;
     let mut daemon = start()?;
-    let id = launch(&storage, &repo, "finish guided task")?;
+    control(&storage, &id, Control::Resume)?;
     let waiting = wait(&storage, &id, |s| s.status == Status::Waiting)?;
+    assert!(!waiting.native_setup);
     let workspace = waiting.workspace.context("workspace")?;
     // Each read uses a fresh frontend connection. Disconnecting does not answer
     // questions or copy files; the persisted request remains actionable.

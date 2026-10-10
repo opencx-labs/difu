@@ -267,6 +267,7 @@ impl Browser {
             return;
         }
         if let Err(error) = self.poll() {
+            crate::repaint::request();
             self.error = Some(format!("{error:#}"));
         }
     }
@@ -311,6 +312,7 @@ impl Browser {
         while let Some(end) = self.input.iter().position(|b| *b == b'\n') {
             let line: Vec<_> = self.input.drain(..=end).collect();
             let message: Value = serde_json::from_slice(&line)?;
+            crate::repaint::request();
             match message.get("type").and_then(Value::as_str) {
                 Some("join") => {
                     ensure!(!self.initialized, "Embedded browser joined twice");

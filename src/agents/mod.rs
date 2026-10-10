@@ -28,6 +28,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 pub const LOCAL_VALIDATION_RULE: &str = "Do not run local tests, linting, typechecks, builds, CI scripts, or validation suites, including through wrappers or delegated agents. Rely on pull-request CI for project validation. Git inspection and git diff checks are allowed.";
+// Retained only for sessions saved before native provider setup.
 pub const WORKTREE_INSTRUCTIONS: &str = "This is a difu-managed worktree. Do not run local tests, linting, typechecks, builds, CI scripts, or other validation suites, including through wrappers or delegated agents. Rely on pull-request CI for all project validation. Git inspection and git diff checks are allowed. Normal source editing tools remain available. Do not commit, push, open a PR, or otherwise publish work unless explicitly requested by the user's task. Finishing a task is not publication authorization.";
 pub const CODING_INSTRUCTIONS: &str = "Do not commit, push, open a PR, or otherwise publish work unless explicitly requested by the user's task. Finishing a task is not publication authorization.";
 
@@ -231,6 +232,9 @@ pub struct Session {
     pub provider_context: Option<String>,
     #[serde(default)]
     pub repository_rules: String,
+    /// New sessions inherit provider policy; missing fields preserve legacy setup.
+    #[serde(default)]
+    pub native_setup: bool,
     pub status: Status,
     pub archived: bool,
     #[serde(default)]
@@ -322,6 +326,7 @@ impl Session {
             provider_threads: Default::default(),
             provider_context: None,
             repository_rules: String::new(),
+            native_setup: true,
             job,
             status: Status::Starting,
             archived: false,
@@ -369,7 +374,8 @@ impl Session {
         }
     }
     pub fn waiting_for_workspace(&self) -> bool {
-        self.deferred_workspace
+        !self.native_setup
+            && self.deferred_workspace
             && !self.workspace_ready
             && matches!(&self.job, Job::Coding(launch) if launch.isolated)
     }
