@@ -151,7 +151,12 @@ pub fn confirm(
         return Ok(());
     }
     let destination = session.workspace.as_deref().context("Missing worktree")?;
-    let files = discover(&launch.repository, destination, cancel, session.native_setup)?;
+    let files = discover(
+        &launch.repository,
+        destination,
+        cancel,
+        session.native_setup,
+    )?;
     if session.native_setup {
         copy(&launch.repository, destination, &files)?;
     } else if !files.is_empty() {

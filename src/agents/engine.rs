@@ -1539,7 +1539,9 @@ mod tests {
         assert!(!super::super::registration::continuation(&restored).contains("PR CI"));
 
         let mut old = saved;
-        old.as_object_mut().context("session")?.remove("native_setup");
+        old.as_object_mut()
+            .context("session")?
+            .remove("native_setup");
         let mut legacy: Session = serde_json::from_value(old)?;
         assert!(!legacy.native_setup);
         for prompt in [
