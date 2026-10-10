@@ -526,7 +526,11 @@ mod tests {
             assert!(!finished.contains("Transcribing…"));
             // The completion toast can cover the composer on narrow terminals.
             assert_eq!(
-                ui.positions.get("voice-test").context("draft")?.draft.text(),
+                ui.positions
+                    .get("voice-test")
+                    .context("draft")?
+                    .draft
+                    .text(),
                 "keep this draftspoken words"
             );
         }
