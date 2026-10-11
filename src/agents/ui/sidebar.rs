@@ -22,9 +22,13 @@ impl State {
             ..Self::default()
         }
     }
-    pub fn save(&self, storage: &Storage) -> anyhow::Result<()> {
-        std::fs::create_dir_all(&storage.cache)?;
-        crate::storage::atomic_json(&Self::path(storage), &self.counts)
+    pub fn save(&self, storage: &Storage, writer: &cache_io::Writer) -> anyhow::Result<()> {
+        let storage = storage.clone();
+        let counts = self.counts.clone();
+        writer.save("session statistics".into(), move || {
+            std::fs::create_dir_all(&storage.cache)?;
+            crate::storage::atomic_json(&Self::path(&storage), &counts)
+        })
     }
     pub fn observe(&mut self, sessions: &[Summary]) {
         for session in sessions {

@@ -7,12 +7,34 @@ pub(super) struct Window {
     session: String,
     width: u16,
     last_position: usize,
-    revision: Option<(u64, i64, Option<String>)>,
+    sources: HashMap<String, Source>,
     heights: HashMap<String, usize>,
     rows: HashMap<String, Vec<Line<'static>>>,
     links: HashMap<String, Vec<transcript::Link>>,
     #[cfg(test)]
     pub formatted: usize,
+}
+#[derive(PartialEq)]
+struct Source {
+    entry: Entry,
+    expanded: bool,
+    focused: bool,
+    // Only unfinished timed entries depend on session state/the clock.
+    timer: Option<(Status, i64)>,
+}
+impl Source {
+    fn matches(
+        &self,
+        entry: &Entry,
+        position: &Position,
+        focused: bool,
+        timer: Option<(Status, i64)>,
+    ) -> bool {
+        self.entry == *entry
+            && self.expanded == position.expanded.contains(&entry.id)
+            && self.focused == (focused && position.focused_entry.as_ref() == Some(&entry.id))
+            && self.timer == timer
+    }
 }
 pub(super) struct View {
     pub lines: Vec<Line<'static>>,
@@ -52,25 +74,7 @@ impl Window {
             self.heights.clear();
             self.rows.clear();
             self.links.clear();
-            self.revision = None;
-        }
-        let revision = (
-            session.version,
-            if session.status.active() {
-                chrono::Utc::now().timestamp()
-            } else {
-                0
-            },
-            if focused {
-                position.focused_entry.clone()
-            } else {
-                None
-            },
-        );
-        if self.revision.as_ref() != Some(&revision) {
-            self.rows.clear();
-            self.links.clear();
-            self.revision = Some(revision);
+            self.sources.clear();
         }
         let outgoing = position
             .outgoing
@@ -89,11 +93,6 @@ impl Window {
                 ..Entry::default()
             })
             .collect::<Vec<_>>();
-        // Local send status can change without a new session revision.
-        for entry in &outgoing {
-            self.rows.remove(&entry.id);
-            self.links.remove(&entry.id);
-        }
         let visible = session
             .entries
             .iter()
@@ -174,15 +173,40 @@ impl Window {
         let mut end = (first + 10).min(sections.len());
         loop {
             for section in sections.get(first..end).unwrap_or_default() {
-                if !self.rows.contains_key(&section.id)
-                    && let Some(entry) = entries.get(section.id.as_str())
+                let Some(entry) = entries.get(section.id.as_str()).copied() else {
+                    continue;
+                };
+                let timer =
+                    (entry.started_at.is_some() && entry.finished_at.is_none()).then(|| {
+                        (
+                            session.status,
+                            if session.status.active() {
+                                chrono::Utc::now().timestamp_millis() / 100
+                            } else {
+                                session.updated
+                            },
+                        )
+                    });
+                if !self
+                    .sources
+                    .get(&section.id)
+                    .is_some_and(|source| source.matches(entry, position, focused, timer))
                 {
                     let (rows, _, links) = transcript::render_entries(
                         session,
-                        std::slice::from_ref(*entry),
+                        std::slice::from_ref(entry),
                         position,
                         width,
                         focused,
+                    );
+                    self.sources.insert(
+                        section.id.clone(),
+                        Source {
+                            entry: entry.clone(),
+                            expanded: position.expanded.contains(&entry.id),
+                            focused: focused && position.focused_entry.as_ref() == Some(&entry.id),
+                            timer,
+                        },
                     );
                     self.heights.insert(section.id.clone(), rows.len());
                     self.rows.insert(section.id.clone(), rows);
@@ -259,6 +283,7 @@ impl Window {
             .iter()
             .map(|s| s.id.as_str())
             .collect();
+        self.sources.retain(|id, _| keep.contains(id.as_str()));
         self.rows.retain(|id, _| keep.contains(id.as_str()));
         self.links.retain(|id, _| keep.contains(id.as_str()));
         let links = sections

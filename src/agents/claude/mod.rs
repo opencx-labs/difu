@@ -95,20 +95,15 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
         }
         Some("notifications/initialized" | "ping") => json!({}),
         Some("tools/list") => {
-            let tools = [
-                super::artifacts::tool(),
-                super::registration::tool(),
-                super::management::tool(),
-                super::questions::tool(),
-            ]
-            .into_iter()
-            .map(|mut tool| {
-                if let Some(tool) = tool.as_object_mut() {
-                    tool.remove("type");
-                }
-                tool
-            })
-            .collect::<Vec<_>>();
+            let tools = super::orchestrator::tools(&store.get(id)?)
+                .into_iter()
+                .map(|mut tool| {
+                    if let Some(tool) = tool.as_object_mut() {
+                        tool.remove("type");
+                    }
+                    tool
+                })
+                .collect::<Vec<_>>();
             json!({"tools":tools})
         }
         Some("tools/call") => {
@@ -119,6 +114,9 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
             let args = message.pointer("/params/arguments").unwrap_or(&Value::Null);
             let mut session = store.get(id)?;
             let result = match name {
+                super::orchestrator::TOOL => {
+                    super::orchestrator::handle(store, id, args).map(|v| v.to_string())
+                }
                 super::questions::TOOL => {
                     super::questions::handle(store, id, args).map(|value| value.to_string())
                 }
@@ -529,6 +527,13 @@ fn command(
 }
 
 pub(super) fn instructions(session: &Session) -> String {
+    if session.orchestrator {
+        return format!(
+            "{}\n\n{}",
+            super::orchestrator::INSTRUCTIONS,
+            super::questions::INSTRUCTIONS
+        );
+    }
     let instructions = format!(
         "{}\n\n{}\n\n{}\n\n{}",
         super::artifacts::INSTRUCTIONS,

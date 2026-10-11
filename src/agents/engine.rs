@@ -231,6 +231,18 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
         .unwrap_or_default();
     let params = event.get("params").unwrap_or(&Value::Null);
     if let Some(id) = event.get("id") {
+        if session.orchestrator
+            && method == "item/tool/call"
+            && params.get("tool").and_then(Value::as_str) == Some(super::orchestrator::TOOL)
+        {
+            session.orchestrator_requests.push(Pending {
+                id: id.clone(),
+                method: method.into(),
+                params: params.clone(),
+                responded: false,
+            });
+            return;
+        }
         if session.question_tools
             && method == "item/tool/call"
             && params.get("tool").and_then(Value::as_str) == Some(super::questions::TOOL)
@@ -443,7 +455,7 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                     if !user_message {
                         entry.text = text;
                     }
-                    entry.data = item.clone();
+                    entry.replace_data(item.clone());
                     if method == "item/completed" {
                         entry.finished_at = Some(chrono::Utc::now().timestamp_millis());
                     }
@@ -1097,6 +1109,13 @@ fn command(
     Ok(())
 }
 fn instructions(session: &Session) -> String {
+    if session.orchestrator {
+        return format!(
+            "{}\n\n{}",
+            super::orchestrator::INSTRUCTIONS,
+            super::questions::INSTRUCTIONS
+        );
+    }
     let base = if session.native_setup {
         super::management::INSTRUCTIONS.to_owned()
     } else {
@@ -1181,12 +1200,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
         )?;
     }
     if !resuming {
-        let mut tools = vec![
-            super::artifacts::tool(),
-            super::registration::tool(),
-            super::management::tool(),
-            super::questions::tool(),
-        ];
+        let mut tools = super::orchestrator::tools(&session);
         if !session.native_setup && session.deferred_workspace && launch.isolated {
             tools.extend(isolation::tools().as_array().cloned().unwrap_or_default());
         }
@@ -1343,6 +1357,38 @@ pub fn run(
             cancel.wake().wait();
             housekeeping_due = true;
             continue;
+        }
+        let requests = store.inspect(id, |s| s.orchestrator_requests.clone())?;
+        if !requests.is_empty() {
+            store.update(id, |s| s.orchestrator_requests.clear())?;
+            for request in requests {
+                let result = (|| -> Result<Value> {
+                    let session = store.get(id)?;
+                    ensure!(
+                        request.params.get("threadId").and_then(Value::as_str)
+                            == session.thread_id.as_deref()
+                            && request.params.get("turnId").and_then(Value::as_str)
+                                == session.turn_id.as_deref(),
+                        "Session action belongs to another turn"
+                    );
+                    let args = request
+                        .params
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let args = if let Some(text) = args.as_str() {
+                        serde_json::from_str(text)?
+                    } else {
+                        args
+                    };
+                    super::orchestrator::handle(store, id, &args)
+                })();
+                let text = match &result {
+                    Ok(value) => value.to_string(),
+                    Err(error) => format!("{error:#}"),
+                };
+                rpc.write(json!({"id":request.id,"result":{"success":result.is_ok(),"contentItems":[{"type":"inputText","text":text}]}}))?;
+            }
         }
         let requests = store.inspect(id, |s| s.deletion_requests.clone())?;
         if !requests.is_empty() {

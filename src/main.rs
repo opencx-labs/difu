@@ -147,8 +147,36 @@ fn main() -> Result<()> {
         let mut focused = true;
         let mut redraw = difu::repaint::Schedule::new(Instant::now());
         while !app.reviews.quit && !terminated.load(std::sync::atomic::Ordering::Relaxed) {
-            // Show optimistic sends before the next background/persistence tick.
-            if !app.agents.take_send_repaint() {
+            // Read queued input before maintenance. Poll wakes immediately on a
+            // key; active animation deadlines never inherit the idle 50 ms wait.
+            let mut input = false;
+            let started = Instant::now();
+            while event::poll(if input {
+                Duration::ZERO
+            } else {
+                redraw.wait(Instant::now(), focused, app.redraw_interval())
+            })? {
+                input = true;
+                redraw.invalidate();
+                match event::read()? {
+                    Event::Key(key) => app.key(key),
+                    Event::FocusGained => focused = true,
+                    Event::FocusLost => {
+                        focused = false;
+                        app.reviews.hover = Default::default();
+                        app.agents.cancel_voice();
+                    }
+                    Event::Mouse(mouse) => app.mouse(mouse),
+                    Event::Paste(text) => app.paste(text),
+                    Event::Resize(..) => app.reviews.invalidate(),
+                }
+                // Bound input batches so continuous typing cannot starve draws.
+                if started.elapsed() >= Duration::from_millis(2) {
+                    break;
+                }
+            }
+            let sent = app.agents.take_send_repaint();
+            if !input && !sent {
                 app.tick_focused(focused);
             }
             app.clipboard(&mut io::stdout().lock());
@@ -163,20 +191,10 @@ fn main() -> Result<()> {
                     .hover
                     .render(&mut io::stdout().lock(), frame.buffer)?;
             }
-            if event::poll(Duration::from_millis(50))? {
-                redraw.invalidate();
-                match event::read()? {
-                    Event::Key(key) => app.key(key),
-                    Event::FocusGained => focused = true,
-                    Event::FocusLost => {
-                        focused = false;
-                        app.reviews.hover = Default::default();
-                        app.agents.cancel_voice();
-                    }
-                    Event::Mouse(mouse) => app.mouse(mouse),
-                    Event::Paste(text) => app.paste(text),
-                    Event::Resize(..) => app.reviews.invalidate(),
-                }
+            // Flush the cleared composer and optimistic message before any work
+            // that receives provider results or schedules cache refreshes.
+            if input || sent {
+                app.tick_focused(focused);
             }
         }
         Ok(())

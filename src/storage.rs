@@ -34,6 +34,8 @@ impl Default for AgentDefaults {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
+    pub slack: Option<crate::agents::slack::Settings>,
+    #[serde(default)]
     pub local_diff_roots: Vec<PathBuf>,
     #[serde(default)]
     pub local_diff_repositories: BTreeSet<PathBuf>,
@@ -72,6 +74,7 @@ fn enabled() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            slack: None,
             local_diff_roots: Vec::new(),
             local_diff_repositories: BTreeSet::new(),
             last_tab_agents: true,

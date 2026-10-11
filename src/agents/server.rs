@@ -14,7 +14,7 @@ use std::{
         net::{UnixListener, UnixStream},
     },
     path::PathBuf,
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -23,6 +23,7 @@ pub struct Store {
     pub home: PathBuf,
     pub storage: Storage,
     sessions: Mutex<BTreeMap<String, Session>>,
+    changed: Condvar,
     save_lock: Mutex<()>,
 }
 impl Store {
@@ -45,6 +46,7 @@ impl Store {
         let session = sessions.get_mut(id).context("Session not found")?;
         f(session);
         session.touch();
+        self.changed.notify_all();
         Ok(())
     }
     pub fn save(&self, id: &str) -> Result<()> {
@@ -123,6 +125,7 @@ impl Store {
             _ => return Ok(false),
         }
         session.touch();
+        self.changed.notify_all();
         Ok(true)
     }
     pub(super) fn list(&self) -> Result<Vec<Summary>> {
@@ -305,6 +308,12 @@ impl Service {
         Ok(id)
     }
     fn handle(&self, request: Request) -> Result<Reply> {
+        let (request, route) = match request {
+            Request::SlackControl { id, control, route } => {
+                (Request::Control { id, control }, Some(route))
+            }
+            request => (request, None),
+        };
         let key = match &request {
             Request::Control { id, .. }
             | Request::Cleanup { id }
@@ -336,19 +345,20 @@ impl Service {
             })
             .transpose()?;
         match request {
+            Request::SlackControl { .. } => anyhow::bail!("Unexpected nested Slack control"),
             Request::Ping => Ok(Reply::Ok),
             Request::ServiceVersion => Ok(Reply::ServiceVersion {
                 version: env!("CARGO_PKG_VERSION").into(),
             }),
             Request::List => Ok(Reply::Sessions(self.store.list()?)),
-            Request::Read { id, version } => {
-                let session = self.store.get(&id)?;
+            Request::Watch { .. } => anyhow::bail!("Watch requires a streaming connection"),
+            Request::Read { id, version } => self.store.inspect(&id, |session| {
                 if version == Some(session.version) {
-                    Ok(Reply::Unchanged)
+                    Reply::Unchanged
                 } else {
-                    Ok(Reply::Session(Box::new(session)))
+                    Reply::Session(Box::new(session.clone()))
                 }
-            }
+            }),
             Request::NewAgent {
                 defaults,
                 cwd,
@@ -413,6 +423,42 @@ impl Service {
                     !session.archived || matches!(control, Control::Interrupt),
                     "Unarchive this session before continuing"
                 );
+                if route.is_some()
+                    && matches!(
+                        control,
+                        Control::Message { .. }
+                            | Control::MessageWithAttachments { .. }
+                            | Control::Resume
+                    )
+                    && session.orchestrator
+                    && (session.status.active() || !session.pending.is_empty())
+                {
+                    ensure!(
+                        session
+                            .slack_route
+                            .as_ref()
+                            .zip(route.as_ref())
+                            .is_some_and(|(a, b)| a.account == b.account
+                                && a.channel == b.channel
+                                && a.thread == b.thread),
+                        "The orchestrator is busy in another conversation; retry when it is ready"
+                    );
+                }
+                if matches!(
+                    control,
+                    Control::Message { .. }
+                        | Control::MessageWithAttachments { .. }
+                        | Control::Resume
+                ) || route.is_some()
+                    && matches!(
+                        control,
+                        Control::AnswerQuestion { .. } | Control::Respond { .. }
+                    )
+                {
+                    self.store
+                        .update(&id, |s| s.set_slack_route(route.clone()))?;
+                    self.store.save(&id)?;
+                }
                 if self.store.queue_preparing(&id, &control)? {
                     self.store.save(&id)?;
                     return Ok(Reply::Ok);
@@ -817,6 +863,7 @@ impl Service {
                         .lock()
                         .map_err(|_| anyhow::anyhow!("Session lock failed"))?
                         .remove(&id);
+                    self.store.changed.notify_all();
                     Ok(Reply::Ok)
                 })();
                 if result.is_err() {
@@ -1005,18 +1052,30 @@ pub fn run(storage: Storage) -> Result<()> {
             home,
             storage,
             sessions: Mutex::new(sessions),
+            changed: Condvar::new(),
             save_lock: Mutex::new(()),
         }),
         workers: Mutex::new(BTreeMap::new()),
         action_locks: Mutex::new(BTreeMap::new()),
         launch_lock: Mutex::new(()),
     });
+    if service.store.get(super::orchestrator::ID).is_err() {
+        let session = super::orchestrator::session(&service.store)?;
+        service
+            .store
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session lock failed"))?
+            .insert(session.id.clone(), session);
+        service.store.save(super::orchestrator::ID)?;
+    }
     let _pr_cache =
         super::pr_cache::Refresher::start(service.store.storage.clone(), service.store.clone())?;
     let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
     for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         signal_hook::flag::register(signal, stopped.clone())?;
     }
+    super::slack::start(service.store.clone(), stopped.clone());
     let mut saved = BTreeMap::new();
     let mut flushed = Instant::now();
     while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1082,10 +1141,104 @@ fn serve(service: &Service, mut stream: UnixStream) -> Result<()> {
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let mut reader = BufReader::new(stream.try_clone()?);
     let request: Request = serde_json::from_str(&super::client::read_line(&mut reader)?)?;
+    if let Request::Watch { id, version } = request {
+        return watch(&service.store, &mut stream, &id, version);
+    }
     let reply = service
         .handle(request)
         .unwrap_or_else(|e| Reply::Error(format!("{e:#}")));
     serde_json::to_writer(&mut stream, &reply)?;
     stream.write_all(b"\n")?;
     Ok(())
+}
+
+fn watch(store: &Store, stream: &mut UnixStream, id: &str, mut version: Option<u64>) -> Result<()> {
+    loop {
+        let sessions = store
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session lock failed"))?;
+        // Predicate and updates share the same lock, so a change between replies
+        // cannot be lost. Heartbeats detect disconnected/hidden UI subscribers.
+        let (sessions, _) = store
+            .changed
+            .wait_timeout_while(sessions, Duration::from_secs(1), |sessions| {
+                sessions.get(id).is_some_and(|s| Some(s.version) == version)
+            })
+            .map_err(|_| anyhow::anyhow!("Session lock failed"))?;
+        let reply = match sessions.get(id) {
+            Some(session) if Some(session.version) != version => {
+                version = Some(session.version);
+                Reply::Session(Box::new(session.clone()))
+            }
+            Some(_) => Reply::Unchanged,
+            None => Reply::Error("Session not found".into()),
+        };
+        drop(sessions);
+        // Never hold the provider's session lock during socket I/O.
+        serde_json::to_writer(&mut *stream, &reply)?;
+        stream.write_all(b"\n")?;
+        if matches!(reply, Reply::Error(_)) {
+            return Ok(());
+        }
+        // Coalesce token bursts; a slow UI never builds an unbounded frame queue.
+        thread::sleep(crate::repaint::FRAME_INTERVAL);
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::*;
+    #[test]
+    fn subscription_delivers_changes_without_list_polling_and_disconnects() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut session = Session::new(
+            "one".into(),
+            Job::Coding(Launch {
+                repository: temp.path().into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.status = Status::Idle;
+        let store = Arc::new(Store {
+            home: temp.path().into(),
+            storage: Storage {
+                config: temp.path().join("config.json"),
+                cache: temp.path().join("cache"),
+            },
+            sessions: Mutex::new(BTreeMap::from([("one".into(), session)])),
+            changed: Condvar::new(),
+            save_lock: Mutex::new(()),
+        });
+        let (client, mut server) = UnixStream::pair()?;
+        client.set_read_timeout(Some(Duration::from_secs(2)))?;
+        server.set_write_timeout(Some(Duration::from_secs(2)))?;
+        let watching = store.clone();
+        let (done, finished) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _ = watch(&watching, &mut server, "one", None);
+            let _ = done.send(());
+        });
+        let mut reader = BufReader::new(client);
+        let first: Reply = serde_json::from_str(&client::read_line(&mut reader)?)?;
+        assert!(matches!(first, Reply::Session(s) if s.version == 0));
+        // Update while the subscriber is between writes/waits. The predicate
+        // must catch the change even if the notification precedes the wait.
+        store.update("one", |s| s.note("agentMessage", "streamed"))?;
+        let next: Reply = serde_json::from_str(&client::read_line(&mut reader)?)?;
+        assert!(
+            matches!(next, Reply::Session(s) if s.version > 0 && s.entries.last().is_some_and(|e| e.text == "streamed"))
+        );
+        reader.get_ref().shutdown(std::net::Shutdown::Both)?;
+        drop(reader);
+        finished.recv_timeout(Duration::from_secs(5))?;
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("watch panicked"))?;
+        Ok(())
+    }
 }
