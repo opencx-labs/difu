@@ -89,6 +89,11 @@ def verify(data, artifact, run, tree, version, repo):
     if not re.fullmatch(r"[0-9a-f]{40}", commit):
         raise ValueError("Invalid source commit")
     built = api(f"repos/{repo}/git/commits/{commit}")
+    # Independently bind the run's GitHub-reported source to the release. An
+    # artifact's own manifest/name is not evidence that its producer ran this code.
+    head = api(f"repos/{repo}/git/commits/{run['head_sha']}")
+    if head["tree"]["sha"] != tree:
+        raise ValueError("PR source tree differs from the release")
     if built["tree"]["sha"] != tree or run["head_sha"] not in {
         commit, *(parent["sha"] for parent in built["parents"])
     }:

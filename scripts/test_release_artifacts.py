@@ -88,6 +88,17 @@ class ReleaseArtifactsTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "PR source"):
                     self.verify()
 
+    def test_manifest_cannot_claim_a_different_runs_source_tree(self):
+        def commits(path):
+            if path.endswith(self.head):
+                return {"tree": {"sha": "d" * 40}, "parents": []}
+            return self.built
+
+        with patch.object(release, "api", side_effect=commits):
+            with self.assertRaisesRegex(ValueError, "PR source tree differs"):
+                release.verify(self.archive(), self.artifact, self.run,
+                               self.tree, self.version, "owner/repo")
+
     def test_failed_incomplete_other_workflow_and_tag_runs_are_ineligible(self):
         self.assertTrue(release.eligible(self.artifact, self.run, 20))
         for key, value in {"conclusion": "failure", "status": "in_progress",

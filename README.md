@@ -1033,6 +1033,8 @@ the resulting artifact. On a version tag, the release workflow first looks for
 matching artifacts from a successful PR run. It verifies their provenance and
 checksums, then creates the draft release without compiling again. Matching by
 source tree allows reuse across merge and squash commits with identical files.
+Both the PR head and its tested checkout must match the release tree; if merging
+adds newer base-branch changes, the release uses the rebuild fallback.
 If matching artifacts are missing, expired, or cannot be validated, the workflow
 automatically rebuilds all four packages. Full test suites run in PR/branch CI;
 release builds retain the package startup checks. A tag must match the version
