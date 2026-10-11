@@ -92,6 +92,36 @@ impl Watch {
     }
 }
 
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+        if let Some(stream) = self.socket.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+impl Ui {
+    pub(super) fn tick_watch(&mut self, visible: bool) {
+        let selected = self
+            .selected
+            .as_ref()
+            .filter(|id| visible && !self.deleting.contains(*id));
+        if self.watch.as_ref().map(|watch| &watch.id) != selected {
+            self.watch = selected.map(|id| {
+                Watch::new(
+                    self.storage.clone(),
+                    id.clone(),
+                    self.sessions.get(id).map(|s| s.version),
+                )
+            });
+        }
+        if let Some(message) = self.watch.as_ref().and_then(Watch::take) {
+            let _ = self.sender.send(message);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,34 +192,5 @@ mod tests {
             .join()
             .map_err(|_| anyhow::anyhow!("socket worker panicked"))??;
         Ok(())
-    }
-}
-impl Drop for Watch {
-    fn drop(&mut self) {
-        self.cancel.cancel();
-        if let Some(stream) = self.socket.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = stream.shutdown(Shutdown::Both);
-        }
-    }
-}
-
-impl Ui {
-    pub(super) fn tick_watch(&mut self, visible: bool) {
-        let selected = self
-            .selected
-            .as_ref()
-            .filter(|id| visible && !self.deleting.contains(*id));
-        if self.watch.as_ref().map(|watch| &watch.id) != selected {
-            self.watch = selected.map(|id| {
-                Watch::new(
-                    self.storage.clone(),
-                    id.clone(),
-                    self.sessions.get(id).map(|s| s.version),
-                )
-            });
-        }
-        if let Some(message) = self.watch.as_ref().and_then(Watch::take) {
-            let _ = self.sender.send(message);
-        }
     }
 }

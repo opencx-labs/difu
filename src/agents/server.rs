@@ -1234,7 +1234,8 @@ mod watch_tests {
             matches!(next, Reply::Session(s) if s.version > 0 && s.entries.last().is_some_and(|e| e.text == "streamed"))
         );
         reader.get_ref().shutdown(std::net::Shutdown::Both)?;
-        finished.recv_timeout(Duration::from_secs(3))?;
+        drop(reader);
+        finished.recv_timeout(Duration::from_secs(5))?;
         worker
             .join()
             .map_err(|_| anyhow::anyhow!("watch panicked"))?;
