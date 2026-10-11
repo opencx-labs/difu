@@ -66,6 +66,9 @@ impl Watch {
                     Ok(())
                 })();
                 socket.lock().unwrap_or_else(|e| e.into_inner()).take();
+                // Restart recovery can change status without increasing the saved
+                // version. Reconnect with a full snapshot rather than trusting it.
+                version = None;
                 if let Err(error) = result
                     && !cancel.cancelled()
                 {
@@ -87,6 +90,79 @@ impl Watch {
     }
     pub fn take(&self) -> Option<ResultMessage> {
         self.latest.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    #[test]
+    fn subscription_coalesces_updates_and_drop_closes_the_socket() -> anyhow::Result<()> {
+        let temp = tempfile::Builder::new()
+            .prefix("difu-watch-")
+            .tempdir_in("/tmp")?;
+        let storage = Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        };
+        let listener = UnixListener::bind(super::super::super::server::socket(&storage)?)?;
+        let (sent, received) = mpsc::channel();
+        let (closed, disconnected) = mpsc::channel();
+        let worker = thread::spawn(move || -> anyhow::Result<()> {
+            let (mut socket, _) = listener.accept()?;
+            socket.set_read_timeout(Some(Duration::from_secs(3)))?;
+            let mut reader = BufReader::new(socket.try_clone()?);
+            let request: Request = serde_json::from_str(&client::read_line(&mut reader)?)?;
+            assert!(matches!(request, Request::Watch { id, .. } if id == "one"));
+            let mut session = Session::new(
+                "one".into(),
+                Job::Coding(Launch {
+                    repository: "/tmp/repo".into(),
+                    isolated: false,
+                    base: "HEAD".into(),
+                    prompt: String::new(),
+                    model: None,
+                    effort: None,
+                }),
+            );
+            for version in 1..=20 {
+                session.version = version;
+                serde_json::to_writer(&mut socket, &Reply::Session(Box::new(session.clone())))?;
+                socket.write_all(b"\n")?;
+            }
+            sent.send(())?;
+            let mut byte = [0];
+            let count = std::io::Read::read(&mut socket, &mut byte)?;
+            closed.send(count)?;
+            Ok(())
+        });
+        let watch = Watch::new(storage, "one".into(), None);
+        received.recv_timeout(Duration::from_secs(3))?;
+        let started = Instant::now();
+        loop {
+            let latest = watch.latest.lock().unwrap_or_else(|e| e.into_inner());
+            if matches!(latest.as_ref(), Some(ResultMessage { result: Ok(Reply::Session(s)), .. }) if s.version == 20)
+            {
+                break;
+            }
+            drop(latest);
+            anyhow::ensure!(
+                started.elapsed() < Duration::from_secs(3),
+                "snapshot did not arrive"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(watch.take(), Some(ResultMessage { result: Ok(Reply::Session(s)), .. }) if s.version == 20)
+        );
+        assert!(watch.take().is_none());
+        drop(watch);
+        assert_eq!(disconnected.recv_timeout(Duration::from_secs(3))?, 0);
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("socket worker panicked"))??;
+        Ok(())
     }
 }
 impl Drop for Watch {

@@ -719,10 +719,10 @@ impl Ui {
                         {
                             self.modal = None;
                         }
-                        self.sessions.insert(id.clone(), *session);
                         if let Some(summary) = self.summaries.iter_mut().find(|s| s.id == id) {
-                            *summary = self.sessions[&id].summary();
+                            *summary = session.summary();
                         }
+                        self.sessions.insert(id.clone(), *session);
                         self.question_received(&id);
                     }
                     (

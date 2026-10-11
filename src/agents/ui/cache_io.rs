@@ -67,3 +67,36 @@ impl Drop for Writer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn slow_writes_do_not_block_submission_and_queued_snapshots_coalesce() -> anyhow::Result<()> {
+        let writer = Writer::default();
+        let (entered, started) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        writer.save("blocker".into(), move || {
+            entered.send(())?;
+            wait.recv_timeout(Duration::from_secs(5))?;
+            Ok(())
+        })?;
+        started.recv_timeout(Duration::from_secs(3))?;
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        for version in [1, 2] {
+            let written = written.clone();
+            writer.save("draft".into(), move || {
+                written
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(version);
+                Ok(())
+            })?;
+        }
+        assert!(written.lock().unwrap_or_else(|e| e.into_inner()).is_empty());
+        release.send(())?;
+        writer.flush()?;
+        assert_eq!(*written.lock().unwrap_or_else(|e| e.into_inner()), vec![2]);
+        Ok(())
+    }
+}

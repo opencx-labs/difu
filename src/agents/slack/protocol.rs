@@ -90,7 +90,11 @@ mod tests {
         let parsed = mention(&event, &scope()).context("mention")?;
         assert_eq!(parsed.thread, "100.000001");
         assert_eq!(parsed.text, "explain a < b && c > d");
-        event["event"]["thread_ts"] = json!("99.000001");
+        event
+            .get_mut("event")
+            .and_then(Value::as_object_mut)
+            .context("event")?
+            .insert("thread_ts".into(), json!("99.000001"));
         assert_eq!(
             mention(&event, &scope()).context("thread mention")?.thread,
             "99.000001"
@@ -117,7 +121,11 @@ mod tests {
         }
         for field in ["subtype", "bot_id"] {
             let mut event = payload();
-            event["event"][field] = json!("ignored");
+            event
+                .get_mut("event")
+                .and_then(Value::as_object_mut)
+                .context("event")?
+                .insert(field.into(), json!("ignored"));
             assert!(mention(&event, &scope()).is_none(), "{field}");
         }
         Ok(())

@@ -741,15 +741,28 @@ mod tests {
             question: Some("b".into()),
             route: origin("first"),
         };
-        session.pending.first_mut().context("pending")?.params["difuAnswers"] =
-            json!({"a":{"answers":["done"]}});
+        session
+            .pending
+            .first_mut()
+            .context("pending")?
+            .params
+            .as_object_mut()
+            .context("params")?
+            .insert("difuAnswers".into(), json!({"a":{"answers":["done"]}}));
         let answer = || commands::Command::Answer {
             reference: "id".into(),
             text: "yes".into(),
         };
         assert!(response(&reference, &session, &origin("first"), answer()).is_ok());
-        session.pending.first_mut().context("pending")?.params["difuAnswers"]["b"] =
-            json!({"answers":["done"]});
+        session
+            .pending
+            .first_mut()
+            .context("pending")?
+            .params
+            .get_mut("difuAnswers")
+            .and_then(Value::as_object_mut)
+            .context("answers")?
+            .insert("b".into(), json!({"answers":["done"]}));
         assert!(response(&reference, &session, &origin("first"), answer()).is_err());
         Ok(())
     }
