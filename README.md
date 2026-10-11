@@ -972,10 +972,13 @@ event subscription, and Socket Mode enabled with `connections:write` on the
 app token. See Slack's [Socket Mode setup](https://docs.slack.dev/apis/events-api/using-socket-mode/).
 
 Mention **@difu** to talk to the persistent **Difu orchestrator** pinned above your
-coding sessions. It can inspect existing sessions, create sessions when needed,
+coding sessions. It can inspect existing sessions, create sessions with your confirmation,
 send instructions, interrupt/resume, select models, rename, archive/unarchive,
 and delete sessions and their worktrees. A mention does not automatically create
-a coding session. The same orchestrator chat is accessible in difu.
+a coding session. Give it several tasks and it will read relevant sessions and
+route each task to the appropriate one, queuing work for busy sessions. It asks
+you when a task has no suitable session or several equally relevant matches.
+The same orchestrator chat is accessible in difu.
 
 Replies and pending questions appear in the originating Slack thread. Mention
 @difu on follow-up messages too. Requests from other threads wait while the
@@ -1023,6 +1026,18 @@ The workflow test uses Python 3 to script GitHub/Codex responses, alongside real
 local Git repositories. The default test suite requires no GitHub credentials or
 AI calls.
 CI runs the checks on macOS and Linux.
+
+Release PR CI also tests and builds packages for all four supported platforms.
+It records the full Git source tree, package version, and file checksums with
+the resulting artifact. On a version tag, the release workflow first looks for
+matching artifacts from a successful PR run. It verifies their provenance and
+checksums, then creates the draft release without compiling again. Matching by
+source tree allows reuse across merge and squash commits with identical files.
+If matching artifacts are missing, expired, or cannot be validated, the workflow
+automatically rebuilds all four packages. Full test suites run in PR/branch CI;
+release builds retain the package startup checks. A tag must match the version
+in `Cargo.toml` in either path. Bump the version in the PR before its build so
+the validated packages already have the version that will be tagged.
 
 An additional live smoke test is ignored by default. It uses your Codex login and
 one Luna High generation against a tiny synthetic repository:
