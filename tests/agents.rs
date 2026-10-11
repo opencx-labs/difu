@@ -908,7 +908,14 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
             attachments: Vec::new(),
         },
     )?;
-    let resumed = wait(&storage, &second, |s| s.status == Status::Idle)?;
+    // Connecting restores an idle thread before the initial control starts its
+    // turn. Wait for this message too, rather than observing that transient idle.
+    let resumed = wait(&storage, &second, |s| {
+        s.status == Status::Idle
+            && s.entries
+                .iter()
+                .any(|e| e.kind == "userMessage" && e.text == "continue after service restart")
+    })?;
     assert_eq!(resumed.thread_id, recovered.thread_id);
     assert_eq!(
         resumed
