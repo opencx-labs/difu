@@ -4380,6 +4380,7 @@ mod tests {
         let response = ui.receiver.recv_timeout(Duration::from_secs(5))?;
         ui.sender.send(response)?;
         ui.tick(false);
+        ui.cache_writer.flush()?;
         assert!(super::super::media::load_draft(&storage, "one")?.is_empty());
         assert!(
             ui.notice
@@ -4807,6 +4808,7 @@ mod tests {
             .draft
             .key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         ui.tick_media();
+        ui.cache_writer.flush()?;
         assert!(super::super::media::load_draft(&storage, "one")?.is_empty());
         draw(&mut ui, 120, 40)?;
         assert_eq!(
@@ -4819,6 +4821,7 @@ mod tests {
             .draft
             .undo();
         ui.tick_media();
+        ui.cache_writer.flush()?;
         assert_eq!(
             super::super::media::load_draft(&storage, "one")?,
             [attachment]

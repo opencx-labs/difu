@@ -50,7 +50,6 @@ impl Watch {
                         let reply: Reply = serde_json::from_str(&client::read_line(&mut reader)?)?;
                         match reply {
                             Reply::Session(session) => {
-                                version = Some(session.version);
                                 *latest.lock().unwrap_or_else(|e| e.into_inner()) =
                                     Some(ResultMessage {
                                         kind: Task::Read(id.clone()),
@@ -72,8 +71,8 @@ impl Watch {
                 if let Err(error) = result
                     && !cancel.cancelled()
                 {
-                    // Keep an unconsumed snapshot; the UI must see the version we
-                    // will resume from. A later retry can report a connection error.
+                    // Keep an unconsumed snapshot. A later retry can report a
+                    // connection error without discarding the last received text.
                     latest
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
