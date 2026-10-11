@@ -14,6 +14,7 @@ use crate::agents::pr_cache::{self, SESSION_LINKS, SessionLink as Cached};
 pub(super) struct State {
     cache: pr_cache::SessionLinks,
     loaded_at: Option<Instant>,
+    loading: Option<mpsc::Receiver<Vec<(Summary, pr_cache::Snapshot)>>>,
     pub visible: HashSet<String>,
     refreshed: HashMap<String, Instant>,
     revisions: HashMap<String, u64>,
@@ -36,6 +37,7 @@ impl State {
         Self {
             cache,
             loaded_at: None,
+            loading: None,
             visible: HashSet::new(),
             refreshed: HashMap::new(),
             revisions: HashMap::new(),
@@ -48,7 +50,12 @@ impl State {
             receiver,
         }
     }
-    pub fn forget(&mut self, id: &str, storage: &Storage) -> anyhow::Result<()> {
+    pub fn forget(
+        &mut self,
+        id: &str,
+        storage: &Storage,
+        writer: &cache_io::Writer,
+    ) -> anyhow::Result<()> {
         if let Some(cancel) = self.pending.remove(id) {
             cancel.cancel();
         }
@@ -58,7 +65,7 @@ impl State {
         self.branches.remove(id);
         self.stale.remove(id);
         self.history.remove(id);
-        self.save(storage)
+        self.queue_save(storage, writer)
     }
     #[cfg(test)]
     pub fn get(&self, id: &str) -> Option<&SessionPr> {
@@ -96,6 +103,15 @@ impl State {
             false
         }
     }
+    fn queue_save(&self, storage: &Storage, writer: &cache_io::Writer) -> anyhow::Result<()> {
+        let storage = storage.clone();
+        let cache = self.cache.clone();
+        writer.save("session PRs".into(), move || {
+            std::fs::create_dir_all(&storage.cache)?;
+            pr_cache::save_links(&storage, &storage.cache.join("agent-prs.json"), &cache)
+        })
+    }
+    #[cfg(test)]
     fn save(&self, storage: &Storage) -> anyhow::Result<()> {
         std::fs::create_dir_all(&storage.cache)?;
         pr_cache::save_links(storage, &storage.cache.join("agent-prs.json"), &self.cache)
@@ -139,31 +155,62 @@ impl Ui {
                 self.prs.refreshed.remove(&session.id);
             }
         }
-        let previous = self.prs.cache.clone();
-        let previous_stale = self.prs.stale.clone();
-        let mut changed = false;
-        if self
-            .prs
-            .loaded_at
-            .is_none_or(|at| at.elapsed() >= Duration::from_secs(5))
+        if visible
+            && self.prs.loading.is_none()
+            && self
+                .prs
+                .loaded_at
+                .is_none_or(|at| at.elapsed() >= Duration::from_secs(5))
         {
             self.prs.loaded_at = Some(Instant::now());
-            for (id, links) in pr_cache::load_links(&self.storage.cache.join(SESSION_LINKS)) {
-                if self.summaries.iter().any(|s| s.id == id) {
-                    pr_cache::merge_links(self.prs.cache.entry(id).or_default(), links);
-                    changed = true;
+            let storage = self.storage.clone();
+            let summaries = self.summaries.clone();
+            let mut cache = self.prs.cache.clone();
+            let (sender, receiver) = mpsc::channel();
+            self.prs.loading = Some(receiver);
+            thread::spawn(move || {
+                for (id, links) in pr_cache::load_links(&storage.cache.join(SESSION_LINKS)) {
+                    pr_cache::merge_links(cache.entry(id).or_default(), links);
                 }
-            }
-            for links in self.prs.cache.values_mut() {
-                pr_cache::hydrate_links(&self.storage, links);
-            }
-            for session in &self.summaries {
-                let saved = pr_cache::snapshot(&self.storage, &session.id);
-                if let Some(links) = self.prs.cache.get_mut(&session.id) {
-                    let before = links.len();
-                    saved.retain_connected(links);
-                    changed |= before != links.len();
+                let snapshots = summaries
+                    .into_iter()
+                    .map(|session| {
+                        let mut saved = pr_cache::snapshot(&storage, &session.id);
+                        let mut links = cache.remove(&session.id).unwrap_or_default();
+                        pr_cache::hydrate_links(&storage, &mut links);
+                        saved.retain_connected(&mut links);
+                        pr_cache::merge_links(&mut links, saved.links);
+                        saved.links = links;
+                        (session, saved)
+                    })
+                    .collect();
+                let _ = sender.send(snapshots);
+                crate::repaint::request();
+            });
+        }
+        let disk = self
+            .prs
+            .loading
+            .as_ref()
+            .and_then(|receiver| receiver.try_recv().ok());
+        if disk.is_some() {
+            self.prs.loading = None;
+        }
+        let updates = self.prs.receiver.try_iter().collect::<Vec<_>>();
+        if disk.is_some() || !updates.is_empty() {
+            let previous = self.prs.cache.clone();
+            let previous_stale = self.prs.stale.clone();
+            for (session, saved) in disk.into_iter().flatten() {
+                // A checkout switch or deletion invalidates in-flight disk reads.
+                if !self.summaries.iter().any(|current| {
+                    current.id == session.id
+                        && current.workspace_revision == session.workspace_revision
+                }) || self.deleting.contains(&session.id)
+                {
+                    continue;
                 }
+                let links = self.prs.cache.entry(session.id.clone()).or_default();
+                saved.retain_connected(links);
                 self.prs
                     .branches
                     .insert(session.id.clone(), saved.branch.clone());
@@ -176,52 +223,43 @@ impl Ui {
                 } else {
                     self.prs.stale.remove(&session.id);
                 }
-                pr_cache::merge_links(
-                    self.prs.cache.entry(session.id.clone()).or_default(),
-                    saved.links,
-                );
+                pr_cache::merge_links(links, saved.links);
             }
-        }
-        while let Ok(mut update) = self.prs.receiver.try_recv() {
-            let saved = pr_cache::snapshot(&self.storage, &update.id);
-            if update.revision < saved.disconnected_before {
-                continue;
-            }
-            if let Ok(links) = &mut update.result {
-                saved.retain_connected(links);
-            }
-            if self.summaries.iter().any(|s| {
-                s.id == update.id
-                    && s.workspace == update.workspace
-                    && s.workspace_revision == update.revision
-            }) {
-                changed |= self.prs.receive(update);
-            }
-        }
-        for session in &self.summaries {
-            if let Some(links) = self.prs.cache.get_mut(&session.id) {
-                let branch = self
-                    .prs
-                    .branches
-                    .get(&session.id)
-                    .map(|b| b.as_deref())
-                    .unwrap_or(session.branch.as_deref());
-                pr_cache::sort_links(links, &session.workspace, branch);
-            }
-        }
-        for session in &self.summaries {
-            if previous.get(&session.id) != self.prs.cache.get(&session.id)
-                || previous_stale.contains(&session.id) != self.prs.stale(&session.id)
-            {
-                crate::repaint::request();
-                self.sidebar.invalidate(&session.id);
-                if self.selected.as_ref() == Some(&session.id) {
-                    self.changes_at = None;
+            for update in updates {
+                if self.summaries.iter().any(|s| {
+                    s.id == update.id
+                        && s.workspace == update.workspace
+                        && s.workspace_revision == update.revision
+                }) && !self.deleting.contains(&update.id)
+                {
+                    self.prs.receive(update);
                 }
             }
-        }
-        if changed && let Err(error) = self.prs.save(&self.storage) {
-            self.notice = Some((format!("Cannot cache session PRs: {error:#}"), true));
+            for session in &self.summaries {
+                if let Some(links) = self.prs.cache.get_mut(&session.id) {
+                    let branch = self
+                        .prs
+                        .branches
+                        .get(&session.id)
+                        .map(|b| b.as_deref())
+                        .unwrap_or(session.branch.as_deref());
+                    pr_cache::sort_links(links, &session.workspace, branch);
+                }
+                if previous.get(&session.id) != self.prs.cache.get(&session.id)
+                    || previous_stale.contains(&session.id) != self.prs.stale(&session.id)
+                {
+                    crate::repaint::request();
+                    self.sidebar.invalidate(&session.id);
+                    if self.selected.as_ref() == Some(&session.id) {
+                        self.changes_at = None;
+                    }
+                }
+            }
+            if previous != self.prs.cache
+                && let Err(error) = self.prs.queue_save(&self.storage, &self.cache_writer)
+            {
+                self.notice = Some((format!("Cannot cache session PRs: {error:#}"), true));
+            }
         }
         let opened = if visible && self.drilled {
             self.selected.clone()
@@ -271,12 +309,20 @@ impl Ui {
             self.prs.pending.insert(id.clone(), cancel.clone());
             let sender = self.prs.sender.clone();
             thread::spawn(move || {
-                let result = pr_cache::refresh_session(&storage, &summary, known, refresh, &cancel)
-                    .map_err(|e| format!("{e:#}"));
+                let mut result =
+                    pr_cache::refresh_session(&storage, &summary, known, refresh, &cancel)
+                        .map_err(|e| format!("{e:#}"));
+                let saved = pr_cache::snapshot(&storage, &summary.id);
+                if summary.workspace_revision < saved.disconnected_before {
+                    return;
+                }
+                if let Ok(links) = &mut result {
+                    saved.retain_connected(links);
+                }
                 let _ = sender.send(Update {
                     id,
                     workspace,
-                    branch: pr_cache::snapshot(&storage, &summary.id).branch,
+                    branch: saved.branch,
                     revision: summary.workspace_revision,
                     result,
                 });
@@ -457,7 +503,7 @@ mod tests {
             ui.positions.get("one").context("position")?.draft.text(),
             "[]"
         );
-        ui.prs.forget("one", &storage)?;
+        ui.prs.forget("one", &storage, &ui.cache_writer)?;
         ui.sync_change_pr("one");
         assert!(ui.change_source("one").pr.is_none());
         assert!(!ui.changes.contains_key("one"));

@@ -1,6 +1,7 @@
 use super::*;
 
 const COMMANDS: &[(&str, &str)] = &[
+    ("slack", "Connect Slack to the difu orchestrator"),
     ("voice", "Configure hold-Space dictation and API key"),
     ("compact", "Compact the current conversation"),
     ("model", "Choose a model"),
@@ -343,6 +344,7 @@ impl Ui {
             return;
         }
         match name.as_str() {
+            "/slack" => self.open_slack(),
             "/voice" => self.open_voice(),
             "/compact" => self.control(Control::Compact),
             "/model" => self.open_model(0),
@@ -388,6 +390,7 @@ impl Ui {
     }
     fn run_command_arguments(&mut self, name: &str, args: &str) {
         match name {
+            "/slack" => self.open_slack(),
             "/rules" => self.open_rules(Some(args.into())),
             "/repo" => self.change_repository(args),
             "/worktree" => self.register_worktree(args),

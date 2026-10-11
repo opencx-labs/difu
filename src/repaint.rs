@@ -5,6 +5,7 @@ use std::{
 };
 
 static REVISION: AtomicU64 = AtomicU64::new(0);
+pub const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
 pub(crate) fn request() {
     REVISION.fetch_add(1, Ordering::Relaxed);
 }
@@ -27,6 +28,20 @@ impl Schedule {
     }
     pub fn invalidate(&mut self) {
         self.dirty = true;
+    }
+    pub fn wait(&self, now: Instant, focused: bool, timer: Option<Duration>) -> Duration {
+        let idle = Duration::from_millis(50);
+        if !focused {
+            return idle;
+        }
+        if self.dirty {
+            return Duration::ZERO;
+        }
+        timer.map_or(idle, |interval| {
+            interval
+                .saturating_sub(now.duration_since(self.drawn))
+                .min(idle)
+        })
     }
     pub fn due(
         &mut self,
@@ -54,6 +69,27 @@ impl Schedule {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn animation_deadlines_and_input_do_not_wait_for_idle_polling() {
+        let now = Instant::now();
+        let mut schedule = Schedule::new(now);
+        assert_eq!(schedule.wait(now, true, None), Duration::ZERO);
+        assert!(schedule.due(now, 0, true, None));
+        assert_eq!(
+            schedule.wait(now, true, Some(FRAME_INTERVAL)),
+            FRAME_INTERVAL
+        );
+        assert_eq!(
+            schedule.wait(now + FRAME_INTERVAL, true, Some(FRAME_INTERVAL)),
+            Duration::ZERO
+        );
+        assert_eq!(
+            schedule.wait(now, false, Some(FRAME_INTERVAL)),
+            Duration::from_millis(50)
+        );
+        schedule.invalidate();
+        assert!(schedule.due(now, 0, true, Some(FRAME_INTERVAL)));
+    }
     #[test]
     fn unchanged_idle_views_sleep_but_input_results_and_focus_return_redraw() {
         let now = Instant::now();

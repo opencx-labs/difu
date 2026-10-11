@@ -1,6 +1,7 @@
 //! Native session UI. Network/process work is performed off the terminal thread.
 use super::*;
 mod browser;
+mod cache_io;
 mod changes;
 mod commands;
 mod defaults;
@@ -16,10 +17,12 @@ mod rules;
 mod selection;
 mod sends;
 mod sidebar;
+mod slack;
 mod transcript;
 mod transcript_window;
 mod usage;
 mod voice;
+mod watch;
 use crate::{
     editor::Editor,
     storage::{Config, Storage},
@@ -31,7 +34,7 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -139,6 +142,9 @@ enum Action {
     EditQueued(usize),
     SaveQueued(bool),
     QuestionTab(usize),
+    SlackField(usize),
+    SlackSave,
+    SlackDisable,
     VoiceField,
     VoiceSave,
     VoiceToggle,
@@ -165,6 +171,7 @@ enum Action {
     DismissNotice,
 }
 pub enum Modal {
+    Slack(slack::Settings),
     Transcript {
         entry: String,
         scroll: usize,
@@ -235,10 +242,6 @@ pub enum Modal {
         scroll: usize,
     },
     Delete,
-    Deleting {
-        id: String,
-        stage: DeletionStage,
-    },
     Help(crate::help::State),
 }
 struct ResultMessage {
@@ -295,7 +298,8 @@ pub struct Ui {
     refreshed: Option<Instant>,
     changes_at: Option<Instant>,
     listing: bool,
-    reading: bool,
+    watch: Option<watch::Watch>,
+    cache_writer: cache_io::Writer,
     changing: Option<(changes::Source, u64)>,
     change_request: u64,
     pub busy: bool,
@@ -303,6 +307,7 @@ pub struct Ui {
     send_repaint: bool,
     send_queues: HashMap<String, VecDeque<(u64, Control)>>,
     interrupting: HashSet<String>,
+    deleting: HashSet<String>,
     question_send: Option<(String, Value, String, usize)>,
     question_reveal: bool,
     question_note_focused: bool,
@@ -325,6 +330,7 @@ pub struct Ui {
     paths_loading: HashSet<String>,
     sidebar: sidebar::State,
     voice: voice::State,
+    slack: slack::State,
     model_completion: models::State,
     toast_rect: Rect,
     media_pending: Option<(String, mpsc::Receiver<Result<super::media::Paste, String>>)>,
@@ -359,7 +365,8 @@ impl Ui {
             refreshed: None,
             changes_at: None,
             listing: false,
-            reading: false,
+            watch: None,
+            cache_writer: Default::default(),
             changing: None,
             change_request: 0,
             busy: false,
@@ -367,6 +374,7 @@ impl Ui {
             send_repaint: false,
             send_queues: HashMap::new(),
             interrupting: HashSet::new(),
+            deleting: HashSet::new(),
             question_send: None,
             question_reveal: true,
             question_note_focused: false,
@@ -388,6 +396,7 @@ impl Ui {
             workspace_paths: HashMap::new(),
             paths_loading: HashSet::new(),
             voice: voice::State::new(config.voice_enabled),
+            slack: slack::State::default(),
             model_completion: models::State::default(),
             toast_rect: Rect::default(),
             media_pending: None,
@@ -409,10 +418,18 @@ impl Ui {
     }
     pub fn redraw_interval(&self) -> Option<Duration> {
         if self.voice_active() {
-            return Some(Duration::from_millis(50));
+            return Some(crate::repaint::FRAME_INTERVAL);
         }
-        if self.busy || self.notice.is_some() || self.summaries.iter().any(|s| s.status.active()) {
-            return Some(Duration::from_secs(1));
+        if self.busy
+            || !self.deleting.is_empty()
+            || self.notice.is_some()
+            || self.summaries.iter().any(|s| {
+                s.status.active()
+                    && (self.selected.as_ref() == Some(&s.id)
+                        || self.list_visible && self.prs.visible.contains(&s.id))
+            })
+        {
+            return Some(crate::repaint::FRAME_INTERVAL);
         }
         if let Some(panels::View::PullRequest { app }) = &self.panels.view {
             return app.redraw_interval();
@@ -420,6 +437,10 @@ impl Ui {
         None
     }
     pub fn tick(&mut self, visible: bool) {
+        if let Some(error) = self.cache_writer.error() {
+            self.notice = Some((error, true));
+        }
+        self.tick_watch(visible);
         self.tick_selection_click();
         self.tick_panels(visible);
         self.tick_prs(visible);
@@ -431,6 +452,7 @@ impl Ui {
         self.tick_rules();
         self.tick_media();
         self.tick_voice(visible);
+        self.tick_slack();
         while let Ok(message) = self.receiver.try_recv() {
             let unchanged = match (&message.kind, &message.result) {
                 (Task::List, Ok(Reply::Sessions(sessions))) => {
@@ -463,13 +485,14 @@ impl Ui {
                     self.listing = false;
                     self.refreshed = Some(Instant::now());
                 }
-                Task::Read(_) => self.reading = false,
+                Task::Read(_) => {}
                 Task::Changes(..) => {}
-                Task::Launch
-                | Task::Repository(_)
-                | Task::Worktree(_)
-                | Task::Action
-                | Task::Delete(_) => self.busy = false,
+                Task::Launch | Task::Repository(_) | Task::Worktree(_) | Task::Action => {
+                    self.busy = false
+                }
+                Task::Delete(id) => {
+                    self.deleting.remove(id);
+                }
                 Task::Interrupt(id) => {
                     self.interrupting.remove(id);
                 }
@@ -545,10 +568,17 @@ impl Ui {
             }
             match message.result {
                 Err(error) => {
-                    if let Task::Delete(id) = &message.kind
-                        && matches!(&self.modal, Some(Modal::Deleting { id: deleting, .. }) if deleting == id)
-                    {
-                        self.modal = Some(Modal::Delete);
+                    if let Task::Delete(id) = &message.kind {
+                        let title = self
+                            .summaries
+                            .iter()
+                            .find(|s| &s.id == id)
+                            .map(|s| s.title.as_str())
+                            .unwrap_or(id);
+                        self.notice = Some((format!("Could not delete {title}: {error}"), true));
+                        self.refreshed = None;
+                        self.ensure_selected();
+                        continue;
                     }
                     if matches!(message.kind, Task::Question) {
                         self.question_send = None;
@@ -574,7 +604,7 @@ impl Ui {
                             continue;
                         }
                         self.sidebar.counts.insert(id, stats);
-                        if let Err(error) = self.sidebar.save(&self.storage) {
+                        if let Err(error) = self.sidebar.save(&self.storage, &self.cache_writer) {
                             self.notice =
                                 Some((format!("Cannot cache session statistics: {error:#}"), true));
                         }
@@ -587,7 +617,15 @@ impl Ui {
                             self.skills.insert(id, (skills, errors));
                         }
                     }
-                    (Task::List, Reply::Sessions(sessions)) => {
+                    (Task::List, Reply::Sessions(mut sessions)) => {
+                        // List replies may race a newer subscription snapshot.
+                        for summary in &mut sessions {
+                            if let Some(current) = self.sessions.get(&summary.id)
+                                && current.version > summary.version
+                            {
+                                *summary = current.summary();
+                            }
+                        }
                         self.sidebar.observe(&sessions);
                         if let Some(id) = self.selected.clone()
                             && self.summaries.iter().any(|s| s.id == id)
@@ -598,8 +636,8 @@ impl Ui {
                             self.positions.remove(&id);
                             self.changes.remove(&id);
                             self.sidebar.counts.remove(&id);
-                            let _ = self.sidebar.save(&self.storage);
-                            let _ = self.prs.forget(&id, &self.storage);
+                            let _ = self.sidebar.save(&self.storage, &self.cache_writer);
+                            let _ = self.prs.forget(&id, &self.storage, &self.cache_writer);
                             self.question_send = None;
                             self.busy = false;
                             self.panels = panels::Panels::new(self.panels.right);
@@ -616,9 +654,9 @@ impl Ui {
                         self.skills.remove(&id);
                         self.workspace_paths.remove(&id);
                         self.changes.remove(&id);
-                        self.sidebar = sidebar::State::load(&self.storage);
                         self.sidebar.counts.remove(&id);
-                        if let Err(error) = self.prs.forget(&id, &self.storage) {
+                        if let Err(error) = self.prs.forget(&id, &self.storage, &self.cache_writer)
+                        {
                             self.notice =
                                 Some((format!("Cannot clear cached PR: {error:#}"), true));
                         }
@@ -637,21 +675,12 @@ impl Ui {
                         {
                             continue;
                         }
-                        if let Some(Modal::Deleting {
-                            id: deleting,
-                            stage,
-                        }) = &mut self.modal
-                            && deleting == &id
-                            && let Some(progress) = session.deletion_progress
-                        {
-                            *stage = progress;
-                        }
                         if !session.workspace_ready
                             && self.sessions.get(&id).is_some_and(|old| {
                                 old.workspace_revision != session.workspace_revision
                             })
                         {
-                            let _ = self.prs.forget(&id, &self.storage);
+                            let _ = self.prs.forget(&id, &self.storage, &self.cache_writer);
                             if self.selected.as_ref() == Some(&id) {
                                 self.panels = panels::Panels::new(self.panels.right);
                             }
@@ -691,6 +720,9 @@ impl Ui {
                             self.modal = None;
                         }
                         self.sessions.insert(id.clone(), *session);
+                        if let Some(summary) = self.summaries.iter_mut().find(|s| s.id == id) {
+                            *summary = self.sessions[&id].summary();
+                        }
                         self.question_received(&id);
                     }
                     (
@@ -718,7 +750,6 @@ impl Ui {
                         self.modal = Some(Modal::Repository(Editor::default()));
                     }
                     (Task::Launch, Reply::Launched(id)) => {
-                        self.reading = true;
                         self.task(
                             Task::Read(id.clone()),
                             Request::Read {
@@ -747,16 +778,13 @@ impl Ui {
                     (Task::Delete(id), Reply::Ok) => {
                         self.panels.shells.remove(&id);
                         self.sidebar.counts.remove(&id);
-                        let _ = self.sidebar.save(&self.storage);
+                        let _ = self.sidebar.save(&self.storage, &self.cache_writer);
                         self.sessions.remove(&id);
                         self.send_queues.remove(&id);
                         self.positions.remove(&id);
                         self.changes.remove(&id);
                         self.summaries.retain(|s| s.id != id);
-                        self.selected = None;
-                        self.drilled = false;
-                        self.modal = None;
-                        self.busy = false;
+                        let _ = self.prs.forget(&id, &self.storage, &self.cache_writer);
                         self.refreshed = None;
                         self.ensure_selected();
                         self.notice = Some(("Chat deleted".into(), false));
@@ -789,23 +817,6 @@ impl Ui {
         if visible && let Some(id) = self.selected.clone() {
             self.sync_change_pr(&id);
             let source = self.change_source(&id);
-            let wanted = self
-                .summaries
-                .iter()
-                .find(|s| s.id == id)
-                .map(|s| s.version);
-            let have = self.sessions.get(&id).map(|s| s.version);
-            if !self.reading && (have.is_none() || wanted != have) {
-                self.reading = true;
-                self.task(
-                    Task::Read(id.clone()),
-                    Request::Read {
-                        id: id.clone(),
-                        version: have,
-                    },
-                    false,
-                );
-            }
             if self.drilled
                 && self.changes_visible
                 && self
@@ -838,16 +849,30 @@ impl Ui {
             .filter(|s| s.kind != "Guide" && s.archived == self.archived)
             .cloned()
             .collect::<Vec<_>>();
-        sessions.sort_by_key(|s| !self.pinned_sessions.contains(&s.id));
+        sessions.sort_by_key(|s| {
+            (
+                s.kind != "Orchestrator",
+                !self.pinned_sessions.contains(&s.id),
+            )
+        });
         sessions
     }
     fn ensure_selected(&mut self) {
-        let list = self.filtered();
+        let list = self.selectable();
         if !list.iter().any(|s| Some(&s.id) == self.selected.as_ref()) && !self.drilled {
             self.selected = list.first().map(|s| s.id.clone());
         }
     }
+    fn selectable(&self) -> Vec<Summary> {
+        self.filtered()
+            .into_iter()
+            .filter(|s| !self.deleting.contains(&s.id))
+            .collect()
+    }
     fn select(&mut self, id: String) {
+        if self.deleting.contains(&id) {
+            return;
+        }
         let changed = self.selected.as_ref() != Some(&id);
         if changed && self.inline_question() {
             self.remember_answers();
@@ -876,7 +901,7 @@ impl Ui {
         self.text_selection.clear();
     }
     fn move_list(&mut self, delta: i32) {
-        let list = self.filtered();
+        let list = self.selectable();
         let current = list
             .iter()
             .position(|s| Some(&s.id) == self.selected.as_ref())
@@ -1054,6 +1079,9 @@ impl Ui {
         }
     }
     pub(crate) fn open_session(&mut self, id: String) {
+        if self.deleting.contains(&id) {
+            return;
+        }
         self.archived = self
             .summaries
             .iter()
@@ -1275,9 +1303,6 @@ impl Ui {
         }
     }
     pub fn key(&mut self, key: KeyEvent) {
-        if matches!(self.modal, Some(Modal::Deleting { .. })) {
-            return;
-        }
         // Release events terminate hold-to-dictate, but never navigate or submit.
         if key.kind == crossterm::event::KeyEventKind::Release {
             self.voice_key(key);
@@ -1861,6 +1886,7 @@ impl Ui {
             return;
         }
         match &mut self.modal {
+            Some(Modal::Slack(_)) => self.slack_paste(text),
             Some(Modal::RepositoryRules(_)) => self.rules_paste(text),
             Some(Modal::AgentDefaults(form)) => {
                 if let Some(editor) = form.fields.get_mut(form.field) {
@@ -1907,7 +1933,8 @@ impl Ui {
         }
     }
     fn modal_key(&mut self, key: KeyEvent) {
-        if matches!(self.modal, Some(Modal::Deleting { .. })) {
+        if matches!(self.modal, Some(Modal::Slack(_))) {
+            self.slack_key(key);
             return;
         }
         if matches!(self.modal, Some(Modal::Usage { .. })) {
@@ -2018,12 +2045,16 @@ impl Ui {
                 }
             }
             Some(Modal::Delete) if key.code == KeyCode::Enter => {
-                if let Some(id) = self.selected.clone() {
-                    self.busy = true;
-                    self.modal = Some(Modal::Deleting {
-                        id: id.clone(),
-                        stage: DeletionStage::Stopping,
-                    });
+                if let Some(id) = self.selected.clone()
+                    && self.deleting.insert(id.clone())
+                {
+                    self.modal = None;
+                    self.selected = None;
+                    self.drilled = false;
+                    self.focus = Focus::List;
+                    self.panels = panels::Panels::new(self.panels.right);
+                    self.text_selection.clear();
+                    self.ensure_selected();
                     self.task(Task::Delete(id.clone()), Request::Delete { id }, false);
                 }
             }
@@ -2118,10 +2149,20 @@ impl Ui {
             Action::RulesSave => self.save_rules(),
             Action::RulesCancel => self.close_rules(),
             Action::Select(id) => {
+                if self.deleting.contains(&id) {
+                    return;
+                }
                 self.select(id);
                 self.focus = Focus::List;
             }
             Action::Open => {
+                if self
+                    .selected
+                    .as_ref()
+                    .is_none_or(|id| self.deleting.contains(id))
+                {
+                    return;
+                }
                 self.follow_latest();
                 self.drilled = true;
                 self.focus = Focus::Composer;
@@ -2171,6 +2212,13 @@ impl Ui {
             Action::QueueEditorFocus => {
                 if let Some(Modal::QueuedEdit { focus, .. }) = &mut self.modal {
                     *focus = 0;
+                }
+            }
+            Action::SlackSave => self.save_slack(),
+            Action::SlackDisable => self.disable_slack(),
+            Action::SlackField(index) => {
+                if let Some(Modal::Slack(form)) = &mut self.modal {
+                    form.field = index;
                 }
             }
             Action::VoiceSave => self.save_voice_key(),
@@ -2644,6 +2692,7 @@ impl Ui {
             }
             let height = heights.get(index).copied().unwrap_or(4);
             let selected = Some(&session.id) == self.selected.as_ref();
+            let deleting = self.deleting.contains(&session.id);
             let row = Rect::new(
                 items.x,
                 items.y.saturating_add(offset as u16),
@@ -2652,11 +2701,15 @@ impl Ui {
             );
             offset += height;
             visible_pr_sessions.push(session.id.clone());
-            let color = match session.status {
-                Status::Failed => RED,
-                Status::Waiting => ACCENT,
-                Status::Completed | Status::Idle => GREEN,
-                _ => DIM,
+            let color = if deleting {
+                DIM
+            } else {
+                match session.status {
+                    Status::Failed => RED,
+                    Status::Waiting => ACCENT,
+                    Status::Completed | Status::Idle => GREEN,
+                    _ => DIM,
+                }
             };
             let elapsed = if session.status.active() {
                 session
@@ -2675,17 +2728,22 @@ impl Ui {
             } else {
                 String::new()
             };
-            let status = format!(
-                "{}{}{}",
-                session.status.label(),
-                elapsed,
-                if session.archived { " · archived" } else { "" }
-            );
-            let pin = if self.pinned_sessions.contains(&session.id) {
-                "◆ "
+            let status = if deleting {
+                "Being deleted…".into()
             } else {
-                ""
+                format!(
+                    "{}{}{}",
+                    session.status.label(),
+                    elapsed,
+                    if session.archived { " · archived" } else { "" }
+                )
             };
+            let pin =
+                if session.kind == "Orchestrator" || self.pinned_sessions.contains(&session.id) {
+                    "◆ "
+                } else {
+                    ""
+                };
             let title_width = usize::from(row.width)
                 .saturating_sub(2 + unicode_width::UnicodeWidthStr::width(pin));
             let mut lines = vec![
@@ -2695,7 +2753,13 @@ impl Ui {
                         if selected { "›" } else { " " },
                         crate::ui::crop(&session.title, 0, title_width)
                     ),
-                    Style::default().fg(if selected { ACCENT } else { TEXT }),
+                    Style::default().fg(if deleting {
+                        DIM
+                    } else if selected {
+                        ACCENT
+                    } else {
+                        TEXT
+                    }),
                 )),
                 Line::from(Span::styled(
                     format!(
@@ -2754,7 +2818,9 @@ impl Ui {
                 }),
                 row,
             );
-            self.hits.push((row, Action::Select(session.id.clone())));
+            if !deleting {
+                self.hits.push((row, Action::Select(session.id.clone())));
+            }
         }
         if list.is_empty() {
             frame.render_widget(
@@ -3094,6 +3160,7 @@ impl Ui {
             Some(Modal::InstallBrowser { .. }) => "Optional HTML preview · Esc cancels",
             Some(Modal::AgentDefaults(_)) => "New agent defaults · Tab fields · Esc cancels",
             Some(Modal::RepositoryRules(_)) => "Repository rules · Tab fields",
+            Some(Modal::Slack(_)) => "Slack setup · Tab fields · Esc closes",
             Some(Modal::Voice { .. }) => "Voice settings",
             Some(Modal::Repository(_)) => "Choose and remember your default repository",
             Some(Modal::ChangeRepository(_)) => "Change session repository",
@@ -3112,7 +3179,6 @@ impl Ui {
             }) => "HTML artifacts · Enter open",
             Some(Modal::Resources { .. }) => "Open shells · Enter view",
             Some(Modal::Delete) => "Stop and delete chat",
-            Some(Modal::Deleting { .. }) => "Deleting session",
             Some(Modal::Help(_)) => "Search agent shortcuts",
             None => "",
         };
@@ -3179,6 +3245,10 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::Voice { .. })) {
             self.draw_voice_settings(frame, area);
+            return;
+        }
+        if matches!(self.modal, Some(Modal::Slack(_))) {
+            self.draw_slack(frame, area);
             return;
         }
         if matches!(self.modal, Some(Modal::Usage { .. })) {
@@ -3280,20 +3350,6 @@ impl Ui {
             }
             Some(Modal::Delete) => {
                 frame.render_widget(Paragraph::new("Stop this agent and permanently delete its difu chat, saved questions, queue, and attachments? Its unlocked difu-owned worktree will also be removed, including all uncommitted, untracked, and ignored files. Existing directories, named branches, commits, and native provider history are not deleted.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
-            }
-            Some(Modal::Deleting { stage, .. }) => {
-                let (percent, label) = stage.progress();
-                frame.render_widget(
-                    Paragraph::new(label).wrap(Wrap { trim: false }),
-                    Rect::new(area.x, area.y, area.width, area.height.min(2)),
-                );
-                frame.render_widget(
-                    Gauge::default()
-                        .gauge_style(Style::default().fg(GREEN).bg(BG))
-                        .percent(percent)
-                        .label(format!("{percent}%")),
-                    Rect::new(area.x, area.y.saturating_add(3), area.width, 1).intersection(area),
-                );
             }
             Some(Modal::Help(state)) => {
                 let search = Rect::new(area.x, area.y, area.width, 3.min(area.height));
@@ -3489,6 +3545,7 @@ impl Ui {
             Some(
                 Modal::AgentDefaults(_)
                 | Modal::RepositoryRules(_)
+                | Modal::Slack(_)
                 | Modal::Voice { .. }
                 | Modal::Commands { .. }
                 | Modal::Status
@@ -3685,58 +3742,140 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn deletion_modal_shows_server_progress_and_recovers_from_failure() -> Result<()> {
+    fn deletion_runs_without_blocking_and_preserves_current_activity() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        for fails in [false, true] {
+            for with_other_session in [false, true] {
+                let dir = tempfile::tempdir()?;
+                let storage = Storage {
+                    config: dir.path().join("config.json"),
+                    cache: dir.path().join("cache"),
+                };
+                let listener = UnixListener::bind(super::super::server::socket(&storage)?)?;
+                let (release, hold) = mpsc::channel();
+                let worker = thread::spawn(move || -> Result<()> {
+                    let (mut stream, _) = listener.accept()?;
+                    let mut line = String::new();
+                    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+                    assert!(
+                        matches!(serde_json::from_str::<Request>(&line)?, Request::Delete { id } if id == "one")
+                    );
+                    hold.recv_timeout(Duration::from_secs(5))?;
+                    let reply = if fails {
+                        Reply::Error("Worktree is locked".into())
+                    } else {
+                        Reply::Ok
+                    };
+                    serde_json::to_writer(&mut stream, &reply)?;
+                    stream.write_all(b"\n")?;
+                    Ok(())
+                });
+                let mut ui = state(storage);
+                if with_other_session {
+                    let mut other = ui.sessions.get("one").context("session")?.clone();
+                    other.id = "two".into();
+                    ui.summaries.push(other.summary());
+                    ui.sessions.insert(other.id.clone(), other);
+                }
+                ui.drilled = true;
+                ui.modal = Some(Modal::Delete);
+                ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                assert!(ui.modal.is_none());
+                assert!(!ui.busy && !ui.drilled);
+                assert!(ui.deleting.contains("one"));
+                assert_eq!(ui.focus, Focus::List);
+                let selected = with_other_session.then_some("two");
+                assert_eq!(ui.selected.as_deref(), selected);
+                let (screen, _) = draw(&mut ui, 120, 30)?;
+                assert!(screen.contains("Being deleted…"));
+                assert!(!screen.contains("Enter confirms"));
+                for (_, action) in &ui.hits {
+                    assert!(!matches!(action, Action::Select(id) if id == "one"));
+                }
+                ui.action(Action::Select("one".into()));
+                ui.open_session("one".into());
+                ui.move_list(-1);
+                ui.ensure_selected();
+                assert_eq!(ui.selected.as_deref(), selected);
+                assert!(!ui.drilled);
+                if with_other_session {
+                    ui.open_session("two".into());
+                    ui.paste("Continue other work");
+                    assert_eq!(
+                        ui.positions.get("two").context("draft")?.draft.text(),
+                        "Continue other work"
+                    );
+                }
+                // Completion must not close a new dialog or clear another task's busy flag.
+                ui.modal = Some(Modal::Help(Default::default()));
+                ui.busy = true;
+                release.send(())?;
+                let response = ui.receiver.recv_timeout(Duration::from_secs(5))?;
+                ui.sender.send(response)?;
+                ui.tick(false);
+                worker
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("Fixture panicked"))??;
+                assert!(ui.deleting.is_empty());
+                assert!(ui.busy && matches!(ui.modal, Some(Modal::Help(_))));
+                assert_eq!(ui.drilled, with_other_session);
+                assert_eq!(ui.sessions.contains_key("one"), fails);
+                assert_eq!(ui.summaries.iter().any(|s| s.id == "one"), fails);
+                if with_other_session {
+                    assert_eq!(ui.selected.as_deref(), Some("two"));
+                    assert_eq!(ui.focus, Focus::Composer);
+                    assert_eq!(
+                        ui.positions.get("two").context("draft")?.draft.text(),
+                        "Continue other work"
+                    );
+                }
+                if fails {
+                    let (notice, error) = ui.notice.as_ref().context("error notice")?;
+                    assert!(*error && notice.contains("Worktree is locked"));
+                    ui.open_session("one".into());
+                    assert_eq!(ui.selected.as_deref(), Some("one"));
+                    assert!(ui.drilled);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn keyboard_skips_deleting_sessions_and_each_deletion_finishes_independently() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut ui = state(Storage {
             config: dir.path().join("config.json"),
             cache: dir.path().join("cache"),
         });
-        ui.busy = true;
-        ui.modal = Some(Modal::Deleting {
-            id: "one".into(),
-            stage: DeletionStage::Stopping,
-        });
-        for stage in [
-            DeletionStage::Stopping,
-            DeletionStage::Worktree,
-            DeletionStage::Attachments,
-            DeletionStage::History,
-        ] {
-            let mut session = ui.sessions.get("one").context("session")?.clone();
-            session.deletion_progress = Some(stage);
-            session.touch();
-            ui.sender.send(ResultMessage {
-                kind: Task::Read("one".into()),
-                result: Ok(Reply::Session(Box::new(session))),
-            })?;
-            ui.tick(false);
-            let (screen, _) = draw(&mut ui, 120, 30)?;
-            let (percent, label) = stage.progress();
-            assert!(screen.contains(label));
-            assert!(screen.contains(&format!("{percent}%")));
-            assert!(!screen.contains("Enter confirms"));
-            for key in [KeyCode::Enter, KeyCode::Esc] {
-                ui.key(KeyEvent::new(key, KeyModifiers::NONE));
-                assert!(matches!(ui.modal, Some(Modal::Deleting { .. })));
-            }
+        for id in ["two", "three", "four"] {
+            let mut other = ui.sessions.get("one").context("session")?.clone();
+            other.id = id.into();
+            ui.summaries.push(other.summary());
+            ui.sessions.insert(id.into(), other);
         }
+        ui.deleting.extend(["two".into(), "three".into()]);
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(ui.selected.as_deref(), Some("four"));
+        ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(ui.selected.as_deref(), Some("one"));
         ui.sender.send(ResultMessage {
-            kind: Task::Delete("one".into()),
-            result: Err("Worktree is locked".into()),
-        })?;
-        ui.tick(false);
-        assert!(!ui.busy && matches!(ui.modal, Some(Modal::Delete)));
-        assert_eq!(
-            ui.notice.as_ref().map(|n| n.0.as_str()),
-            Some("Worktree is locked")
-        );
-        assert!(ui.sessions.contains_key("one"));
-        ui.sender.send(ResultMessage {
-            kind: Task::Delete("one".into()),
+            kind: Task::Delete("two".into()),
             result: Ok(Reply::Ok),
         })?;
         ui.tick(false);
-        assert!(ui.modal.is_none() && !ui.sessions.contains_key("one"));
+        assert!(!ui.deleting.contains("two") && ui.deleting.contains("three"));
+        ui.select("three".into());
+        assert_eq!(ui.selected.as_deref(), Some("one"));
+        ui.sender.send(ResultMessage {
+            kind: Task::Delete("three".into()),
+            result: Err("Worktree is locked".into()),
+        })?;
+        ui.tick(false);
+        ui.select("three".into());
+        assert_eq!(ui.selected.as_deref(), Some("three"));
         Ok(())
     }
 
@@ -4838,6 +4977,26 @@ mod tests {
         assert_eq!(
             window.formatted, measured,
             "stationary repaint must reuse formatted rows"
+        );
+        session
+            .entries
+            .last_mut()
+            .context("last entry")?
+            .text
+            .push_str(" streamed");
+        session.touch();
+        window.render(session, &mut position, 80, 25, false);
+        assert_eq!(
+            window.formatted,
+            measured + 1,
+            "streaming must only reformat the changed message"
+        );
+        session.touch();
+        window.render(session, &mut position, 80, 25, false);
+        assert_eq!(
+            window.formatted,
+            measured + 1,
+            "metadata updates must preserve transcript rows"
         );
         let reference = transcript::render(session, &Position::default(), 80, false).0;
         let mut expected = reference.len().saturating_sub(25);
@@ -6487,7 +6646,8 @@ mod tests {
                 removed: 7,
             },
         );
-        ui.sidebar.save(&storage)?;
+        ui.sidebar.save(&storage, &ui.cache_writer)?;
+        ui.cache_writer.flush()?;
         assert_eq!(
             sidebar::State::load(&storage).counts.get("one").copied(),
             Some(DiffStatistics {

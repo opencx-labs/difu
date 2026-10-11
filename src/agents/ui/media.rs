@@ -1,6 +1,22 @@
 use super::*;
+fn save_draft(
+    writer: &cache_io::Writer,
+    storage: &Storage,
+    id: &str,
+    attachments: &[super::super::media::Attachment],
+) -> anyhow::Result<()> {
+    let storage = storage.clone();
+    let id = id.to_owned();
+    let attachments = attachments.to_vec();
+    writer.save(format!("attachment draft {id}"), move || {
+        super::super::media::save_draft(&storage, &id, &attachments)
+    })
+}
 impl Position {
     pub(super) fn active_attachments(&self) -> Vec<super::super::media::Attachment> {
+        if self.attachments.is_empty() {
+            return Vec::new();
+        }
         self.draft
             .attachment_tokens()
             .into_iter()
@@ -83,7 +99,7 @@ impl Ui {
         for (id, position) in &mut self.positions {
             let active = position.active_attachments();
             if position.media_loaded && active != position.saved_attachments {
-                match super::super::media::save_draft(&self.storage, id, &active) {
+                match save_draft(&self.cache_writer, &self.storage, id, &active) {
                     Ok(()) => position.saved_attachments = active,
                     Err(error) => {
                         self.notice =
@@ -124,7 +140,7 @@ impl Ui {
                     p.attachments.push(attachment);
                 }
                 let active = p.active_attachments();
-                if let Err(error) = super::super::media::save_draft(&self.storage, &id, &active) {
+                if let Err(error) = save_draft(&self.cache_writer, &self.storage, &id, &active) {
                     self.notice = Some((format!("Cannot save attachment draft: {error:#}"), true));
                     return;
                 }

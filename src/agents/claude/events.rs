@@ -68,7 +68,7 @@ fn block_entry(
         // A full assistant frame reconciles deltas; it does not finish a tool call.
         if entry.finished_at.is_none() || entry_kind != "mcpToolCall" {
             entry.text = content;
-            entry.data = data;
+            entry.replace_data(data);
         }
         if complete && entry_kind != "mcpToolCall" {
             entry.finished_at = Some(now);

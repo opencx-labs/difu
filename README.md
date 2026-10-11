@@ -164,8 +164,10 @@ Deleting a chat removes its unlocked difu-owned worktree, including modified,
 untracked, and ignored files. Existing and externally registered worktrees,
 Git branches and commits, and native provider history are retained. The separate
 worktree-only cleanup action still requires a clean worktree. Archive keeps the
-chat and worktree. While deleting, a progress bar shows shell shutdown, worktree
-removal, attachment deletion, and saved-chat cleanup.
+chat and worktree. Confirming deletion closes the dialog immediately. The session
+shows **Being deleted…** and cannot be selected while cleanup runs; other sessions
+remain usable. Successful deletion removes it from the list. If deletion fails,
+an error appears and the session becomes selectable again.
 
 Agents can call **difu_delete_session** when explicitly asked to delete their own
 session and managed worktree. It deletes the chat and attachments and discards
@@ -956,6 +958,57 @@ chapters by concern. The guide groups chapters in this order:
 Each group can contain multiple chapters with a divider between groups. Empty
 groups are omitted. Difu enforces the group order while preserving chapter order
 within each group.
+
+## Slack control (macOS)
+
+Open **Cmd+K → `/slack`** to connect your Slack app. Enter its bot token
+(`xoxb-`), Socket Mode app token (`xapp-`), your Slack member ID, and the channel
+ID. Tokens are masked and saved in macOS Keychain; the config contains only
+connection identifiers. The same form shows connection status and disables Slack.
+Invite the app to your private channel before messaging it.
+
+The app needs bot scopes `app_mentions:read` and `chat:write`, an `app_mention`
+event subscription, and Socket Mode enabled with `connections:write` on the
+app token. See Slack's [Socket Mode setup](https://docs.slack.dev/apis/events-api/using-socket-mode/).
+
+Mention **@difu** to talk to the persistent **Difu orchestrator** pinned above your
+coding sessions. It can inspect existing sessions, create sessions when needed,
+send instructions, interrupt/resume, select models, rename, archive/unarchive,
+and delete sessions and their worktrees. A mention does not automatically create
+a coding session. The same orchestrator chat is accessible in difu.
+
+Replies and pending questions appear in the originating Slack thread. Mention
+@difu on follow-up messages too. Requests from other threads wait while the
+orchestrator is working or awaiting an answer; follow-ups in its current thread
+can steer it. Only the configured member in the configured workspace/channel can
+issue commands. Questions and permissions include an ID; reply in that thread:
+
+```text
+@difu answer <question-id> <your answer>
+@difu approve <request-id>
+@difu deny <request-id>
+```
+
+Structured permission forms accept `@difu approve <request-id> {"field":"value"}`
+matching the displayed schema. Permissions apply to that request/turn, never the
+whole session. Casual replies such as “yes” do not grant permission. Use
+`@difu help` for command reminders. Reading a session through the orchestrator also
+makes its pending questions available in Slack.
+
+The local agent service maintains the outbound WebSocket while your Mac is awake
+and online; no public HTTP endpoint is needed. Slack reconnects automatically.
+Incoming events are saved before acknowledgement and deduplicated. Following a
+service interruption, uncertain requests are reported instead of replayed. Replies
+are queued and retried on connection errors or rate limits; a reply can appear twice
+if Slack accepted it just before a connection or process failure. Disabling Slack
+stops receiving and sending; existing agents continue running.
+
+Active chat views render at up to 60 fps. Input and optimistic sends are drawn
+before background maintenance, and the selected session receives pushed updates
+instead of waiting for the session-list poll. Hidden/unfocused subscriptions close;
+idle views redraw only when their state changes. PR cache refreshes and draft/cache
+writes run in background workers. Unchanged transcript messages retain their
+formatted rows while new text streams.
 
 ## Development
 

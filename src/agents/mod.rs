@@ -6,12 +6,14 @@ mod engine;
 mod guidance;
 mod management;
 pub mod media;
+mod orchestrator;
 pub(crate) mod pr_cache;
 pub mod provider;
 mod questions;
 mod registration;
 mod rules;
 pub mod server;
+pub mod slack;
 mod startup;
 mod suggestions;
 mod title;
@@ -124,7 +126,7 @@ impl Status {
         }
     }
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Entry {
     pub id: String,
     pub kind: String,
@@ -137,6 +139,14 @@ pub struct Entry {
     pub finished_at: Option<i64>,
 }
 impl Entry {
+    pub fn replace_data(&mut self, mut data: Value) {
+        if let Some(origin) = self.data.get("difuSlackRoute")
+            && let Some(object) = data.as_object_mut()
+        {
+            object.insert("difuSlackRoute".into(), origin.clone());
+        }
+        self.data = data;
+    }
     pub fn is_tool(&self) -> bool {
         !matches!(
             self.kind.as_str(),
@@ -209,6 +219,14 @@ impl DeletionStage {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Session {
+    #[serde(default)]
+    pub orchestrator: bool,
+    #[serde(default)]
+    pub slack_route: Option<slack::Route>,
+    #[serde(default)]
+    pub slack_after: usize,
+    #[serde(skip)]
+    pub orchestrator_requests: Vec<Pending>,
     pub id: String,
     pub title: String,
     #[serde(default)]
@@ -311,6 +329,10 @@ impl Session {
             _ => (None, None),
         };
         Self {
+            orchestrator: false,
+            slack_route: None,
+            slack_after: 0,
+            orchestrator_requests: Vec::new(),
             title: job.title(),
             title_ready: false,
             title_response: String::new(),
@@ -372,6 +394,42 @@ impl Session {
             result: None,
             guide: None,
         }
+    }
+    /// Freeze completed output and pending-request origins before another UI or
+    /// Slack conversation takes over the live session.
+    pub fn set_slack_route(&mut self, route: Option<slack::Route>) {
+        if self.status.active()
+            && self
+                .slack_route
+                .as_ref()
+                .zip(route.as_ref())
+                .is_some_and(|(a, b)| {
+                    a.account == b.account && a.channel == b.channel && a.thread == b.thread
+                })
+        {
+            return;
+        }
+        if let Some(previous) = &self.slack_route {
+            let value = serde_json::json!(previous);
+            for entry in self.entries.iter_mut().skip(self.slack_after) {
+                if !entry.data.is_object() {
+                    entry.data = serde_json::json!({});
+                }
+                if let Some(data) = entry.data.as_object_mut() {
+                    data.entry("difuSlackRoute")
+                        .or_insert_with(|| value.clone());
+                }
+            }
+            for pending in &mut self.pending {
+                if let Some(params) = pending.params.as_object_mut() {
+                    params
+                        .entry("difuSlackRoute")
+                        .or_insert_with(|| value.clone());
+                }
+            }
+        }
+        self.slack_route = route;
+        self.slack_after = self.entries.len();
     }
     pub fn waiting_for_workspace(&self) -> bool {
         !self.native_setup
@@ -444,7 +502,12 @@ impl Session {
         Summary {
             id: self.id.clone(),
             title: self.title.clone(),
-            kind: self.job.kind().into(),
+            kind: if self.orchestrator {
+                "Orchestrator"
+            } else {
+                self.job.kind()
+            }
+            .into(),
             status: self.status,
             archived: self.archived,
             updated: self.updated,
@@ -464,7 +527,7 @@ impl Session {
             branch: self.branch.clone(),
             workspaces: self.workspaces.clone(),
             workspace_revision: self.workspace_revision,
-            repository: Some(self.job.root().clone()),
+            repository: (!self.orchestrator).then(|| self.job.root().clone()),
             worktree: self.workspace_ready
                 && !self.workspace_removed
                 && matches!(&self.job, Job::Coding(launch) if launch.isolated),
@@ -607,12 +670,22 @@ pub enum Control {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
+    SlackControl {
+        id: String,
+        control: Control,
+        route: slack::Route,
+    },
     Usage {
         id: String,
     },
     Ping,
     ServiceVersion,
     List,
+    /// Subscribe to the selected session; unchanged replies are heartbeats.
+    Watch {
+        id: String,
+        version: Option<u64>,
+    },
     Read {
         id: String,
         version: Option<u64>,
