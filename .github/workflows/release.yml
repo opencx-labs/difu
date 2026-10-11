@@ -41,12 +41,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes musl-tools
-      - name: Test and build
+      - name: Test
+        if: github.event_name == 'pull_request'
         env:
           DIFU_TARGET: ${{ matrix.target }}
-        run: |
-          cargo test --locked --target "$DIFU_TARGET"
-          cargo build --locked --release --target "$DIFU_TARGET"
+        run: cargo test --locked --target "$DIFU_TARGET"
+      - name: Build release
+        env:
+          DIFU_TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$DIFU_TARGET"
       - name: Package and smoke test
         env:
           DIFU_TARGET: ${{ matrix.target }}
