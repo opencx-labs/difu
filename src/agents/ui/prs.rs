@@ -185,7 +185,8 @@ impl Ui {
                     })
                     .collect();
                 let _ = sender.send(snapshots);
-                crate::repaint::request();
+                // tick_prs compares the result before requesting a redraw; an
+                // unchanged disk refresh must leave an idle view quiet.
             });
         }
         let disk = self
