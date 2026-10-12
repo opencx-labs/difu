@@ -91,6 +91,7 @@ impl Shell {
         self.reviews.config.agent_changes_visible = self.agents.changes_visible;
         self.reviews.config.agent_panel_right = self.agents.panel_right();
         self.reviews.config.pinned_sessions = self.agents.pinned_sessions.clone();
+        self.reviews.config.session_order = self.agents.session_order.clone();
         self.reviews.config.voice_enabled = self.agents.voice_enabled();
         if self.reviews_started {
             self.reviews.tick_visible(focused && !self.agents_active);
@@ -149,6 +150,10 @@ impl Shell {
         }
         if self.agents_active {
             self.agents.key(key);
+            self.reviews
+                .config
+                .session_order
+                .clone_from(&self.agents.session_order);
         } else {
             self.reviews.key_event(key);
         }

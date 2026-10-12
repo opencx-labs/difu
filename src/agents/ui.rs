@@ -287,6 +287,7 @@ pub struct Ui {
     pub list_visible: bool,
     pub changes_visible: bool,
     pub pinned_sessions: std::collections::BTreeSet<String>,
+    pub session_order: Vec<String>,
     pub archived: bool,
     pub modal: Option<Modal>,
     pub notice: Option<(String, bool)>,
@@ -353,6 +354,7 @@ impl Ui {
             list_visible: config.agent_list_visible,
             changes_visible: config.agent_changes_visible,
             pinned_sessions: config.pinned_sessions.clone(),
+            session_order: config.session_order.clone(),
             archived: false,
             modal: None,
             notice: None,
@@ -849,13 +851,84 @@ impl Ui {
             .filter(|s| s.kind != "Guide" && s.archived == self.archived)
             .cloned()
             .collect::<Vec<_>>();
-        sessions.sort_by_key(|s| {
-            (
-                s.kind != "Orchestrator",
-                !self.pinned_sessions.contains(&s.id),
-            )
+        let positions: HashMap<_, _> = self
+            .session_order
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (id, i))
+            .collect();
+        sessions.sort_by(|a, b| {
+            (a.kind != "Orchestrator")
+                .cmp(&(b.kind != "Orchestrator"))
+                .then_with(|| {
+                    self.pinned_sessions
+                        .contains(&b.id)
+                        .cmp(&self.pinned_sessions.contains(&a.id))
+                })
+                .then_with(|| positions.get(&a.id).cmp(&positions.get(&b.id)))
+                // Session IDs start with their creation timestamp. New sessions
+                // appear first; updates and status changes never affect order.
+                .then_with(|| b.id.cmp(&a.id))
         });
         sessions
+    }
+    fn reorder_session(&mut self, down: bool) {
+        let list = self.filtered();
+        let Some(index) = list
+            .iter()
+            .position(|s| Some(&s.id) == self.selected.as_ref())
+        else {
+            return;
+        };
+        let Some(next) = (if down {
+            index.checked_add(1)
+        } else {
+            index.checked_sub(1)
+        })
+        .and_then(|index| list.get(index)) else {
+            return;
+        };
+        let Some(current) = list.get(index) else {
+            return;
+        };
+        if current.kind == "Orchestrator"
+            || next.kind == "Orchestrator"
+            || self.deleting.contains(&current.id)
+            || self.deleting.contains(&next.id)
+            || self.pinned_sessions.contains(&current.id) != self.pinned_sessions.contains(&next.id)
+        {
+            return;
+        }
+        let mut order: Vec<_> = self
+            .summaries
+            .iter()
+            .filter(|s| !self.session_order.contains(&s.id))
+            .map(|s| s.id.clone())
+            .collect();
+        order.sort_by(|a, b| b.cmp(a));
+        order.extend(self.session_order.iter().cloned());
+        let Some(from) = order.iter().position(|id| id == &current.id) else {
+            return;
+        };
+        let Some(to) = order.iter().position(|id| id == &next.id) else {
+            return;
+        };
+        order.swap(from, to);
+        let result = self.storage.load_config().and_then(|mut config| {
+            config.session_order.clone_from(&order);
+            self.storage.save_config(&config)
+        });
+        match result {
+            Ok(()) => {
+                if let Some(panels::View::PullRequest { app }) = &mut self.panels.view {
+                    app.config.session_order.clone_from(&order);
+                }
+                self.session_order = order;
+            }
+            Err(error) => {
+                self.notice = Some((format!("Could not save session order: {error:#}"), true))
+            }
+        }
     }
     fn ensure_selected(&mut self) {
         let list = self.selectable();
@@ -1216,6 +1289,9 @@ impl Ui {
                 if let Some(questions) = pending.params.get("questions").and_then(Value::as_array) {
                     for (question, answer) in questions.iter().zip(answers) {
                         if answer.text().trim().is_empty() {
+                            if super::elicitation::is_form(pending) {
+                                continue;
+                            }
                             self.notice =
                                 Some(("Answer each question before submitting".into(), true));
                             return;
@@ -1227,30 +1303,14 @@ impl Ui {
                 }
                 serde_json::json!({"answers":map})
             }
-            "mcpServer/elicitation/request" => {
-                let content = answers.first().map(Editor::text).unwrap_or_default();
-                let content = if choice == 0 && !content.trim().is_empty() {
-                    match serde_json::from_str::<Value>(&content) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            self.notice = Some((format!("Invalid JSON: {error}"), true));
-                            return;
-                        }
-                    }
-                } else {
-                    Value::Null
-                };
-                serde_json::json!({"action":if choice == 0 { "accept" } else { "decline" },"content":content})
+            _ => {
+                self.control(Control::Interrupt);
+                self.notice = Some((
+                    "Request stopped. Ask the agent to use the questions tool.".into(),
+                    false,
+                ));
+                return;
             }
-            _ => match serde_json::from_str::<Value>(
-                &answers.first().map(Editor::text).unwrap_or_default(),
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    self.notice = Some((format!("Enter a JSON response: {error}"), true));
-                    return;
-                }
-            },
         };
         self.control(Control::Respond {
             request: pending.id.clone(),
@@ -1279,7 +1339,12 @@ impl Ui {
                 effort,
                 field,
             }) => Some(if *field == 0 { model } else { effort }),
-            Some(Modal::Approval { answers, field, .. }) => answers.get(*field),
+            Some(Modal::Approval {
+                pending,
+                answers,
+                field,
+                ..
+            }) if pending.method == "item/tool/requestUserInput" => answers.get(*field),
             None if self.focus == Focus::Composer && self.drilled => self
                 .selected
                 .as_ref()
@@ -1360,6 +1425,13 @@ impl Ui {
         if self.modal.is_some() {
             self.modal_key(key);
             self.remember_answers();
+            return;
+        }
+        if self.focus == Focus::List
+            && key.modifiers == KeyModifiers::CONTROL
+            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+        {
+            self.reorder_session(key.code == KeyCode::Down);
             return;
         }
         if self.drilled
@@ -1909,7 +1981,7 @@ impl Ui {
                 pending,
                 selected,
                 ..
-            }) => {
+            }) if pending.method == "item/tool/requestUserInput" => {
                 *selected = pending
                     .params
                     .get("questions")
@@ -2065,13 +2137,7 @@ impl Ui {
                 field,
                 scroll,
             }) => {
-                let text_input = pending.method == "item/tool/requestUserInput"
-                    || !matches!(
-                        pending.method.as_str(),
-                        "item/commandExecution/requestApproval"
-                            | "item/fileChange/requestApproval"
-                            | "item/permissions/requestApproval"
-                    );
+                let text_input = pending.method == "item/tool/requestUserInput";
                 match key.code {
                     KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
                     KeyCode::PageDown => *scroll = scroll.saturating_add(10),
@@ -2088,13 +2154,13 @@ impl Ui {
                     }
                     KeyCode::Up if !text_input => *selected = selected.saturating_sub(1),
                     KeyCode::Down if !text_input => {
-                        *selected = (*selected + 1).min(
-                            if pending.method == "item/permissions/requestApproval" {
-                                1
-                            } else {
-                                3
-                            },
-                        )
+                        let last = match pending.method.as_str() {
+                            "item/permissions/requestApproval" => 1,
+                            "item/commandExecution/requestApproval"
+                            | "item/fileChange/requestApproval" => 3,
+                            _ => 0,
+                        };
+                        *selected = (*selected + 1).min(last)
                     }
                     _ if text_input => {
                         if let Some(e) = answers.get_mut(*field) {
@@ -3487,19 +3553,21 @@ impl Ui {
                         })
                         .map(|entry| entry.text.as_str())
                         .unwrap_or_default();
-                    let description = format!(
+                    let mut description = format!(
                         "{} · PageUp/Down scroll\n\n{}\n\n{}",
                         pending.method, content, related
                     );
-                    let text_input = !matches!(
+                    let unsupported = !matches!(
                         pending.method.as_str(),
                         "item/commandExecution/requestApproval"
                             | "item/fileChange/requestApproval"
                             | "item/permissions/requestApproval"
                     );
-                    let bottom = if text_input { 7 } else { 5 };
+                    if unsupported {
+                        description = "This request cannot be displayed as questions. Stop it and ask the agent to use the questions tool.".into();
+                    }
                     let rows = wrapped(&description, area.width);
-                    let height = area.height.saturating_sub(bottom);
+                    let height = area.height.saturating_sub(5);
                     *scroll = (*scroll).min(rows.len().saturating_sub(height as usize));
                     frame.render_widget(
                         Paragraph::new(
@@ -3511,19 +3579,10 @@ impl Ui {
                         ),
                         Rect::new(area.x, area.y, area.width, height),
                     );
-                    if text_input && let Some(answer) = answers.first() {
-                        editor(
-                            frame,
-                            Rect::new(area.x, area.bottom().saturating_sub(7), area.width, 5),
-                            "Structured response JSON",
-                            answer,
-                            true,
-                        );
-                    }
                     let choices = if pending.method == "item/permissions/requestApproval" {
                         vec!["Allow requested permissions for this turn", "Deny"]
-                    } else if text_input {
-                        vec!["Submit · Ctrl+Enter"]
+                    } else if unsupported {
+                        vec!["Stop request · ask the agent to use questions"]
                     } else {
                         vec!["Allow once", "Allow for session", "Decline", "Cancel"]
                     };
@@ -3595,6 +3654,10 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
             "Open session / interrupt agent and send waiting messages; go back when idle",
         ),
         ("Cmd+K", "Search sessions, pull requests and commands"),
+        (
+            "Ctrl+↑ / ↓ in sessions",
+            "Reorder within the pinned or unpinned group (saved)",
+        ),
         (
             "Tab / Shift+Tab",
             "Cycle sessions, chat or tree/diff, and helper canvas",
@@ -3876,6 +3939,97 @@ mod tests {
         ui.tick(false);
         ui.select("three".into());
         assert_eq!(ui.selected.as_deref(), Some("three"));
+        Ok(())
+    }
+
+    #[test]
+    fn manual_session_order_persists_and_stays_inside_pin_groups() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        let mut ui = state(storage.clone());
+        let template = ui.summaries.first().context("session")?.clone();
+        ui.summaries = ["100-a", "200-b", "300-c", "400-d", "orchestrator"]
+            .into_iter()
+            .map(|id| {
+                let mut summary = template.clone();
+                summary.id = id.into();
+                if id == "orchestrator" {
+                    summary.kind = "Orchestrator".into();
+                }
+                summary
+            })
+            .collect();
+        ui.toggle_pin("100-a");
+        ui.toggle_pin("200-b");
+        ui.panels.view = Some(panels::View::PullRequest {
+            app: Box::new(crate::app::App::new(
+                storage.clone(),
+                storage.load_config()?,
+            )),
+        });
+        fn ids(ui: &Ui) -> Vec<String> {
+            ui.filtered().into_iter().map(|s| s.id).collect()
+        }
+        let original = ids(&ui);
+        assert_eq!(
+            original,
+            ["orchestrator", "200-b", "100-a", "400-d", "300-c"]
+        );
+        // Simulate backend polls changing both activity and input order.
+        ui.summaries.reverse();
+        for (index, summary) in ui.summaries.iter_mut().enumerate() {
+            summary.updated = index as i64;
+            summary.status = if index % 2 == 0 {
+                Status::Running
+            } else {
+                Status::Idle
+            };
+        }
+        assert_eq!(ids(&ui), original);
+        ui.focus = Focus::List;
+        ui.selected = Some("100-a".into());
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        assert_eq!(ids(&ui), original); // Cannot cross into unpinned sessions.
+        ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(
+            ids(&ui),
+            ["orchestrator", "100-a", "200-b", "400-d", "300-c"]
+        );
+        ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(ids(&ui).first().map(String::as_str), Some("orchestrator"));
+        ui.selected = Some("400-d".into());
+        ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL));
+        assert_eq!(
+            ids(&ui),
+            ["orchestrator", "100-a", "200-b", "400-d", "300-c"]
+        );
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL));
+        assert_eq!(
+            ids(&ui),
+            ["orchestrator", "100-a", "200-b", "300-c", "400-d"]
+        );
+        assert_eq!(ui.selected.as_deref(), Some("400-d"));
+        // Saving a setting in a pane opened before the reorder must preserve it.
+        let Some(panels::View::PullRequest { app }) = &mut ui.panels.view else {
+            anyhow::bail!("PR pane");
+        };
+        app.action(crate::app::Action::ToggleWrap);
+        assert_eq!(storage.load_config()?.session_order, ui.session_order);
+        let mut restored = Ui::new(storage.clone(), &storage.load_config()?);
+        restored.summaries = ui.summaries.clone();
+        assert_eq!(ids(&restored), ids(&ui));
+        // A newly created session appears first in its group without disturbing
+        // the relative order of sessions that were manually arranged.
+        let mut newest = template;
+        newest.id = "500-e".into();
+        restored.summaries.push(newest);
+        assert_eq!(
+            ids(&restored),
+            ["orchestrator", "100-a", "200-b", "500-e", "300-c", "400-d"]
+        );
         Ok(())
     }
 

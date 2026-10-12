@@ -86,7 +86,8 @@ impl Ui {
         });
         self.notice = Some(match result {
             Ok(()) => (
-                "Slack enabled · mention @difu in your configured channel".into(),
+                "Slack enabled · message difu directly, or mention it in your configured channel"
+                    .into(),
                 false,
             ),
             Err(error) => (error, true),
@@ -143,14 +144,14 @@ impl Ui {
         };
         let field = form.field;
         let fields = form.fields.clone();
-        frame.render_widget(Paragraph::new(format!("{}\nTokens are masked and stored in macOS Keychain.\nOnly the member and channel below can control difu.", form.status)).wrap(Wrap { trim: false }), Rect::new(area.x, area.y, area.width, 4.min(area.height)));
+        frame.render_widget(Paragraph::new(format!("{}\nTokens are masked and stored in macOS Keychain.\nOnly the member below can control difu. Channel mentions are optional.", form.status)).wrap(Wrap { trim: false }), Rect::new(area.x, area.y, area.width, 4.min(area.height)));
         for (index, (input, label)) in fields
             .iter()
             .zip([
                 "Bot token · xoxb-",
                 "App token · xapp-",
                 "Allowed member ID · U…",
-                "Allowed channel ID · C…",
+                "Optional channel ID · C… (blank for DMs only)",
             ])
             .enumerate()
         {

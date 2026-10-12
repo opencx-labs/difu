@@ -17,8 +17,8 @@ pub(super) struct Mention {
     pub text: String,
 }
 
-/// Only an explicit mention by the configured user in the configured workspace
-/// and channel can become an agent instruction. Edits and bot messages cannot.
+/// Accept direct messages from the configured user, or explicit mentions in the
+/// configured channel. Edits, bots, and other users/workspaces cannot dispatch.
 pub(super) fn mention(payload: &Value, scope: &Scope<'_>) -> Option<Mention> {
     if payload.get("type")?.as_str()? != "event_callback"
         || payload.get("team_id")?.as_str()? != scope.team
@@ -26,17 +26,25 @@ pub(super) fn mention(payload: &Value, scope: &Scope<'_>) -> Option<Mention> {
         return None;
     }
     let event = payload.get("event")?;
-    if event.get("type")?.as_str()? != "app_mention"
-        || event.get("user")?.as_str()? != scope.user
-        || event.get("channel")?.as_str()? != scope.channel
+    if event.get("user")?.as_str()? != scope.user
         || event.get("bot_id").is_some()
         || event.get("subtype").is_some()
     {
         return None;
     }
+    let channel = event.get("channel")?.as_str()?;
+    let direct = event.get("type")?.as_str()? == "message"
+        && event.get("channel_type").and_then(Value::as_str) == Some("im")
+        && super::valid_id(channel, &['D']);
+    let channel_mention = event.get("type")?.as_str()? == "app_mention"
+        && !scope.channel.is_empty()
+        && channel == scope.channel;
+    if !direct && !channel_mention {
+        return None;
+    }
     let text = event.get("text")?.as_str()?;
     let tag = format!("<@{}>", scope.bot);
-    if !text.contains(&tag) {
+    if !direct && !text.contains(&tag) {
         return None;
     }
     let timestamp = event.get("ts")?.as_str()?;
@@ -50,7 +58,7 @@ pub(super) fn mention(payload: &Value, scope: &Scope<'_>) -> Option<Mention> {
     }
     Some(Mention {
         event_id: event_id.into(),
-        channel: scope.channel.into(),
+        channel: channel.into(),
         thread: thread.into(),
         text: text
             .replacen(&tag, "", 1)
@@ -99,6 +107,49 @@ mod tests {
             mention(&event, &scope()).context("thread mention")?.thread,
             "99.000001"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn direct_messages_start_threads_and_followups_keep_them_without_mentions() -> Result<()> {
+        let mut event = json!({"type":"event_callback","team_id":"TTEAM","event_id":"Ev2",
+            "event":{"type":"message","channel_type":"im","user":"UALI","channel":"DDIRECT",
+                "text":"list my sessions","ts":"101.000001"}});
+        let mut scope = scope();
+        scope.channel = "";
+        let parsed = mention(&event, &scope).context("direct message")?;
+        assert_eq!(parsed.channel, "DDIRECT");
+        assert_eq!(parsed.thread, "101.000001");
+        assert_eq!(parsed.text, "list my sessions");
+        event
+            .get_mut("event")
+            .and_then(Value::as_object_mut)
+            .context("event")?
+            .insert("thread_ts".into(), json!("100.000001"));
+        assert_eq!(
+            mention(&event, &scope).context("followup")?.thread,
+            "100.000001"
+        );
+        for (path, value) in [
+            ("/event/user", json!("UOTHER")),
+            ("/team_id", json!("TOTHER")),
+            ("/event/channel_type", json!("mpim")),
+            ("/event/channel", json!("CPUBLIC")),
+            ("/event/thread_ts", json!("")),
+        ] {
+            let mut invalid = event.clone();
+            *invalid.pointer_mut(path).context("field")? = value;
+            assert!(mention(&invalid, &scope).is_none(), "{path}");
+        }
+        for field in ["bot_id", "subtype"] {
+            let mut invalid = event.clone();
+            invalid
+                .get_mut("event")
+                .and_then(Value::as_object_mut)
+                .context("event")?
+                .insert(field.into(), json!("ignored"));
+            assert!(mention(&invalid, &scope).is_none());
+        }
         Ok(())
     }
 

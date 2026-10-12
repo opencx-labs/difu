@@ -20,8 +20,18 @@ pub struct Settings {
     pub team: String,
     pub bot: String,
     pub user: String,
+    #[serde(default)]
     pub channel: String,
     pub account: String,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl Settings {
+    pub(super) fn accepts_route(&self, route: &Route) -> bool {
+        route.account == self.account
+            && (valid_id(&route.channel, &['D'])
+                || (!self.channel.is_empty() && route.channel == self.channel))
+    }
 }
 
 // Deliberately no Debug implementation: tokens must never enter logs or session history.
@@ -44,8 +54,8 @@ pub fn configure(
         "Enter your Slack member ID (U…)"
     );
     ensure!(
-        valid_id(&channel, &['C', 'G']),
-        "Enter the channel ID (C… or G…)"
+        channel.is_empty() || valid_id(&channel, &['C', 'G']),
+        "Enter a channel ID (C… or G…), or leave it blank for direct messages"
     );
     #[cfg(target_os = "macos")]
     {
@@ -141,6 +151,30 @@ mod tests {
             channel: "C1".into(),
             account: "keychain-reference".into(),
         };
+        let direct = Route {
+            account: settings.account.clone(),
+            channel: "DDIRECT".into(),
+            thread: "1.0".into(),
+            event: "Ev1".into(),
+        };
+        assert!(settings.accepts_route(&direct));
+        assert!(!settings.accepts_route(&Route {
+            account: "other".into(),
+            ..direct.clone()
+        }));
+        assert!(!settings.accepts_route(&Route {
+            channel: "COTHER".into(),
+            ..direct.clone()
+        }));
+        let direct_only = Settings {
+            channel: String::new(),
+            ..settings.clone()
+        };
+        assert!(direct_only.accepts_route(&direct));
+        assert!(!direct_only.accepts_route(&Route {
+            channel: "C1".into(),
+            ..direct
+        }));
         let json = serde_json::to_value(settings)?;
         assert!(json.get("bot_token").is_none() && json.get("app_token").is_none());
         Ok(())

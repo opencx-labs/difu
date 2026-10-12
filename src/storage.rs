@@ -52,6 +52,8 @@ pub struct Config {
     #[serde(default)]
     pub pinned_sessions: BTreeSet<String>,
     #[serde(default)]
+    pub session_order: Vec<String>,
+    #[serde(default)]
     pub model: ModelChoice,
     #[serde(default = "ModelChoice::conflict_default")]
     pub conflict_model: ModelChoice,
@@ -83,6 +85,7 @@ impl Default for Config {
             repositories: BTreeMap::new(),
             pinned_repositories: BTreeSet::new(),
             pinned_sessions: BTreeSet::new(),
+            session_order: Vec::new(),
             model: ModelChoice::default(),
             conflict_model: ModelChoice::conflict_default(),
             unified: false,

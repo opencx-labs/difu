@@ -1,20 +1,13 @@
 //! Explicit commands never fall through to the model on malformed/stale input.
 use super::super::{Control, Pending};
 use anyhow::{Result, ensure};
-use serde_json::{Value, json};
+use serde_json::json;
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Command {
     Message,
-    Answer {
-        reference: String,
-        text: String,
-    },
-    Decision {
-        reference: String,
-        approve: bool,
-        content: Option<Value>,
-    },
+    Answer { reference: String, text: String },
+    Decision { reference: String, approve: bool },
     Help,
 }
 pub(super) fn parse(text: &str) -> Result<Command> {
@@ -24,30 +17,20 @@ pub(super) fn parse(text: &str) -> Result<Command> {
     match verb {
         "approve" | "deny" => {
             let (reference, extra) = tail.split_once(char::is_whitespace).unwrap_or((tail, ""));
-            ensure!(!reference.is_empty(), "Use: @difu {verb} <request-id>");
-            let content = if extra.trim().is_empty() {
-                None
-            } else {
-                ensure!(verb == "approve", "Use: @difu deny <request-id>");
-                let value: Value = serde_json::from_str(extra).map_err(|_| {
-                    anyhow::anyhow!("Additional approval input must be a JSON object")
-                })?;
-                ensure!(
-                    value.is_object(),
-                    "Additional approval input must be a JSON object"
-                );
-                Some(value)
-            };
+            ensure!(!reference.is_empty(), "Use: {verb} <request-id>");
+            ensure!(
+                extra.trim().is_empty(),
+                "Use: {verb} <request-id>. Requested information is collected through questions."
+            );
             Ok(Command::Decision {
                 reference: reference.into(),
                 approve: verb == "approve",
-                content,
             })
         }
         "answer" => {
             let (reference, text) = tail
                 .split_once(char::is_whitespace)
-                .ok_or_else(|| anyhow::anyhow!("Use: @difu answer <question-id> <answer>"))?;
+                .ok_or_else(|| anyhow::anyhow!("Use: answer <question-id> <answer>"))?;
             ensure!(
                 !reference.is_empty() && !text.trim().is_empty(),
                 "An explicit answer is required"
@@ -62,15 +45,7 @@ pub(super) fn parse(text: &str) -> Result<Command> {
     }
 }
 
-pub(super) fn decision(
-    pending: &Pending,
-    approve: bool,
-    content: Option<Value>,
-) -> Result<Control> {
-    ensure!(
-        content.is_none() || pending.method == "mcpServer/elicitation/request",
-        "This permission does not accept additional input"
-    );
+pub(super) fn decision(pending: &Pending, approve: bool) -> Result<Control> {
     ensure!(!pending.responded, "This request was already answered");
     let response = match pending.method.as_str() {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
@@ -78,24 +53,6 @@ pub(super) fn decision(
         }
         "item/permissions/requestApproval" => {
             json!({"permissions":if approve {pending.params.get("permissions").cloned().unwrap_or_else(|| json!({}))} else {json!({})},"scope":"turn"})
-        }
-        "mcpServer/elicitation/request" => {
-            // Claude permission callbacks carry their original input. General MCP
-            // forms may require structured values; a bare approve cannot invent them.
-            ensure!(
-                !approve
-                    || content.is_some()
-                    || pending.params.get("claudeInput").is_some()
-                    || !pending
-                        .params
-                        .get("requestedSchema")
-                        .is_some_and(|schema| schema
-                            .get("required")
-                            .and_then(Value::as_array)
-                            .is_some_and(|fields| !fields.is_empty())),
-                "Use: @difu approve <request-id> <JSON object matching the requested schema>"
-            );
-            json!({"action":if approve {"accept"} else {"decline"},"content":content.unwrap_or(Value::Null)})
         }
         _ => anyhow::bail!("This request is not a supported permission; answer it in difu"),
     };
@@ -126,8 +83,7 @@ mod tests {
             parse("approve abc")?,
             Command::Decision {
                 reference: "abc".into(),
-                approve: true,
-                content: None
+                approve: true
             }
         );
         assert_eq!(
@@ -147,7 +103,7 @@ mod tests {
             params: json!({}),
             responded: false,
         };
-        let Control::Respond { response, .. } = decision(&pending, true, None)? else {
+        let Control::Respond { response, .. } = decision(&pending, true)? else {
             anyhow::bail!("response");
         };
         assert_eq!(response, json!({"decision":"accept"}));
@@ -157,8 +113,7 @@ mod tests {
                     method: "item/tool/requestUserInput".into(),
                     ..pending
                 },
-                true,
-                None
+                true
             )
             .is_err()
         );
