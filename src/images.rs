@@ -69,12 +69,40 @@ impl Request {
         Url::parse(&format!("{prefix}{}", path.path())).context("Invalid repository image URL")
     }
     pub fn download_url(&self) -> Result<Url> {
-        let mut url = self.browser_url()?;
-        if url.host_str() == Some("github.com") {
-            let path = url.path().replacen("/blob/", "/raw/", 1);
-            url.set_path(&path);
-        }
+        let url = self.browser_url()?;
         validate_url(&url)?;
+        // GitHub's web /raw endpoint can return 404 for private repositories even
+        // with a token. The contents API accepts repository authentication.
+        let parts: Vec<_> = url.path().trim_start_matches('/').splitn(5, '/').collect();
+        let repository = match (url.host_str(), parts.as_slice()) {
+            (Some("github.com"), [owner, repo, "blob" | "raw", reference, path]) => {
+                Some((*owner, *repo, *reference, (*path).to_owned()))
+            }
+            (Some("raw.githubusercontent.com"), [owner, repo, reference, rest @ ..])
+                if !rest.is_empty() =>
+            {
+                Some((*owner, *repo, *reference, rest.join("/")))
+            }
+            _ => None,
+        };
+        if let Some((owner, repo, reference, path)) = repository
+            && !owner.is_empty()
+            && !repo.is_empty()
+            && !reference.is_empty()
+            && reference != "refs"
+            && !path.is_empty()
+        {
+            let mut api = Url::parse(&format!(
+                "https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+            ))?;
+            // Decode the URL path component before encoding it as a query value.
+            // Literal '+' and '&' in a branch name are not form separators.
+            let encoded = format!("ref={}", reference.replace('+', "%2B").replace('&', "%26"));
+            if let Some((_, reference)) = url::form_urlencoded::parse(encoded.as_bytes()).next() {
+                api.query_pairs_mut().append_pair("ref", &reference);
+            }
+            return Ok(api);
+        }
         Ok(url)
     }
     pub fn id(&self) -> String {
@@ -799,7 +827,7 @@ Useful summary text.
         let request = Request::new("docs/screen%20shot.png".into(), "Screen".into(), &pr());
         assert_eq!(
             request.download_url()?.as_str(),
-            "https://github.com/example/repo/raw/abc123/docs/screen%20shot.png"
+            "https://api.github.com/repos/example/repo/contents/docs/screen%20shot.png?ref=abc123"
         );
         for source in [
             "file:///etc/passwd",
@@ -833,6 +861,47 @@ Useful summary text.
         assert!(public_ip("8.8.8.8".parse()?));
         Ok(())
     }
+    #[test]
+    fn private_repository_images_keep_their_pinned_reference_through_the_api() -> Result<()> {
+        let reference = "84444f56f257a874ff454d95189c412bb0a3a32a";
+        for source in [
+            format!(
+                "https://github.com/example/repo/blob/{reference}/.github/pr-assets/screen%20one.png?raw=true"
+            ),
+            format!(
+                "https://github.com/example/repo/raw/{reference}/.github/pr-assets/screen%20one.png"
+            ),
+            format!(
+                "https://raw.githubusercontent.com/example/repo/{reference}/.github/pr-assets/screen%20one.png"
+            ),
+        ] {
+            let request = Request::new(source, "Screen".into(), &pr());
+            assert_eq!(
+                request.download_url()?.as_str(),
+                format!(
+                    "https://api.github.com/repos/example/repo/contents/.github/pr-assets/screen%20one.png?ref={reference}"
+                )
+            );
+        }
+        let request = Request::new(
+            "https://github.com/example/repo/blob/feature%2Fcards%2Bfix/screen.png".into(),
+            "Screen".into(),
+            &pr(),
+        );
+        assert_eq!(
+            request
+                .download_url()?
+                .query_pairs()
+                .find(|(key, _)| key == "ref")
+                .map(|(_, value)| value.into_owned()),
+            Some("feature/cards+fix".into())
+        );
+        let source =
+            "<details>\n<summary>Screenshots</summary>\n\n![Screen](docs/screen.png)\n\n</details>";
+        assert_eq!(references(source).len(), 1);
+        Ok(())
+    }
+
     #[test]
     fn cache_reuses_valid_image_and_rejects_invalid_or_cancelled_data() -> Result<()> {
         let dir = tempfile::tempdir()?;

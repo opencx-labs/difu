@@ -307,12 +307,14 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
             return;
         }
         if !session.pending.iter().any(|p| &p.id == id) {
-            session.pending.push(Pending {
+            let mut pending = Pending {
                 id: id.clone(),
                 method: method.into(),
                 params: params.clone(),
                 responded: false,
-            });
+            };
+            super::elicitation::normalize(&mut pending);
+            session.pending.push(pending);
         }
         session.status = Status::Waiting;
         return;
@@ -995,11 +997,13 @@ fn command(
                 }
             } else if updated.unanswered_questions().is_empty() {
                 // Blocking native tools accept one response for the whole batch.
+                let response = super::elicitation::response(
+                    &updated,
+                    json!({"answers":updated.params.get("difuAnswers")}),
+                )?;
                 updated.responded = true;
                 super::questions::save_answer(store, id, updated.clone())?;
-                rpc.write(
-                    json!({"id":request,"result":{"answers":updated.params.get("difuAnswers")}}),
-                )?;
+                rpc.write(json!({"id":request,"result":response}))?;
             }
             super::questions::save_answer(store, id, updated)?;
         }
@@ -1062,6 +1066,7 @@ fn command(
                 store.save(id)?;
                 return Ok(());
             }
+            let response = super::elicitation::response(pending, response)?;
             rpc.write(json!({"id":request,"result":response}))?;
             store.update(id, |s| {
                 if let Some(pending) = s.pending.iter_mut().find(|p| p.id == request) {

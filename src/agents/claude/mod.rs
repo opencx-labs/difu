@@ -193,7 +193,7 @@ fn request(store: &Store, id: &str, rpc: &mut Connection, frame: &Value) -> Resu
         .and_then(Value::as_str)
         .context("Missing tool name")?;
     let input = request.get("input").cloned().unwrap_or_else(|| json!({}));
-    let pending = if name == "AskUserQuestion" {
+    let mut pending = if name == "AskUserQuestion" {
         let questions = input
             .get("questions")
             .and_then(Value::as_array)
@@ -219,11 +219,12 @@ fn request(store: &Store, id: &str, rpc: &mut Connection, frame: &Value) -> Resu
         Pending {
             id: request_id,
             method: "mcpServer/elicitation/request".into(),
-            params: json!({"serverName":"Claude Code","message":format!("Allow {name}?\n{}", serde_json::to_string_pretty(&input)?),
+            params: json!({"serverName":"Claude Code","message":format!("Allow {name}?\n{}", input.get("command").or_else(|| input.get("file_path")).and_then(Value::as_str).unwrap_or("Review the tool's request in the conversation.")),
                 "claudeInput":input,"tool":name,"requestedSchema":{"type":"object","properties":{}}}),
             responded: false,
         }
     };
+    super::elicitation::normalize(&mut pending);
     store.update(id, |s| {
         if !s.pending.iter().any(|p| p.id == pending.id) {
             s.pending.push(pending);
@@ -251,7 +252,10 @@ fn respond(
         .get("claudeInput")
         .cloned()
         .context("Not a Claude tool request")?;
-    let output = if pending.method == "item/tool/requestUserInput" {
+    let response = super::elicitation::response(pending, response.clone())?;
+    let output = if pending.method == "item/tool/requestUserInput"
+        && !super::elicitation::is_form(pending)
+    {
         let answers = response
             .get("answers")
             .and_then(Value::as_object)

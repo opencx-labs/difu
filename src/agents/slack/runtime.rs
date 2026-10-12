@@ -24,7 +24,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const HELP: &str = "Mention @difu with a request to talk to the persistent orchestrator. It can inspect and manage your sessions.\nReply in the same thread with:\n@difu answer <question-id> <answer>\n@difu approve <request-id>\n@difu deny <request-id>\nEach ID applies only to the request shown in this thread. A normal message never grants permission.";
+const HELP: &str = "Send difu a direct message to talk to the persistent orchestrator. Replies stay in the thread of your message; no mention is needed in DMs. In a configured channel, mention @difu on every message.\nReply in the same thread with:\nanswer <question-id> <answer>\napprove <request-id>\ndeny <request-id>\nPrefix commands with @difu in channels. Each ID applies only to the request shown in this thread. A normal message never grants permission.";
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct State {
@@ -372,7 +372,7 @@ fn dispatch(
         commands::Command::Message => {
             ensure!(
                 !mention.text.trim().is_empty(),
-                "Add a message after @difu, or use @difu help"
+                "Send a message, or use help (mention @difu in channels)"
             );
             client::request(
                 &store.storage,
@@ -448,11 +448,9 @@ fn response(
                 answer: Some(text),
             }
         }
-        commands::Command::Decision {
-            approve, content, ..
-        } => {
+        commands::Command::Decision { approve, .. } => {
             ensure!(reference.question.is_none(), "Use answer for this question");
-            commands::decision(pending, approve, content)?
+            commands::decision(pending, approve)?
         }
         _ => anyhow::bail!("Invalid request command"),
     };
@@ -491,9 +489,7 @@ fn observe(
             } else {
                 None
             });
-            let Some(origin) =
-                origin.filter(|r| r.account == settings.account && r.channel == settings.channel)
-            else {
+            let Some(origin) = origin.filter(|r| settings.accepts_route(r)) else {
                 continue;
             };
             if (entry.kind == "agentMessage" && entry.finished_at.is_some()
@@ -519,7 +515,7 @@ fn observe(
             let Some(origin) = saved
                 .as_ref()
                 .or(session.slack_route.as_ref())
-                .filter(|r| r.account == settings.account && r.channel == settings.channel)
+                .filter(|r| settings.accepts_route(r))
             else {
                 continue;
             };
@@ -563,7 +559,7 @@ fn observe(
         let Some(origin) = session
             .slack_route
             .as_ref()
-            .filter(|r| r.account == settings.account && r.channel == settings.channel)
+            .filter(|r| settings.accepts_route(r))
         else {
             continue;
         };
@@ -612,12 +608,15 @@ fn reference(
     if journal.read(|s| s.references.contains_key(&id))? {
         return Ok(());
     }
-    let instruction = if question.is_some() {
-        format!("@difu answer {id} <answer>")
+    let prefix = if super::valid_id(&origin.channel, &['D']) {
+        ""
     } else {
-        format!(
-            "@difu approve {id}\n@difu deny {id}\nFor a structured form: @difu approve {id} {{JSON fields}}"
-        )
+        "@difu "
+    };
+    let instruction = if question.is_some() {
+        format!("{prefix}answer {id} <answer>")
+    } else {
+        format!("{prefix}approve {id}\n{prefix}deny {id}")
     };
     journal.update(|state| {
         state.references.insert(
@@ -718,7 +717,6 @@ mod tests {
         let approve = || commands::Command::Decision {
             reference: "id".into(),
             approve: true,
-            content: None,
         };
         assert!(response(&reference, &session, &origin("second"), approve()).is_err());
         assert!(response(&reference, &session, &origin("first"), approve()).is_ok());

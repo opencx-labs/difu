@@ -108,6 +108,9 @@ retain cached results.
 Pin or unpin a session in its actions menu, or select it in Cmd+K and press
 **Cmd+P**. Pins persist across restarts and appear first in the session list,
 with a ◆ marker, within the current active/archived view.
+Session activity never changes list order. With the session list focused, use
+**Ctrl+↑/↓** to move the selected session within its pinned or unpinned group.
+The order persists across restarts; the orchestrator stays fixed at the top.
 
 ### Local diffs and branch PRs
 
@@ -962,16 +965,18 @@ within each group.
 ## Slack control (macOS)
 
 Open **Cmd+K → `/slack`** to connect your Slack app. Enter its bot token
-(`xoxb-`), Socket Mode app token (`xapp-`), your Slack member ID, and the channel
-ID. Tokens are masked and saved in macOS Keychain; the config contains only
+(`xoxb-`), Socket Mode app token (`xapp-`), and your Slack member ID. The channel
+ID is optional; leave it blank for direct messages only. Tokens are masked and saved in macOS Keychain; the config contains only
 connection identifiers. The same form shows connection status and disables Slack.
-Invite the app to your private channel before messaging it.
+For channel mentions, invite the app to your configured channel.
 
-The app needs bot scopes `app_mentions:read` and `chat:write`, an `app_mention`
-event subscription, and Socket Mode enabled with `connections:write` on the
-app token. See Slack's [Socket Mode setup](https://docs.slack.dev/apis/events-api/using-socket-mode/).
+Enable **App Home → Messages Tab → Allow users to send Slash commands and messages**.
+The app needs bot scopes `im:history` and `chat:write`, a `message.im` bot event
+subscription, and Socket Mode enabled with `connections:write` on the app token.
+For channel mentions, also keep `app_mentions:read` and the `app_mention` event.
+Reinstall the app after changing scopes. See Slack's [Socket Mode setup](https://docs.slack.dev/tools/python-slack-sdk/socket-mode/).
 
-Mention **@difu** to talk to the persistent **Difu orchestrator** pinned above your
+Message the app directly, or mention **@difu** in your configured channel, to talk to the persistent **Difu orchestrator** pinned above your
 coding sessions. It can inspect existing sessions, create sessions with your confirmation,
 send instructions, interrupt/resume, select models, rename, archive/unarchive,
 and delete sessions and their worktrees. A mention does not automatically create
@@ -980,11 +985,12 @@ route each task to the appropriate one, queuing work for busy sessions. It asks
 you when a task has no suitable session or several equally relevant matches.
 The same orchestrator chat is accessible in difu.
 
-Replies and pending questions appear in the originating Slack thread. Mention
-@difu on follow-up messages too. Requests from other threads wait while the
+Each new direct message gets a reply thread. Follow-ups within that thread stay
+there and need no mention. Channel messages and follow-ups still require @difu.
+Replies and pending questions stay in the originating thread. Requests from other threads wait while the
 orchestrator is working or awaiting an answer; follow-ups in its current thread
-can steer it. Only the configured member in the configured workspace/channel can
-issue commands. Questions and permissions include an ID; reply in that thread:
+can steer it. Only the configured member in the configured workspace can issue commands,
+in their app DM or the optional configured channel. Questions and permissions include an ID; reply in that thread:
 
 ```text
 @difu answer <question-id> <your answer>
@@ -992,8 +998,10 @@ issue commands. Questions and permissions include an ID; reply in that thread:
 @difu deny <request-id>
 ```
 
-Structured permission forms accept `@difu approve <request-id> {"field":"value"}`
-matching the displayed schema. Permissions apply to that request/turn, never the
+In DMs, omit `@difu` from these commands. MCP and Claude permission forms appear
+as ordinary questions: choose Allow once, Deny, or Cancel, then answer any fields
+individually. Difu builds the protocol response internally; you never enter JSON.
+Unsupported forms offer Deny/Cancel so the agent can ask ordinary questions instead. Permissions apply to that request/turn, never the
 whole session. Casual replies such as “yes” do not grant permission. Use
 `@difu help` for command reminders. Reading a session through the orchestrator also
 makes its pending questions available in Slack.

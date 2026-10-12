@@ -120,6 +120,7 @@ pub(super) fn prepare_answer(
         .and_then(|(_, q)| q.get("question"))
         .and_then(Value::as_str)
         .context("This question was already answered or skipped")?;
+    super::elicitation::check_answer(pending, question, answer)?;
     let text = if let Some(answer) = answer {
         ensure!(
             !answer.trim().is_empty(),
@@ -148,6 +149,7 @@ pub(super) fn prepare_answer(
         question.into(),
         json!({"answers":answer.into_iter().collect::<Vec<_>>()}),
     );
+    super::elicitation::finish_decline(&mut updated, question, answer);
     Ok((updated, text))
 }
 
@@ -181,6 +183,9 @@ pub(super) fn record_answer(session: &mut Session, mut updated: Pending) {
 
 impl Session {
     pub(crate) fn restore_async_questions(&mut self) {
+        for pending in &mut self.pending {
+            super::elicitation::normalize(pending);
+        }
         for entry in &self.entries {
             if entry.kind != "agentMessage"
                 || entry.data.get("delivery").and_then(Value::as_str) != Some("async")

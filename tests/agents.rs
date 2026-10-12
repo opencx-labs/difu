@@ -1729,9 +1729,10 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     control(
         &storage,
         &id,
-        Control::Respond {
+        Control::AnswerQuestion {
             request,
-            response: serde_json::json!({"action":"accept","content":{}}),
+            question: "difu-decision".into(),
+            answer: Some("Allow once".into()),
         },
     )?;
     wait(&storage, &id, |s| {
@@ -1777,14 +1778,15 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     control(
         &storage,
         &id,
-        Control::Respond {
+        Control::AnswerQuestion {
             request: awaiting
                 .pending
                 .first()
                 .context("Claude approval")?
                 .id
                 .clone(),
-            response: serde_json::json!({"action":"accept"}),
+            question: "difu-decision".into(),
+            answer: Some("Allow once".into()),
         },
     )?;
     let claude = wait(&storage, &id, |s| {
