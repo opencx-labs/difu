@@ -366,6 +366,25 @@ impl Service {
             })
             .transpose()?;
         match request {
+            Request::OrchestratorThread { route, title } => {
+                let _launch = self
+                    .launch_lock
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Launch lock failed"))?;
+                let id = super::orchestrator::thread_id(&route);
+                if self.store.inspect(&id, |s| s.orchestrator).unwrap_or(false) {
+                    return Ok(Reply::Launched(id));
+                }
+                let session = super::orchestrator::thread_session(&self.store, route, &title)?;
+                storage::atomic_json(&self.store.home.join(format!("{id}.json")), &session)?;
+                self.store
+                    .sessions
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Session lock failed"))?
+                    .insert(id.clone(), session);
+                self.store.changed.notify_all();
+                Ok(Reply::Launched(id))
+            }
             Request::SlackControl { .. } => anyhow::bail!("Unexpected nested Slack control"),
             Request::Ping => Ok(Reply::Ok),
             Request::ServiceVersion => Ok(Reply::ServiceVersion {

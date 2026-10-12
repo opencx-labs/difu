@@ -73,6 +73,40 @@ pub(super) fn session(store: &Store) -> Result<Session> {
     Ok(session)
 }
 
+/// Stable identity uses the Slack thread, never the individual event ID.
+pub(super) fn thread_id(route: &super::slack::Route) -> String {
+    let time: String = route
+        .thread
+        .chars()
+        .filter(char::is_ascii_digit)
+        .take(24)
+        .collect();
+    format!(
+        "orchestrator-{time}-{}",
+        crate::storage::hash(json!([route.account, route.channel, route.thread]).to_string())
+    )
+}
+pub(super) fn thread_session(
+    store: &Store,
+    route: super::slack::Route,
+    title: &str,
+) -> Result<Session> {
+    let mut session = session(store)?;
+    session.id = thread_id(&route);
+    let root = store.home.join("orchestrator-workspace").join(&session.id);
+    std::fs::create_dir_all(&root)?;
+    session.workspace = Some(root.clone());
+    if let Job::Coding(launch) = &mut session.job {
+        launch.repository = root;
+    }
+    session.title = knowledge::short(title, 120).replace(['\n', '\r'], " ");
+    if session.title.trim().is_empty() {
+        session.title = "Slack conversation".into();
+    }
+    session.orchestrator_origin = Some(route);
+    Ok(session)
+}
+
 pub(super) fn handle(store: &Store, caller: &str, args: &Value) -> Result<Value> {
     ensure!(
         store.inspect(caller, |s| s.orchestrator)?,
@@ -264,5 +298,51 @@ mod tests {
                     == Some(super::super::management::TOOL))
         );
         assert_eq!(session.summary().kind, "Orchestrator");
+    }
+}
+
+#[cfg(test)]
+mod thread_tests {
+    use super::*;
+    #[test]
+    fn conversation_identity_ignores_event_but_separates_threads_channels_and_accounts() {
+        let route = super::super::slack::Route {
+            account: "one".into(),
+            channel: "D123".into(),
+            thread: "100.0001".into(),
+            event: "event1".into(),
+        };
+        let original = thread_id(&route);
+        let mut next = route.clone();
+        next.event = "event2".into();
+        assert_eq!(original, thread_id(&next));
+        next.thread = "100.0002".into();
+        assert_ne!(original, thread_id(&next));
+        next = route.clone();
+        next.channel = "D456".into();
+        assert_ne!(original, thread_id(&next));
+        next = route;
+        next.account = "two".into();
+        assert_ne!(original, thread_id(&next));
+    }
+    #[test]
+    fn thread_conversation_has_no_worktree_or_inherited_chat_history() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = Store::fixture(home.path().into(), Vec::new());
+        let route = super::super::slack::Route {
+            account: "one".into(),
+            channel: "D123".into(),
+            thread: "100.0001".into(),
+            event: "event1".into(),
+        };
+        let session = thread_session(&store, route.clone(), "Investigate an invoice")?;
+        assert!(session.orchestrator && session.entries.is_empty() && session.thread_id.is_none());
+        assert!(
+            matches!(session.job,Job::Coding(ref launch) if !launch.isolated && launch.prompt.is_empty())
+        );
+        assert_eq!(session.orchestrator_origin, Some(route));
+        assert_eq!(session.status, Status::Idle);
+        assert!(!session.job.root().join(".git").exists());
+        Ok(())
     }
 }

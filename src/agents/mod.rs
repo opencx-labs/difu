@@ -225,6 +225,8 @@ pub struct Session {
     #[serde(default)]
     pub orchestrator: bool,
     #[serde(default)]
+    pub orchestrator_origin: Option<slack::Route>,
+    #[serde(default)]
     pub slack_route: Option<slack::Route>,
     #[serde(default)]
     pub slack_after: usize,
@@ -333,6 +335,7 @@ impl Session {
         };
         Self {
             orchestrator: false,
+            orchestrator_origin: None,
             slack_route: None,
             slack_after: 0,
             orchestrator_requests: Vec::new(),
@@ -673,6 +676,10 @@ pub enum Control {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
+    OrchestratorThread {
+        route: slack::Route,
+        title: String,
+    },
     SlackControl {
         id: String,
         control: Control,

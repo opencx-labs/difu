@@ -122,6 +122,7 @@ pub struct Position {
 #[derive(Clone)]
 enum Action {
     Select(String),
+    OrchestratorBack,
     Open,
     Focus(Focus),
     Resources(bool),
@@ -289,6 +290,7 @@ pub struct Ui {
     pub pinned_sessions: std::collections::BTreeSet<String>,
     pub session_order: Vec<String>,
     pub archived: bool,
+    orchestrator_list: bool,
     pub modal: Option<Modal>,
     pub notice: Option<(String, bool)>,
     pub clipboard: Option<String>,
@@ -356,6 +358,7 @@ impl Ui {
             pinned_sessions: config.pinned_sessions.clone(),
             session_order: config.session_order.clone(),
             archived: false,
+            orchestrator_list: false,
             modal: None,
             notice: None,
             clipboard: None,
@@ -849,6 +852,13 @@ impl Ui {
             .summaries
             .iter()
             .filter(|s| s.kind != "Guide" && s.archived == self.archived)
+            .filter(|s| {
+                if self.orchestrator_list {
+                    s.kind == "Orchestrator"
+                } else {
+                    s.kind != "Orchestrator" || s.id == super::orchestrator::ID
+                }
+            })
             .cloned()
             .collect::<Vec<_>>();
         let positions: HashMap<_, _> = self
@@ -858,8 +868,8 @@ impl Ui {
             .map(|(i, id)| (id, i))
             .collect();
         sessions.sort_by(|a, b| {
-            (a.kind != "Orchestrator")
-                .cmp(&(b.kind != "Orchestrator"))
+            (a.id != super::orchestrator::ID)
+                .cmp(&(b.id != super::orchestrator::ID))
                 .then_with(|| {
                     self.pinned_sessions
                         .contains(&b.id)
@@ -870,7 +880,30 @@ impl Ui {
                 // appear first; updates and status changes never affect order.
                 .then_with(|| b.id.cmp(&a.id))
         });
+        if self.orchestrator_list {
+            if let Some(root) = sessions
+                .iter_mut()
+                .find(|s| s.id == super::orchestrator::ID)
+            {
+                root.title = "Existing orchestrator chat".into();
+            }
+        }
         sessions
+    }
+    fn open_orchestrator_list(&mut self) {
+        self.orchestrator_list = true;
+        self.drilled = false;
+        self.focus = Focus::List;
+        self.list_scroll = 0;
+        self.ensure_selected();
+    }
+    fn close_orchestrator_list(&mut self) {
+        self.orchestrator_list = false;
+        self.drilled = false;
+        self.archived = false;
+        self.focus = Focus::List;
+        self.list_scroll = 0;
+        self.select(super::orchestrator::ID.into());
     }
     fn reorder_session(&mut self, down: bool) {
         let list = self.filtered();
@@ -891,8 +924,8 @@ impl Ui {
         let Some(current) = list.get(index) else {
             return;
         };
-        if current.kind == "Orchestrator"
-            || next.kind == "Orchestrator"
+        if current.id == super::orchestrator::ID
+            || next.id == super::orchestrator::ID
             || self.deleting.contains(&current.id)
             || self.deleting.contains(&next.id)
             || self.pinned_sessions.contains(&current.id) != self.pinned_sessions.contains(&next.id)
@@ -1461,6 +1494,18 @@ impl Ui {
             } else {
                 self.move_transcript(key.code == KeyCode::Down);
             }
+            return;
+        }
+        if self.focus == Focus::List
+            && key.code == KeyCode::Enter
+            && !self.orchestrator_list
+            && self.selected.as_deref() == Some(super::orchestrator::ID)
+        {
+            self.open_orchestrator_list();
+            return;
+        }
+        if self.orchestrator_list && !self.drilled && key.code == KeyCode::Esc {
+            self.close_orchestrator_list();
             return;
         }
         if self.changes_visible && self.drilled && key.code == KeyCode::Esc {
@@ -2214,7 +2259,12 @@ impl Ui {
             Action::RulesOption(index) => self.rules_option(index),
             Action::RulesSave => self.save_rules(),
             Action::RulesCancel => self.close_rules(),
+            Action::OrchestratorBack => self.close_orchestrator_list(),
             Action::Select(id) => {
+                if id == super::orchestrator::ID && !self.orchestrator_list {
+                    self.open_orchestrator_list();
+                    return;
+                }
                 if self.deleting.contains(&id) {
                     return;
                 }
@@ -2222,6 +2272,12 @@ impl Ui {
                 self.focus = Focus::List;
             }
             Action::Open => {
+                if self.selected.as_deref() == Some(super::orchestrator::ID)
+                    && !self.orchestrator_list
+                {
+                    self.open_orchestrator_list();
+                    return;
+                }
                 if self
                     .selected
                     .as_ref()
@@ -2713,7 +2769,13 @@ impl Ui {
         let area = panel(
             frame,
             rect,
-            if self.archived {
+            if self.orchestrator_list {
+                if self.archived {
+                    "Archived orchestrator chats"
+                } else {
+                    "Orchestrator chats"
+                }
+            } else if self.archived {
                 "Archived agents"
             } else {
                 "Agents"
@@ -2721,6 +2783,14 @@ impl Ui {
             !self.panels.focused && self.focus == Focus::List,
         );
         self.hits.push((rect, Action::Focus(Focus::List)));
+        if self.orchestrator_list {
+            let back = Rect::new(area.x, area.y, area.width, 1);
+            frame.render_widget(
+                Paragraph::new("← All sessions · Esc").style(Style::default().fg(DIM)),
+                back,
+            );
+            self.hits.push((back, Action::OrchestratorBack));
+        }
         let items = Rect::new(
             area.x,
             area.y.saturating_add(1),
@@ -2804,12 +2874,13 @@ impl Ui {
                     if session.archived { " · archived" } else { "" }
                 )
             };
-            let pin =
-                if session.kind == "Orchestrator" || self.pinned_sessions.contains(&session.id) {
-                    "◆ "
-                } else {
-                    ""
-                };
+            let pin = if session.id == super::orchestrator::ID
+                || self.pinned_sessions.contains(&session.id)
+            {
+                "◆ "
+            } else {
+                ""
+            };
             let title_width = usize::from(row.width)
                 .saturating_sub(2 + unicode_width::UnicodeWidthStr::width(pin));
             let mut lines = vec![
@@ -3773,6 +3844,47 @@ mod tests {
         ui.sessions.insert(session.id.clone(), session);
         ui.select("one".into());
         ui
+    }
+    #[test]
+    fn orchestrator_threads_live_in_a_separate_navigable_list() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        let mut root = ui.sessions.get("one").context("fixture")?.clone();
+        root.id = super::super::orchestrator::ID.into();
+        root.orchestrator = true;
+        root.title = "Difu orchestrator".into();
+        let mut thread = root.clone();
+        thread.id = "orchestrator-100-thread".into();
+        thread.title = "Investigate billing".into();
+        ui.summaries.extend([root.summary(), thread.summary()]);
+        ui.sessions.insert(root.id.clone(), root);
+        ui.sessions.insert(thread.id.clone(), thread);
+        assert!(
+            !ui.filtered()
+                .iter()
+                .any(|s| s.id == "orchestrator-100-thread")
+        );
+        ui.action(Action::Select(super::super::orchestrator::ID.into()));
+        assert!(ui.orchestrator_list && !ui.drilled);
+        assert!(ui.filtered().iter().all(|s| s.kind == "Orchestrator"));
+        assert!(
+            ui.filtered()
+                .iter()
+                .any(|s| s.id == "orchestrator-100-thread")
+        );
+        ui.action(Action::Select("orchestrator-100-thread".into()));
+        ui.action(Action::Open);
+        assert!(ui.drilled);
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!ui.drilled && ui.orchestrator_list);
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(!ui.orchestrator_list);
+        assert_eq!(ui.selected.as_deref(), Some(super::super::orchestrator::ID));
+        assert!(ui.filtered().iter().any(|s| s.id == "one"));
+        Ok(())
     }
     #[test]
     fn palette_review_follows_focus_and_selected_session() -> Result<()> {
