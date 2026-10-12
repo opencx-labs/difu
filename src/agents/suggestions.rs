@@ -84,8 +84,8 @@ impl Task {
                 .find(|e| e.kind == "agentMessage" && !e.text.is_empty())?;
             Some((
                 turn.clone(),
-                prompt.text.clone(),
-                response.text.clone(),
+                prompt.text.to_string(),
+                response.text.to_string(),
                 prompt.id.clone(),
             ))
         })?;

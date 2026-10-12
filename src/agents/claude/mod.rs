@@ -352,6 +352,9 @@ fn send(
     decoder: &mut events::Decoder,
     prompt: &Prompt,
 ) -> Result<()> {
+    if let Prompt::Routed { origin, .. } = prompt {
+        store.update(id, |s| s.set_slack_route(origin.clone()))?;
+    }
     let session = store.get(id)?;
     let message_id = uuid(&session);
     let mut content = Vec::new();
@@ -388,7 +391,7 @@ fn send(
     store.update(id, |s| {
         s.entries.retain(|entry| !(entry.kind == "awaiting connection" && entry.text == prompt.text()));
         s.entries.push(Entry { id: message_id.clone(), kind: "sending".into(), text: prompt.text().into(),
-            data: json!({"prompt":prompt,"attachments":prompt.attachments(),"difuSteeringTurn":s.turn_id}), ..Entry::default() });
+            data: json!({"prompt":prompt,"attachments":prompt.attachments(),"difuSteeringTurn":s.turn_id}).into(), ..Entry::default() });
         if s.turn_id.is_none() { s.turn_id = Some(message_id.clone()); s.turn_started_at = Some(chrono::Utc::now().timestamp_millis()); }
         if s.pending.is_empty() { s.status = Status::Running; }
         s.error = None;
@@ -518,7 +521,7 @@ fn command(
             store.update(id, |s| {
                 if let Some(prompt) = replacement {
                     if let Some(slot) = s.queue.get_mut(index) {
-                        *slot = prompt;
+                        *slot = prompt.inherit_route(slot);
                     }
                 } else {
                     s.queue.remove(index);

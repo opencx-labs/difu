@@ -46,8 +46,23 @@ impl Watch {
                     )?;
                     stream.write_all(b"\n")?;
                     let mut reader = BufReader::new(stream);
+                    let mut current: Option<Box<Session>> = None;
                     while !cancel.cancelled() {
-                        let reply: Reply = serde_json::from_str(&client::read_line(&mut reader)?)?;
+                        let reply = super::super::transport::read_reply(&mut reader)?;
+                        let reply = match reply {
+                            Reply::SessionDelta(delta) => {
+                                let snapshot = current.as_mut().ok_or_else(|| {
+                                    anyhow::anyhow!("Session update arrived without a baseline")
+                                })?;
+                                delta.apply(snapshot)?;
+                                Reply::Session(snapshot.clone())
+                            }
+                            Reply::Session(snapshot) => {
+                                current = Some(snapshot.clone());
+                                Reply::Session(snapshot)
+                            }
+                            other => other,
+                        };
                         match reply {
                             Reply::Session(session) => {
                                 *latest.lock().unwrap_or_else(|e| e.into_inner()) =

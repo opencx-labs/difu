@@ -8,7 +8,7 @@ use nix::fcntl::{Flock, FlockArg};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{BufReader, Write},
+    io::BufReader,
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
@@ -27,6 +27,19 @@ pub struct Store {
     save_lock: Mutex<()>,
 }
 impl Store {
+    #[cfg(test)]
+    pub(super) fn fixture(home: PathBuf, sessions: Vec<Session>) -> Self {
+        Self {
+            storage: Storage {
+                config: home.join("config.json"),
+                cache: home.join("cache"),
+            },
+            home,
+            sessions: Mutex::new(sessions.into_iter().map(|s| (s.id.clone(), s)).collect()),
+            changed: Condvar::new(),
+            save_lock: Mutex::new(()),
+        }
+    }
     pub fn get(&self, id: &str) -> Result<Session> {
         self.inspect(id, Clone::clone)
     }
@@ -49,6 +62,14 @@ impl Store {
         self.changed.notify_all();
         Ok(())
     }
+    /// Serialize durable manager-record changes with saves, without touching chat history.
+    pub(super) fn durable<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _guard = self
+            .save_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Persistence lock failed"))?;
+        action()
+    }
     pub fn save(&self, id: &str) -> Result<()> {
         let _guard = self
             .save_lock
@@ -67,7 +88,12 @@ impl Store {
         }
         Ok(())
     }
-    fn queue_preparing(&self, id: &str, control: &Control) -> Result<bool> {
+    fn queue_preparing(
+        &self,
+        id: &str,
+        control: &Control,
+        route: &Option<slack::Route>,
+    ) -> Result<bool> {
         if !matches!(
             control,
             Control::Message { .. }
@@ -99,10 +125,13 @@ impl Store {
                 ..
             } => {
                 ensure!(!text.trim().is_empty(), "Message cannot be empty");
-                session.queue.push(Prompt::WithSkills {
-                    text: text.clone(),
-                    skills: skills.clone(),
-                    attachments: attachments.clone(),
+                session.queue.push(Prompt::Routed {
+                    prompt: Box::new(Prompt::WithSkills {
+                        text: text.clone(),
+                        skills: skills.clone(),
+                        attachments: attachments.clone(),
+                    }),
+                    origin: route.clone(),
                 });
             }
             Control::ReplaceQueued {
@@ -116,7 +145,7 @@ impl Store {
                 );
                 if let Some(prompt) = replacement {
                     if let Some(item) = session.queue.get_mut(*index) {
-                        *item = prompt.clone();
+                        *item = prompt.clone().inherit_route(item);
                     }
                 } else {
                     session.queue.remove(*index);
@@ -345,6 +374,25 @@ impl Service {
             })
             .transpose()?;
         match request {
+            Request::OrchestratorThread { route, title } => {
+                let _launch = self
+                    .launch_lock
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Launch lock failed"))?;
+                let id = super::orchestrator::thread_id(&route);
+                if self.store.inspect(&id, |s| s.orchestrator).unwrap_or(false) {
+                    return Ok(Reply::Launched(id));
+                }
+                let session = super::orchestrator::thread_session(&self.store, route, &title)?;
+                storage::atomic_json(&self.store.home.join(format!("{id}.json")), &session)?;
+                self.store
+                    .sessions
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Session lock failed"))?
+                    .insert(id.clone(), session);
+                self.store.changed.notify_all();
+                Ok(Reply::Launched(id))
+            }
             Request::SlackControl { .. } => anyhow::bail!("Unexpected nested Slack control"),
             Request::Ping => Ok(Reply::Ok),
             Request::ServiceVersion => Ok(Reply::ServiceVersion {
@@ -444,6 +492,40 @@ impl Service {
                         "The orchestrator is busy in another conversation; retry when it is ready"
                     );
                 }
+                // A queued task belongs to its originating thread. Changing the
+                // active route here would send the current task's output elsewhere.
+                if let Control::Message {
+                    text,
+                    queue: true,
+                    skills,
+                    attachments,
+                }
+                | Control::MessageWithAttachments {
+                    text,
+                    queue: true,
+                    skills,
+                    attachments,
+                } = &control
+                    && session.turn_id.is_some()
+                {
+                    ensure!(!text.trim().is_empty(), "Message cannot be empty");
+                    self.store.update(&id, |s| {
+                        s.queue.push(Prompt::Routed {
+                            prompt: Box::new(Prompt::WithSkills {
+                                text: text.clone(),
+                                skills: skills.clone(),
+                                attachments: attachments.clone(),
+                            }),
+                            origin: route.clone(),
+                        })
+                    })?;
+                    self.store.save(&id)?;
+                    return Ok(Reply::Ok);
+                }
+                if self.store.queue_preparing(&id, &control, &route)? {
+                    self.store.save(&id)?;
+                    return Ok(Reply::Ok);
+                }
                 if matches!(
                     control,
                     Control::Message { .. }
@@ -458,10 +540,6 @@ impl Service {
                     self.store
                         .update(&id, |s| s.set_slack_route(route.clone()))?;
                     self.store.save(&id)?;
-                }
-                if self.store.queue_preparing(&id, &control)? {
-                    self.store.save(&id)?;
-                    return Ok(Reply::Ok);
                 }
                 let session = self.store.get(&id)?;
                 if !matches!(session.job, Job::Coding(_)) {
@@ -627,7 +705,7 @@ impl Service {
                                 if let Some(entry) = s.entries.last_mut() {
                                     entry.data = serde_json::json!({"prompt":Prompt::WithSkills {
                                         text:text.clone(), skills:skills.clone(), attachments:attachments.clone()
-                                    }});
+                                    }}).into();
                                 }
                             }
                         })?;
@@ -992,6 +1070,22 @@ fn run_review(store: &Arc<Store>, id: &str, cancel: &Cancel) -> Result<()> {
     Ok(())
 }
 
+fn ensure_orchestrator(store: &Store) -> Result<()> {
+    if store
+        .inspect(super::orchestrator::ID, |s| s.orchestrator_generation > 0)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let session = super::orchestrator::session(store)?;
+    store
+        .sessions
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Session lock failed"))?
+        .insert(session.id.clone(), session);
+    store.save(super::orchestrator::ID)
+}
+
 pub fn run(storage: Storage) -> Result<()> {
     let home = home(&storage)?;
     let file = OpenOptions::new()
@@ -1025,6 +1119,11 @@ pub fn run(storage: Storage) -> Result<()> {
             path.file_stem().and_then(|s| s.to_str()) == Some(&session.id),
             "Invalid session storage identity"
         );
+        // Replace the legacy shared manager once. Its provider thread, queued
+        // actions and history must not enter any of the new conversations.
+        if session.id == super::orchestrator::ID && session.orchestrator_generation == 0 {
+            continue;
+        }
         if session.status.active() {
             session.status = Status::Interrupted;
             session.turn_id = None;
@@ -1059,16 +1158,7 @@ pub fn run(storage: Storage) -> Result<()> {
         action_locks: Mutex::new(BTreeMap::new()),
         launch_lock: Mutex::new(()),
     });
-    if service.store.get(super::orchestrator::ID).is_err() {
-        let session = super::orchestrator::session(&service.store)?;
-        service
-            .store
-            .sessions
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Session lock failed"))?
-            .insert(session.id.clone(), session);
-        service.store.save(super::orchestrator::ID)?;
-    }
+    ensure_orchestrator(&service.store)?;
     let _pr_cache =
         super::pr_cache::Refresher::start(service.store.storage.clone(), service.store.clone())?;
     let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1147,12 +1237,14 @@ fn serve(service: &Service, mut stream: UnixStream) -> Result<()> {
     let reply = service
         .handle(request)
         .unwrap_or_else(|e| Reply::Error(format!("{e:#}")));
-    serde_json::to_writer(&mut stream, &reply)?;
-    stream.write_all(b"\n")?;
+    super::transport::write_reply(&mut stream, &reply)?;
     Ok(())
 }
 
-fn watch(store: &Store, stream: &mut UnixStream, id: &str, mut version: Option<u64>) -> Result<()> {
+fn watch(store: &Store, stream: &mut UnixStream, id: &str, _version: Option<u64>) -> Result<()> {
+    let mut previous: Option<Session> = None;
+    // Each connection starts with a complete baseline, then sends only changes.
+    let mut version = None;
     loop {
         let sessions = store
             .sessions
@@ -1169,15 +1261,21 @@ fn watch(store: &Store, stream: &mut UnixStream, id: &str, mut version: Option<u
         let reply = match sessions.get(id) {
             Some(session) if Some(session.version) != version => {
                 version = Some(session.version);
-                Reply::Session(Box::new(session.clone()))
+                let reply = match &previous {
+                    Some(previous) => {
+                        Reply::SessionDelta(super::transport::Delta::between(previous, session))
+                    }
+                    None => Reply::Session(Box::new(session.clone())),
+                };
+                previous = Some(session.clone());
+                reply
             }
             Some(_) => Reply::Unchanged,
             None => Reply::Error("Session not found".into()),
         };
         drop(sessions);
         // Never hold the provider's session lock during socket I/O.
-        serde_json::to_writer(&mut *stream, &reply)?;
-        stream.write_all(b"\n")?;
+        super::transport::write_reply(&mut *stream, &reply)?;
         if matches!(reply, Reply::Error(_)) {
             return Ok(());
         }
@@ -1224,14 +1322,14 @@ mod watch_tests {
             let _ = done.send(());
         });
         let mut reader = BufReader::new(client);
-        let first: Reply = serde_json::from_str(&client::read_line(&mut reader)?)?;
+        let first = super::super::transport::read_reply(&mut reader)?;
         assert!(matches!(first, Reply::Session(s) if s.version == 0));
         // Update while the subscriber is between writes/waits. The predicate
         // must catch the change even if the notification precedes the wait.
         store.update("one", |s| s.note("agentMessage", "streamed"))?;
-        let next: Reply = serde_json::from_str(&client::read_line(&mut reader)?)?;
+        let next = super::super::transport::read_reply(&mut reader)?;
         assert!(
-            matches!(next, Reply::Session(s) if s.version > 0 && s.entries.last().is_some_and(|e| e.text == "streamed"))
+            matches!(next, Reply::SessionDelta(s) if s.session.version > 0 && s.entries.last().is_some_and(|(_,e)| e.text == "streamed"))
         );
         reader.get_ref().shutdown(std::net::Shutdown::Both)?;
         drop(reader);
@@ -1239,6 +1337,144 @@ mod watch_tests {
         worker
             .join()
             .map_err(|_| anyhow::anyhow!("watch panicked"))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod routed_queue_tests {
+    use super::*;
+    #[test]
+    fn replacing_legacy_manager_is_one_time_and_threads_reuse_only_their_own_context() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let store = Arc::new(Store::fixture(temp.path().into(), Vec::new()));
+        let mut old = super::super::orchestrator::session(&store)?;
+        old.orchestrator_generation = 0;
+        old.thread_id = Some("old-provider-thread".into());
+        old.note("agentMessage", "legacy shared transcript");
+        old.queue.push(Prompt::from("must not replay"));
+        store
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock"))?
+            .insert(old.id.clone(), old);
+        ensure_orchestrator(&store)?;
+        let fresh = store.get(super::super::orchestrator::ID)?;
+        assert!(fresh.entries.is_empty() && fresh.queue.is_empty() && fresh.thread_id.is_none());
+        store.update(&fresh.id, |s| {
+            s.note("userMessage", "new local conversation")
+        })?;
+        ensure_orchestrator(&store)?;
+        assert_eq!(store.get(&fresh.id)?.entries.len(), 1);
+        let service = Service {
+            store,
+            workers: Mutex::new(BTreeMap::new()),
+            action_locks: Mutex::new(BTreeMap::new()),
+            launch_lock: Mutex::new(()),
+        };
+        let mut route = slack::Route {
+            account: "account".into(),
+            channel: "D1".into(),
+            thread: "1.0".into(),
+            event: "first".into(),
+        };
+        let request = |route| Request::OrchestratorThread {
+            route,
+            title: "First task".into(),
+        };
+        let Reply::Launched(first) = service.handle(request(route.clone()))? else {
+            anyhow::bail!("missing conversation")
+        };
+        service
+            .store
+            .update(&first, |s| s.note("userMessage", "thread-specific context"))?;
+        route.event = "followup".into();
+        let Reply::Launched(continued) = service.handle(request(route.clone()))? else {
+            anyhow::bail!("missing conversation")
+        };
+        assert_eq!(first, continued);
+        assert_eq!(service.store.get(&continued)?.entries.len(), 1);
+        route.thread = "2.0".into();
+        let Reply::Launched(second) = service.handle(request(route))? else {
+            anyhow::bail!("missing conversation")
+        };
+        assert_ne!(first, second);
+        assert!(service.store.get(&second)?.entries.is_empty());
+        assert!(
+            service
+                .workers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock"))?
+                .is_empty()
+        );
+        Ok(())
+    }
+    #[test]
+    fn queueing_another_threads_task_does_not_retarget_active_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut session = Session::new(
+            "worker".into(),
+            Job::Coding(Launch {
+                repository: temp.path().into(),
+                isolated: false,
+                base: String::new(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.status = Status::Running;
+        session.turn_id = Some("turn".into());
+        let first = slack::Route {
+            account: "account".into(),
+            channel: "D1".into(),
+            thread: "1.0".into(),
+            event: "e1".into(),
+        };
+        let second = slack::Route {
+            thread: "2.0".into(),
+            event: "e2".into(),
+            ..first.clone()
+        };
+        session.slack_route = Some(first.clone());
+        session.note("agentMessage", "first task output");
+        let service = Service {
+            store: Arc::new(Store::fixture(temp.path().into(), vec![session])),
+            workers: Mutex::new(BTreeMap::new()),
+            action_locks: Mutex::new(BTreeMap::new()),
+            launch_lock: Mutex::new(()),
+        };
+        service.handle(Request::SlackControl {
+            id: "worker".into(),
+            route: second.clone(),
+            control: Control::Message {
+                text: "second task".into(),
+                queue: true,
+                skills: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })?;
+        let mut current = service.store.get("worker")?;
+        assert_eq!(current.slack_route, Some(first.clone()));
+        let queued = current.queue.pop().context("queued task")?;
+        let Prompt::Routed { origin, .. } = &queued else {
+            anyhow::bail!("Missing queued origin")
+        };
+        assert_eq!(origin.as_ref(), Some(&second));
+        let replacement = Prompt::from("edited task").inherit_route(&queued);
+        assert!(matches!(replacement,Prompt::Routed{origin:Some(ref route),..} if route==&second));
+        current.set_slack_route(origin.clone());
+        let saved = current
+            .entries
+            .first()
+            .and_then(|e| e.data.get("difuSlackRoute"))
+            .context("original output route")?;
+        assert_eq!(
+            serde_json::from_value::<slack::Route>(saved.clone())?,
+            first
+        );
+        assert_eq!(current.slack_route, Some(second));
         Ok(())
     }
 }

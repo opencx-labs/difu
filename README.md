@@ -980,16 +980,25 @@ Message the app directly, or mention **@difu** in your configured channel, to ta
 coding sessions. It can inspect existing sessions, create sessions with your confirmation,
 send instructions, interrupt/resume, select models, rename, archive/unarchive,
 and delete sessions and their worktrees. A mention does not automatically create
-a coding session. Give it several tasks and it will read relevant sessions and
+a coding session. Give it several tasks and it will search relevant sessions and
 route each task to the appropriate one, queuing work for busy sessions. It asks
 you when a task has no suitable session or several equally relevant matches.
-The same orchestrator chat is accessible in difu.
+Select **Difu orchestrator** to open its separate conversation list. Slack
+conversations do not appear among coding sessions; **Difu chat** is the local
+conversation. **Esc** returns to the main list.
+
+Each Slack thread has independent model context and creates no coding worktree.
+The conversations share bounded session search/status tools and small persistent
+task/decision records. Whole session transcripts are never returned to the
+orchestrator. Provider-native automatic compaction manages working context;
+records are retrieved only when needed. Upgrading replaces the old shared
+orchestrator chat with a fresh local conversation, without migrating its history,
+queued actions, or pending approvals. Existing coding sessions are preserved.
 
 Each new direct message gets a reply thread. Follow-ups within that thread stay
 there and need no mention. Channel messages and follow-ups still require @difu.
-Replies and pending questions stay in the originating thread. Requests from other threads wait while the
-orchestrator is working or awaiting an answer; follow-ups in its current thread
-can steer it. Only the configured member in the configured workspace can issue commands,
+Replies and pending questions stay in the originating thread. Different threads
+can work independently; follow-ups in a thread continue its own conversation. Only the configured member in the configured workspace can issue commands,
 in their app DM or the optional configured channel. Questions and permissions include an ID; reply in that thread:
 
 ```text

@@ -14,10 +14,12 @@ mod questions;
 mod registration;
 mod rules;
 pub mod server;
+mod shared;
 pub mod slack;
 mod startup;
 mod suggestions;
 mod title;
+mod transport;
 pub mod ui;
 mod workspace;
 
@@ -131,9 +133,9 @@ impl Status {
 pub struct Entry {
     pub id: String,
     pub kind: String,
-    pub text: String,
+    pub text: shared::Shared<String>,
     #[serde(default)]
-    pub data: Value,
+    pub data: shared::Shared<Value>,
     #[serde(default)]
     pub started_at: Option<i64>,
     #[serde(default)]
@@ -146,7 +148,7 @@ impl Entry {
         {
             object.insert("difuSlackRoute".into(), origin.clone());
         }
-        self.data = data;
+        self.data = data.into();
     }
     pub fn is_tool(&self) -> bool {
         !matches!(
@@ -222,6 +224,10 @@ impl DeletionStage {
 pub struct Session {
     #[serde(default)]
     pub orchestrator: bool,
+    #[serde(default)]
+    pub orchestrator_origin: Option<slack::Route>,
+    #[serde(default)]
+    pub orchestrator_generation: u32,
     #[serde(default)]
     pub slack_route: Option<slack::Route>,
     #[serde(default)]
@@ -331,6 +337,8 @@ impl Session {
         };
         Self {
             orchestrator: false,
+            orchestrator_origin: None,
+            orchestrator_generation: 0,
             slack_route: None,
             slack_after: 0,
             orchestrator_requests: Vec::new(),
@@ -414,7 +422,7 @@ impl Session {
             let value = serde_json::json!(previous);
             for entry in self.entries.iter_mut().skip(self.slack_after) {
                 if !entry.data.is_object() {
-                    entry.data = serde_json::json!({});
+                    entry.data = serde_json::json!({}).into();
                 }
                 if let Some(data) = entry.data.as_object_mut() {
                     data.entry("difuSlackRoute")
@@ -453,7 +461,7 @@ impl Session {
         self.entries.push(Entry {
             id: format!("difu-{}-{}", self.version, self.entries.len()),
             kind: kind.into(),
-            text: text.into(),
+            text: text.into().into(),
             ..Entry::default()
         });
         self.touch();
@@ -461,7 +469,7 @@ impl Session {
     pub fn unsent(&mut self, prompt: Prompt) {
         self.note("unsent", prompt.text());
         if let Some(entry) = self.entries.last_mut() {
-            entry.data = serde_json::json!({"prompt":prompt});
+            entry.data = serde_json::json!({"prompt":prompt}).into();
         }
     }
     pub fn tool_running(&self) -> bool {
@@ -579,6 +587,10 @@ pub struct Skill {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Prompt {
+    Routed {
+        prompt: Box<Prompt>,
+        origin: Option<slack::Route>,
+    },
     Text(String),
     QuestionAnswer {
         text: String,
@@ -593,8 +605,26 @@ pub enum Prompt {
     },
 }
 impl Prompt {
+    pub fn inherit_route(self, previous: &Self) -> Self {
+        let prompt = self.unrouted();
+        if let Self::Routed { origin, .. } = previous {
+            Self::Routed {
+                prompt: Box::new(prompt),
+                origin: origin.clone(),
+            }
+        } else {
+            prompt
+        }
+    }
+    fn unrouted(self) -> Self {
+        match self {
+            Self::Routed { prompt, .. } => prompt.unrouted(),
+            other => other,
+        }
+    }
     pub fn text(&self) -> &str {
         match self {
+            Self::Routed { prompt, .. } => prompt.text(),
             Self::Text(s)
             | Self::WithSkills { text: s, .. }
             | Self::QuestionAnswer { text: s, .. } => s,
@@ -602,12 +632,14 @@ impl Prompt {
     }
     pub fn attachments(&self) -> &[media::Attachment] {
         match self {
+            Self::Routed { prompt, .. } => prompt.attachments(),
             Self::Text(_) | Self::QuestionAnswer { .. } => &[],
             Self::WithSkills { attachments, .. } => attachments,
         }
     }
     pub fn skills(&self) -> &[Skill] {
         match self {
+            Self::Routed { prompt, .. } => prompt.skills(),
             Self::Text(_) | Self::QuestionAnswer { .. } => &[],
             Self::WithSkills { skills, .. } => skills,
         }
@@ -671,6 +703,10 @@ pub enum Control {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
+    OrchestratorThread {
+        route: slack::Route,
+        title: String,
+    },
     SlackControl {
         id: String,
         control: Control,
@@ -760,6 +796,7 @@ pub enum Reply {
     Shells(Vec<Value>),
     Sessions(Vec<Summary>),
     Session(Box<Session>),
+    SessionDelta(transport::Delta),
     Unchanged,
     Launched(String),
     ChooseRepository,
