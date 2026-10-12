@@ -430,8 +430,8 @@ fn preview(
     let bounded = Entry {
         id: entry.id.clone(),
         kind: entry.kind.clone(),
-        text: prefix(&entry.text, budget),
-        data: Value::Object(data),
+        text: prefix(&entry.text, budget).into(),
+        data: Value::Object(data).into(),
         started_at: entry.started_at,
         finished_at: entry.finished_at,
     };
@@ -733,7 +733,7 @@ pub(super) fn render_entries(
                         .unwrap_or(&entry.text)
                         .to_owned()
                 } else {
-                    entry.text.clone()
+                    entry.text.to_string()
                 };
                 let shown = output;
                 let rows = if entry.kind == "commandExecution" {

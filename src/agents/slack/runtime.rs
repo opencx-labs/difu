@@ -500,7 +500,7 @@ fn observe(
                     format!("entry:{}:{}:{}", session.id, origin.event, entry.id),
                     origin.clone(),
                     if session.id == orchestrator::ID {
-                        entry.text.clone()
+                        entry.text.to_string()
                     } else {
                         format!("{}\n{}", session.title, entry.text)
                     },

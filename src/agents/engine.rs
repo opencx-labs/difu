@@ -176,6 +176,20 @@ fn item_text(item: &Value) -> String {
         .unwrap_or("activity");
     match kind {
         "agentMessage" => string(item, "text"),
+        "dynamicToolCall"
+            if item.get("tool").and_then(Value::as_str) == Some(super::orchestrator::TOOL) =>
+        {
+            format!(
+                "{} · {} · {}",
+                super::orchestrator::TOOL,
+                item.pointer("/arguments/action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("lookup"),
+                item.get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("running")
+            )
+        }
         "userMessage" => item
             .get("content")
             .and_then(Value::as_array)
@@ -368,7 +382,7 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                 })
             {
                 session.title_ready = true;
-                session.title_response = entry.text.clone();
+                session.title_response = entry.text.to_string();
             }
             if session.status != Status::Idle && !session.switching_workspace {
                 for text in std::mem::take(&mut session.queue) {
@@ -385,7 +399,7 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
             let now = chrono::Utc::now().timestamp_millis();
             let completed = method.ends_with("/completed");
             if let Some(entry) = session.entries.iter_mut().find(|e| e.id == id) {
-                entry.data = params.clone();
+                entry.data = params.clone().into();
                 if completed {
                     entry.finished_at = Some(
                         params
@@ -398,7 +412,7 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                 session.entries.push(Entry {
                     id,
                     kind: "autoApprovalReview".into(),
-                    data: params.clone(),
+                    data: params.clone().into(),
                     started_at: Some(
                         params
                             .get("startedAtMs")
@@ -447,7 +461,7 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                     if entry.kind == "sending_context" {
                         kind = "system".into();
                     }
-                    text = entry.text.clone();
+                    text = entry.text.to_string();
                 }
                 if let Some(entry) = session.entries.iter_mut().find(|e| e.id == id) {
                     let user_message = kind == "userMessage";
@@ -455,7 +469,7 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                         entry.kind = kind;
                     }
                     if !user_message {
-                        entry.text = text;
+                        entry.text = text.into();
                     }
                     entry.replace_data(item.clone());
                     if method == "item/completed" {
@@ -465,8 +479,8 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                     session.entries.push(Entry {
                         id,
                         kind,
-                        text,
-                        data: item.clone(),
+                        text: text.into(),
+                        data: item.clone().into(),
                         started_at: Some(chrono::Utc::now().timestamp_millis()),
                         finished_at: (method == "item/completed")
                             .then(|| chrono::Utc::now().timestamp_millis()),
@@ -500,12 +514,12 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
         "turn/plan/updated" => {
             let id = format!("plan-{}", session.turn_id.as_deref().unwrap_or("current"));
             if let Some(entry) = session.entries.iter_mut().find(|e| e.id == id) {
-                entry.data = params.clone();
+                entry.data = params.clone().into();
             } else {
                 session.entries.push(Entry {
                     id,
                     kind: "plan".into(),
-                    data: params.clone(),
+                    data: params.clone().into(),
                     ..Entry::default()
                 });
             }
@@ -671,8 +685,10 @@ fn send_turn(
         );
         if let Some(entry) = s.entries.last_mut() {
             sending_id = Some(entry.id.clone());
-            entry.data = json!({"wire_text":wire_text,"attachments":prompt.attachments(),"prompt":prompt,
-                "difuSteeringTurn":if steer && !internal { session.turn_id.clone() } else { None }});
+            entry.data =
+                json!({"wire_text":wire_text,"attachments":prompt.attachments(),"prompt":prompt,
+                "difuSteeringTurn":if steer && !internal { session.turn_id.clone() } else { None }})
+                .into();
         }
     })?;
     store.save(id)?;
@@ -1633,7 +1649,7 @@ mod tests {
         for text in ["first steering message", "> Question?\nAnswer with notes"] {
             session.note("userMessage", text);
             session.entries.last_mut().context("message")?.data =
-                json!({"wire_text":text, "difuSteeringTurn":"t"});
+                json!({"wire_text":text, "difuSteeringTurn":"t"}).into();
         }
         session.note("agentMessage", "Continuing the task");
         session.turn_id = Some("t".into());
@@ -1722,7 +1738,8 @@ mod tests {
             );
         }
         session.note("sending", "follow up");
-        session.entries.last_mut().context("message")?.data = json!({"difuSteeringTurn":"t"});
+        session.entries.last_mut().context("message")?.data =
+            json!({"difuSteeringTurn":"t"}).into();
         assert!(session.tool_running());
         assert_eq!(session.pending_steering().count(), 1);
         session.entries.last_mut().context("message")?.kind = "userMessage".into();
@@ -1751,7 +1768,8 @@ mod tests {
         );
         assert_eq!(session.pending_steering().count(), 0); // A later tool cannot queue the message again.
         session.note("sending", "delayed acknowledgement");
-        session.entries.last_mut().context("message")?.data = json!({"difuSteeringTurn":"t"});
+        session.entries.last_mut().context("message")?.data =
+            json!({"difuSteeringTurn":"t"}).into();
         apply_event(
             &mut session,
             &json!({"method":"item/completed","params":{"item":{

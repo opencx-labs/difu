@@ -388,7 +388,7 @@ fn send(
     store.update(id, |s| {
         s.entries.retain(|entry| !(entry.kind == "awaiting connection" && entry.text == prompt.text()));
         s.entries.push(Entry { id: message_id.clone(), kind: "sending".into(), text: prompt.text().into(),
-            data: json!({"prompt":prompt,"attachments":prompt.attachments(),"difuSteeringTurn":s.turn_id}), ..Entry::default() });
+            data: json!({"prompt":prompt,"attachments":prompt.attachments(),"difuSteeringTurn":s.turn_id}).into(), ..Entry::default() });
         if s.turn_id.is_none() { s.turn_id = Some(message_id.clone()); s.turn_started_at = Some(chrono::Utc::now().timestamp_millis()); }
         if s.pending.is_empty() { s.status = Status::Running; }
         s.error = None;

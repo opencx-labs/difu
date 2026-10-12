@@ -88,8 +88,8 @@ impl Window {
                     "sending"
                 }
                 .into(),
-                text: pending.text.clone(),
-                data: serde_json::json!({"difuRetry":pending.failed.is_some()}),
+                text: pending.text.clone().into(),
+                data: serde_json::json!({"difuRetry":pending.failed.is_some()}).into(),
                 ..Entry::default()
             })
             .collect::<Vec<_>>();

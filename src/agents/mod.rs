@@ -14,10 +14,12 @@ mod questions;
 mod registration;
 mod rules;
 pub mod server;
+mod shared;
 pub mod slack;
 mod startup;
 mod suggestions;
 mod title;
+mod transport;
 pub mod ui;
 mod workspace;
 
@@ -131,9 +133,9 @@ impl Status {
 pub struct Entry {
     pub id: String,
     pub kind: String,
-    pub text: String,
+    pub text: shared::Shared<String>,
     #[serde(default)]
-    pub data: Value,
+    pub data: shared::Shared<Value>,
     #[serde(default)]
     pub started_at: Option<i64>,
     #[serde(default)]
@@ -146,7 +148,7 @@ impl Entry {
         {
             object.insert("difuSlackRoute".into(), origin.clone());
         }
-        self.data = data;
+        self.data = data.into();
     }
     pub fn is_tool(&self) -> bool {
         !matches!(
@@ -222,6 +224,9 @@ impl DeletionStage {
 pub struct Session {
     #[serde(default)]
     pub orchestrator: bool,
+    /// Shared manager state contains task facts, never permission grants.
+    #[serde(default)]
+    pub orchestrator_state: std::collections::BTreeMap<String, orchestrator::Record>,
     #[serde(default)]
     pub slack_route: Option<slack::Route>,
     #[serde(default)]
@@ -331,6 +336,7 @@ impl Session {
         };
         Self {
             orchestrator: false,
+            orchestrator_state: Default::default(),
             slack_route: None,
             slack_after: 0,
             orchestrator_requests: Vec::new(),
@@ -414,7 +420,7 @@ impl Session {
             let value = serde_json::json!(previous);
             for entry in self.entries.iter_mut().skip(self.slack_after) {
                 if !entry.data.is_object() {
-                    entry.data = serde_json::json!({});
+                    entry.data = serde_json::json!({}).into();
                 }
                 if let Some(data) = entry.data.as_object_mut() {
                     data.entry("difuSlackRoute")
@@ -453,7 +459,7 @@ impl Session {
         self.entries.push(Entry {
             id: format!("difu-{}-{}", self.version, self.entries.len()),
             kind: kind.into(),
-            text: text.into(),
+            text: text.into().into(),
             ..Entry::default()
         });
         self.touch();
@@ -461,7 +467,7 @@ impl Session {
     pub fn unsent(&mut self, prompt: Prompt) {
         self.note("unsent", prompt.text());
         if let Some(entry) = self.entries.last_mut() {
-            entry.data = serde_json::json!({"prompt":prompt});
+            entry.data = serde_json::json!({"prompt":prompt}).into();
         }
     }
     pub fn tool_running(&self) -> bool {
@@ -760,6 +766,7 @@ pub enum Reply {
     Shells(Vec<Value>),
     Sessions(Vec<Summary>),
     Session(Box<Session>),
+    SessionDelta(transport::Delta),
     Unchanged,
     Launched(String),
     ChooseRepository,

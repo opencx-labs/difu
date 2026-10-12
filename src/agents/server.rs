@@ -627,7 +627,7 @@ impl Service {
                                 if let Some(entry) = s.entries.last_mut() {
                                     entry.data = serde_json::json!({"prompt":Prompt::WithSkills {
                                         text:text.clone(), skills:skills.clone(), attachments:attachments.clone()
-                                    }});
+                                    }}).into();
                                 }
                             }
                         })?;
@@ -1147,12 +1147,14 @@ fn serve(service: &Service, mut stream: UnixStream) -> Result<()> {
     let reply = service
         .handle(request)
         .unwrap_or_else(|e| Reply::Error(format!("{e:#}")));
-    serde_json::to_writer(&mut stream, &reply)?;
-    stream.write_all(b"\n")?;
+    super::transport::write_reply(&mut stream, &reply)?;
     Ok(())
 }
 
-fn watch(store: &Store, stream: &mut UnixStream, id: &str, mut version: Option<u64>) -> Result<()> {
+fn watch(store: &Store, stream: &mut UnixStream, id: &str, _version: Option<u64>) -> Result<()> {
+    let mut previous: Option<Session> = None;
+    // Each connection starts with a complete baseline, then sends only changes.
+    let mut version = None;
     loop {
         let sessions = store
             .sessions
@@ -1169,15 +1171,21 @@ fn watch(store: &Store, stream: &mut UnixStream, id: &str, mut version: Option<u
         let reply = match sessions.get(id) {
             Some(session) if Some(session.version) != version => {
                 version = Some(session.version);
-                Reply::Session(Box::new(session.clone()))
+                let reply = match &previous {
+                    Some(previous) => {
+                        Reply::SessionDelta(super::transport::Delta::between(previous, session))
+                    }
+                    None => Reply::Session(Box::new(session.clone())),
+                };
+                previous = Some(session.clone());
+                reply
             }
             Some(_) => Reply::Unchanged,
             None => Reply::Error("Session not found".into()),
         };
         drop(sessions);
         // Never hold the provider's session lock during socket I/O.
-        serde_json::to_writer(&mut *stream, &reply)?;
-        stream.write_all(b"\n")?;
+        super::transport::write_reply(&mut *stream, &reply)?;
         if matches!(reply, Reply::Error(_)) {
             return Ok(());
         }
@@ -1224,14 +1232,14 @@ mod watch_tests {
             let _ = done.send(());
         });
         let mut reader = BufReader::new(client);
-        let first: Reply = serde_json::from_str(&client::read_line(&mut reader)?)?;
+        let first = super::super::transport::read_reply(&mut reader)?;
         assert!(matches!(first, Reply::Session(s) if s.version == 0));
         // Update while the subscriber is between writes/waits. The predicate
         // must catch the change even if the notification precedes the wait.
         store.update("one", |s| s.note("agentMessage", "streamed"))?;
-        let next: Reply = serde_json::from_str(&client::read_line(&mut reader)?)?;
+        let next = super::super::transport::read_reply(&mut reader)?;
         assert!(
-            matches!(next, Reply::Session(s) if s.version > 0 && s.entries.last().is_some_and(|e| e.text == "streamed"))
+            matches!(next, Reply::SessionDelta(s) if s.session.version > 0 && s.entries.last().is_some_and(|(_,e)| e.text == "streamed"))
         );
         reader.get_ref().shutdown(std::net::Shutdown::Both)?;
         drop(reader);

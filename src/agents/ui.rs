@@ -4275,7 +4275,7 @@ mod tests {
         let mut canonical = session.clone();
         canonical.note("sending", "follow up immediately");
         canonical.entries.last_mut().context("message")?.data =
-            serde_json::json!({"difuSteeringTurn":"t"});
+            serde_json::json!({"difuSteeringTurn":"t"}).into();
         ui.sender.send(ResultMessage {
             kind: Task::Read("one".into()),
             result: Ok(Reply::Session(Box::new(canonical.clone()))),
@@ -4388,7 +4388,7 @@ mod tests {
         canonical.turn_id = Some("t".into());
         canonical.note("sending", "Show this immediately");
         canonical.entries.last_mut().context("message")?.data =
-            serde_json::json!({"difuSteeringTurn":"t"});
+            serde_json::json!({"difuSteeringTurn":"t"}).into();
         ui.sender.send(ResultMessage {
             kind: Task::Read("one".into()),
             result: Ok(Reply::Session(Box::new(canonical))),
@@ -5058,8 +5058,8 @@ mod tests {
             session.entries.push(Entry {
                 id: id.into(),
                 kind: kind.into(),
-                text,
-                data,
+                text: text.into(),
+                data: data.into(),
                 ..Entry::default()
             });
         }
@@ -5924,8 +5924,8 @@ mod tests {
         });
         let session = ui.sessions.get_mut("one").context("session")?;
         session.entries.clear();
-        session.entries.push(Entry { id: "command".into(), kind: "commandExecution".into(), text: "const output = 42;\nsecond\nthird\nfourth".into(), data: serde_json::json!({"command":"python3 - <<'PY'\nfrom pathlib import Path\nPY","exitCode":0}), ..Entry::default() });
-        session.entries.push(Entry { id: "edit".into(), kind: "fileChange".into(), data: serde_json::json!({"changes":[{"path":"src/example.rs","diff":"@@ -9 +9,2 @@\n-old\n+let answer = 42;\n+return answer;"}]}), ..Entry::default() });
+        session.entries.push(Entry { id: "command".into(), kind: "commandExecution".into(), text: "const output = 42;\nsecond\nthird\nfourth".into(), data: serde_json::json!({"command":"python3 - <<'PY'\nfrom pathlib import Path\nPY","exitCode":0}).into(), ..Entry::default() });
+        session.entries.push(Entry { id: "edit".into(), kind: "fileChange".into(), data: serde_json::json!({"changes":[{"path":"src/example.rs","diff":"@@ -9 +9,2 @@\n-old\n+let answer = 42;\n+return answer;"}]}).into(), ..Entry::default() });
         let mut position = Position::default();
         position.expanded.insert("edit".into());
         let (rows, sections) = transcript::render(session, &position, 72, false);
@@ -5982,7 +5982,7 @@ mod tests {
             id: "shell".into(),
             kind: "commandExecution".into(),
             text: "$ git status\nfresh streamed output".into(),
-            data: serde_json::json!({"aggregatedOutput":""}),
+            data: serde_json::json!({"aggregatedOutput":""}).into(),
             ..Entry::default()
         });
         ui.select_resource(false, 0);
@@ -6616,14 +6616,14 @@ mod tests {
         session.entries.push(Entry {
             id: "tool".into(),
             kind: "commandExecution".into(),
-            data: serde_json::json!({"command":"git diff --stat"}),
+            data: serde_json::json!({"command":"git diff --stat"}).into(),
             started_at: session.turn_started_at,
             ..Entry::default()
         });
         session.entries.push(Entry {
             id: "review".into(),
             kind: "autoApprovalReview".into(),
-            data: serde_json::json!({"targetItemId":"tool"}),
+            data: serde_json::json!({"targetItemId":"tool"}).into(),
             started_at: session.turn_started_at,
             ..Entry::default()
         });
@@ -6631,7 +6631,7 @@ mod tests {
             id: "steer".into(),
             kind: "userMessage".into(),
             text: "Focus on navigation".into(),
-            data: serde_json::json!({"difuSteeringTurn":"active"}),
+            data: serde_json::json!({"difuSteeringTurn":"active"}).into(),
             ..Entry::default()
         });
         session.queue.push("Explain the result next".into());
@@ -6863,7 +6863,8 @@ mod tests {
                 {"title":"What next?","options":["Explore","Review"]},
                 {"title":"How much detail?","options":["Brief","Full"]},
                 {"title":"Anything else?","options":null}
-            ]}),
+            ]})
+            .into(),
             ..Entry::default()
         });
         session.restore_async_questions();
@@ -7195,7 +7196,7 @@ mod tests {
             id: "tool".into(),
             kind: "commandExecution".into(),
             text: "preview one\npreview two\npreview three\nhidden tool output".into(),
-            data: serde_json::json!({"command":"git status","status":"completed"}),
+            data: serde_json::json!({"command":"git status","status":"completed"}).into(),
             finished_at: Some(1),
             ..Entry::default()
         });

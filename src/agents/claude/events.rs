@@ -67,7 +67,7 @@ fn block_entry(
     if let Some(entry) = session.entries.iter_mut().find(|entry| entry.id == id) {
         // A full assistant frame reconciles deltas; it does not finish a tool call.
         if entry.finished_at.is_none() || entry_kind != "mcpToolCall" {
-            entry.text = content;
+            entry.text = content.into();
             entry.replace_data(data);
         }
         if complete && entry_kind != "mcpToolCall" {
@@ -77,8 +77,8 @@ fn block_entry(
         session.entries.push(Entry {
             id: id.clone(),
             kind: entry_kind.into(),
-            text: content,
-            data,
+            text: content.into(),
+            data: data.into(),
             started_at: Some(now),
             finished_at: (complete && entry_kind != "mcpToolCall").then_some(now),
         });
@@ -191,7 +191,7 @@ impl Decoder {
                                 let input = self.input.entry(id.clone()).or_default();
                                 input.push_str(partial);
                                 if let Ok(arguments) = serde_json::from_str::<Value>(input) {
-                                    entry.text = arguments.to_string();
+                                    entry.text = arguments.to_string().into();
                                     if let Some(data) = entry.data.as_object_mut() {
                                         data.insert("arguments".into(), arguments);
                                     }
@@ -265,7 +265,8 @@ impl Decoder {
                                 "{}\n{}",
                                 entry.text,
                                 text(block.get("content").unwrap_or(&Value::Null))
-                            );
+                            )
+                            .into();
                         }
                     }
                 }
@@ -344,7 +345,7 @@ mod tests {
                 id: id.into(),
                 kind: "sending".into(),
                 text: id.into(),
-                data: json!({"difuSteeringTurn":"turn"}),
+                data: json!({"difuSteeringTurn":"turn"}).into(),
                 ..Entry::default()
             });
             decoder.sending();

@@ -30,6 +30,21 @@ pub fn read_line(reader: &mut impl BufRead) -> Result<String> {
     }
 }
 pub fn request(storage: &Storage, request: Request) -> Result<Reply> {
+    let operation = match &request {
+        Request::Read { id, .. } => format!("read session {id}"),
+        Request::Watch { id, .. } => format!("watch session {id}"),
+        Request::Control { id, .. } | Request::SlackControl { id, .. } => {
+            format!("apply session action to {id}")
+        }
+        Request::List => "list sessions".into(),
+        Request::Delete { id } => format!("delete session {id}"),
+        Request::Repository { id, .. } | Request::RegisterWorktree { id, .. } => {
+            format!("change workspace for {id}")
+        }
+        Request::Usage { id } => format!("read usage for {id}"),
+        Request::Launch { .. } | Request::NewAgent { .. } => "create session".into(),
+        _ => "request session service data".into(),
+    };
     let mut stream = UnixStream::connect(super::server::socket(storage)?)
         .context("Agent service is disconnected; refresh to reconnect")?;
     // Large worktrees can take longer than an RPC timeout to remove. These
@@ -41,9 +56,13 @@ pub fn request(storage: &Storage, request: Request) -> Result<Reply> {
     };
     stream.set_read_timeout(timeout)?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
-    serde_json::to_writer(&mut stream, &request)?;
-    stream.write_all(b"\n")?;
-    let response = serde_json::from_str(&read_line(&mut BufReader::new(stream))?)?;
+    serde_json::to_writer(&mut stream, &request)
+        .with_context(|| format!("Could not send request to {operation}"))?;
+    stream
+        .write_all(b"\n")
+        .with_context(|| format!("Could not finish sending request to {operation}"))?;
+    let response = super::transport::read_reply(&mut BufReader::new(stream))
+        .with_context(|| format!("Could not {operation}: waiting for the agent service reply failed. Inspect the session before retrying a message or action"))?;
     match response {
         Reply::Error(error) => anyhow::bail!("{error}"),
         other => Ok(other),
@@ -273,7 +292,7 @@ pub fn review_job(
             Reply::Session(session) => {
                 version = Some(session.version);
                 if let Some(entry) = session.entries.last() {
-                    progress(entry.text.clone());
+                    progress(entry.text.to_string());
                 }
                 match session.status {
                     Status::Completed => return Ok(*session),
