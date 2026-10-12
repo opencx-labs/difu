@@ -35,7 +35,13 @@ pub(super) fn handle(
             // Preserve delivery of questions to the requesting Slack thread without
             // exporting permission payloads or chat history to the model.
             let route = store.inspect(caller, |s| s.slack_route.clone())?;
-            if let Some(route) = route {
+            if let Some(route) = route
+                && store.inspect(&id, |s| {
+                    s.pending
+                        .iter()
+                        .any(|p| p.params.get("difuSlackRoute").is_none())
+                })?
+            {
                 store.update(&id, |s| {
                     for pending in &mut s.pending {
                         if let Some(params) = pending.params.as_object_mut() {
@@ -255,20 +261,32 @@ mod tests {
             ID,
             &json!({"action":"search","query":"invoice","limit":1}),
         )?;
-        assert_eq!(first["matches"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            first.get("matches").and_then(Value::as_array).map(Vec::len),
+            Some(1)
+        );
         let next = super::super::handle(
             &store,
             ID,
-            &json!({"action":"search","query":"invoice","limit":1,"after":first["next_after"]}),
+            &json!({"action":"search","query":"invoice","limit":1,"after":first.get("next_after").context("continuation")?}),
         )?;
-        assert_eq!(next["matches"].as_array().map(Vec::len), Some(1));
-        assert!(next["next_after"].is_null());
+        assert_eq!(
+            next.get("matches").and_then(Value::as_array).map(Vec::len),
+            Some(1)
+        );
+        assert!(next.get("next_after").is_some_and(Value::is_null));
         let legacy = super::super::handle(
             &store,
             ID,
             &json!({"action":"control","control":{"lookup":{"action":"search","query":"invoice"}}}),
         )?;
-        assert_eq!(legacy["matches"].as_array().map(Vec::len), Some(2));
+        assert_eq!(
+            legacy
+                .get("matches")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
         assert!(
             super::super::handle(
                 &store,
@@ -295,8 +313,11 @@ mod tests {
             ID,
             &json!({"action":"state_get","key":"billing-task"}),
         )?;
-        assert_eq!(value["record"]["revision"], 1);
-        assert_eq!(value["record"]["value"]["session"], "worker");
+        assert_eq!(value.pointer("/record/revision"), Some(&json!(1)));
+        assert_eq!(
+            value.pointer("/record/value/session"),
+            Some(&json!("worker"))
+        );
         assert!(
             super::super::handle(&store, ID, &json!({"action":"state_get","key":"../config"}))
                 .is_err()
