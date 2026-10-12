@@ -150,6 +150,10 @@ impl Shell {
         }
         if self.agents_active {
             self.agents.key(key);
+            self.reviews
+                .config
+                .session_order
+                .clone_from(&self.agents.session_order);
         } else {
             self.reviews.key_event(key);
         }

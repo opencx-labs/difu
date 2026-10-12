@@ -919,7 +919,12 @@ impl Ui {
             self.storage.save_config(&config)
         });
         match result {
-            Ok(()) => self.session_order = order,
+            Ok(()) => {
+                if let Some(panels::View::PullRequest { app }) = &mut self.panels.view {
+                    app.config.session_order.clone_from(&order);
+                }
+                self.session_order = order;
+            }
             Err(error) => {
                 self.notice = Some((format!("Could not save session order: {error:#}"), true))
             }
@@ -3959,6 +3964,12 @@ mod tests {
             .collect();
         ui.toggle_pin("100-a");
         ui.toggle_pin("200-b");
+        ui.panels.view = Some(panels::View::PullRequest {
+            app: Box::new(crate::app::App::new(
+                storage.clone(),
+                storage.load_config()?,
+            )),
+        });
         fn ids(ui: &Ui) -> Vec<String> {
             ui.filtered().into_iter().map(|s| s.id).collect()
         }
@@ -4001,6 +4012,12 @@ mod tests {
             ["orchestrator", "100-a", "200-b", "300-c", "400-d"]
         );
         assert_eq!(ui.selected.as_deref(), Some("400-d"));
+        // Saving a setting in a pane opened before the reorder must preserve it.
+        let Some(panels::View::PullRequest { app }) = &mut ui.panels.view else {
+            anyhow::bail!("PR pane");
+        };
+        app.action(crate::app::Action::ToggleWrap);
+        assert_eq!(storage.load_config()?.session_order, ui.session_order);
         let mut restored = Ui::new(storage.clone(), &storage.load_config()?);
         restored.summaries = ui.summaries.clone();
         assert_eq!(ids(&restored), ids(&ui));
