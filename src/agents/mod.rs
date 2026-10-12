@@ -224,9 +224,6 @@ impl DeletionStage {
 pub struct Session {
     #[serde(default)]
     pub orchestrator: bool,
-    /// Shared manager state contains task facts, never permission grants.
-    #[serde(default)]
-    pub orchestrator_state: std::collections::BTreeMap<String, orchestrator::Record>,
     #[serde(default)]
     pub slack_route: Option<slack::Route>,
     #[serde(default)]
@@ -336,7 +333,6 @@ impl Session {
         };
         Self {
             orchestrator: false,
-            orchestrator_state: Default::default(),
             slack_route: None,
             slack_after: 0,
             orchestrator_requests: Vec::new(),

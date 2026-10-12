@@ -8,7 +8,7 @@ use nix::fcntl::{Flock, FlockArg};
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::{BufReader, Write},
+    io::BufReader,
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
         net::{UnixListener, UnixStream},
@@ -27,6 +27,19 @@ pub struct Store {
     save_lock: Mutex<()>,
 }
 impl Store {
+    #[cfg(test)]
+    pub(super) fn fixture(home: PathBuf, sessions: Vec<Session>) -> Self {
+        Self {
+            storage: Storage {
+                config: home.join("config.json"),
+                cache: home.join("cache"),
+            },
+            home,
+            sessions: Mutex::new(sessions.into_iter().map(|s| (s.id.clone(), s)).collect()),
+            changed: Condvar::new(),
+            save_lock: Mutex::new(()),
+        }
+    }
     pub fn get(&self, id: &str) -> Result<Session> {
         self.inspect(id, Clone::clone)
     }
@@ -48,6 +61,14 @@ impl Store {
         session.touch();
         self.changed.notify_all();
         Ok(())
+    }
+    /// Serialize durable manager-record changes with saves, without touching chat history.
+    pub(super) fn durable<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _guard = self
+            .save_lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Persistence lock failed"))?;
+        action()
     }
     pub fn save(&self, id: &str) -> Result<()> {
         let _guard = self

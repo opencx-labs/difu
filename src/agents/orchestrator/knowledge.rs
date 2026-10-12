@@ -127,10 +127,9 @@ pub(super) fn handle(
         }
         "state_get" => {
             let key = required(args, "key")?;
-            Ok(Some(store.inspect(
-                ID,
-                |s| json!({"key":key,"record":s.orchestrator_state.get(&key)}),
-            )?))
+            let path = record_path(store, &key)?;
+            let record = read_record(&path)?;
+            Ok(Some(json!({"key":key,"record":record})))
         }
         "state_list" => {
             let after = args
@@ -138,25 +137,31 @@ pub(super) fn handle(
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let limit = limit(args)?;
-            Ok(Some(store.inspect(ID, |s| {
-                let mut keys = s
-                    .orchestrator_state
-                    .iter()
-                    .filter(|(k, _)| k.as_str() > after);
-                let records: Vec<_> = keys
-                    .by_ref()
-                    .take(limit)
-                    .map(|(k, v)| json!({"key":k,"revision":v.revision}))
-                    .collect();
-                let next = keys
-                    .next()
-                    .and_then(|_| records.last()?.get("key").cloned());
-                json!({"records":records,"next_after":next})
-            })?))
+            let directory = store.home.join("orchestrator-state");
+            let mut keys = Vec::new();
+            if directory.exists() {
+                for entry in std::fs::read_dir(&directory)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_file()
+                        && let Some(key) = entry
+                            .file_name()
+                            .to_str()
+                            .and_then(|s| s.strip_suffix(".json"))
+                        && key > after
+                    {
+                        keys.push(key.to_owned());
+                    }
+                }
+            }
+            keys.sort();
+            let more = keys.len() > limit;
+            keys.truncate(limit);
+            let next = if more { keys.last().cloned() } else { None };
+            Ok(Some(json!({"keys":keys,"next_after":next})))
         }
         "state_put" => {
             let key = required(args, "key")?;
-            ensure!(key.len() <= 128, "State key must be at most 128 bytes");
+            let path = record_path(store, &key)?;
             let value = args.get("value").context("Missing value")?.clone();
             ensure!(
                 serde_json::to_vec(&value)?.len() <= 8192,
@@ -166,24 +171,136 @@ pub(super) fn handle(
                 .get("revision")
                 .and_then(Value::as_u64)
                 .context("Supply the current revision, or 0 for a new record")?;
-            let mut result = Err(anyhow::anyhow!("State was not saved"));
-            store.update(ID, |s| {
-                let revision = s.orchestrator_state.get(&key).map_or(0, |v| v.revision);
-                if revision != expected {
-                    result = Err(anyhow::anyhow!(
-                        "State changed; retrieve the record before updating it"
-                    ));
-                    return;
-                }
-                let revision = revision.saturating_add(1);
-                s.orchestrator_state
-                    .insert(key.clone(), Record { revision, value });
-                result = Ok(json!({"key":key,"revision":revision}));
+            let result = store.durable(|| {
+                let revision = read_record(&path)?.map_or(0, |r| r.revision);
+                ensure!(
+                    revision == expected,
+                    "State changed; retrieve the record before updating it"
+                );
+                let revision = revision
+                    .checked_add(1)
+                    .context("State revision exhausted")?;
+                std::fs::create_dir_all(path.parent().context("Missing task directory")?)?;
+                crate::storage::atomic_json(&path, &Record { revision, value })?;
+                Ok(json!({"key":key,"revision":revision}))
             })?;
-            let result = result?;
-            store.save(ID)?;
             Ok(Some(result))
         }
         _ => Ok(None),
+    }
+}
+
+fn record_path(store: &Store, key: &str) -> Result<std::path::PathBuf> {
+    ensure!(
+        !key.is_empty()
+            && key.len() <= 128
+            && key != "."
+            && key != ".."
+            && key
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.')),
+        "State key must use 1–128 ASCII letters, digits, hyphens, underscores, or dots"
+    );
+    Ok(store
+        .home
+        .join("orchestrator-state")
+        .join(format!("{key}.json")))
+}
+fn read_record(path: &std::path::Path) -> Result<Option<Record>> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "Task record must be a regular file"
+    );
+    Ok(Some(serde_json::from_slice(&std::fs::read(path)?)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture(home: &std::path::Path) -> Store {
+        let mut manager = Session::new(
+            ID.into(),
+            Job::Coding(Launch {
+                repository: home.into(),
+                isolated: false,
+                base: String::new(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        manager.orchestrator = true;
+        let mut worker = manager.clone();
+        worker.id = "worker".into();
+        worker.orchestrator = false;
+        worker.note("userMessage", "Fix invoice rounding");
+        worker.note("agentMessage", "The invoice total now uses cents");
+        worker.note("dynamicToolCall", "invoice copied history".repeat(100_000));
+        Store::fixture(home.into(), vec![manager, worker])
+    }
+    #[test]
+    fn retrieval_never_exports_transcripts_or_nested_tool_results() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = fixture(home.path());
+        let status = super::super::handle(&store, ID, &json!({"action":"read","id":"worker"}))?;
+        assert!(status.get("entries").is_none());
+        assert!(serde_json::to_vec(&status)?.len() < 2048);
+        let first = super::super::handle(
+            &store,
+            ID,
+            &json!({"action":"search","query":"invoice","limit":1}),
+        )?;
+        assert_eq!(first["matches"].as_array().map(Vec::len), Some(1));
+        let next = super::super::handle(
+            &store,
+            ID,
+            &json!({"action":"search","query":"invoice","limit":1,"after":first["next_after"]}),
+        )?;
+        assert_eq!(next["matches"].as_array().map(Vec::len), Some(1));
+        assert!(next["next_after"].is_null());
+        let legacy = super::super::handle(
+            &store,
+            ID,
+            &json!({"action":"control","control":{"lookup":{"action":"search","query":"invoice"}}}),
+        )?;
+        assert_eq!(legacy["matches"].as_array().map(Vec::len), Some(2));
+        assert!(
+            super::super::handle(
+                &store,
+                ID,
+                &json!({"action":"control","control":{"lookup":{"action":"delete","id":"worker"}}})
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+    #[test]
+    fn task_state_survives_restart_without_entering_chat_and_rejects_lost_updates() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = fixture(home.path());
+        let args = json!({"action":"state_put","key":"billing-task","revision":0,"value":{"session":"worker","status":"assigned"}});
+        let before = store.get(ID)?.version;
+        super::super::handle(&store, ID, &args)?;
+        assert_eq!(store.get(ID)?.version, before);
+        assert!(super::super::handle(&store, ID, &args).is_err());
+        drop(store);
+        let store = fixture(home.path());
+        let value = super::super::handle(
+            &store,
+            ID,
+            &json!({"action":"state_get","key":"billing-task"}),
+        )?;
+        assert_eq!(value["record"]["revision"], 1);
+        assert_eq!(value["record"]["value"]["session"], "worker");
+        assert!(
+            super::super::handle(&store, ID, &json!({"action":"state_get","key":"../config"}))
+                .is_err()
+        );
+        Ok(())
     }
 }
