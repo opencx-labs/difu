@@ -4,7 +4,7 @@ on:
   pull_request:
     paths:
       - .github/workflows/release.yml
-      - scripts/prepare-release.py
+      - scripts/**
       - Cargo.toml
       - Cargo.lock
       - src/**
@@ -17,7 +17,36 @@ permissions:
   contents: read
 
 jobs:
+  reuse:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reused: ${{ steps.reuse.outputs.reused }}
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Find and verify matching PR packages
+        id: reuse
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release-artifacts.py reuse dist
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: steps.reuse.outputs.reused == 'true'
+        id: upload
+        with:
+          name: ${{ steps.reuse.outputs.artifact_name }}
+          path: dist/*
+          if-no-files-found: error
+
   build:
+    needs: reuse
+    if: >-
+      ${{ always() && !cancelled() &&
+          (github.event_name == 'pull_request' ||
+           (needs.reuse.result == 'success' && needs.reuse.outputs.reused == 'false')) }}
     strategy:
       fail-fast: false
       matrix:
@@ -41,12 +70,15 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes musl-tools
-      - name: Test and build
+      - name: Test
+        if: github.event_name == 'pull_request'
         env:
           DIFU_TARGET: ${{ matrix.target }}
-        run: |
-          cargo test --locked --target "$DIFU_TARGET"
-          cargo build --locked --release --target "$DIFU_TARGET"
+        run: cargo test --locked --target "$DIFU_TARGET"
+      - name: Build release
+        env:
+          DIFU_TARGET: ${{ matrix.target }}
+        run: cargo build --locked --release --target "$DIFU_TARGET"
       - name: Package and smoke test
         env:
           DIFU_TARGET: ${{ matrix.target }}
@@ -81,7 +113,10 @@ jobs:
 
   prepare:
     needs: build
+    if: ${{ always() && !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-24.04
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
@@ -93,26 +128,34 @@ jobs:
         run: |
           python3 scripts/prepare-release.py dist
           ruby -c dist/difu.rb
+      - name: Record validated source and package checksums
+        id: source
+        run: python3 scripts/release-artifacts.py record dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        id: upload
         with:
-          name: release
+          name: ${{ steps.source.outputs.artifact_name }}
           path: dist/*
           if-no-files-found: error
 
   draft:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: prepare
+    if: >-
+      ${{ always() && !cancelled() && startsWith(github.ref, 'refs/tags/v') &&
+          ((needs.reuse.result == 'success' && needs.reuse.outputs.reused == 'true') ||
+           needs.prepare.result == 'success') }}
+    needs: [reuse, prepare]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          name: release
+          artifact-ids: ${{ needs.reuse.outputs.artifact_id || needs.prepare.outputs.artifact_id }}
           path: dist
+          merge-multiple: true
       - name: Create draft release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           DIFU_TAG: ${{ github.ref_name }}
-        run: gh release create "$DIFU_TAG" dist/* --verify-tag --draft --title "difu $DIFU_TAG" --generate-notes
+        run: gh release create "$DIFU_TAG" dist/*.tar.gz dist/SHA256SUMS dist/difu.rb --verify-tag --draft --title "difu $DIFU_TAG" --generate-notes

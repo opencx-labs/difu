@@ -1,6 +1,7 @@
 name: Rust
 on:
   push:
+    branches: ['**']
   pull_request:
 permissions:
   contents: read
@@ -12,6 +13,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+      - name: Check release artifact selection and verification
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

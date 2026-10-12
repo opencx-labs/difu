@@ -503,7 +503,11 @@ fn observe(
                 journal.output(
                     format!("entry:{}:{}:{}", session.id, origin.event, entry.id),
                     origin.clone(),
-                    format!("{}\n{}", session.title, entry.text),
+                    if session.id == orchestrator::ID {
+                        entry.text.clone()
+                    } else {
+                        format!("{}\n{}", session.title, entry.text)
+                    },
                 )?;
             }
         }
