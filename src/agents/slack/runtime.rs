@@ -6,7 +6,7 @@ use super::{
     socket::Socket,
 };
 use crate::{
-    agents::{Control, Pending, Request, Session, client, orchestrator, server::Store},
+    agents::{Control, Pending, Reply, Request, Session, client, orchestrator, server::Store},
     storage,
 };
 use anyhow::{Context, Result, ensure};
@@ -28,6 +28,8 @@ const HELP: &str = "Send difu a direct message to talk to the persistent orchest
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 struct State {
+    #[serde(default)]
+    independent_threads: bool,
     received: BTreeSet<String>,
     inbox: VecDeque<Mention>,
     // Persist dispatch intent before handing a message to the service. After a
@@ -92,6 +94,12 @@ impl Journal {
     }
     fn recover(&self, settings: &Settings) -> Result<()> {
         self.update(|state| {
+            if !state.independent_threads {
+                // The shared manager was replaced, so its pending request IDs
+                // must never resolve against a fresh conversation.
+                state.references.retain(|_, r| r.session != orchestrator::ID);
+                state.independent_threads = true;
+            }
             let mut interrupted: Vec<_> = state.inbox.drain(..).collect();
             interrupted.extend(state.dispatching.take());
             for mention in interrupted {
@@ -285,33 +293,8 @@ fn process(
             break;
         }
         observe(store, settings, journal, &mut observed)?;
-        // Commands can answer a blocked turn even when ordinary messages from
-        // another thread are waiting for the shared orchestrator to become idle.
-        let manager = store.get(orchestrator::ID)?;
-        let ready =
-            !manager.status.active() && manager.turn_id.is_none() && manager.pending.is_empty();
-        let mention = journal.read(|state| {
-            state
-                .inbox
-                .iter()
-                .find(|mention| {
-                    !matches!(
-                        commands::parse(&mention.text),
-                        Ok(commands::Command::Message)
-                    ) || ready
-                        || manager.slack_route.as_ref().is_some_and(|r| {
-                            r.account == settings.account
-                                && r.channel == mention.channel
-                                && r.thread == mention.thread
-                        })
-                })
-                .cloned()
-        })?;
-        if mention.is_none() {
-            for queued in journal.read(|state| state.inbox.iter().cloned().collect::<Vec<_>>())? {
-                journal.output(format!("queued:{}", queued.event_id), route(settings, &queued), "The orchestrator is working or waiting for an answer in another conversation. Your message is queued.".into())?;
-            }
-        }
+        // Independent threads never wait for another manager conversation.
+        let mention = journal.read(|state| state.inbox.front().cloned())?;
         if let Some(mention) = mention {
             journal.update(|state| {
                 state.inbox.retain(|m| m.event_id != mention.event_id);
@@ -374,10 +357,20 @@ fn dispatch(
                 !mention.text.trim().is_empty(),
                 "Send a message, or use help (mention @difu in channels)"
             );
+            let Reply::Launched(id) = client::request(
+                &store.storage,
+                Request::OrchestratorThread {
+                    route: origin.clone(),
+                    title: mention.text.clone(),
+                },
+            )?
+            else {
+                anyhow::bail!("Could not open the orchestrator conversation");
+            };
             client::request(
                 &store.storage,
                 Request::SlackControl {
-                    id: orchestrator::ID.into(),
+                    id,
                     route: origin,
                     control: Control::Message {
                         text: format!("[Slack thread {}]\n{}", mention.thread, mention.text),
@@ -499,7 +492,7 @@ fn observe(
                 journal.output(
                     format!("entry:{}:{}:{}", session.id, origin.event, entry.id),
                     origin.clone(),
-                    if session.id == orchestrator::ID {
+                    if session.orchestrator {
                         entry.text.to_string()
                     } else {
                         format!("{}\n{}", session.title, entry.text)

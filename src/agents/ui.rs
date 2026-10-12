@@ -880,13 +880,12 @@ impl Ui {
                 // appear first; updates and status changes never affect order.
                 .then_with(|| b.id.cmp(&a.id))
         });
-        if self.orchestrator_list {
-            if let Some(root) = sessions
+        if self.orchestrator_list
+            && let Some(root) = sessions
                 .iter_mut()
                 .find(|s| s.id == super::orchestrator::ID)
-            {
-                root.title = "Existing orchestrator chat".into();
-            }
+        {
+            root.title = "Difu chat".into();
         }
         sessions
     }
@@ -1188,6 +1187,11 @@ impl Ui {
         if self.deleting.contains(&id) {
             return;
         }
+        self.orchestrator_list = id != super::orchestrator::ID
+            && self
+                .summaries
+                .iter()
+                .any(|s| s.id == id && s.kind == "Orchestrator");
         self.archived = self
             .summaries
             .iter()

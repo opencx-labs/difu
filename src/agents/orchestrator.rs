@@ -62,6 +62,7 @@ pub(super) fn session(store: &Store) -> Result<Session> {
         }),
     );
     session.orchestrator = true;
+    session.orchestrator_generation = 1;
     session.title = "Difu orchestrator".into();
     session.title_manual = true;
     session.title_ready = true;

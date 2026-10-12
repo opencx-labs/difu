@@ -352,6 +352,9 @@ fn send(
     decoder: &mut events::Decoder,
     prompt: &Prompt,
 ) -> Result<()> {
+    if let Prompt::Routed { origin, .. } = prompt {
+        store.update(id, |s| s.set_slack_route(origin.clone()))?;
+    }
     let session = store.get(id)?;
     let message_id = uuid(&session);
     let mut content = Vec::new();
@@ -518,7 +521,7 @@ fn command(
             store.update(id, |s| {
                 if let Some(prompt) = replacement {
                     if let Some(slot) = s.queue.get_mut(index) {
-                        *slot = prompt;
+                        *slot = prompt.inherit_route(slot);
                     }
                 } else {
                     s.queue.remove(index);

@@ -301,7 +301,7 @@ pub(super) fn queue_while_waiting(store: &Store, id: &str, control: Control) -> 
             store.update(id, |s| {
                 if let Some(prompt) = replacement {
                     if let Some(item) = s.queue.get_mut(index) {
-                        *item = prompt;
+                        *item = prompt.inherit_route(item);
                     }
                 } else {
                     s.queue.remove(index);

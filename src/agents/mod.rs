@@ -227,6 +227,8 @@ pub struct Session {
     #[serde(default)]
     pub orchestrator_origin: Option<slack::Route>,
     #[serde(default)]
+    pub orchestrator_generation: u32,
+    #[serde(default)]
     pub slack_route: Option<slack::Route>,
     #[serde(default)]
     pub slack_after: usize,
@@ -336,6 +338,7 @@ impl Session {
         Self {
             orchestrator: false,
             orchestrator_origin: None,
+            orchestrator_generation: 0,
             slack_route: None,
             slack_after: 0,
             orchestrator_requests: Vec::new(),
@@ -584,6 +587,10 @@ pub struct Skill {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Prompt {
+    Routed {
+        prompt: Box<Prompt>,
+        origin: Option<slack::Route>,
+    },
     Text(String),
     QuestionAnswer {
         text: String,
@@ -598,8 +605,26 @@ pub enum Prompt {
     },
 }
 impl Prompt {
+    pub fn inherit_route(self, previous: &Self) -> Self {
+        let prompt = self.unrouted();
+        if let Self::Routed { origin, .. } = previous {
+            Self::Routed {
+                prompt: Box::new(prompt),
+                origin: origin.clone(),
+            }
+        } else {
+            prompt
+        }
+    }
+    fn unrouted(self) -> Self {
+        match self {
+            Self::Routed { prompt, .. } => prompt.unrouted(),
+            other => other,
+        }
+    }
     pub fn text(&self) -> &str {
         match self {
+            Self::Routed { prompt, .. } => prompt.text(),
             Self::Text(s)
             | Self::WithSkills { text: s, .. }
             | Self::QuestionAnswer { text: s, .. } => s,
@@ -607,12 +632,14 @@ impl Prompt {
     }
     pub fn attachments(&self) -> &[media::Attachment] {
         match self {
+            Self::Routed { prompt, .. } => prompt.attachments(),
             Self::Text(_) | Self::QuestionAnswer { .. } => &[],
             Self::WithSkills { attachments, .. } => attachments,
         }
     }
     pub fn skills(&self) -> &[Skill] {
         match self {
+            Self::Routed { prompt, .. } => prompt.skills(),
             Self::Text(_) | Self::QuestionAnswer { .. } => &[],
             Self::WithSkills { skills, .. } => skills,
         }

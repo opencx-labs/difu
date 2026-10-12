@@ -88,7 +88,12 @@ impl Store {
         }
         Ok(())
     }
-    fn queue_preparing(&self, id: &str, control: &Control) -> Result<bool> {
+    fn queue_preparing(
+        &self,
+        id: &str,
+        control: &Control,
+        route: &Option<slack::Route>,
+    ) -> Result<bool> {
         if !matches!(
             control,
             Control::Message { .. }
@@ -120,10 +125,13 @@ impl Store {
                 ..
             } => {
                 ensure!(!text.trim().is_empty(), "Message cannot be empty");
-                session.queue.push(Prompt::WithSkills {
-                    text: text.clone(),
-                    skills: skills.clone(),
-                    attachments: attachments.clone(),
+                session.queue.push(Prompt::Routed {
+                    prompt: Box::new(Prompt::WithSkills {
+                        text: text.clone(),
+                        skills: skills.clone(),
+                        attachments: attachments.clone(),
+                    }),
+                    origin: route.clone(),
                 });
             }
             Control::ReplaceQueued {
@@ -137,7 +145,7 @@ impl Store {
                 );
                 if let Some(prompt) = replacement {
                     if let Some(item) = session.queue.get_mut(*index) {
-                        *item = prompt.clone();
+                        *item = prompt.clone().inherit_route(item);
                     }
                 } else {
                     session.queue.remove(*index);
@@ -484,6 +492,40 @@ impl Service {
                         "The orchestrator is busy in another conversation; retry when it is ready"
                     );
                 }
+                // A queued task belongs to its originating thread. Changing the
+                // active route here would send the current task's output elsewhere.
+                if let Control::Message {
+                    text,
+                    queue: true,
+                    skills,
+                    attachments,
+                }
+                | Control::MessageWithAttachments {
+                    text,
+                    queue: true,
+                    skills,
+                    attachments,
+                } = &control
+                    && session.turn_id.is_some()
+                {
+                    ensure!(!text.trim().is_empty(), "Message cannot be empty");
+                    self.store.update(&id, |s| {
+                        s.queue.push(Prompt::Routed {
+                            prompt: Box::new(Prompt::WithSkills {
+                                text: text.clone(),
+                                skills: skills.clone(),
+                                attachments: attachments.clone(),
+                            }),
+                            origin: route.clone(),
+                        })
+                    })?;
+                    self.store.save(&id)?;
+                    return Ok(Reply::Ok);
+                }
+                if self.store.queue_preparing(&id, &control, &route)? {
+                    self.store.save(&id)?;
+                    return Ok(Reply::Ok);
+                }
                 if matches!(
                     control,
                     Control::Message { .. }
@@ -498,10 +540,6 @@ impl Service {
                     self.store
                         .update(&id, |s| s.set_slack_route(route.clone()))?;
                     self.store.save(&id)?;
-                }
-                if self.store.queue_preparing(&id, &control)? {
-                    self.store.save(&id)?;
-                    return Ok(Reply::Ok);
                 }
                 let session = self.store.get(&id)?;
                 if !matches!(session.job, Job::Coding(_)) {
@@ -1065,6 +1103,11 @@ pub fn run(storage: Storage) -> Result<()> {
             path.file_stem().and_then(|s| s.to_str()) == Some(&session.id),
             "Invalid session storage identity"
         );
+        // Replace the legacy shared manager once. Its provider thread, queued
+        // actions and history must not enter any of the new conversations.
+        if session.id == super::orchestrator::ID && session.orchestrator_generation == 0 {
+            continue;
+        }
         if session.status.active() {
             session.status = Status::Interrupted;
             session.turn_id = None;
@@ -1287,6 +1330,78 @@ mod watch_tests {
         worker
             .join()
             .map_err(|_| anyhow::anyhow!("watch panicked"))?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod routed_queue_tests {
+    use super::*;
+    #[test]
+    fn queueing_another_threads_task_does_not_retarget_active_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut session = Session::new(
+            "worker".into(),
+            Job::Coding(Launch {
+                repository: temp.path().into(),
+                isolated: false,
+                base: String::new(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.status = Status::Running;
+        session.turn_id = Some("turn".into());
+        let first = slack::Route {
+            account: "account".into(),
+            channel: "D1".into(),
+            thread: "1.0".into(),
+            event: "e1".into(),
+        };
+        let second = slack::Route {
+            thread: "2.0".into(),
+            event: "e2".into(),
+            ..first.clone()
+        };
+        session.slack_route = Some(first.clone());
+        session.note("agentMessage", "first task output");
+        let service = Service {
+            store: Arc::new(Store::fixture(temp.path().into(), vec![session])),
+            workers: Mutex::new(BTreeMap::new()),
+            action_locks: Mutex::new(BTreeMap::new()),
+            launch_lock: Mutex::new(()),
+        };
+        service.handle(Request::SlackControl {
+            id: "worker".into(),
+            route: second.clone(),
+            control: Control::Message {
+                text: "second task".into(),
+                queue: true,
+                skills: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })?;
+        let mut current = service.store.get("worker")?;
+        assert_eq!(current.slack_route, Some(first.clone()));
+        let queued = current.queue.pop().context("queued task")?;
+        let Prompt::Routed { origin, .. } = &queued else {
+            anyhow::bail!("Missing queued origin")
+        };
+        assert_eq!(origin.as_ref(), Some(&second));
+        let replacement = Prompt::from("edited task").inherit_route(&queued);
+        assert!(matches!(replacement,Prompt::Routed{origin:Some(ref route),..} if route==&second));
+        current.set_slack_route(origin.clone());
+        let saved = current
+            .entries
+            .first()
+            .and_then(|e| e.data.get("difuSlackRoute"))
+            .context("original output route")?;
+        assert_eq!(
+            serde_json::from_value::<slack::Route>(saved.clone())?,
+            first
+        );
+        assert_eq!(current.slack_route, Some(second));
         Ok(())
     }
 }
