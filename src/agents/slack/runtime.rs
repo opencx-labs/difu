@@ -692,6 +692,47 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn migration_discards_only_legacy_manager_references() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let journal = Journal::open(temp.path().join("journal.json"))?;
+        journal.update(|s| {
+            for id in [
+                orchestrator::ID,
+                "coding-session",
+                "orchestrator-new-thread",
+            ] {
+                s.references.insert(
+                    id.into(),
+                    Reference {
+                        session: id.into(),
+                        pending: Pending {
+                            id: json!(1),
+                            method: "approval".into(),
+                            params: json!({}),
+                            responded: false,
+                        },
+                        question: None,
+                        route: origin("first"),
+                    },
+                );
+            }
+        })?;
+        let settings = Settings {
+            enabled: true,
+            team: "T".into(),
+            bot: "B".into(),
+            user: "U".into(),
+            channel: "C1".into(),
+            account: "fixture-account".into(),
+        };
+        journal.recover(&settings)?;
+        assert!(!journal.read(|s| s.references.contains_key(orchestrator::ID))?);
+        assert_eq!(journal.read(|s| s.references.len())?, 2);
+        journal.recover(&settings)?;
+        assert_eq!(journal.read(|s| s.references.len())?, 2);
+        Ok(())
+    }
+    #[test]
     fn approval_requires_same_thread_and_unchanged_pending_request() -> Result<()> {
         let mut session = session();
         let pending = Pending {

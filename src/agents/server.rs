@@ -1070,6 +1070,22 @@ fn run_review(store: &Arc<Store>, id: &str, cancel: &Cancel) -> Result<()> {
     Ok(())
 }
 
+fn ensure_orchestrator(store: &Store) -> Result<()> {
+    if store
+        .inspect(super::orchestrator::ID, |s| s.orchestrator_generation > 0)
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let session = super::orchestrator::session(store)?;
+    store
+        .sessions
+        .lock()
+        .map_err(|_| anyhow::anyhow!("Session lock failed"))?
+        .insert(session.id.clone(), session);
+    store.save(super::orchestrator::ID)
+}
+
 pub fn run(storage: Storage) -> Result<()> {
     let home = home(&storage)?;
     let file = OpenOptions::new()
@@ -1142,16 +1158,7 @@ pub fn run(storage: Storage) -> Result<()> {
         action_locks: Mutex::new(BTreeMap::new()),
         launch_lock: Mutex::new(()),
     });
-    if service.store.get(super::orchestrator::ID).is_err() {
-        let session = super::orchestrator::session(&service.store)?;
-        service
-            .store
-            .sessions
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Session lock failed"))?
-            .insert(session.id.clone(), session);
-        service.store.save(super::orchestrator::ID)?;
-    }
+    ensure_orchestrator(&service.store)?;
     let _pr_cache =
         super::pr_cache::Refresher::start(service.store.storage.clone(), service.store.clone())?;
     let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1337,6 +1344,72 @@ mod watch_tests {
 #[cfg(test)]
 mod routed_queue_tests {
     use super::*;
+    #[test]
+    fn replacing_legacy_manager_is_one_time_and_threads_reuse_only_their_own_context() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let store = Arc::new(Store::fixture(temp.path().into(), Vec::new()));
+        let mut old = super::super::orchestrator::session(&store)?;
+        old.orchestrator_generation = 0;
+        old.thread_id = Some("old-provider-thread".into());
+        old.note("agentMessage", "legacy shared transcript");
+        old.queue.push(Prompt::from("must not replay"));
+        store
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock"))?
+            .insert(old.id.clone(), old);
+        ensure_orchestrator(&store)?;
+        let fresh = store.get(super::super::orchestrator::ID)?;
+        assert!(fresh.entries.is_empty() && fresh.queue.is_empty() && fresh.thread_id.is_none());
+        store.update(&fresh.id, |s| {
+            s.note("userMessage", "new local conversation")
+        })?;
+        ensure_orchestrator(&store)?;
+        assert_eq!(store.get(&fresh.id)?.entries.len(), 1);
+        let service = Service {
+            store,
+            workers: Mutex::new(BTreeMap::new()),
+            action_locks: Mutex::new(BTreeMap::new()),
+            launch_lock: Mutex::new(()),
+        };
+        let mut route = slack::Route {
+            account: "account".into(),
+            channel: "D1".into(),
+            thread: "1.0".into(),
+            event: "first".into(),
+        };
+        let request = |route| Request::OrchestratorThread {
+            route,
+            title: "First task".into(),
+        };
+        let Reply::Launched(first) = service.handle(request(route.clone()))? else {
+            anyhow::bail!("missing conversation")
+        };
+        service
+            .store
+            .update(&first, |s| s.note("userMessage", "thread-specific context"))?;
+        route.event = "followup".into();
+        let Reply::Launched(continued) = service.handle(request(route.clone()))? else {
+            anyhow::bail!("missing conversation")
+        };
+        assert_eq!(first, continued);
+        assert_eq!(service.store.get(&continued)?.entries.len(), 1);
+        route.thread = "2.0".into();
+        let Reply::Launched(second) = service.handle(request(route))? else {
+            anyhow::bail!("missing conversation")
+        };
+        assert_ne!(first, second);
+        assert!(service.store.get(&second)?.entries.is_empty());
+        assert!(
+            service
+                .workers
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock"))?
+                .is_empty()
+        );
+        Ok(())
+    }
     #[test]
     fn queueing_another_threads_task_does_not_retarget_active_output() -> Result<()> {
         let temp = tempfile::tempdir()?;
