@@ -3,6 +3,10 @@ use super::*;
 const COMMANDS: &[(&str, &str)] = &[
     ("slack", "Connect Slack to the difu orchestrator"),
     ("voice", "Configure hold-Space dictation and API key"),
+    (
+        "tweaks",
+        "Chat animation speeds for replies, sent messages and input",
+    ),
     ("compact", "Compact the current conversation"),
     ("model", "Choose a model"),
     ("effort", "Choose the reasoning level"),
@@ -366,6 +370,7 @@ impl Ui {
         match name.as_str() {
             "/slack" => self.open_slack(),
             "/voice" => self.open_voice(),
+            "/tweaks" => self.open_tweaks(),
             "/compact" => self.control(Control::Compact),
             "/model" => self.open_model(0),
             "/effort" => self.open_model(1),

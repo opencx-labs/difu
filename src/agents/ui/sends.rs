@@ -15,11 +15,15 @@ impl Ui {
         if !self.sessions.contains_key(&id) {
             return;
         }
+        let tweaks = self.tweaks;
         let position = self.positions.entry(id.clone()).or_default();
         let text = position.draft.text();
         if text.trim().is_empty() {
             return;
         }
+        let now = Instant::now();
+        position.clearing = reveal::Typing::start(&text, tweaks.input_clear_ms, now);
+        position.sent = reveal::Typing::start(&text, tweaks.sent_message_ms, now);
         let attachments = position.active_attachments();
         let skills = std::mem::take(&mut position.skills);
         position.draft = Editor::default();

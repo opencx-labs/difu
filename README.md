@@ -313,9 +313,17 @@ Recalled prompts are editable and never sent automatically.
 
 Type **/** in an empty composer for native commands: `/compact`, `/model`, `/effort`,
 `/skills`, `/status`, `/rules`, `/usage`, `/diff`, `/new`, `/rename`, `/clear`, `/repo`, `/worktree`,
-`/help`, `/voice`, and `/actions`.
+`/help`, `/voice`, `/tweaks`, and `/actions`.
 Opening a session keeps the composer focused; pending questions remain available
 through the questions control.
+
+Replies type in character by character at 200 characters per second, speeding up
+when they fall more than 0.8 seconds behind the stream; replies already in a
+session when you open it appear at once. A sent message types into the chat over
+1 second while the composer clears over 1 second, whatever their length; typing
+during the clear finishes it immediately. **/tweaks** (also in the command
+palette) changes these three values, saved in the difu config; 0 turns an
+animation off.
 
 **/usage** shows labeled quota bars and local reset times: percent used for Claude,
 percent remaining for Codex. It reads Claude Code's structured `/usage` data or Codex's account limits

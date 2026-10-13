@@ -31,6 +31,28 @@ impl Default for AgentDefaults {
     }
 }
 
+/// Chat animation timing, set through `/tweaks`. Zero turns an animation off.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tweaks {
+    /// Characters per second for agent replies. Replies speed up to stay
+    /// within a short lag of the stream.
+    pub agent_reply_cps: u32,
+    /// Milliseconds for a sent message to type into the chat.
+    pub sent_message_ms: u32,
+    /// Milliseconds for the composer to clear after sending.
+    pub input_clear_ms: u32,
+}
+impl Default for Tweaks {
+    fn default() -> Self {
+        Self {
+            agent_reply_cps: 200,
+            sent_message_ms: 1000,
+            input_clear_ms: 1000,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -69,6 +91,8 @@ pub struct Config {
     pub agent_panel_right: bool,
     #[serde(default)]
     pub voice_enabled: bool,
+    #[serde(default)]
+    pub tweaks: Tweaks,
 }
 fn enabled() -> bool {
     true
@@ -94,6 +118,7 @@ impl Default for Config {
             agent_changes_visible: false,
             agent_panel_right: true,
             voice_enabled: false,
+            tweaks: Tweaks::default(),
         }
     }
 }

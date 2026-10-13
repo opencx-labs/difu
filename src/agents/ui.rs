@@ -13,6 +13,7 @@ mod patch;
 mod prompt;
 mod prs;
 mod questions;
+mod reveal;
 mod rules;
 mod selection;
 mod sends;
@@ -20,6 +21,7 @@ mod sidebar;
 mod slack;
 mod transcript;
 mod transcript_window;
+mod tweaks;
 mod usage;
 mod voice;
 mod watch;
@@ -120,6 +122,11 @@ pub struct Position {
     question_notes: HashMap<(String, usize, usize), Editor>,
     /// Checked options of multi-select questions, by request and question.
     question_checks: HashMap<(String, usize), std::collections::BTreeSet<usize>>,
+    /// Chat animations from `/tweaks`.
+    reply: Option<reveal::Reply>,
+    replies_seen: bool,
+    sent: Option<reveal::Typing>,
+    clearing: Option<reveal::Typing>,
 }
 #[derive(Clone)]
 enum Action {
@@ -151,6 +158,8 @@ enum Action {
     VoiceField,
     VoiceSave,
     VoiceToggle,
+    TweaksField(usize),
+    TweaksSave,
     AnswerFocus,
     QueueEditorFocus,
     ChooseRepository,
@@ -196,6 +205,10 @@ pub enum Modal {
     RepositoryRules(Box<rules::Settings>),
     Voice {
         key: Editor,
+        field: usize,
+    },
+    Tweaks {
+        fields: [Editor; 3],
         field: usize,
     },
     Repository(Editor),
@@ -337,6 +350,8 @@ pub struct Ui {
     paths_loading: HashSet<String>,
     sidebar: sidebar::State,
     voice: voice::State,
+    /// Chat animation timing from `/tweaks`.
+    pub tweaks: crate::storage::Tweaks,
     slack: slack::State,
     model_completion: models::State,
     toast_rect: Rect,
@@ -405,6 +420,7 @@ impl Ui {
             workspace_paths: HashMap::new(),
             paths_loading: HashSet::new(),
             voice: voice::State::new(config.voice_enabled),
+            tweaks: config.tweaks,
             slack: slack::State::default(),
             model_completion: models::State::default(),
             toast_rect: Rect::default(),
@@ -426,7 +442,13 @@ impl Ui {
         });
     }
     pub fn redraw_interval(&self) -> Option<Duration> {
-        if self.voice_active() {
+        if self.voice_active()
+            || self
+                .selected
+                .as_ref()
+                .and_then(|id| self.positions.get(id))
+                .is_some_and(Position::animating)
+        {
             return Some(crate::repaint::FRAME_INTERVAL);
         }
         if self.busy
@@ -2049,6 +2071,11 @@ impl Ui {
                 | Modal::QueuedEdit { editor: e, .. }
                 | Modal::Voice { key: e, .. },
             ) => e.insert(text),
+            Some(Modal::Tweaks { fields, field }) => {
+                if let Some(editor) = fields.get_mut(*field) {
+                    editor.insert(text);
+                }
+            }
             Some(Modal::Model { .. }) => self.model_paste(text),
             Some(Modal::Approval {
                 answers,
@@ -2102,6 +2129,10 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::Voice { .. })) {
             self.voice_modal_key(key);
+            return;
+        }
+        if matches!(self.modal, Some(Modal::Tweaks { .. })) {
+            self.tweaks_key(key);
             return;
         }
         if self.question_or_queue_key(key) {
@@ -2385,6 +2416,12 @@ impl Ui {
             }
             Action::VoiceSave => self.save_voice_key(),
             Action::VoiceToggle => self.toggle_voice(),
+            Action::TweaksSave => self.save_tweaks(),
+            Action::TweaksField(index) => {
+                if let Some(Modal::Tweaks { field, .. }) = &mut self.modal {
+                    *field = index;
+                }
+            }
             Action::VoiceField => {
                 if let Some(Modal::Voice { field, .. }) = &mut self.modal {
                     *field = 0;
@@ -3114,6 +3151,7 @@ impl Ui {
         }
         position.transcript_viewport = Some((body.width, body.height, session.version));
         let before_measure = position.conversation;
+        let tweaks = self.tweaks;
         let view = self.transcript_window.render(
             session,
             position,
@@ -3130,6 +3168,17 @@ impl Ui {
             mut total,
             sections,
         } = view;
+        reveal::apply(
+            position,
+            session,
+            &sections,
+            start,
+            total,
+            &mut lines,
+            tweaks,
+            body.width,
+            Instant::now(),
+        );
         if session.entries.is_empty() && total == 0 {
             lines.push(Line::from(if session.status == Status::Idle {
                 "Send a message to start."
@@ -3276,15 +3325,17 @@ impl Ui {
                 .composer_suggestion()
                 .unwrap_or("Ask anything…")
                 .to_owned();
+            let clear_ms = self.tweaks.input_clear_ms;
             let position = self.positions.entry(id.clone()).or_default();
+            let clearing = reveal::clearing(position, clear_ms, Instant::now());
             editor(
                 frame,
                 composer,
                 voice_status.as_deref().unwrap_or(""),
-                &position.draft,
+                clearing.as_ref().unwrap_or(&position.draft),
                 self.focus == Focus::Composer && !self.panels.focused && self.modal.is_none(),
             );
-            if position.draft.chars.is_empty() {
+            if position.draft.chars.is_empty() && clearing.is_none() {
                 frame.render_widget(
                     Paragraph::new(placeholder).style(Style::default().fg(DIM)),
                     inner(composer),
@@ -3339,6 +3390,7 @@ impl Ui {
             Some(Modal::RepositoryRules(_)) => "Repository rules · Tab fields",
             Some(Modal::Slack(_)) => "Slack setup · Tab fields · Esc closes",
             Some(Modal::Voice { .. }) => "Voice settings",
+            Some(Modal::Tweaks { .. }) => "Tweaks · chat animations",
             Some(Modal::Repository(_)) => "Choose and remember your default repository",
             Some(Modal::ChangeRepository(_)) => "Change session repository",
             Some(Modal::Menu { .. }) => "Agent actions",
@@ -3423,6 +3475,10 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::Voice { .. })) {
             self.draw_voice_settings(frame, area);
+            return;
+        }
+        if matches!(self.modal, Some(Modal::Tweaks { .. })) {
+            self.draw_tweaks(frame, area);
             return;
         }
         if matches!(self.modal, Some(Modal::Slack(_))) {
@@ -3721,6 +3777,7 @@ impl Ui {
                 | Modal::RepositoryRules(_)
                 | Modal::Slack(_)
                 | Modal::Voice { .. }
+                | Modal::Tweaks { .. }
                 | Modal::Commands { .. }
                 | Modal::Status
                 | Modal::Usage { .. }
@@ -3869,6 +3926,14 @@ mod tests {
     use super::*;
     use anyhow::{Context, Result};
     use ratatui::{Terminal, backend::TestBackend};
+    /// Delivery and layout tests read text the moment it arrives.
+    fn still(ui: &mut Ui) {
+        ui.tweaks = crate::storage::Tweaks {
+            agent_reply_cps: 0,
+            sent_message_ms: 0,
+            input_clear_ms: 0,
+        };
+    }
     fn state(storage: Storage) -> Ui {
         let mut ui = Ui::new(storage, &Config::default());
         let mut session = Session::new(
@@ -4458,6 +4523,7 @@ mod tests {
             Ok(())
         });
         let mut ui = state(storage);
+        still(&mut ui);
         ui.drilled = true;
         ui.focus = Focus::Composer;
         let session = ui.sessions.get_mut("one").context("session")?;
@@ -4574,6 +4640,7 @@ mod tests {
             Ok(())
         });
         let mut ui = state(storage);
+        still(&mut ui);
         ui.drilled = true;
         ui.focus = Focus::Composer;
         let session = ui.sessions.get_mut("one").context("session")?;
@@ -4656,6 +4723,7 @@ mod tests {
             Ok(())
         });
         let mut ui = state(storage);
+        still(&mut ui);
         ui.drilled = true;
         ui.focus = Focus::Composer;
         ui.positions.get_mut("one").context("position")?.draft = Editor::from("first");
@@ -6877,6 +6945,100 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn sending_clears_the_composer_and_types_the_message_into_chat() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        draw(&mut ui, 120, 30)?;
+        ui.positions.get_mut("one").context("position")?.draft = Editor::from("Typed message");
+        ui.send(false);
+        assert!(
+            ui.redraw_interval().is_some(),
+            "animations keep frames coming"
+        );
+        let (screen, _) = draw(&mut ui, 120, 30)?;
+        // The composer still shows the text it is clearing; the chat copy has
+        // only started typing in.
+        assert_eq!(screen.matches("Typed message").count(), 1);
+        assert!(!screen.contains("Ask anything"));
+        assert!(
+            ui.positions
+                .get("one")
+                .context("draft")?
+                .draft
+                .text()
+                .is_empty()
+        );
+        let position = ui.positions.get_mut("one").context("position")?;
+        for typing in [&mut position.sent, &mut position.clearing]
+            .into_iter()
+            .flatten()
+        {
+            typing.age(Duration::from_secs(2));
+        }
+        let (screen, _) = draw(&mut ui, 120, 30)?;
+        assert!(screen.contains("› Typed message"));
+        assert!(screen.contains("Ask anything"));
+        assert!(!ui.positions.get("one").context("position")?.animating());
+        Ok(())
+    }
+    #[test]
+    fn tweaks_save_animation_timing_and_reject_invalid_values() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        };
+        let mut ui = state(storage.clone());
+        assert!(
+            ui.palette_commands()
+                .iter()
+                .any(|(name, _, _)| name == "/tweaks")
+        );
+        ui.run_palette_command("/tweaks", "/tweaks");
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert!(screen.contains("Agent reply speed") && screen.contains("200"));
+        let set = |ui: &mut Ui, value: &str| {
+            ui.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            ui.paste(value);
+            ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        };
+        set(&mut ui, "120");
+        set(&mut ui, "0");
+        set(&mut ui, "20000");
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(ui.modal, Some(Modal::Tweaks { .. })));
+        assert!(
+            ui.notice
+                .as_ref()
+                .is_some_and(|(text, error)| *error && text.contains("0 to 10000"))
+        );
+        assert_eq!(ui.tweaks, crate::storage::Tweaks::default());
+        ui.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        set(&mut ui, "750");
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let expected = crate::storage::Tweaks {
+            agent_reply_cps: 120,
+            sent_message_ms: 0,
+            input_clear_ms: 750,
+        };
+        assert!(ui.modal.is_none());
+        assert_eq!(ui.tweaks, expected);
+        assert_eq!(storage.load_config()?.tweaks, expected);
+        // A sent message is not animated when its duration is 0.
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        ui.positions.get_mut("one").context("position")?.draft = Editor::from("No typing");
+        ui.send(false);
+        let position = ui.positions.get("one").context("position")?;
+        assert!(position.sent.is_none() && position.clearing.is_some());
+        Ok(())
+    }
+    #[test]
     fn activity_and_pending_messages_stay_above_composer_when_reading_history() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut ui = state(Storage {
@@ -7237,6 +7399,7 @@ mod tests {
             config: temp.path().join("config.json"),
             cache: temp.path().join("cache"),
         });
+        still(&mut ui);
         ui.drilled = true;
         ui.focus = Focus::Composer;
         let session = ui.sessions.get_mut("one").context("session")?;
