@@ -20,7 +20,16 @@ pub(super) struct Options<'a> {
     pub effort: Option<&'a str>,
     pub resume: Option<&'a str>,
     pub instructions: &'a str,
-    pub discovery: bool,
+    pub mode: Mode,
+}
+pub(super) enum Mode {
+    /// A difu session, with difu's MCP tools.
+    Session,
+    /// The model catalog: no settings, hooks, MCP servers or saved session.
+    Models,
+    /// The skill and command catalog: user, project and plugin settings load,
+    /// but hooks, MCP servers and session persistence stay off.
+    Commands,
 }
 pub(super) struct Connection {
     _child: ChildGroup,
@@ -68,18 +77,31 @@ impl Connection {
                 .arg("--append-system-prompt")
                 .arg(options.instructions);
         }
-        if options.discovery {
-            command.args([
-                "--no-session-persistence",
-                "--setting-sources=",
-                "--strict-mcp-config",
-                "--mcp-config",
-                "{\"mcpServers\":{}}",
-            ]);
-        } else {
-            command
-                .arg("--mcp-config")
-                .arg(json!({"mcpServers":{"difu":{"type":"sdk","name":"difu"}}}).to_string());
+        match options.mode {
+            Mode::Session => {
+                command
+                    .arg("--mcp-config")
+                    .arg(json!({"mcpServers":{"difu":{"type":"sdk","name":"difu"}}}).to_string());
+            }
+            Mode::Models => {
+                command.args([
+                    "--no-session-persistence",
+                    "--setting-sources=",
+                    "--strict-mcp-config",
+                    "--mcp-config",
+                    "{\"mcpServers\":{}}",
+                ]);
+            }
+            Mode::Commands => {
+                command.args([
+                    "--no-session-persistence",
+                    "--settings",
+                    "{\"disableAllHooks\":true}",
+                    "--strict-mcp-config",
+                    "--mcp-config",
+                    "{\"mcpServers\":{}}",
+                ]);
+            }
         }
         let mut child = ChildGroup::spawn_tree(&mut command)
             .context("Cannot start Claude Code; install and authenticate the claude CLI")?;

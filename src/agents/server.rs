@@ -349,6 +349,7 @@ impl Service {
             | Request::Delete { id }
             | Request::Archive { id, .. }
             | Request::Repository { id, .. }
+            | Request::Clear { id }
             | Request::RegisterWorktree { id, .. }
             | Request::Usage { id }
             | Request::Rename { id, .. } => Some(id.clone()),
@@ -820,40 +821,56 @@ impl Service {
                 let revision = previous.workspace_revision.saturating_add(1);
                 super::pr_cache::disconnect(&self.store.storage, &id, revision)?;
                 self.store.update(&id, |s| {
-                    s.status = Status::Idle;
-                    s.turn_id = None;
-                    s.turn_started_at = None;
-                    s.switching_workspace = false;
-                    for prompt in std::mem::take(&mut s.queue) {
-                        s.unsent(prompt);
-                    }
-                    s.pending.clear();
-                    s.workspace_requests.clear();
-                    s.registration_requests.clear();
-                    s.artifact_requests.clear();
-                    s.question_requests.clear();
-                    s.deletion_requests.clear();
-                    s.job = candidate.job;
-                    s.repository_rules = candidate.repository_rules;
-                    s.workspace = candidate.workspace;
-                    s.baseline = candidate.baseline;
-                    s.workspace_ready = false;
-                    s.workspace_removed = false;
-                    s.deferred_workspace = false;
-                    s.workspaces.clear();
-                    s.workspace_revision = revision;
-                    s.branch = None;
-                    s.comparison_base = None;
-                    s.artifacts.clear();
-                    s.guidance_checked = false;
-                    s.shells.clear();
-                    s.suggestion = None;
-                    s.suggestion_attempted = None;
-                    s.result = None;
-                    s.error = None;
+                    reset_workspace(s, candidate, revision);
                     s.note("system", format!("Repository changed to {}. Previous local work, artifacts, and PR associations were discarded. Re-read repository instructions before continuing.", s.job.root().display()));
                 })?;
                 self.store.save(&id)?;
+                Ok(Reply::Session(Box::new(self.store.get(&id)?)))
+            }
+            Request::Clear { id } => {
+                let mut candidate = self.store.get(&id)?;
+                ensure!(
+                    !candidate.archived,
+                    "Unarchive the session before clearing it"
+                );
+                ensure!(
+                    !candidate.workspace_removed,
+                    "This worktree was explicitly removed. Launch a new session from its retained branch to continue coding."
+                );
+                ensure!(
+                    !candidate.orchestrator
+                        && matches!(&candidate.job, Job::Coding(launch) if launch.isolated),
+                    "Only worktree coding sessions can be cleared"
+                );
+                candidate.baseline = None;
+                super::workspace::inspect(&mut candidate, &Cancel::default())?;
+                super::rules::capture(&self.store.storage, &mut candidate)?;
+                let owned = self.store.home.join("worktrees").join(&id);
+                if owned.try_exists()? {
+                    ensure!(
+                        !candidate.job.root().starts_with(owned.canonicalize()?),
+                        "The session repository is inside the worktree being discarded"
+                    );
+                }
+                // Validate first so a missing repository leaves the session intact.
+                self.stop_worker(&id)?;
+                let previous = self.store.get(&id)?;
+                super::workspace::discard(&previous, &self.store.home, &Cancel::default())?;
+                let revision = previous.workspace_revision.saturating_add(1);
+                super::pr_cache::disconnect(&self.store.storage, &id, revision)?;
+                self.store.update(&id, |s| {
+                    reset_workspace(s, candidate, revision);
+                    clear_conversation(s);
+                    s.status = Status::Starting;
+                    s.note(
+                        "system",
+                        "Session cleared. Preparing a fresh worktree from the latest origin/main.",
+                    );
+                })?;
+                self.store.save(&id)?;
+                // The empty-session path fetches origin/main and prepares the worktree
+                // without starting a provider until the next message.
+                self.start(&id, None)?;
                 Ok(Reply::Session(Box::new(self.store.get(&id)?)))
             }
             Request::Rename { id, title } => {
@@ -1004,9 +1021,6 @@ impl Service {
             Request::Defaults { cwd } => super::engine::defaults(&cwd),
             Request::Skills { id, force } => {
                 let session = self.store.get(&id)?;
-                if session.provider == provider::Provider::Claude {
-                    return Ok(super::claude::skills());
-                }
                 ensure!(
                     matches!(session.job, Job::Coding(_)),
                     "Skills are available for coding agents"
@@ -1015,9 +1029,80 @@ impl Service {
                     .workspace
                     .as_deref()
                     .context("Workspace is still being prepared")?;
-                super::engine::skills(cwd, force)
+                match session.provider {
+                    provider::Provider::Codex => super::engine::skills(cwd, force),
+                    // Each listing starts Claude Code, which rereads skills from disk.
+                    provider::Provider::Claude => super::claude::skills(cwd),
+                }
             }
         }
+    }
+}
+
+/// A replacement worktree drops the previous workspace's requests, artifacts and
+/// PR associations. Queued prompts remain visible as unsent messages.
+fn reset_workspace(s: &mut Session, candidate: Session, revision: u64) {
+    s.status = Status::Idle;
+    s.turn_id = None;
+    s.turn_started_at = None;
+    s.switching_workspace = false;
+    for prompt in std::mem::take(&mut s.queue) {
+        s.unsent(prompt);
+    }
+    s.pending.clear();
+    s.workspace_requests.clear();
+    s.registration_requests.clear();
+    s.artifact_requests.clear();
+    s.question_requests.clear();
+    s.deletion_requests.clear();
+    s.job = candidate.job;
+    s.repository_rules = candidate.repository_rules;
+    s.workspace = candidate.workspace;
+    s.baseline = candidate.baseline;
+    s.workspace_ready = false;
+    s.workspace_removed = false;
+    s.deferred_workspace = false;
+    s.workspaces.clear();
+    s.workspace_revision = revision;
+    s.branch = None;
+    s.comparison_base = None;
+    s.artifacts.clear();
+    s.guidance_checked = false;
+    s.shells.clear();
+    s.suggestion = None;
+    s.suggestion_attempted = None;
+    s.result = None;
+    s.error = None;
+}
+
+/// Keep the session's identity, provider, model and manual name, but nothing it
+/// learned: the next message starts a new native thread with no handoff context.
+fn clear_conversation(s: &mut Session) {
+    s.entries.clear();
+    s.slack_route = None;
+    s.slack_after = 0;
+    s.thread_id = None;
+    s.provider_threads.clear();
+    s.provider_context = None;
+    s.completed_turn = None;
+    s.token_usage = Value::Null;
+    s.usage = Value::Null;
+    s.answered_questions.clear();
+    s.permissions = Value::Null;
+    s.inherited_permissions = Value::Null;
+    s.artifact_tools = false;
+    s.registration_tools = false;
+    s.question_tools = false;
+    s.native_setup = true;
+    s.guide = None;
+    if let Job::Coding(launch) = &mut s.job {
+        launch.prompt.clear();
+    }
+    s.title_ready = false;
+    s.title_attempted = false;
+    s.title_response.clear();
+    if !s.title_manual {
+        s.title = "New session".into();
     }
 }
 
@@ -1475,6 +1560,204 @@ mod routed_queue_tests {
             first
         );
         assert_eq!(current.slack_route, Some(second));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod clear_tests {
+    use super::*;
+    use crate::{
+        agents::pr_cache::{SESSION_LINKS, SessionLink, SessionLinks},
+        github::SessionPr,
+        model::PrKey,
+    };
+    fn git(root: &std::path::Path, args: &[&str]) -> Result<String> {
+        crate::process::checked(
+            crate::repo::git(root)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args),
+            &Cancel::default(),
+        )
+        .map(|s| s.trim().to_owned())
+    }
+    #[test]
+    fn clear_discards_context_links_and_work_then_prepares_fresh_main() -> Result<()> {
+        for manual_title in [false, true] {
+            let temp = tempfile::tempdir()?;
+            let root = temp.path().canonicalize()?;
+            let (origin, local, home) =
+                (root.join("origin"), root.join("local"), root.join("home"));
+            for path in [&origin, &local] {
+                fs::create_dir(path)?;
+                git(path, &["init", "-b", "main"])?;
+                fs::write(path.join("tracked.txt"), "base\n")?;
+                git(path, &["add", "."])?;
+                git(path, &["commit", "-m", "base"])?;
+            }
+            git(
+                &local,
+                &[
+                    "remote",
+                    "add",
+                    "origin",
+                    origin.to_str().context("origin")?,
+                ],
+            )?;
+            fs::write(local.join("tracked.txt"), "user's own checkout edit\n")?;
+            let local_head = git(&local, &["rev-parse", "HEAD"])?;
+            let mut session = Session::new(
+                "one".into(),
+                Job::Coding(Launch {
+                    repository: local.clone(),
+                    isolated: true,
+                    base: "origin/main".into(),
+                    prompt: "Original task".into(),
+                    model: Some("chosen-model".into()),
+                    effort: None,
+                }),
+            );
+            let cancel = Cancel::default();
+            super::super::workspace::inspect(&mut session, &cancel)?;
+            super::super::workspace::prepare(&mut session, &home, &cancel, |_| Ok(()))?;
+            let tree = home.join("worktrees").join("one");
+            assert_eq!(session.workspace.as_deref(), Some(tree.as_path()));
+            // Unpushed commit, uncommitted edit and untracked file in the old worktree.
+            fs::write(tree.join("tracked.txt"), "old task commit\n")?;
+            git(&tree, &["commit", "-am", "old task"])?;
+            fs::write(tree.join("tracked.txt"), "old uncommitted edit\n")?;
+            fs::write(tree.join("untracked.txt"), "old untracked\n")?;
+            session.status = Status::Idle;
+            session.thread_id = Some("old-thread".into());
+            session
+                .provider_threads
+                .insert("claude".into(), Default::default());
+            session.provider_context = Some("old handoff".into());
+            session.note("userMessage", "earlier private context");
+            session.queue.push(Prompt::from("queued for the old task"));
+            session.answered_questions.insert("old-question".into());
+            session.token_usage = serde_json::json!({"total": 1});
+            session.artifacts.push(super::super::artifacts::Artifact {
+                path: "report.html".into(),
+                title: "Old report".into(),
+                workspace: Some(tree.clone()),
+            });
+            session.title = "Old task title".into();
+            session.title_ready = true;
+            session.title_attempted = true;
+            session.title_manual = manual_title;
+            let store = Arc::new(Store::fixture(home.clone(), vec![session.clone()]));
+            fs::create_dir_all(&store.storage.cache)?;
+            let link = SessionLink {
+                workspace: tree.clone(),
+                workspace_revision: 0,
+                pr: SessionPr {
+                    summary: None,
+                    key: PrKey {
+                        owner: "example".into(),
+                        repo: "project".into(),
+                        number: 7,
+                    },
+                    state: "OPEN".into(),
+                    draft: false,
+                    conflicts: false,
+                    head_branch: "difu/agent-one".into(),
+                    head: git(&tree, &["rev-parse", "HEAD"])?,
+                    updated: "2026-10-01T00:00:00Z".into(),
+                },
+            };
+            crate::github::store::session(&store.storage, &link.pr)?;
+            let links_path = store.storage.cache.join(SESSION_LINKS);
+            let links: SessionLinks = [("one".to_owned(), vec![link])].into_iter().collect();
+            super::super::pr_cache::save_links(&store.storage, &links_path, &links)?;
+            assert!(super::super::pr_cache::load_links(&links_path).contains_key("one"));
+            fs::write(origin.join("tracked.txt"), "fresh remote main\n")?;
+            git(&origin, &["commit", "-am", "advance main"])?;
+            let fresh = git(&origin, &["rev-parse", "HEAD"])?;
+            let service = Service {
+                store: store.clone(),
+                workers: Mutex::new(BTreeMap::new()),
+                action_locks: Mutex::new(BTreeMap::new()),
+                launch_lock: Mutex::new(()),
+            };
+
+            let Reply::Session(_) = service.handle(Request::Clear { id: "one".into() })? else {
+                anyhow::bail!("clear returned no session")
+            };
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let cleared = loop {
+                let current = store.get("one")?;
+                if current.status == Status::Idle && current.workspace_ready {
+                    break current;
+                }
+                ensure!(
+                    current.status != Status::Failed && Instant::now() < deadline,
+                    "fresh worktree was not prepared: {:?} {:?}",
+                    current.status,
+                    current.error
+                );
+                thread::sleep(Duration::from_millis(50));
+            };
+            service.stop_worker("one")?;
+
+            assert_eq!(cleared.workspace.as_deref(), Some(tree.as_path()));
+            assert_eq!(cleared.baseline.as_deref(), Some(fresh.as_str()));
+            assert_eq!(cleared.branch.as_deref(), Some("difu/agent-one-1"));
+            assert_eq!(git(&tree, &["rev-parse", "HEAD"])?, fresh);
+            assert_eq!(
+                fs::read_to_string(tree.join("tracked.txt"))?,
+                "fresh remote main\n"
+            );
+            assert!(!tree.join("untracked.txt").exists());
+            assert!(
+                git(
+                    &local,
+                    &["show-ref", "--verify", "refs/heads/difu/agent-one"]
+                )
+                .is_err()
+            );
+            assert_eq!(git(&local, &["rev-parse", "HEAD"])?, local_head);
+            assert_eq!(
+                fs::read_to_string(local.join("tracked.txt"))?,
+                "user's own checkout edit\n"
+            );
+
+            assert_eq!(cleared.entries.len(), 1);
+            assert!(
+                cleared
+                    .entries
+                    .iter()
+                    .all(|e| e.kind == "system" && !e.text.contains("earlier private context"))
+            );
+            assert!(cleared.thread_id.is_none() && cleared.provider_context.is_none());
+            assert!(cleared.provider_threads.is_empty());
+            assert!(cleared.queue.is_empty() && cleared.pending.is_empty());
+            assert!(cleared.answered_questions.is_empty() && cleared.artifacts.is_empty());
+            assert!(cleared.token_usage.is_null());
+            assert!(matches!(&cleared.job, Job::Coding(l) if l.prompt.is_empty()
+                && l.model.as_deref() == Some("chosen-model")));
+            assert!(!cleared.title_ready && !cleared.title_attempted);
+            assert_eq!(
+                cleared.title,
+                if manual_title {
+                    "Old task title"
+                } else {
+                    "New session"
+                }
+            );
+            assert!(!super::super::pr_cache::load_links(&links_path).contains_key("one"));
+            assert_eq!(
+                super::super::pr_cache::snapshot(&store.storage, "one").disconnected_before,
+                1
+            );
+        }
         Ok(())
     }
 }

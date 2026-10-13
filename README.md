@@ -224,6 +224,15 @@ session. Remote branches and PRs are untouched. Conversation is preserved; the
 next message creates a fresh worktree. Queued messages are retained as unsent
 messages. The new-session default is unchanged.
 
+Use **/clear** to start a session over without creating a new one. After
+confirmation it stops the agent and discards the managed worktree and local
+branches the same way as **/repo**, then removes the chat, conversation context,
+queue, questions, artifacts, and connected PRs. A fresh worktree is prepared
+immediately from the latest `origin/main`, and the next message starts a new
+provider conversation. The provider, model, and a manually set name are kept;
+an automatic name resets. Remote branches, PRs, registered external worktrees,
+and native provider history are untouched.
+
 Codex model and reasoning inherit your configuration unless overridden. Legacy
 read-only investigation sessions permit app/MCP approval prompts while blocking
 filesystem escalation. In worktrees, Codex's inherited permissions apply. Claude
@@ -303,7 +312,7 @@ With an empty composer, **Up** recalls sent prompts from the current session.
 Recalled prompts are editable and never sent automatically.
 
 Type **/** in an empty composer for native commands: `/compact`, `/model`, `/effort`,
-`/skills`, `/status`, `/rules`, `/usage`, `/diff`, `/new`, `/rename`, `/repo`, `/worktree`,
+`/skills`, `/status`, `/rules`, `/usage`, `/diff`, `/new`, `/rename`, `/clear`, `/repo`, `/worktree`,
 `/help`, `/voice`, and `/actions`.
 Opening a session keeps the composer focused; pending questions remain available
 through the questions control.
@@ -321,7 +330,11 @@ A slash inside an existing message stays literal. `/model` and `/effort` suggest
 Codex’s available models and supported reasoning levels: type to filter, use
 Up/Down to select, Enter to fill, and Enter again to apply.
 The skills picker discovers enabled skills for the session's actual directory;
-selecting one attaches it to the draft without sending. `/actions` (or Esc then /)
+selecting one attaches it to the draft without sending. In Claude sessions, `/`
+also lists Claude Code's user, project, and plugin skills and commands for the
+session worktree. Selecting one inserts `/name` for Claude Code to run with the
+message; difu's own command wins when the names match. Discovery starts the
+Claude CLI without hooks, MCP servers, or a saved session. `/actions` (or Esc then /)
 opens searchable session controls: continue, interrupt, rename, change model,
 archive/unarchive, toggle panes, and delete a chat with its worktree.
 

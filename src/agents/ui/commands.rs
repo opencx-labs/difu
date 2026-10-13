@@ -14,6 +14,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("new", "Launch a new coding session"),
     ("rename", "Rename this session"),
     (
+        "clear",
+        "Start over: clear context, PRs and artifacts; fresh worktree from main",
+    ),
+    (
         "repo",
         "Change repository and discard previous workspace work",
     ),
@@ -190,7 +194,10 @@ impl Ui {
             }
         }
         if let Some((skills, _)) = self.selected.as_ref().and_then(|id| self.skills.get(id)) {
-            for skill in skills.iter().filter(|s| s.enabled) {
+            // difu's own command runs when a Claude command shares its name.
+            for skill in skills.iter().filter(|s| {
+                s.enabled && !(s.slash && COMMANDS.iter().any(|(command, _)| *command == s.name))
+            }) {
                 if format!(
                     "{} {} {}",
                     skill.name,
@@ -200,11 +207,19 @@ impl Ui {
                 .to_lowercase()
                 .contains(query)
                 {
-                    result.push((
-                        format!("${}", skill.name),
-                        format!("{} · {}", skill.description, skill.path.display()),
-                        Some(skill.clone()),
-                    ));
+                    result.push(if skill.slash {
+                        (
+                            format!("/{}", skill.name),
+                            skill.description.clone(),
+                            Some(skill.clone()),
+                        )
+                    } else {
+                        (
+                            format!("${}", skill.name),
+                            format!("{} · {}", skill.description, skill.path.display()),
+                            Some(skill.clone()),
+                        )
+                    });
                 }
             }
         }
@@ -320,9 +335,14 @@ impl Ui {
         if let Some(skill) = skill {
             if let Some(id) = self.selected.clone() {
                 let position = self.positions.entry(id).or_default();
-                position.draft.insert(&format!("${} ", skill.name));
-                position.skills.retain(|s| s.path != skill.path);
-                position.skills.push(skill);
+                if skill.slash {
+                    // Claude Code runs the command from the message text itself.
+                    position.draft.insert(&format!("/{} ", skill.name));
+                } else {
+                    position.draft.insert(&format!("${} ", skill.name));
+                    position.skills.retain(|s| s.path != skill.path);
+                    position.skills.push(skill);
+                }
                 self.focus = Focus::Composer;
                 self.drilled = true;
                 self.modal = None;
@@ -371,6 +391,7 @@ impl Ui {
             }
             "/new" => self.launch(),
             "/rename" => self.menu_action(3),
+            "/clear" => self.modal = Some(Modal::Clear),
             "/repo" => {
                 if let Some(session) = self.selected.as_ref().and_then(|id| self.sessions.get(id)) {
                     self.modal = Some(Modal::ChangeRepository(Editor::from(

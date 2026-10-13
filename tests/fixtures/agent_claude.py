@@ -31,7 +31,13 @@ for line in sys.stdin:
     if frame['type'] == 'control_request':
         request = frame['request']
         if request['subtype'] == 'initialize':
-            if '--no-session-persistence' in sys.argv:
+            if '{"disableAllHooks":true}' in sys.argv:
+                reply(frame, dict(commands=[
+                    dict(name='fixture-skill', description='Fixture\n  skill (project)', argumentHint='<target>'),
+                    dict(name='compact', description='Compact the conversation', argumentHint=''),
+                    dict(name='__server-only', description='Server-launched sessions only', argumentHint=''),
+                ]))
+            elif '--no-session-persistence' in sys.argv:
                 reply(frame, dict(models=[dict(value='sonnet', displayName='Sonnet', supportedEffortLevels=['low','medium','high'])]))
             else:
                 initializing = frame

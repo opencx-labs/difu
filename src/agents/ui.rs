@@ -243,6 +243,7 @@ pub enum Modal {
         scroll: usize,
     },
     Delete,
+    Clear,
     Help(crate::help::State),
 }
 struct ResultMessage {
@@ -264,6 +265,7 @@ enum Task {
     Skills(String, std::path::PathBuf, provider::Provider),
     Launch,
     Repository(String),
+    Clear(String),
     Worktree(String),
     Usage(String),
     Action,
@@ -492,9 +494,11 @@ impl Ui {
                 }
                 Task::Read(_) => {}
                 Task::Changes(..) => {}
-                Task::Launch | Task::Repository(_) | Task::Worktree(_) | Task::Action => {
-                    self.busy = false
-                }
+                Task::Launch
+                | Task::Repository(_)
+                | Task::Clear(_)
+                | Task::Worktree(_)
+                | Task::Action => self.busy = false,
                 Task::Delete(id) => {
                     self.deleting.remove(id);
                 }
@@ -656,21 +660,25 @@ impl Ui {
                         self.ensure_selected();
                     }
                     (Task::Repository(id), Reply::Session(session)) => {
-                        self.skills.remove(&id);
-                        self.workspace_paths.remove(&id);
-                        self.changes.remove(&id);
-                        self.sidebar.counts.remove(&id);
-                        if let Err(error) = self.prs.forget(&id, &self.storage, &self.cache_writer)
-                        {
-                            self.notice =
-                                Some((format!("Cannot clear cached PR: {error:#}"), true));
+                        self.replaced_workspace(id, *session);
+                    }
+                    (Task::Clear(id), Reply::Session(session)) => {
+                        if let Some(position) = self.positions.get_mut(&id) {
+                            // Keep the composer; the old transcript, questions and
+                            // change selections no longer exist.
+                            *position = Position {
+                                draft: std::mem::take(&mut position.draft),
+                                skills: std::mem::take(&mut position.skills),
+                                attachments: std::mem::take(&mut position.attachments),
+                                image_count: position.image_count,
+                                video_count: position.video_count,
+                                media_loaded: position.media_loaded,
+                                saved_attachments: std::mem::take(&mut position.saved_attachments),
+                                follow: true,
+                                ..Position::default()
+                            };
                         }
-                        self.panels = panels::Panels::new(self.panels.right);
-                        self.summaries.retain(|s| s.id != id);
-                        self.summaries.push(session.summary());
-                        self.sessions.insert(id, *session);
-                        self.modal = None;
-                        self.refreshed = None;
+                        self.replaced_workspace(id, *session);
                     }
                     (Task::Read(id) | Task::Worktree(id), Reply::Session(session)) => {
                         if self
@@ -961,6 +969,22 @@ impl Ui {
                 self.notice = Some((format!("Could not save session order: {error:#}"), true))
             }
         }
+    }
+    /// A new worktree invalidates cached skills, paths, changes, PRs and panes.
+    fn replaced_workspace(&mut self, id: String, session: Session) {
+        self.skills.remove(&id);
+        self.workspace_paths.remove(&id);
+        self.changes.remove(&id);
+        self.sidebar.counts.remove(&id);
+        if let Err(error) = self.prs.forget(&id, &self.storage, &self.cache_writer) {
+            self.notice = Some((format!("Cannot clear cached PR: {error:#}"), true));
+        }
+        self.panels = panels::Panels::new(self.panels.right);
+        self.summaries.retain(|s| s.id != id);
+        self.summaries.push(session.summary());
+        self.sessions.insert(id, session);
+        self.modal = None;
+        self.refreshed = None;
     }
     fn ensure_selected(&mut self) {
         let list = self.selectable();
@@ -2179,6 +2203,15 @@ impl Ui {
                     self.task(Task::Delete(id.clone()), Request::Delete { id }, false);
                 }
             }
+            Some(Modal::Clear) if key.code == KeyCode::Enter => {
+                if !self.busy
+                    && let Some(id) = self.selected.clone()
+                {
+                    self.busy = true;
+                    self.modal = None;
+                    self.task(Task::Clear(id.clone()), Request::Clear { id }, false);
+                }
+            }
             Some(Modal::Approval {
                 pending,
                 selected,
@@ -3320,6 +3353,7 @@ impl Ui {
             }) => "HTML artifacts · Enter open",
             Some(Modal::Resources { .. }) => "Open shells · Enter view",
             Some(Modal::Delete) => "Stop and delete chat",
+            Some(Modal::Clear) => "Clear session",
             Some(Modal::Help(_)) => "Search agent shortcuts",
             None => "",
         };
@@ -3491,6 +3525,9 @@ impl Ui {
             }
             Some(Modal::Delete) => {
                 frame.render_widget(Paragraph::new("Stop this agent and permanently delete its difu chat, saved questions, queue, and attachments? Its unlocked difu-owned worktree will also be removed, including all uncommitted, untracked, and ignored files. Existing directories, named branches, commits, and native provider history are not deleted.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
+            }
+            Some(Modal::Clear) => {
+                frame.render_widget(Paragraph::new("Stop this agent and start this session over? Its chat, conversation context, queue, questions, artifacts, and PR links are removed, and the next message starts a new conversation. Its difu-owned worktree and local branch are discarded, including uncommitted and unpushed work, and a fresh worktree is created from the latest origin/main. Pushed branches, open PRs, registered external worktrees, and native provider history are not deleted.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
             }
             Some(Modal::Help(state)) => {
                 let search = Rect::new(area.x, area.y, area.width, 3.min(area.height));
@@ -4019,6 +4056,69 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn clear_requires_confirmation_and_keeps_the_draft_but_not_the_old_view() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let listener = UnixListener::bind(super::super::server::socket(&storage)?)?;
+        let mut ui = state(storage);
+        let mut cleared = ui.sessions.get("one").context("session")?.clone();
+        cleared.entries.clear();
+        cleared.title = "New session".into();
+        cleared.note("system", "Session cleared");
+        let reply = cleared.clone();
+        let worker = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut line = String::new();
+            BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+            assert!(
+                matches!(serde_json::from_str::<Request>(&line)?, Request::Clear { id } if id == "one")
+            );
+            serde_json::to_writer(&mut stream, &Reply::Session(Box::new(reply)))?;
+            stream.write_all(b"\n")?;
+            Ok(())
+        });
+        ui.drilled = true;
+        let position = ui.positions.entry("one".into()).or_default();
+        position.draft.insert("Next task");
+        position.follow = false;
+        position.conversation = 40;
+        position.expanded.insert("old-entry".into());
+        ui.run_palette_command("/clear", "/clear");
+        assert!(matches!(ui.modal, Some(Modal::Clear)));
+        let (screen, _) = draw(&mut ui, 120, 30)?;
+        assert!(screen.contains("uncommitted and unpushed work"));
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.modal.is_none() && !ui.busy, "Esc must not clear");
+        ui.run_palette_command("/clear", "/clear");
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(ui.modal.is_none() && ui.busy);
+        let response = ui.receiver.recv_timeout(Duration::from_secs(5))?;
+        ui.sender.send(response)?;
+        ui.tick(false);
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("Fixture panicked"))??;
+        assert!(!ui.busy);
+        let session = ui.sessions.get("one").context("cleared session")?;
+        assert_eq!(session.entries.len(), 1);
+        assert!(
+            ui.summaries
+                .iter()
+                .any(|s| s.id == "one" && s.title == "New session")
+        );
+        let position = ui.positions.get("one").context("position")?;
+        assert_eq!(position.draft.text(), "Next task");
+        assert!(position.follow && position.conversation == 0 && position.expanded.is_empty());
         Ok(())
     }
 
@@ -4633,6 +4733,7 @@ mod tests {
             path: "review/SKILL.md".into(),
             description: String::new(),
             enabled: true,
+            slash: false,
         };
         let p = ui.positions.get_mut("one").context("position")?;
         p.draft = Editor::from("Review ");
@@ -6668,6 +6769,7 @@ mod tests {
                     path: "/tmp/project/.agents/skills/fixture/SKILL.md".into(),
                     description: "fixture skill".into(),
                     enabled: true,
+                    slash: false,
                 }],
                 Vec::new(),
             ),
@@ -6711,6 +6813,64 @@ mod tests {
         ui.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
         ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
         assert_eq!(ui.clipboard.as_deref(), Some("/"));
+        Ok(())
+    }
+    #[test]
+    fn claude_skills_complete_as_slash_commands_sent_as_message_text() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        let command = |name: &str, description: &str| Skill {
+            name: name.into(),
+            path: Default::default(),
+            description: description.into(),
+            enabled: true,
+            slash: true,
+        };
+        ui.skills.insert(
+            "one".into(),
+            (
+                vec![
+                    command("fixture-skill", "<target> · Fixture skill (project)"),
+                    command("compact", "Claude's own compaction"),
+                ],
+                Vec::new(),
+            ),
+        );
+        let entries = ui.palette_commands();
+        assert!(
+            entries
+                .iter()
+                .any(|(name, description, _)| name == "/fixture-skill"
+                    && description == "<target> · Fixture skill (project)")
+        );
+        // difu's /compact handles the name; Claude's duplicate is not listed.
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|(name, _, _)| name == "/compact")
+                .map(|(_, description, _)| description.as_str())
+                .collect::<Vec<_>>(),
+            ["Compact the current conversation"]
+        );
+        ui.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        ui.paste("fixture-sk");
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(ui.modal.is_none());
+        let position = ui.positions.get_mut("one").context("draft")?;
+        assert_eq!(position.draft.text(), "/fixture-skill ");
+        assert!(position.skills.is_empty());
+        position.draft.insert("src/lib.rs");
+        assert!(!ui.command_draft(), "Claude commands are sent as messages");
+        let position = ui.positions.get_mut("one").context("draft")?;
+        position.draft.clear();
+        position.draft.insert("/status");
+        assert!(ui.command_draft());
+        assert!(matches!(ui.modal, Some(Modal::Status)));
         Ok(())
     }
     #[test]
@@ -6866,6 +7026,7 @@ mod tests {
                     path: "/tmp/inspect/SKILL.md".into(),
                     description: "Inspect code".into(),
                     enabled: true,
+                    slash: false,
                 }],
                 Vec::new(),
             ),

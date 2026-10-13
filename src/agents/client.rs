@@ -38,6 +38,7 @@ pub fn request(storage: &Storage, request: Request) -> Result<Reply> {
         }
         Request::List => "list sessions".into(),
         Request::Delete { id } => format!("delete session {id}"),
+        Request::Clear { id } => format!("clear session {id}"),
         Request::Repository { id, .. } | Request::RegisterWorktree { id, .. } => {
             format!("change workspace for {id}")
         }
@@ -49,7 +50,10 @@ pub fn request(storage: &Storage, request: Request) -> Result<Reply> {
         .context("Agent service is disconnected; refresh to reconnect")?;
     // Large worktrees can take longer than an RPC timeout to remove. These
     // actions run off the UI thread; deletion progress is read independently.
-    let timeout = if matches!(request, Request::Delete { .. } | Request::Repository { .. }) {
+    let timeout = if matches!(
+        request,
+        Request::Delete { .. } | Request::Repository { .. } | Request::Clear { .. }
+    ) {
         None
     } else {
         Some(Duration::from_secs(65))
