@@ -359,6 +359,9 @@ output. Reading earlier output keeps your place. Toasts dismiss after five secon
 at a time with **Enter**, or skip it without answering with **Ctrl+]**.
 On a suggested choice, **n** opens a note beneath it. **Enter** submits the choice
 and its note together; **Esc** returns to the choices while keeping the note.
+When Claude allows several answers, choices show checkboxes: **Space** or a click
+toggles one, and **Enter** submits every checked choice (or the highlighted one if
+none are checked) plus any typed answer, as comma-separated labels with their notes.
 **Alt+Up** advances; **Alt+Down** returns to the previous question, or the composer
 from the first question. Question drafts survive dismissal and session switching.
 Asynchronous question cards remain available after the agent finishes its turn

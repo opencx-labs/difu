@@ -1899,6 +1899,39 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
         fs::read_to_string(repo.join("tracked.txt"))?,
         "precious local edit\n"
     );
+    // Multi-select answers reach Claude as comma-separated labels.
+    control(&storage, &id, message("claude multi question"))?;
+    let asked = wait(&storage, &id, |s| !s.pending.is_empty())?;
+    let question = asked.pending.first().context("Claude question")?;
+    assert_eq!(
+        question.params.pointer("/questions/0/multiSelect"),
+        Some(&serde_json::json!(true))
+    );
+    control(
+        &storage,
+        &id,
+        Control::AnswerQuestion {
+            request: question.id.clone(),
+            question: "0".into(),
+            answer: Some("Lint, Build".into()),
+        },
+    )?;
+    wait(&storage, &id, |s| {
+        s.status == Status::Idle && s.pending.is_empty()
+    })?;
+    let answered = fs::read_to_string(root.join("claude-protocol.jsonl"))?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|frame| frame.pointer("/response/request_id") == Some(&question.id))
+        .context("Claude answer")?;
+    assert_eq!(
+        answered.pointer("/response/response/updatedInput/answers"),
+        Some(&serde_json::json!({"Which checks?": "Lint, Build"}))
+    );
+    assert_eq!(
+        answered.pointer("/response/response/updatedInput/questions/0/multiSelect"),
+        Some(&serde_json::json!(true))
+    );
 
     let registered = root.join("manual worktree");
     git(

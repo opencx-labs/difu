@@ -60,6 +60,62 @@ impl Ui {
         self.question_note_focused = true;
         self.question_reveal = true;
     }
+    /// Claude marks questions that accept several options with `multiSelect`.
+    fn multi_select_key(&self) -> Option<(String, usize)> {
+        let Some(Modal::Approval { pending, field, .. }) = &self.modal else {
+            return None;
+        };
+        let question = pending.params.get("questions")?.as_array()?.get(*field)?;
+        (self.inline_question()
+            && question.get("multiSelect").and_then(Value::as_bool) == Some(true))
+        .then(|| (pending.id.to_string(), *field))
+    }
+    fn question_checks(&self) -> Option<&std::collections::BTreeSet<usize>> {
+        let key = self.multi_select_key()?;
+        self.positions
+            .get(self.selected.as_ref()?)?
+            .question_checks
+            .get(&key)
+    }
+    /// Toggle the highlighted option of a multi-select question. "Other" remains
+    /// a text field, so this reports whether an option was toggled.
+    pub(super) fn toggle_question_check(&mut self) -> bool {
+        let Some(key) = self.multi_select_key() else {
+            return false;
+        };
+        let Some(Modal::Approval {
+            pending,
+            field,
+            selected,
+            ..
+        }) = &self.modal
+        else {
+            return false;
+        };
+        let choice = *selected;
+        let count = pending
+            .params
+            .get("questions")
+            .and_then(Value::as_array)
+            .and_then(|q| q.get(*field))
+            .and_then(|q| q.get("options"))
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let Some(id) = self.selected.clone().filter(|_| choice < count) else {
+            return false;
+        };
+        let checks = self
+            .positions
+            .entry(id)
+            .or_default()
+            .question_checks
+            .entry(key)
+            .or_default();
+        if !checks.remove(&choice) {
+            checks.insert(choice);
+        }
+        true
+    }
     pub(super) fn selected_question_answer(&self) -> Option<String> {
         let Some(Modal::Approval {
             pending,
@@ -72,13 +128,51 @@ impl Ui {
             return None;
         };
         let question = pending.params.get("questions")?.as_array()?.get(*field)?;
-        let text = if let Some(label) = question
-            .get("options")
-            .and_then(Value::as_array)
-            .and_then(|options| options.get(*selected))
-            .and_then(|option| option.get("label"))
-            .and_then(Value::as_str)
-        {
+        let label = |index: usize| {
+            question
+                .get("options")
+                .and_then(Value::as_array)
+                .and_then(|options| options.get(index))
+                .and_then(|option| option.get("label"))
+                .and_then(Value::as_str)
+        };
+        let text = if self.multi_select_key().is_some() {
+            let other = answers
+                .get(*field)
+                .map(Editor::text)
+                .filter(|text| !text.trim().is_empty());
+            let mut chosen = self.question_checks().cloned().unwrap_or_default();
+            // With nothing checked, Enter answers with the highlighted option.
+            if chosen.is_empty() && other.is_none() {
+                chosen.insert(*selected);
+            }
+            let chosen = chosen
+                .into_iter()
+                .filter_map(|index| Some((index, label(index)?)))
+                .collect::<Vec<_>>();
+            // Claude reads several choices as comma-separated labels.
+            let mut text = chosen
+                .iter()
+                .map(|(_, label)| *label)
+                .chain(other.as_deref())
+                .collect::<Vec<_>>()
+                .join(", ");
+            for (index, label) in chosen {
+                if let Some(note) = self
+                    .positions
+                    .get(self.selected.as_ref()?)
+                    .and_then(|p| {
+                        p.question_notes
+                            .get(&(pending.id.to_string(), *field, index))
+                    })
+                    .map(Editor::text)
+                    .filter(|note| !note.trim().is_empty())
+                {
+                    text.push_str(&format!("\n\nNote on {label}: {note}"));
+                }
+            }
+            text
+        } else if let Some(label) = label(*selected) {
             let mut text = label.to_owned();
             if let Some(note) = self
                 .question_note()
@@ -227,6 +321,13 @@ impl Ui {
         {
             note.key(key);
             self.question_reveal = true;
+            return true;
+        }
+        if key.code == KeyCode::Char(' ')
+            && key.modifiers.is_empty()
+            && self.toggle_question_check()
+        {
+            self.remember_answers();
             return true;
         }
         if key.code == KeyCode::Char('n')
@@ -392,6 +493,14 @@ impl Ui {
             ))
         })
         .collect();
+        let multi = self.multi_select_key().is_some();
+        let checks = self.question_checks();
+        if multi {
+            lines.push(Line::from(Span::styled(
+                "Choose one or more",
+                Style::default().fg(DIM),
+            )));
+        }
         lines.push(Line::from(""));
         let options = question
             .get("options")
@@ -407,8 +516,15 @@ impl Ui {
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let prefix = format!(
-                "{} {}. ",
+                "{} {}{}. ",
                 if index == *selected { "›" } else { " " },
+                if !multi {
+                    ""
+                } else if checks.is_some_and(|checks| checks.contains(&index)) {
+                    "[x] "
+                } else {
+                    "[ ] "
+                },
                 index + 1
             );
             lines.extend(
@@ -633,6 +749,8 @@ impl Ui {
             } else {
                 if self.question_note_focused {
                     "Enter submit with note · Esc choices · Alt+↑↓ questions"
+                } else if self.multi_select_key().is_some() {
+                    "Space choose · n add note · Enter submit · Ctrl+] skip · Alt+↓ previous/input · Alt+↑ next"
                 } else {
                     "n add note · Enter submit · Ctrl+] skip · Alt+↓ previous/input · Alt+↑ next"
                 }

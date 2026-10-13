@@ -67,6 +67,12 @@ for line in sys.stdin:
         elif prompt.startswith('fixture shell: '):
             subprocess.Popen([sys.executable, prompt.split(': ', 1)[1]], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             complete()
+        elif prompt == 'claude multi question':
+            tool = f'ask-{connection}-{turn}'
+            ask = dict(questions=[dict(question='Which checks?', header='Checks', multiSelect=True, options=[dict(label=label, description='') for label in ('Lint', 'Tests', 'Build')])])
+            emit(dict(type='assistant', message=dict(id=f'assistant-{connection}-{turn}', content=[dict(type='tool_use', id=tool, name='AskUserQuestion', input=ask)])))
+            pending = tool
+            emit(dict(type='control_request', request_id=tool, request=dict(subtype='can_use_tool', tool_name='AskUserQuestion', input=ask)))
         elif 'claude tool' in prompt:
             tool = f'tool-{connection}-{turn}'
             emit(dict(type='assistant', message=dict(id=f'assistant-{connection}-{turn}', content=[dict(type='tool_use', id=tool, name='Bash', input=dict(command='echo fixture'))])))

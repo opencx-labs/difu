@@ -118,6 +118,8 @@ pub struct Position {
     pub answers: HashMap<String, questions::Draft>,
     question_choices: HashMap<(String, usize), usize>,
     question_notes: HashMap<(String, usize, usize), Editor>,
+    /// Checked options of multi-select questions, by request and question.
+    question_checks: HashMap<(String, usize), std::collections::BTreeSet<usize>>,
 }
 #[derive(Clone)]
 enum Action {
@@ -2345,6 +2347,7 @@ impl Ui {
                 if let Some(Modal::Approval { selected, .. }) = &mut self.modal {
                     *selected = choice;
                 }
+                self.toggle_question_check();
                 self.remember_answers();
             }
             Action::Queue => self.modal = Some(Modal::Queue { selected: 0 }),
@@ -7427,6 +7430,110 @@ mod tests {
             draw(&mut ui, width, height)?;
         }
         assert!(!ui.busy); // Editing never submits a choice automatically.
+        Ok(())
+    }
+    #[test]
+    fn multi_select_questions_check_several_options_and_send_every_label() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let listener = UnixListener::bind(super::super::server::socket(&storage)?)?;
+        let worker = thread::spawn(move || -> Result<Request> {
+            let (mut stream, _) = listener.accept()?;
+            let mut line = String::new();
+            BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+            serde_json::to_writer(&mut stream, &Reply::Ok)?;
+            stream.write_all(b"\n")?;
+            Ok(serde_json::from_str(&line)?)
+        });
+        let mut ui = state(storage);
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        ui.sessions
+            .get_mut("one")
+            .context("session")?
+            .pending
+            .push(Pending {
+                id: serde_json::json!("multi"),
+                method: "item/tool/requestUserInput".into(),
+                responded: false,
+                params: serde_json::json!({"questions":[
+                    {"id":"0","question":"Which checks?","multiSelect":true,
+                     "options":[{"label":"Lint"},{"label":"Tests"},{"label":"Build"}]},
+                    {"id":"1","question":"Ship it?","multiSelect":false,
+                     "options":[{"label":"Yes"},{"label":"No"}]}
+                ]}),
+            });
+        ui.open_question(0);
+        assert_eq!(ui.selected_question_answer().as_deref(), Some("Lint"));
+        let space = || KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        ui.key(space());
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        ui.key(space());
+        assert_eq!(
+            ui.selected_question_answer().as_deref(),
+            Some("Lint, Build")
+        );
+        ui.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        ui.paste("CI only");
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            ui.selected_question_answer().as_deref(),
+            Some("Lint, Build\n\nNote on Build: CI only")
+        );
+        let (screen, _) = draw(&mut ui, 120, 35)?;
+        for text in [
+            "Choose one or more",
+            "[x] 1. Lint",
+            "[ ] 2. Tests",
+            "[x] 3. Build",
+            "Space choose",
+        ] {
+            assert!(screen.contains(text), "missing {text}");
+        }
+        // Unchecking drops the option and its note; a click checks like Space.
+        ui.key(space());
+        assert_eq!(ui.selected_question_answer().as_deref(), Some("Lint"));
+        ui.key(space());
+        ui.action(Action::QuestionChoice(1));
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let (screen, _) = draw(&mut ui, 120, 35)?;
+        assert!(screen.contains("Ship it?") && !screen.contains("[ ]"));
+        assert_eq!(ui.selected_question_answer().as_deref(), Some("Yes"));
+        ui.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
+        ui.paste("ocs");
+        assert_eq!(
+            ui.selected_question_answer().as_deref(),
+            Some("Lint, Tests, Build, Docs\n\nNote on Build: CI only")
+        );
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let request = worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
+        let Request::Control {
+            control:
+                Control::AnswerQuestion {
+                    request,
+                    question,
+                    answer,
+                },
+            ..
+        } = request
+        else {
+            anyhow::bail!("expected a question answer");
+        };
+        assert_eq!(request, serde_json::json!("multi"));
+        assert_eq!(question, "0");
+        assert_eq!(
+            answer.as_deref(),
+            Some("Lint, Tests, Build, Docs\n\nNote on Build: CI only")
+        );
         Ok(())
     }
     #[test]
