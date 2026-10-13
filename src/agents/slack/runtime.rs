@@ -529,13 +529,19 @@ fn observe(
                         .filter_map(|o| o.get("label").and_then(Value::as_str))
                         .collect::<Vec<_>>()
                         .join(" / ");
+                    let multiple =
+                        if question.get("multiSelect").and_then(Value::as_bool) == Some(true) {
+                            "\nChoose one or more, separated by commas."
+                        } else {
+                            ""
+                        };
                     reference(
                         journal,
                         &session,
                         pending,
                         Some(id.into()),
                         origin,
-                        format!("{title}\n{options}"),
+                        format!("{title}\n{options}{multiple}"),
                     )?;
                 }
             } else {

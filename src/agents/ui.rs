@@ -13,6 +13,7 @@ mod patch;
 mod prompt;
 mod prs;
 mod questions;
+mod reveal;
 mod rules;
 mod selection;
 mod sends;
@@ -20,6 +21,7 @@ mod sidebar;
 mod slack;
 mod transcript;
 mod transcript_window;
+mod tweaks;
 mod usage;
 mod voice;
 mod watch;
@@ -118,6 +120,13 @@ pub struct Position {
     pub answers: HashMap<String, questions::Draft>,
     question_choices: HashMap<(String, usize), usize>,
     question_notes: HashMap<(String, usize, usize), Editor>,
+    /// Checked options of multi-select questions, by request and question.
+    question_checks: HashMap<(String, usize), std::collections::BTreeSet<usize>>,
+    /// Chat animations from `/tweaks`.
+    reply: Option<reveal::Reply>,
+    replies_seen: bool,
+    sent: Option<reveal::Typing>,
+    clearing: Option<reveal::Typing>,
 }
 #[derive(Clone)]
 enum Action {
@@ -149,6 +158,8 @@ enum Action {
     VoiceField,
     VoiceSave,
     VoiceToggle,
+    TweaksField(usize),
+    TweaksSave,
     AnswerFocus,
     QueueEditorFocus,
     ChooseRepository,
@@ -194,6 +205,10 @@ pub enum Modal {
     RepositoryRules(Box<rules::Settings>),
     Voice {
         key: Editor,
+        field: usize,
+    },
+    Tweaks {
+        fields: [Editor; 3],
         field: usize,
     },
     Repository(Editor),
@@ -243,6 +258,7 @@ pub enum Modal {
         scroll: usize,
     },
     Delete,
+    Clear,
     Help(crate::help::State),
 }
 struct ResultMessage {
@@ -264,6 +280,7 @@ enum Task {
     Skills(String, std::path::PathBuf, provider::Provider),
     Launch,
     Repository(String),
+    Clear(String),
     Worktree(String),
     Usage(String),
     Action,
@@ -333,6 +350,8 @@ pub struct Ui {
     paths_loading: HashSet<String>,
     sidebar: sidebar::State,
     voice: voice::State,
+    /// Chat animation timing from `/tweaks`.
+    pub tweaks: crate::storage::Tweaks,
     slack: slack::State,
     model_completion: models::State,
     toast_rect: Rect,
@@ -401,6 +420,7 @@ impl Ui {
             workspace_paths: HashMap::new(),
             paths_loading: HashSet::new(),
             voice: voice::State::new(config.voice_enabled),
+            tweaks: config.tweaks,
             slack: slack::State::default(),
             model_completion: models::State::default(),
             toast_rect: Rect::default(),
@@ -422,7 +442,13 @@ impl Ui {
         });
     }
     pub fn redraw_interval(&self) -> Option<Duration> {
-        if self.voice_active() {
+        if self.voice_active()
+            || self
+                .selected
+                .as_ref()
+                .and_then(|id| self.positions.get(id))
+                .is_some_and(Position::animating)
+        {
             return Some(crate::repaint::FRAME_INTERVAL);
         }
         if self.busy
@@ -492,9 +518,11 @@ impl Ui {
                 }
                 Task::Read(_) => {}
                 Task::Changes(..) => {}
-                Task::Launch | Task::Repository(_) | Task::Worktree(_) | Task::Action => {
-                    self.busy = false
-                }
+                Task::Launch
+                | Task::Repository(_)
+                | Task::Clear(_)
+                | Task::Worktree(_)
+                | Task::Action => self.busy = false,
                 Task::Delete(id) => {
                     self.deleting.remove(id);
                 }
@@ -656,21 +684,25 @@ impl Ui {
                         self.ensure_selected();
                     }
                     (Task::Repository(id), Reply::Session(session)) => {
-                        self.skills.remove(&id);
-                        self.workspace_paths.remove(&id);
-                        self.changes.remove(&id);
-                        self.sidebar.counts.remove(&id);
-                        if let Err(error) = self.prs.forget(&id, &self.storage, &self.cache_writer)
-                        {
-                            self.notice =
-                                Some((format!("Cannot clear cached PR: {error:#}"), true));
+                        self.replaced_workspace(id, *session);
+                    }
+                    (Task::Clear(id), Reply::Session(session)) => {
+                        if let Some(position) = self.positions.get_mut(&id) {
+                            // Keep the composer; the old transcript, questions and
+                            // change selections no longer exist.
+                            *position = Position {
+                                draft: std::mem::take(&mut position.draft),
+                                skills: std::mem::take(&mut position.skills),
+                                attachments: std::mem::take(&mut position.attachments),
+                                image_count: position.image_count,
+                                video_count: position.video_count,
+                                media_loaded: position.media_loaded,
+                                saved_attachments: std::mem::take(&mut position.saved_attachments),
+                                follow: true,
+                                ..Position::default()
+                            };
                         }
-                        self.panels = panels::Panels::new(self.panels.right);
-                        self.summaries.retain(|s| s.id != id);
-                        self.summaries.push(session.summary());
-                        self.sessions.insert(id, *session);
-                        self.modal = None;
-                        self.refreshed = None;
+                        self.replaced_workspace(id, *session);
                     }
                     (Task::Read(id) | Task::Worktree(id), Reply::Session(session)) => {
                         if self
@@ -961,6 +993,22 @@ impl Ui {
                 self.notice = Some((format!("Could not save session order: {error:#}"), true))
             }
         }
+    }
+    /// A new worktree invalidates cached skills, paths, changes, PRs and panes.
+    fn replaced_workspace(&mut self, id: String, session: Session) {
+        self.skills.remove(&id);
+        self.workspace_paths.remove(&id);
+        self.changes.remove(&id);
+        self.sidebar.counts.remove(&id);
+        if let Err(error) = self.prs.forget(&id, &self.storage, &self.cache_writer) {
+            self.notice = Some((format!("Cannot clear cached PR: {error:#}"), true));
+        }
+        self.panels = panels::Panels::new(self.panels.right);
+        self.summaries.retain(|s| s.id != id);
+        self.summaries.push(session.summary());
+        self.sessions.insert(id, session);
+        self.modal = None;
+        self.refreshed = None;
     }
     fn ensure_selected(&mut self) {
         let list = self.selectable();
@@ -2023,6 +2071,11 @@ impl Ui {
                 | Modal::QueuedEdit { editor: e, .. }
                 | Modal::Voice { key: e, .. },
             ) => e.insert(text),
+            Some(Modal::Tweaks { fields, field }) => {
+                if let Some(editor) = fields.get_mut(*field) {
+                    editor.insert(text);
+                }
+            }
             Some(Modal::Model { .. }) => self.model_paste(text),
             Some(Modal::Approval {
                 answers,
@@ -2076,6 +2129,10 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::Voice { .. })) {
             self.voice_modal_key(key);
+            return;
+        }
+        if matches!(self.modal, Some(Modal::Tweaks { .. })) {
+            self.tweaks_key(key);
             return;
         }
         if self.question_or_queue_key(key) {
@@ -2177,6 +2234,15 @@ impl Ui {
                     self.text_selection.clear();
                     self.ensure_selected();
                     self.task(Task::Delete(id.clone()), Request::Delete { id }, false);
+                }
+            }
+            Some(Modal::Clear) if key.code == KeyCode::Enter => {
+                if !self.busy
+                    && let Some(id) = self.selected.clone()
+                {
+                    self.busy = true;
+                    self.modal = None;
+                    self.task(Task::Clear(id.clone()), Request::Clear { id }, false);
                 }
             }
             Some(Modal::Approval {
@@ -2312,6 +2378,7 @@ impl Ui {
                 if let Some(Modal::Approval { selected, .. }) = &mut self.modal {
                     *selected = choice;
                 }
+                self.toggle_question_check();
                 self.remember_answers();
             }
             Action::Queue => self.modal = Some(Modal::Queue { selected: 0 }),
@@ -2349,6 +2416,12 @@ impl Ui {
             }
             Action::VoiceSave => self.save_voice_key(),
             Action::VoiceToggle => self.toggle_voice(),
+            Action::TweaksSave => self.save_tweaks(),
+            Action::TweaksField(index) => {
+                if let Some(Modal::Tweaks { field, .. }) = &mut self.modal {
+                    *field = index;
+                }
+            }
             Action::VoiceField => {
                 if let Some(Modal::Voice { field, .. }) = &mut self.modal {
                     *field = 0;
@@ -3078,6 +3151,7 @@ impl Ui {
         }
         position.transcript_viewport = Some((body.width, body.height, session.version));
         let before_measure = position.conversation;
+        let tweaks = self.tweaks;
         let view = self.transcript_window.render(
             session,
             position,
@@ -3094,6 +3168,17 @@ impl Ui {
             mut total,
             sections,
         } = view;
+        reveal::apply(
+            position,
+            session,
+            &sections,
+            start,
+            total,
+            &mut lines,
+            tweaks,
+            body.width,
+            Instant::now(),
+        );
         if session.entries.is_empty() && total == 0 {
             lines.push(Line::from(if session.status == Status::Idle {
                 "Send a message to start."
@@ -3240,15 +3325,17 @@ impl Ui {
                 .composer_suggestion()
                 .unwrap_or("Ask anything…")
                 .to_owned();
+            let clear_ms = self.tweaks.input_clear_ms;
             let position = self.positions.entry(id.clone()).or_default();
+            let clearing = reveal::clearing(position, clear_ms, Instant::now());
             editor(
                 frame,
                 composer,
                 voice_status.as_deref().unwrap_or(""),
-                &position.draft,
+                clearing.as_ref().unwrap_or(&position.draft),
                 self.focus == Focus::Composer && !self.panels.focused && self.modal.is_none(),
             );
-            if position.draft.chars.is_empty() {
+            if position.draft.chars.is_empty() && clearing.is_none() {
                 frame.render_widget(
                     Paragraph::new(placeholder).style(Style::default().fg(DIM)),
                     inner(composer),
@@ -3303,6 +3390,7 @@ impl Ui {
             Some(Modal::RepositoryRules(_)) => "Repository rules · Tab fields",
             Some(Modal::Slack(_)) => "Slack setup · Tab fields · Esc closes",
             Some(Modal::Voice { .. }) => "Voice settings",
+            Some(Modal::Tweaks { .. }) => "Tweaks · chat animations",
             Some(Modal::Repository(_)) => "Choose and remember your default repository",
             Some(Modal::ChangeRepository(_)) => "Change session repository",
             Some(Modal::Menu { .. }) => "Agent actions",
@@ -3320,6 +3408,7 @@ impl Ui {
             }) => "HTML artifacts · Enter open",
             Some(Modal::Resources { .. }) => "Open shells · Enter view",
             Some(Modal::Delete) => "Stop and delete chat",
+            Some(Modal::Clear) => "Clear session",
             Some(Modal::Help(_)) => "Search agent shortcuts",
             None => "",
         };
@@ -3386,6 +3475,10 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::Voice { .. })) {
             self.draw_voice_settings(frame, area);
+            return;
+        }
+        if matches!(self.modal, Some(Modal::Tweaks { .. })) {
+            self.draw_tweaks(frame, area);
             return;
         }
         if matches!(self.modal, Some(Modal::Slack(_))) {
@@ -3491,6 +3584,9 @@ impl Ui {
             }
             Some(Modal::Delete) => {
                 frame.render_widget(Paragraph::new("Stop this agent and permanently delete its difu chat, saved questions, queue, and attachments? Its unlocked difu-owned worktree will also be removed, including all uncommitted, untracked, and ignored files. Existing directories, named branches, commits, and native provider history are not deleted.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
+            }
+            Some(Modal::Clear) => {
+                frame.render_widget(Paragraph::new("Stop this agent and start this session over? Its chat, conversation context, queue, questions, artifacts, and PR links are removed, and the next message starts a new conversation. Its difu-owned worktree and local branch are discarded, including uncommitted and unpushed work, and a fresh worktree is created from the latest origin/main. Pushed branches, open PRs, registered external worktrees, and native provider history are not deleted.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
             }
             Some(Modal::Help(state)) => {
                 let search = Rect::new(area.x, area.y, area.width, 3.min(area.height));
@@ -3681,6 +3777,7 @@ impl Ui {
                 | Modal::RepositoryRules(_)
                 | Modal::Slack(_)
                 | Modal::Voice { .. }
+                | Modal::Tweaks { .. }
                 | Modal::Commands { .. }
                 | Modal::Status
                 | Modal::Usage { .. }
@@ -3829,6 +3926,14 @@ mod tests {
     use super::*;
     use anyhow::{Context, Result};
     use ratatui::{Terminal, backend::TestBackend};
+    /// Delivery and layout tests read text the moment it arrives.
+    fn still(ui: &mut Ui) {
+        ui.tweaks = crate::storage::Tweaks {
+            agent_reply_cps: 0,
+            sent_message_ms: 0,
+            input_clear_ms: 0,
+        };
+    }
     fn state(storage: Storage) -> Ui {
         let mut ui = Ui::new(storage, &Config::default());
         let mut session = Session::new(
@@ -4019,6 +4124,69 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn clear_requires_confirmation_and_keeps_the_draft_but_not_the_old_view() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let listener = UnixListener::bind(super::super::server::socket(&storage)?)?;
+        let mut ui = state(storage);
+        let mut cleared = ui.sessions.get("one").context("session")?.clone();
+        cleared.entries.clear();
+        cleared.title = "New session".into();
+        cleared.note("system", "Session cleared");
+        let reply = cleared.clone();
+        let worker = thread::spawn(move || -> Result<()> {
+            let (mut stream, _) = listener.accept()?;
+            let mut line = String::new();
+            BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+            assert!(
+                matches!(serde_json::from_str::<Request>(&line)?, Request::Clear { id } if id == "one")
+            );
+            serde_json::to_writer(&mut stream, &Reply::Session(Box::new(reply)))?;
+            stream.write_all(b"\n")?;
+            Ok(())
+        });
+        ui.drilled = true;
+        let position = ui.positions.entry("one".into()).or_default();
+        position.draft.insert("Next task");
+        position.follow = false;
+        position.conversation = 40;
+        position.expanded.insert("old-entry".into());
+        ui.run_palette_command("/clear", "/clear");
+        assert!(matches!(ui.modal, Some(Modal::Clear)));
+        let (screen, _) = draw(&mut ui, 120, 30)?;
+        assert!(screen.contains("uncommitted and unpushed work"));
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.modal.is_none() && !ui.busy, "Esc must not clear");
+        ui.run_palette_command("/clear", "/clear");
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(ui.modal.is_none() && ui.busy);
+        let response = ui.receiver.recv_timeout(Duration::from_secs(5))?;
+        ui.sender.send(response)?;
+        ui.tick(false);
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("Fixture panicked"))??;
+        assert!(!ui.busy);
+        let session = ui.sessions.get("one").context("cleared session")?;
+        assert_eq!(session.entries.len(), 1);
+        assert!(
+            ui.summaries
+                .iter()
+                .any(|s| s.id == "one" && s.title == "New session")
+        );
+        let position = ui.positions.get("one").context("position")?;
+        assert_eq!(position.draft.text(), "Next task");
+        assert!(position.follow && position.conversation == 0 && position.expanded.is_empty());
         Ok(())
     }
 
@@ -4355,6 +4523,7 @@ mod tests {
             Ok(())
         });
         let mut ui = state(storage);
+        still(&mut ui);
         ui.drilled = true;
         ui.focus = Focus::Composer;
         let session = ui.sessions.get_mut("one").context("session")?;
@@ -4471,6 +4640,7 @@ mod tests {
             Ok(())
         });
         let mut ui = state(storage);
+        still(&mut ui);
         ui.drilled = true;
         ui.focus = Focus::Composer;
         let session = ui.sessions.get_mut("one").context("session")?;
@@ -4553,6 +4723,7 @@ mod tests {
             Ok(())
         });
         let mut ui = state(storage);
+        still(&mut ui);
         ui.drilled = true;
         ui.focus = Focus::Composer;
         ui.positions.get_mut("one").context("position")?.draft = Editor::from("first");
@@ -4633,6 +4804,7 @@ mod tests {
             path: "review/SKILL.md".into(),
             description: String::new(),
             enabled: true,
+            slash: false,
         };
         let p = ui.positions.get_mut("one").context("position")?;
         p.draft = Editor::from("Review ");
@@ -6668,6 +6840,7 @@ mod tests {
                     path: "/tmp/project/.agents/skills/fixture/SKILL.md".into(),
                     description: "fixture skill".into(),
                     enabled: true,
+                    slash: false,
                 }],
                 Vec::new(),
             ),
@@ -6711,6 +6884,158 @@ mod tests {
         ui.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
         ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
         assert_eq!(ui.clipboard.as_deref(), Some("/"));
+        Ok(())
+    }
+    #[test]
+    fn claude_skills_complete_as_slash_commands_sent_as_message_text() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        let command = |name: &str, description: &str| Skill {
+            name: name.into(),
+            path: Default::default(),
+            description: description.into(),
+            enabled: true,
+            slash: true,
+        };
+        ui.skills.insert(
+            "one".into(),
+            (
+                vec![
+                    command("fixture-skill", "<target> · Fixture skill (project)"),
+                    command("compact", "Claude's own compaction"),
+                ],
+                Vec::new(),
+            ),
+        );
+        let entries = ui.palette_commands();
+        assert!(
+            entries
+                .iter()
+                .any(|(name, description, _)| name == "/fixture-skill"
+                    && description == "<target> · Fixture skill (project)")
+        );
+        // difu's /compact handles the name; Claude's duplicate is not listed.
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|(name, _, _)| name == "/compact")
+                .map(|(_, description, _)| description.as_str())
+                .collect::<Vec<_>>(),
+            ["Compact the current conversation"]
+        );
+        ui.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
+        ui.paste("fixture-sk");
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(ui.modal.is_none());
+        let position = ui.positions.get_mut("one").context("draft")?;
+        assert_eq!(position.draft.text(), "/fixture-skill ");
+        assert!(position.skills.is_empty());
+        position.draft.insert("src/lib.rs");
+        assert!(!ui.command_draft(), "Claude commands are sent as messages");
+        let position = ui.positions.get_mut("one").context("draft")?;
+        position.draft.clear();
+        position.draft.insert("/status");
+        assert!(ui.command_draft());
+        assert!(matches!(ui.modal, Some(Modal::Status)));
+        Ok(())
+    }
+    #[test]
+    fn sending_clears_the_composer_and_types_the_message_into_chat() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        draw(&mut ui, 120, 30)?;
+        ui.positions.get_mut("one").context("position")?.draft = Editor::from("Typed message");
+        ui.send(false);
+        assert!(
+            ui.redraw_interval().is_some(),
+            "animations keep frames coming"
+        );
+        let (screen, _) = draw(&mut ui, 120, 30)?;
+        // The composer still shows the text it is clearing; the chat copy has
+        // only started typing in.
+        assert_eq!(screen.matches("Typed message").count(), 1);
+        assert!(!screen.contains("Ask anything"));
+        assert!(
+            ui.positions
+                .get("one")
+                .context("draft")?
+                .draft
+                .text()
+                .is_empty()
+        );
+        let position = ui.positions.get_mut("one").context("position")?;
+        for typing in [&mut position.sent, &mut position.clearing]
+            .into_iter()
+            .flatten()
+        {
+            typing.age(Duration::from_secs(2));
+        }
+        let (screen, _) = draw(&mut ui, 120, 30)?;
+        assert!(screen.contains("› Typed message"));
+        assert!(screen.contains("Ask anything"));
+        assert!(!ui.positions.get("one").context("position")?.animating());
+        Ok(())
+    }
+    #[test]
+    fn tweaks_save_animation_timing_and_reject_invalid_values() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        };
+        let mut ui = state(storage.clone());
+        assert!(
+            ui.palette_commands()
+                .iter()
+                .any(|(name, _, _)| name == "/tweaks")
+        );
+        ui.run_palette_command("/tweaks", "/tweaks");
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert!(screen.contains("Agent reply speed") && screen.contains("200"));
+        let set = |ui: &mut Ui, value: &str| {
+            ui.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+            ui.paste(value);
+            ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        };
+        set(&mut ui, "120");
+        set(&mut ui, "0");
+        set(&mut ui, "20000");
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(ui.modal, Some(Modal::Tweaks { .. })));
+        assert!(
+            ui.notice
+                .as_ref()
+                .is_some_and(|(text, error)| *error && text.contains("0 to 10000"))
+        );
+        assert_eq!(ui.tweaks, crate::storage::Tweaks::default());
+        ui.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        set(&mut ui, "750");
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let expected = crate::storage::Tweaks {
+            agent_reply_cps: 120,
+            sent_message_ms: 0,
+            input_clear_ms: 750,
+        };
+        assert!(ui.modal.is_none());
+        assert_eq!(ui.tweaks, expected);
+        assert_eq!(storage.load_config()?.tweaks, expected);
+        // A sent message is not animated when its duration is 0.
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        ui.positions.get_mut("one").context("position")?.draft = Editor::from("No typing");
+        ui.send(false);
+        let position = ui.positions.get("one").context("position")?;
+        assert!(position.sent.is_none() && position.clearing.is_some());
         Ok(())
     }
     #[test]
@@ -6866,6 +7191,7 @@ mod tests {
                     path: "/tmp/inspect/SKILL.md".into(),
                     description: "Inspect code".into(),
                     enabled: true,
+                    slash: false,
                 }],
                 Vec::new(),
             ),
@@ -7073,6 +7399,7 @@ mod tests {
             config: temp.path().join("config.json"),
             cache: temp.path().join("cache"),
         });
+        still(&mut ui);
         ui.drilled = true;
         ui.focus = Focus::Composer;
         let session = ui.sessions.get_mut("one").context("session")?;
@@ -7266,6 +7593,110 @@ mod tests {
             draw(&mut ui, width, height)?;
         }
         assert!(!ui.busy); // Editing never submits a choice automatically.
+        Ok(())
+    }
+    #[test]
+    fn multi_select_questions_check_several_options_and_send_every_label() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let listener = UnixListener::bind(super::super::server::socket(&storage)?)?;
+        let worker = thread::spawn(move || -> Result<Request> {
+            let (mut stream, _) = listener.accept()?;
+            let mut line = String::new();
+            BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+            serde_json::to_writer(&mut stream, &Reply::Ok)?;
+            stream.write_all(b"\n")?;
+            Ok(serde_json::from_str(&line)?)
+        });
+        let mut ui = state(storage);
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        ui.sessions
+            .get_mut("one")
+            .context("session")?
+            .pending
+            .push(Pending {
+                id: serde_json::json!("multi"),
+                method: "item/tool/requestUserInput".into(),
+                responded: false,
+                params: serde_json::json!({"questions":[
+                    {"id":"0","question":"Which checks?","multiSelect":true,
+                     "options":[{"label":"Lint"},{"label":"Tests"},{"label":"Build"}]},
+                    {"id":"1","question":"Ship it?","multiSelect":false,
+                     "options":[{"label":"Yes"},{"label":"No"}]}
+                ]}),
+            });
+        ui.open_question(0);
+        assert_eq!(ui.selected_question_answer().as_deref(), Some("Lint"));
+        let space = || KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        ui.key(space());
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        ui.key(space());
+        assert_eq!(
+            ui.selected_question_answer().as_deref(),
+            Some("Lint, Build")
+        );
+        ui.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        ui.paste("CI only");
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(
+            ui.selected_question_answer().as_deref(),
+            Some("Lint, Build\n\nNote on Build: CI only")
+        );
+        let (screen, _) = draw(&mut ui, 120, 35)?;
+        for text in [
+            "Choose one or more",
+            "[x] 1. Lint",
+            "[ ] 2. Tests",
+            "[x] 3. Build",
+            "Space choose",
+        ] {
+            assert!(screen.contains(text), "missing {text}");
+        }
+        // Unchecking drops the option and its note; a click checks like Space.
+        ui.key(space());
+        assert_eq!(ui.selected_question_answer().as_deref(), Some("Lint"));
+        ui.key(space());
+        ui.action(Action::QuestionChoice(1));
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let (screen, _) = draw(&mut ui, 120, 35)?;
+        assert!(screen.contains("Ship it?") && !screen.contains("[ ]"));
+        assert_eq!(ui.selected_question_answer().as_deref(), Some("Yes"));
+        ui.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::SHIFT));
+        ui.paste("ocs");
+        assert_eq!(
+            ui.selected_question_answer().as_deref(),
+            Some("Lint, Tests, Build, Docs\n\nNote on Build: CI only")
+        );
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let request = worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
+        let Request::Control {
+            control:
+                Control::AnswerQuestion {
+                    request,
+                    question,
+                    answer,
+                },
+            ..
+        } = request
+        else {
+            anyhow::bail!("expected a question answer");
+        };
+        assert_eq!(request, serde_json::json!("multi"));
+        assert_eq!(question, "0");
+        assert_eq!(
+            answer.as_deref(),
+            Some("Lint, Tests, Build, Docs\n\nNote on Build: CI only")
+        );
         Ok(())
     }
     #[test]

@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{model::ModelInfo, process::Cancel};
 use anyhow::{Context, Result, ensure};
-use protocol::{Connection, Options};
+use protocol::{Connection, Mode, Options};
 use serde_json::{Value, json};
 use std::{
     sync::{Arc, mpsc},
@@ -24,7 +24,7 @@ pub(super) fn models(cancel: &Cancel) -> Result<Vec<ModelInfo>> {
             effort: None,
             resume: None,
             instructions: "",
-            discovery: true,
+            mode: Mode::Models,
         },
         cancel,
     )?;
@@ -68,7 +68,7 @@ pub(super) fn usage(store: &Store, id: &str, session: &Session, cancel: &Cancel)
             effort: None,
             resume: session.thread_id.as_deref(),
             instructions: "",
-            discovery: false,
+            mode: Mode::Session,
         },
         cancel,
     )?;
@@ -581,7 +581,7 @@ fn connect(store: &Store, id: &str, session: &Session, cancel: &Cancel) -> Resul
             }),
             resume: session.thread_id.as_deref(),
             instructions: &instructions,
-            discovery: false,
+            mode: Mode::Session,
         },
         cancel,
     )?;
@@ -780,6 +780,66 @@ pub(super) fn run(
     store.save(id)
 }
 
-pub(super) fn skills() -> Reply {
-    Reply::Skills { skills: Vec::new(), errors: vec!["Claude Code loads its workspace skills natively; use their slash commands in the message.".into()] }
+/// Claude Code reports user, project, plugin and built-in commands, skills
+/// included, when it initializes in the workspace. They run as `/name` text.
+pub(super) fn skills(cwd: &std::path::Path) -> Result<Reply> {
+    let cancel = Cancel::default();
+    let mut connection = Connection::open(
+        Options {
+            cwd,
+            model: None,
+            effort: None,
+            resume: None,
+            instructions: "",
+            mode: Mode::Commands,
+        },
+        &cancel,
+    )?;
+    let response = connection.call(json!({"subtype":"initialize"}), &cancel, |_| {
+        anyhow::bail!("Unexpected request during skill discovery")
+    })?;
+    Ok(Reply::Skills {
+        skills: commands(&response)?,
+        errors: Vec::new(),
+    })
+}
+
+fn commands(response: &Value) -> Result<Vec<super::Skill>> {
+    let commands = response
+        .get("commands")
+        .and_then(Value::as_array)
+        .context("Claude CLI did not report its skills and commands")?;
+    Ok(commands
+        .iter()
+        .filter_map(|command| {
+            let name = command.get("name").and_then(Value::as_str)?;
+            // Double-underscore commands serve server-launched sessions only.
+            if name.starts_with("__") {
+                return None;
+            }
+            let description = command
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let hint = command
+                .get("argumentHint")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            Some(super::Skill {
+                name: name.into(),
+                path: Default::default(),
+                description: if hint.is_empty() {
+                    description
+                } else {
+                    format!("{hint} · {description}")
+                },
+                enabled: true,
+                slash: true,
+            })
+        })
+        .collect())
 }

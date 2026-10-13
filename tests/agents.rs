@@ -1757,6 +1757,42 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
             .as_deref()
             .is_some_and(|c| c.contains("explain this repository"))
     );
+    let Reply::Skills { skills, errors } = client::request(
+        &storage,
+        Request::Skills {
+            id: id.clone(),
+            force: false,
+        },
+    )?
+    else {
+        anyhow::bail!("Missing Claude skills");
+    };
+    assert!(errors.is_empty());
+    assert_eq!(
+        skills
+            .iter()
+            .map(|s| (s.name.as_str(), s.description.as_str(), s.slash))
+            .collect::<Vec<_>>(),
+        [
+            ("fixture-skill", "<target> · Fixture skill (project)", true),
+            ("compact", "Compact the conversation", true),
+        ]
+    );
+    // Discovery reads the worktree's skills without running hooks, MCP servers
+    // or the session's conversation.
+    let starts = fs::read_to_string(root.join("claude-starts.jsonl"))?;
+    let start: serde_json::Value =
+        serde_json::from_str(starts.lines().last().context("Claude start")?)?;
+    assert_eq!(
+        Path::new(start.get("cwd").and_then(|v| v.as_str()).context("cwd")?).canonicalize()?,
+        workspace.canonicalize()?
+    );
+    let args = start.get("args").context("args")?.to_string();
+    assert!(args.contains("disableAllHooks") && args.contains("--strict-mcp-config"));
+    assert!(args.contains(r#"\"mcpServers\":{}"#));
+    let unchanged = session(&storage, &id)?;
+    assert!(unchanged.thread_id.is_none());
+    assert_eq!(unchanged.entries.len(), switched.entries.len());
     control(
         &storage,
         &id,
@@ -1862,6 +1898,39 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     assert_eq!(
         fs::read_to_string(repo.join("tracked.txt"))?,
         "precious local edit\n"
+    );
+    // Multi-select answers reach Claude as comma-separated labels.
+    control(&storage, &id, message("claude multi question"))?;
+    let asked = wait(&storage, &id, |s| !s.pending.is_empty())?;
+    let question = asked.pending.first().context("Claude question")?;
+    assert_eq!(
+        question.params.pointer("/questions/0/multiSelect"),
+        Some(&serde_json::json!(true))
+    );
+    control(
+        &storage,
+        &id,
+        Control::AnswerQuestion {
+            request: question.id.clone(),
+            question: "0".into(),
+            answer: Some("Lint, Build".into()),
+        },
+    )?;
+    wait(&storage, &id, |s| {
+        s.status == Status::Idle && s.pending.is_empty()
+    })?;
+    let answered = fs::read_to_string(root.join("claude-protocol.jsonl"))?
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|frame| frame.pointer("/response/request_id") == Some(&question.id))
+        .context("Claude answer")?;
+    assert_eq!(
+        answered.pointer("/response/response/updatedInput/answers"),
+        Some(&serde_json::json!({"Which checks?": "Lint, Build"}))
+    );
+    assert_eq!(
+        answered.pointer("/response/response/updatedInput/questions/0/multiSelect"),
+        Some(&serde_json::json!(true))
     );
 
     let registered = root.join("manual worktree");

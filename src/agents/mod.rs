@@ -583,6 +583,10 @@ pub struct Skill {
     pub description: String,
     #[serde(default)]
     pub enabled: bool,
+    /// Claude Code skills and commands run from `/name` message text instead of
+    /// being attached to the prompt.
+    #[serde(default)]
+    pub slash: bool,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -742,6 +746,10 @@ pub enum Request {
     Repository {
         id: String,
         repository: PathBuf,
+    },
+    /// Keep the session but start over: new conversation, fresh worktree from origin/main.
+    Clear {
+        id: String,
     },
     Rename {
         id: String,
