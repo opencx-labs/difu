@@ -80,17 +80,15 @@ fn push(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
     }
 }
 
-fn rgb(color: Color) -> (u8, u8, u8) {
-    match color {
-        Color::Rgb(r, g, b) => (r, g, b),
-        _ => (220, 225, 232),
-    }
-}
-
-/// `age` 1 is the newest character, closest to the dim colour.
+/// `age` 1 is the newest character, closest to the dim colour. Terminal
+/// palette colours (ANSI themes) cannot be blended and keep their style.
 fn fade(style: Style, age: usize) -> Style {
-    let (r, g, b) = rgb(style.fg.unwrap_or(TEXT));
-    let (dr, dg, db) = rgb(DIM);
+    let (Color::Rgb(r, g, b), Color::Rgb(dr, dg, db)) = (
+        crate::theme::resolve(style.fg.unwrap_or(TEXT)),
+        crate::theme::resolve(DIM),
+    ) else {
+        return style;
+    };
     let t = age as f32 / (FADE + 1) as f32;
     let mix = |from: u8, to: u8| (f32::from(from) + (f32::from(to) - f32::from(from)) * t) as u8;
     style.fg(Color::Rgb(mix(dr, r), mix(dg, g), mix(db, b)))

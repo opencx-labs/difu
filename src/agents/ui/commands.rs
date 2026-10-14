@@ -7,6 +7,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "tweaks",
         "Chat animation speeds for replies, sent messages and input",
     ),
+    (
+        "theme",
+        "Pick a colour theme; Default restores the original colours",
+    ),
     ("compact", "Compact the current conversation"),
     ("model", "Choose a model"),
     ("effort", "Choose the reasoning level"),
@@ -371,6 +375,7 @@ impl Ui {
             "/slack" => self.open_slack(),
             "/voice" => self.open_voice(),
             "/tweaks" => self.open_tweaks(),
+            "/theme" => self.open_theme(),
             "/compact" => self.control(Control::Compact),
             "/model" => self.open_model(0),
             "/effort" => self.open_model(1),

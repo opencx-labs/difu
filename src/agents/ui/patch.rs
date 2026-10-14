@@ -203,7 +203,8 @@ mod tests {
         assert!(
             rows.iter()
                 .flat_map(|row| &row.spans)
-                .any(|span| span.content == "let" && span.style.fg == Some(ACCENT))
+                .any(|span| span.content == "let"
+                    && span.style.fg == Some(crate::theme::slot(crate::theme::Role::Keyword)))
         );
         assert!(
             rows.iter()

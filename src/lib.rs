@@ -20,6 +20,7 @@ pub mod repaint;
 pub mod repo;
 pub mod review;
 pub mod storage;
+pub mod theme;
 pub mod tree;
 pub mod ui;
 pub mod workflow;

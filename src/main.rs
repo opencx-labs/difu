@@ -96,6 +96,7 @@ fn main() -> Result<()> {
     };
     let storage = Storage::discover()?;
     let config = storage.load_config()?;
+    difu::theme::select(difu::theme::index(config.theme.as_deref()));
     let mut app = if local_diff {
         Shell::local(storage, config, std::env::current_dir()?)
     } else {
@@ -186,7 +187,10 @@ fn main() -> Result<()> {
                 focused,
                 app.redraw_interval(),
             ) {
-                let frame = terminal.draw(|frame| app.draw(frame))?;
+                let frame = terminal.draw(|frame| {
+                    app.draw(frame);
+                    difu::theme::present(frame.buffer_mut());
+                })?;
                 app.reviews
                     .hover
                     .render(&mut io::stdout().lock(), frame.buffer)?;

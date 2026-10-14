@@ -1,5 +1,5 @@
 use super::*;
-use ratatui::style::Color;
+use crate::theme::{Role, slot};
 
 pub(super) struct Section {
     pub id: String,
@@ -260,9 +260,9 @@ fn shimmer(text: &str, now: i64) -> Line<'static> {
             .map(|(index, ch)| {
                 let distance = (index as isize).abs_diff(phase);
                 let color = match distance {
-                    0..=1 => Color::Rgb(235, 240, 235),
-                    2..=3 => Color::Rgb(190, 200, 190),
-                    4..=5 => Color::Rgb(150, 165, 150),
+                    0..=1 => slot(Role::ShimmerPeak),
+                    2..=3 => slot(Role::ShimmerNear),
+                    4..=5 => slot(Role::ShimmerFar),
                     _ => DIM,
                 };
                 Span::styled(ch.to_string(), Style::default().fg(color))
@@ -810,7 +810,7 @@ pub(super) fn render_entries(
             && position.focused_entry.as_ref() == Some(&entry.id)
             && let Some(section) = sections.last()
         {
-            let background = ratatui::style::Color::Rgb(16, 39, 25);
+            let background = slot(Role::FocusedEntry);
             for line in lines.iter_mut().skip(section.row) {
                 line.style = line.style.bg(background);
                 for span in &mut line.spans {
@@ -898,12 +898,12 @@ mod tests {
         assert!(
             rows.iter()
                 .flat_map(|row| &row.spans)
-                .any(|span| span.content == "SELECT" && span.style.fg == Some(ACCENT))
+                .any(|span| span.content == "SELECT" && span.style.fg == Some(slot(Role::Keyword)))
         );
         let quoted: String = rows
             .iter()
             .flat_map(|row| &row.spans)
-            .filter(|span| span.style.fg == Some(ratatui::style::Color::Rgb(221, 194, 139)))
+            .filter(|span| span.style.fg == Some(slot(Role::String)))
             .map(|span| span.content.as_ref())
             .collect();
         assert_eq!(quoted, "'abcdefghijklmno'");

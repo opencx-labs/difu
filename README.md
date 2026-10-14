@@ -313,7 +313,7 @@ Recalled prompts are editable and never sent automatically.
 
 Type **/** in an empty composer for native commands: `/compact`, `/model`, `/effort`,
 `/skills`, `/status`, `/rules`, `/usage`, `/diff`, `/new`, `/rename`, `/clear`, `/repo`, `/worktree`,
-`/help`, `/voice`, `/tweaks`, and `/actions`.
+`/help`, `/voice`, `/tweaks`, `/theme`, and `/actions`.
 Opening a session keeps the composer focused; pending questions remain available
 through the questions control.
 
@@ -324,6 +324,16 @@ session when you open it appear at once. A sent message types into the chat over
 during the clear finishes it immediately. **/tweaks** (also in the command
 palette) changes these three values, saved in the difu config; 0 turns an
 animation off.
+
+**/theme** (also in the command palette) picks a colour theme for all of difu:
+the accent, text, borders, diffs, status colours, and syntax highlighting. Moving
+through the list previews each theme live; Enter applies and saves it, Esc keeps
+the current one. **Default** is difu's original colours and clears the setting.
+Default, Amber, and Ocean keep your terminal's own background. ANSI and ANSI
+Light use your terminal's 16 colours, so difu follows its colour scheme. The other
+themes paint their own background: Dracula, Nord, Gruvbox Dark, Catppuccin Mocha,
+Tokyo Night, One Dark, Monokai, Solarized Dark, Rosé Pine, Kanagawa, Everforest
+Dark, Solarized Light, GitHub Light, Catppuccin Latte, and Gruvbox Light.
 
 **/usage** shows labeled quota bars and local reset times: percent used for Claude,
 percent remaining for Codex. It reads Claude Code's structured `/usage` data or Codex's account limits
