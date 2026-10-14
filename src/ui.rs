@@ -3,6 +3,7 @@ use crate::{
     context::Direction,
     diff::{DiffFile, DiffLine, Hunk, LineKind, split_rows},
     model::{InboxTab, PrState, PrSummary, clean},
+    theme::{Role, slot},
 };
 use ratatui::{
     Frame,
@@ -13,27 +14,26 @@ use ratatui::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-pub(crate) const BG: Color = Color::Reset;
-pub(crate) const INK: Color = Color::Rgb(12, 14, 18);
-pub(crate) const PANEL: Color = Color::Reset;
-pub(crate) const TEXT: Color = Color::Rgb(220, 225, 232);
-pub(crate) const DIM: Color = Color::Rgb(130, 140, 156);
-pub(crate) const BORDER: Color = Color::Rgb(96, 106, 122);
-pub(crate) const ACCENT: Color = Color::Rgb(0, 255, 65);
-/// Dark theme tint with white text (approximately 12:1 contrast).
+// Logical colours; the active theme resolves them when a frame is presented.
+pub(crate) const BG: Color = slot(Role::Background);
+pub(crate) const INK: Color = slot(Role::OnAccent);
+pub(crate) const PANEL: Color = slot(Role::Panel);
+pub(crate) const TEXT: Color = slot(Role::Text);
+pub(crate) const DIM: Color = slot(Role::Dim);
+pub(crate) const BORDER: Color = slot(Role::Border);
+pub(crate) const ACCENT: Color = slot(Role::Accent);
+/// Accent-tinted background for the user's own messages.
 pub(crate) fn user_message_style() -> Style {
-    let background = match ACCENT {
-        Color::Rgb(r, g, b) => Color::Rgb(r / 4, g / 4, b / 4),
-        _ => Color::Rgb(0, 63, 16),
-    };
-    Style::default().bg(background).fg(Color::White)
+    Style::default()
+        .bg(slot(Role::UserMessage))
+        .fg(slot(Role::UserMessageText))
 }
-pub(crate) const GREEN: Color = Color::Rgb(114, 216, 163);
-pub(crate) const PURPLE: Color = Color::Rgb(171, 125, 248);
-pub(crate) const YELLOW: Color = Color::Rgb(229, 192, 100);
-pub(crate) const RED: Color = Color::Rgb(247, 137, 145);
-pub(crate) const ADD_BG: Color = Color::Rgb(18, 43, 32);
-pub(crate) const REMOVE_BG: Color = Color::Rgb(49, 25, 31);
+pub(crate) const GREEN: Color = slot(Role::Green);
+pub(crate) const PURPLE: Color = slot(Role::Purple);
+pub(crate) const YELLOW: Color = slot(Role::Yellow);
+pub(crate) const RED: Color = slot(Role::Red);
+pub(crate) const ADD_BG: Color = slot(Role::AddBg);
+pub(crate) const REMOVE_BG: Color = slot(Role::RemoveBg);
 
 #[derive(Clone, Default)]
 pub struct TextRow {
@@ -307,9 +307,9 @@ pub(crate) fn syntax_spans(content: &str) -> Vec<Span<'static>> {
             return;
         }
         let color = if comment {
-            DIM
+            slot(Role::Comment)
         } else if quoted {
-            Color::Rgb(221, 194, 139)
+            slot(Role::String)
         } else if [
             "fn",
             "for",
@@ -391,9 +391,9 @@ pub(crate) fn syntax_spans(content: &str) -> Vec<Span<'static>> {
         ]
         .contains(&token.to_ascii_lowercase().as_str())
         {
-            ACCENT
+            slot(Role::Keyword)
         } else if token.chars().all(|c| c.is_ascii_digit()) {
-            Color::Rgb(224, 171, 129)
+            slot(Role::Number)
         } else {
             TEXT
         };
@@ -413,7 +413,7 @@ pub(crate) fn syntax_spans(content: &str) -> Vec<Span<'static>> {
             }
             spans.push(Span::styled(
                 c.to_string(),
-                Style::default().fg(Color::Rgb(221, 194, 139)).bg(bg),
+                Style::default().fg(slot(Role::String)).bg(bg),
             ));
         } else if !quoted && !c.is_alphanumeric() && c != '_' {
             emit(&mut token, &mut spans, false);
@@ -1257,9 +1257,9 @@ fn paint_diff(
         for x in code.x + offset..(code.x + offset + width).min(code.right()) {
             if let Some(cell) = frame.buffer_mut().cell_mut((x, code.y)) {
                 cell.set_bg(if selected {
-                    Color::Rgb(18, 64, 34)
+                    slot(Role::SelectedCode)
                 } else {
-                    Color::Rgb(18, 21, 27)
+                    slot(Role::FocusedCode)
                 });
             }
         }
@@ -3211,7 +3211,7 @@ mod tests {
                 0
             )
             .iter()
-            .all(|span| span.style.bg == Some(Color::Reset))
+            .all(|span| span.style.bg == Some(BG))
         );
         Ok(())
     }

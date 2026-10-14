@@ -93,6 +93,9 @@ pub struct Config {
     pub voice_enabled: bool,
     #[serde(default)]
     pub tweaks: Tweaks,
+    /// Colour theme id; None is the Default theme.
+    #[serde(default)]
+    pub theme: Option<String>,
 }
 fn enabled() -> bool {
     true
@@ -119,6 +122,7 @@ impl Default for Config {
             agent_panel_right: true,
             voice_enabled: false,
             tweaks: Tweaks::default(),
+            theme: None,
         }
     }
 }

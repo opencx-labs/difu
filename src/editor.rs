@@ -843,7 +843,7 @@ mod tests {
         assert!(
             rows.iter()
                 .flat_map(|r| &r.spans)
-                .any(|s| s.style.fg == Some(crate::ui::ACCENT))
+                .any(|s| s.style.fg == Some(crate::theme::slot(crate::theme::Role::Keyword)))
         );
         e.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
         let (rows, _) = e.styled_layout(80, Style::default().bg(ratatui::style::Color::Blue));

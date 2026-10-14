@@ -19,6 +19,7 @@ mod selection;
 mod sends;
 mod sidebar;
 mod slack;
+mod themes;
 mod transcript;
 mod transcript_window;
 mod tweaks;
@@ -160,6 +161,7 @@ enum Action {
     VoiceToggle,
     TweaksField(usize),
     TweaksSave,
+    ThemeChoice(usize),
     AnswerFocus,
     QueueEditorFocus,
     ChooseRepository,
@@ -210,6 +212,9 @@ pub enum Modal {
     Tweaks {
         fields: [Editor; 3],
         field: usize,
+    },
+    Theme {
+        selected: usize,
     },
     Repository(Editor),
     ChangeRepository(Editor),
@@ -352,6 +357,8 @@ pub struct Ui {
     voice: voice::State,
     /// Chat animation timing from `/tweaks`.
     pub tweaks: crate::storage::Tweaks,
+    /// Saved colour theme; `/theme` previews others only while open.
+    theme: usize,
     slack: slack::State,
     model_completion: models::State,
     toast_rect: Rect,
@@ -421,6 +428,7 @@ impl Ui {
             paths_loading: HashSet::new(),
             voice: voice::State::new(config.voice_enabled),
             tweaks: config.tweaks,
+            theme: crate::theme::index(config.theme.as_deref()),
             slack: slack::State::default(),
             model_completion: models::State::default(),
             toast_rect: Rect::default(),
@@ -484,6 +492,7 @@ impl Ui {
         self.tick_media();
         self.tick_voice(visible);
         self.tick_slack();
+        self.tick_theme();
         while let Ok(message) = self.receiver.try_recv() {
             let unchanged = match (&message.kind, &message.result) {
                 (Task::List, Ok(Reply::Sessions(sessions))) => {
@@ -2135,6 +2144,10 @@ impl Ui {
             self.tweaks_key(key);
             return;
         }
+        if matches!(self.modal, Some(Modal::Theme { .. })) {
+            self.theme_key(key);
+            return;
+        }
         if self.question_or_queue_key(key) {
             return;
         }
@@ -2417,6 +2430,7 @@ impl Ui {
             Action::VoiceSave => self.save_voice_key(),
             Action::VoiceToggle => self.toggle_voice(),
             Action::TweaksSave => self.save_tweaks(),
+            Action::ThemeChoice(index) => self.preview_theme(index),
             Action::TweaksField(index) => {
                 if let Some(Modal::Tweaks { field, .. }) = &mut self.modal {
                     *field = index;
@@ -3371,12 +3385,16 @@ impl Ui {
         let full = frame.area();
         let width = full.width.saturating_sub(4).min(110);
         let height = full.height.saturating_sub(4).min(38);
-        let rect = Rect::new(
-            full.width.saturating_sub(width) / 2,
-            full.height.saturating_sub(height) / 2,
-            width,
-            height,
-        );
+        let rect = if matches!(self.modal, Some(Modal::Theme { .. })) {
+            themes::rect(full)
+        } else {
+            Rect::new(
+                full.width.saturating_sub(width) / 2,
+                full.height.saturating_sub(height) / 2,
+                width,
+                height,
+            )
+        };
         frame.render_widget(Clear, rect);
         frame.render_widget(
             Block::default().style(Style::default().bg(PANEL).fg(TEXT)),
@@ -3391,6 +3409,7 @@ impl Ui {
             Some(Modal::Slack(_)) => "Slack setup · Tab fields · Esc closes",
             Some(Modal::Voice { .. }) => "Voice settings",
             Some(Modal::Tweaks { .. }) => "Tweaks · chat animations",
+            Some(Modal::Theme { .. }) => "Theme",
             Some(Modal::Repository(_)) => "Choose and remember your default repository",
             Some(Modal::ChangeRepository(_)) => "Change session repository",
             Some(Modal::Menu { .. }) => "Agent actions",
@@ -3479,6 +3498,10 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::Tweaks { .. })) {
             self.draw_tweaks(frame, area);
+            return;
+        }
+        if matches!(self.modal, Some(Modal::Theme { .. })) {
+            self.draw_theme(frame, area);
             return;
         }
         if matches!(self.modal, Some(Modal::Slack(_))) {
@@ -3778,6 +3801,7 @@ impl Ui {
                 | Modal::Slack(_)
                 | Modal::Voice { .. }
                 | Modal::Tweaks { .. }
+                | Modal::Theme { .. }
                 | Modal::Commands { .. }
                 | Modal::Status
                 | Modal::Usage { .. }
@@ -6230,7 +6254,8 @@ mod tests {
             assert!(
                 rows.iter()
                     .flat_map(|row| &row.spans)
-                    .any(|span| span.content.contains(keyword) && span.style.fg == Some(ACCENT)),
+                    .any(|span| span.content.contains(keyword)
+                        && span.style.fg == Some(crate::theme::slot(crate::theme::Role::Keyword))),
                 "Missing syntax color for {keyword}"
             );
         }
@@ -6514,7 +6539,8 @@ mod tests {
             assert!(
                 row.spans
                     .iter()
-                    .all(|s| s.style.bg == Some(ratatui::style::Color::Rgb(16, 39, 25)))
+                    .all(|s| s.style.bg
+                        == Some(crate::theme::slot(crate::theme::Role::FocusedEntry)))
             );
         }
         ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER));
@@ -6679,11 +6705,11 @@ mod tests {
         assert!(!scrolled.contains("Newest user prompt"));
         assert_eq!(
             crate::ui::user_message_style().fg,
-            Some(ratatui::style::Color::White)
+            Some(crate::theme::slot(crate::theme::Role::UserMessageText))
         );
         assert_eq!(
             crate::ui::user_message_style().bg,
-            Some(ratatui::style::Color::Rgb(0, 63, 16))
+            Some(crate::theme::slot(crate::theme::Role::UserMessage))
         );
         Ok(())
     }
@@ -7036,6 +7062,105 @@ mod tests {
         ui.send(false);
         let position = ui.positions.get("one").context("position")?;
         assert!(position.sent.is_none() && position.clearing.is_some());
+        Ok(())
+    }
+    #[test]
+    fn theme_picker_previews_saves_and_restores_default() -> Result<()> {
+        use crate::theme;
+        let temp = tempfile::tempdir()?;
+        let storage = Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        };
+        let mut ui = state(storage.clone());
+        assert!(
+            ui.palette_commands()
+                .iter()
+                .any(|(name, _, _)| name == "/theme")
+        );
+        let key = |ui: &mut Ui, code| ui.key(KeyEvent::new(code, KeyModifiers::NONE));
+
+        // Moving previews live; Esc returns to the saved theme. The picker
+        // leaves the conversation visible so the preview shows on it.
+        ui.drilled = true;
+        ui.run_palette_command("/theme", "/theme");
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert!(
+            screen.contains("Default")
+                && screen.contains("GitHub Light")
+                && screen.contains("saved")
+        );
+        assert!(screen.contains("A streamed response with useful context"));
+        assert!(
+            theme::themes()
+                .iter()
+                .all(|choice| choice.name.chars().count() <= themes::NAME_WIDTH)
+        );
+        // A short terminal scrolls the list to keep the selection visible.
+        key(&mut ui, KeyCode::End);
+        let (screen, _) = draw(&mut ui, 100, 16)?;
+        assert!(screen.contains("› Gruvbox Light"));
+        key(&mut ui, KeyCode::Home);
+        key(&mut ui, KeyCode::Down);
+        assert_eq!(theme::active().id, "amber");
+        key(&mut ui, KeyCode::Esc);
+        assert_eq!(theme::active().id, "default");
+        assert_eq!(storage.load_config()?.theme, None);
+
+        // A preview never outlives the picker, however it closes.
+        ui.run_palette_command("/theme", "/theme");
+        key(&mut ui, KeyCode::Down);
+        ui.modal = None;
+        ui.tick(false);
+        assert_eq!(theme::active().id, "default");
+
+        ui.run_palette_command("/theme", "/theme");
+        for _ in 0..theme::index(Some("dracula")) {
+            key(&mut ui, KeyCode::Down);
+        }
+        key(&mut ui, KeyCode::Enter);
+        assert!(ui.modal.is_none());
+        assert_eq!(theme::active().id, "dracula");
+        assert_eq!(storage.load_config()?.theme.as_deref(), Some("dracula"));
+        ui.tick(false);
+        assert_eq!(theme::active().id, "dracula", "a saved theme stays");
+
+        // Choosing Default goes back to the original colours and clears the setting.
+        ui.run_palette_command("/theme", "/theme");
+        key(&mut ui, KeyCode::Home);
+        key(&mut ui, KeyCode::Enter);
+        assert_eq!(theme::active().id, "default");
+        assert_eq!(storage.load_config()?.theme, None);
+
+        // Every theme resolves every colour difu draws.
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        for (index, choice) in theme::themes().iter().enumerate() {
+            theme::select(index);
+            let mut terminal = Terminal::new(TestBackend::new(120, 40))?;
+            terminal.draw(|frame| {
+                ui.draw(frame);
+                theme::present(frame.buffer_mut());
+            })?;
+            let buffer = terminal.backend().buffer();
+            assert!(
+                buffer
+                    .content
+                    .iter()
+                    .all(|cell| !theme::is_slot(cell.fg) && !theme::is_slot(cell.bg)),
+                "{} left a colour unresolved",
+                choice.id
+            );
+            assert!(
+                buffer
+                    .content
+                    .iter()
+                    .any(|cell| cell.fg == choice.color(theme::Role::Accent)),
+                "{} accent is drawn",
+                choice.id
+            );
+        }
+        theme::select(0);
         Ok(())
     }
     #[test]
