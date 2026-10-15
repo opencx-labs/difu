@@ -53,6 +53,8 @@ pub struct NativeSession {
     pub registration_tools: bool,
     #[serde(default)]
     pub question_tools: bool,
+    #[serde(default)]
+    pub peer_tools: bool,
 }
 
 pub fn switch(
@@ -92,6 +94,7 @@ pub fn switch(
             artifact_tools: session.artifact_tools,
             registration_tools: session.registration_tools,
             question_tools: session.question_tools,
+            peer_tools: session.peer_tools,
         },
     );
     let target = session
@@ -122,6 +125,7 @@ pub fn switch(
     session.artifact_tools = target.artifact_tools;
     session.registration_tools = target.registration_tools;
     session.question_tools = target.question_tools;
+    session.peer_tools = target.peer_tools;
     session.usage = Value::Null;
     session.token_usage = Value::Null;
     session.completed_turn = None;

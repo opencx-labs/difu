@@ -8,6 +8,7 @@ mod guidance;
 mod management;
 pub mod media;
 mod orchestrator;
+mod peers;
 pub(crate) mod pr_cache;
 pub mod provider;
 mod questions;
@@ -36,6 +37,14 @@ pub const LOCAL_VALIDATION_RULE: &str = "Do not run local tests, linting, typech
 // Retained only for sessions saved before native provider setup.
 pub const WORKTREE_INSTRUCTIONS: &str = "This is a difu-managed worktree. Do not run local tests, linting, typechecks, builds, CI scripts, or other validation suites, including through wrappers or delegated agents. Rely on pull-request CI for all project validation. Git inspection and git diff checks are allowed. Normal source editing tools remain available. Do not commit, push, open a PR, or otherwise publish work unless explicitly requested by the user's task. Finishing a task is not publication authorization.";
 pub const CODING_INSTRUCTIONS: &str = "Do not commit, push, open a PR, or otherwise publish work unless explicitly requested by the user's task. Finishing a task is not publication authorization.";
+
+/// Tells a coding session's agent where it runs and how it is identified.
+fn identity(session: &Session) -> String {
+    format!(
+        "You are running inside difu, the user's terminal workspace for Codex and Claude Code coding sessions and GitHub pull request reviews. This conversation is difu session {}. The user follows it in difu's chat, may not be watching live, and may run other difu sessions in parallel. Tools named difu_* act on difu itself.",
+        session.id
+    )
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Launch {
@@ -314,6 +323,9 @@ pub struct Session {
     pub artifact_tools: bool,
     #[serde(default)]
     pub question_tools: bool,
+    /// The provider thread was given difu_peer_sessions.
+    #[serde(default)]
+    pub peer_tools: bool,
     #[serde(skip)]
     pub artifact_requests: Vec<Pending>,
     #[serde(skip)]
@@ -392,6 +404,7 @@ impl Session {
             artifacts: Vec::new(),
             artifact_tools: false,
             question_tools: false,
+            peer_tools: false,
             artifact_requests: Vec::new(),
             question_requests: Vec::new(),
             shells: Vec::new(),

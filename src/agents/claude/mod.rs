@@ -120,6 +120,9 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                 super::questions::TOOL => {
                     super::questions::handle(store, id, args).map(|value| value.to_string())
                 }
+                super::peers::TOOL => {
+                    super::peers::handle(store, id, args).map(|value| value.to_string())
+                }
                 super::artifacts::TOOL => super::artifacts::register(&mut session, args)
                     .map(|()| "Artifact registered in difu".to_owned()),
                 super::management::TOOL => (|| {
@@ -152,7 +155,7 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                 })(),
                 _ => anyhow::bail!("Unknown difu tool"),
             };
-            if result.is_ok() && name != super::questions::TOOL {
+            if result.is_ok() && ![super::questions::TOOL, super::peers::TOOL].contains(&name) {
                 store.update(id, |s| {
                     s.artifacts = session.artifacts;
                     s.registration_requests = session.registration_requests;
@@ -193,36 +196,15 @@ fn request(store: &Store, id: &str, rpc: &mut Connection, frame: &Value) -> Resu
         .and_then(Value::as_str)
         .context("Missing tool name")?;
     let input = request.get("input").cloned().unwrap_or_else(|| json!({}));
-    let mut pending = if name == "AskUserQuestion" {
-        let questions = input
-            .get("questions")
-            .and_then(Value::as_array)
-            .context("Missing Claude questions")?
-            .iter()
-            .enumerate()
-            .map(|(index, question)| {
-                let mut question = question
-                    .as_object()
-                    .cloned()
-                    .context("Invalid Claude question")?;
-                question.insert("id".into(), json!(index.to_string()));
-                Ok(Value::Object(question))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        Pending {
-            id: request_id,
-            method: "item/tool/requestUserInput".into(),
-            params: json!({"questions":questions,"claudeInput":input}),
-            responded: false,
-        }
-    } else {
-        Pending {
-            id: request_id,
-            method: "mcpServer/elicitation/request".into(),
-            params: json!({"serverName":"Claude Code","message":format!("Allow {name}?\n{}", input.get("command").or_else(|| input.get("file_path")).and_then(Value::as_str).unwrap_or("Review the tool's request in the conversation.")),
-                "claudeInput":input,"tool":name,"requestedSchema":{"type":"object","properties":{}}}),
-            responded: false,
-        }
+    if name == "AskUserQuestion" {
+        return defer_questions(store, id, rpc, request, &request_id, &input);
+    }
+    let mut pending = Pending {
+        id: request_id,
+        method: "mcpServer/elicitation/request".into(),
+        params: json!({"serverName":"Claude Code","message":format!("Allow {name}?\n{}", input.get("command").or_else(|| input.get("file_path")).and_then(Value::as_str).unwrap_or("Review the tool's request in the conversation.")),
+            "claudeInput":input,"tool":name,"requestedSchema":{"type":"object","properties":{}}}),
+        responded: false,
     };
     super::elicitation::normalize(&mut pending);
     store.update(id, |s| {
@@ -232,6 +214,63 @@ fn request(store: &Store, id: &str, rpc: &mut Connection, frame: &Value) -> Resu
         s.status = Status::Waiting;
     })?;
     store.save(id)
+}
+
+const QUESTIONS: &str = "AskUserQuestion is non-blocking in difu: it returns immediately while the user answers in difu's question panel, and each answer arrives later as its own user message. Ask related questions together, then continue work that does not depend on the answers, or end your turn if you cannot proceed without them.";
+const DEFERRED: &str = "Difu shows these questions to the user, who will answer them asynchronously. This is not a refusal. Each answer will arrive later as a separate user message. Do not ask them again, reword them, or assume answers. Continue work that does not depend on them; if you cannot proceed without an answer, end your turn and wait.";
+
+/// Difu's question panel for a Claude tool call; answers arrive as chat messages.
+fn question_request(tool: &str) -> String {
+    format!("difu-async:{tool}")
+}
+
+/// AskUserQuestion would hold Claude's turn until every answer is in. Show the
+/// questions as asynchronous cards instead and release the tool call at once.
+fn defer_questions(
+    store: &Store,
+    id: &str,
+    rpc: &mut Connection,
+    request: &Value,
+    request_id: &Value,
+    input: &Value,
+) -> Result<()> {
+    let questions = input
+        .get("questions")
+        .and_then(Value::as_array)
+        .context("Missing Claude questions")?
+        .iter()
+        .enumerate()
+        .map(|(index, question)| {
+            let mut question = question
+                .as_object()
+                .cloned()
+                .context("Invalid Claude question")?;
+            question.insert("id".into(), json!(index.to_string()));
+            Ok(Value::Object(question))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let tool = request
+        .get("tool_use_id")
+        .and_then(Value::as_str)
+        .or_else(|| request_id.as_str())
+        .context("Missing Claude tool ID")?;
+    let pending = Pending {
+        id: json!(question_request(tool)),
+        method: "item/tool/requestUserInput".into(),
+        params: json!({"difuAsync":true,"toolUseId":tool,"questions":questions}),
+        responded: false,
+    };
+    // Persist the questions before Claude can continue past them.
+    store.update(id, |s| {
+        if !s.pending.iter().any(|p| p.id == pending.id) {
+            s.pending.push(pending);
+        }
+    })?;
+    store.save(id)?;
+    rpc.reply(
+        request_id,
+        json!({"behavior":"deny","message":DEFERRED,"interrupt":false}),
+    )
 }
 fn respond(
     store: &Store,
@@ -247,69 +286,24 @@ fn respond(
         .find(|p| &p.id == request)
         .context("This request is no longer pending")?;
     ensure!(!pending.responded, "This request was already answered");
-    let mut input = pending
+    let input = pending
         .params
         .get("claudeInput")
         .cloned()
         .context("Not a Claude tool request")?;
     let response = super::elicitation::response(pending, response.clone())?;
-    let output = if pending.method == "item/tool/requestUserInput"
-        && !super::elicitation::is_form(pending)
-    {
-        let answers = response
-            .get("answers")
-            .and_then(Value::as_object)
-            .context("Missing answers")?;
-        let questions = pending
-            .params
-            .get("questions")
-            .and_then(Value::as_array)
-            .context("Missing questions")?;
-        let mut values = serde_json::Map::new();
-        for question in questions {
-            let key = question
-                .get("id")
-                .and_then(Value::as_str)
-                .context("Missing question ID")?;
-            let answer = answers
-                .get(key)
-                .and_then(|v| v.get("answers"))
-                .and_then(Value::as_array)
-                .context("Answer each question")?;
-            values.insert(
-                question
-                    .get("question")
-                    .and_then(Value::as_str)
-                    .context("Missing question")?
-                    .into(),
-                json!(
-                    answer
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ),
-            );
-        }
-        input
-            .as_object_mut()
-            .context("Invalid Claude tool input")?
-            .insert("answers".into(), Value::Object(values));
+    let action = response
+        .get("action")
+        .and_then(Value::as_str)
+        .context("Missing approval action")?;
+    ensure!(
+        matches!(action, "accept" | "decline" | "cancel"),
+        "Invalid approval action"
+    );
+    let output = if action == "accept" {
         json!({"behavior":"allow","updatedInput":input})
     } else {
-        let action = response
-            .get("action")
-            .and_then(Value::as_str)
-            .context("Missing approval action")?;
-        ensure!(
-            matches!(action, "accept" | "decline" | "cancel"),
-            "Invalid approval action"
-        );
-        if action == "accept" {
-            json!({"behavior":"allow","updatedInput":input})
-        } else {
-            json!({"behavior":"deny","message":"The user declined this tool call."})
-        }
+        json!({"behavior":"deny","message":"The user declined this tool call."})
     };
     store.update(id, |s| {
         if let Some(pending) = s.pending.iter_mut().find(|p| &p.id == request) {
@@ -320,7 +314,7 @@ fn respond(
     rpc.reply(request, output)?;
     store.update(id, |s| {
         s.pending.retain(|p| &p.id != request);
-        s.status = if s.pending.is_empty() {
+        s.status = if s.pending.iter().all(Pending::is_async_question) {
             Status::Running
         } else {
             Status::Waiting
@@ -393,7 +387,7 @@ fn send(
         s.entries.push(Entry { id: message_id.clone(), kind: "sending".into(), text: prompt.text().into(),
             data: json!({"prompt":prompt,"attachments":prompt.attachments(),"difuSteeringTurn":s.turn_id}).into(), ..Entry::default() });
         if s.turn_id.is_none() { s.turn_id = Some(message_id.clone()); s.turn_started_at = Some(chrono::Utc::now().timestamp_millis()); }
-        if s.pending.is_empty() { s.status = Status::Running; }
+        if s.pending.iter().all(Pending::is_async_question) { s.status = Status::Running; }
         s.error = None;
         if let Job::Coding(launch) = &mut s.job && launch.prompt.is_empty() { launch.prompt = prompt.text().into(); }
         if !s.title_manual && !s.title_ready { s.title = prompt.text().lines().next().unwrap_or("Claude session").chars().take(100).collect(); s.title_ready = true; }
@@ -455,23 +449,69 @@ fn command(
                 send(store, id, rpc, decoder, &prompt)?;
             }
         }
-        Control::Respond { request, response } => respond(store, id, rpc, &request, &response)?,
+        Control::Respond { request, response } => {
+            if let Some(pending) = session
+                .pending
+                .iter()
+                .find(|p| p.id == request && p.is_async_question())
+            {
+                let text = super::questions::answer_text(pending, &response)?;
+                // A failed delivery leaves the questions available for a retry.
+                send(
+                    store,
+                    id,
+                    rpc,
+                    decoder,
+                    &Prompt::QuestionAnswer {
+                        text,
+                        question_request: request.clone(),
+                        question_id: None,
+                    },
+                )?;
+                store.update(id, |s| {
+                    if let Some(id) = request.as_str() {
+                        s.answered_questions.insert(id.into());
+                    }
+                    s.pending.retain(|p| p.id != request);
+                })?;
+            } else {
+                respond(store, id, rpc, &request, &response)?;
+            }
+        }
         Control::AnswerQuestion {
             request,
             question,
             answer,
         } => {
-            let (updated, _) =
+            let (updated, text) =
                 super::questions::prepare_answer(&session, &request, &question, answer.as_deref())?;
-            super::questions::save_answer(store, id, updated.clone())?;
-            if updated.unanswered_questions().is_empty() {
-                respond(
-                    store,
-                    id,
-                    rpc,
-                    &request,
-                    &json!({"answers":updated.params.get("difuAnswers")}),
-                )?;
+            if updated.is_async_question() {
+                // Each answer is its own chat message, recorded only once sent.
+                if answer.is_some() {
+                    send(
+                        store,
+                        id,
+                        rpc,
+                        decoder,
+                        &Prompt::QuestionAnswer {
+                            text,
+                            question_request: request.clone(),
+                            question_id: Some(question),
+                        },
+                    )?;
+                }
+                super::questions::save_answer(store, id, updated)?;
+            } else {
+                super::questions::save_answer(store, id, updated.clone())?;
+                if updated.unanswered_questions().is_empty() {
+                    respond(
+                        store,
+                        id,
+                        rpc,
+                        &request,
+                        &json!({"answers":updated.params.get("difuAnswers")}),
+                    )?;
+                }
             }
         }
         Control::Interrupt | Control::InterruptAndSend => {
@@ -536,23 +576,25 @@ fn command(
 pub(super) fn instructions(session: &Session) -> String {
     if session.orchestrator {
         return format!(
-            "{}\n\n{}",
+            "{}\n\n{QUESTIONS}\n\n{}",
             super::orchestrator::INSTRUCTIONS,
             super::questions::INSTRUCTIONS
         );
     }
     let instructions = format!(
-        "{}\n\n{}\n\n{}\n\n{}",
+        "{}\n\n{}\n\n{}\n\n{QUESTIONS}\n\n{}\n\n{}",
         super::artifacts::INSTRUCTIONS,
         super::registration::INSTRUCTIONS,
         super::management::INSTRUCTIONS,
-        super::questions::INSTRUCTIONS
+        super::questions::INSTRUCTIONS,
+        super::peers::INSTRUCTIONS
     );
     let instructions = if session.native_setup {
         instructions
     } else {
         format!("{}\n\n{instructions}", super::WORKTREE_INSTRUCTIONS)
     };
+    let instructions = format!("{}\n\n{instructions}", super::identity(session));
     super::rules::instructions(session, instructions)
 }
 
@@ -593,6 +635,7 @@ fn connect(store: &Store, id: &str, session: &Session, cancel: &Cancel) -> Resul
         s.artifact_tools = true;
         s.registration_tools = true;
         s.question_tools = true;
+        s.peer_tools = true;
     })?;
     Ok(rpc)
 }

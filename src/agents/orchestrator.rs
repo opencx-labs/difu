@@ -1,5 +1,6 @@
 //! The persistent manager uses the same provider/session lifecycle as coding chats.
 mod knowledge;
+pub(super) use knowledge::{handle as lookup, short, status};
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Record {
@@ -35,6 +36,7 @@ pub(super) fn tools(session: &Session) -> Vec<Value> {
             super::registration::tool(),
             super::management::tool(),
             super::questions::tool(),
+            super::peers::tool(),
         ]
     }
 }

@@ -177,11 +177,14 @@ fn item_text(item: &Value) -> String {
     match kind {
         "agentMessage" => string(item, "text"),
         "dynamicToolCall"
-            if item.get("tool").and_then(Value::as_str) == Some(super::orchestrator::TOOL) =>
+            if matches!(
+                item.get("tool").and_then(Value::as_str),
+                Some(super::orchestrator::TOOL | super::peers::TOOL)
+            ) =>
         {
             format!(
                 "{} · {} · {}",
-                super::orchestrator::TOOL,
+                string(item, "tool"),
                 item.pointer("/arguments/action")
                     .and_then(Value::as_str)
                     .unwrap_or("lookup"),
@@ -245,9 +248,10 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
         .unwrap_or_default();
     let params = event.get("params").unwrap_or(&Value::Null);
     if let Some(id) = event.get("id") {
-        if session.orchestrator
-            && method == "item/tool/call"
-            && params.get("tool").and_then(Value::as_str) == Some(super::orchestrator::TOOL)
+        let tool = params.get("tool").and_then(Value::as_str);
+        if method == "item/tool/call"
+            && (session.orchestrator && tool == Some(super::orchestrator::TOOL)
+                || session.peer_tools && tool == Some(super::peers::TOOL))
         {
             session.orchestrator_requests.push(Pending {
                 id: id.clone(),
@@ -1156,7 +1160,13 @@ fn instructions(session: &Session) -> String {
             super::management::INSTRUCTIONS
         )
     };
-    let base = super::rules::instructions(session, base);
+    let base =
+        super::rules::instructions(session, format!("{}\n\n{base}", super::identity(session)));
+    let base = if session.peer_tools {
+        format!("{base}\n\n{}", super::peers::INSTRUCTIONS)
+    } else {
+        base
+    };
     let base = if session.question_tools {
         format!("{base}\n\n{}", super::questions::INSTRUCTIONS)
     } else {
@@ -1179,6 +1189,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
             s.artifact_tools = true;
             s.registration_tools = true;
             s.question_tools = true;
+            s.peer_tools = true;
         })?;
     }
     let session = store.get(id)?;
@@ -1405,7 +1416,13 @@ pub fn run(
                     } else {
                         args
                     };
-                    super::orchestrator::handle(store, id, &args)
+                    if request.params.get("tool").and_then(Value::as_str)
+                        == Some(super::peers::TOOL)
+                    {
+                        super::peers::handle(store, id, &args)
+                    } else {
+                        super::orchestrator::handle(store, id, &args)
+                    }
                 })();
                 let text = match &result {
                     Ok(value) => value.to_string(),
@@ -1586,6 +1603,7 @@ mod tests {
         session.artifact_tools = true;
         session.registration_tools = true;
         session.question_tools = true;
+        session.peer_tools = true;
         let saved = serde_json::to_value(&session)?;
         let restored: Session = serde_json::from_value(saved.clone())?;
         assert!(restored.native_setup);
@@ -1594,11 +1612,16 @@ mod tests {
             super::super::claude::instructions(&restored),
         ] {
             assert!(prompt.contains("Use the repository service layer."));
+            assert!(
+                prompt.starts_with("You are running inside difu, the user's terminal workspace")
+            );
+            assert!(prompt.contains("This conversation is difu session policy."));
             for tool in [
                 "difu_present_artifact",
                 "difu_remove_questions",
                 "difu_register_worktree",
                 "difu_delete_session",
+                "difu_peer_sessions",
             ] {
                 assert!(prompt.contains(tool));
             }

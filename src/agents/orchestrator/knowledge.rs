@@ -1,7 +1,7 @@
 //! Bounded, explicit retrieval for the manager. Never return Session or Entry JSON.
 use super::*;
 
-pub(super) fn short(text: &str, limit: usize) -> String {
+pub(in crate::agents) fn short(text: &str, limit: usize) -> String {
     let mut end = text.len().min(limit);
     while !text.is_char_boundary(end) {
         end -= 1;
@@ -17,13 +17,13 @@ fn limit(args: &Value) -> Result<usize> {
     ensure!((1..=20).contains(&limit), "limit must be between 1 and 20");
     Ok(limit as usize)
 }
-pub(super) fn status(session: &Session) -> Value {
+pub(in crate::agents) fn status(session: &Session) -> Value {
     json!({"id":session.id,"title":short(&session.title,512),"repository":session.job.root(),
         "status":session.status,"version":session.version,"archived":session.archived,
         "pending":session.pending_question_count(),"queued":session.queue.len(),
         "error":session.error.as_deref().map(|s|short(s,1024))})
 }
-pub(super) fn handle(
+pub(in crate::agents) fn handle(
     store: &Store,
     caller: &str,
     args: &Value,

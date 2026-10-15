@@ -178,6 +178,19 @@ uncommitted work, just like the UI action. It cannot target other sessions.
 The tool is available in new Codex threads and in Claude sessions; existing Codex
 threads keep the tools they were created with.
 
+Sessions can spawn and talk to other sessions with **difu_peer_sessions**. Its
+`list`, `search`, and `status` actions find sessions; `messages` reads a session's
+most recent chat messages; `create` starts a session with a task in a new
+worktree (of this session's repository unless another is given); and `message`
+sends text to another session, queued until its current turn ends unless `queue`
+is false. Every prompt and message is signed with the sender's session ID so the
+recipient can reply the same way. Agents are told to spawn sessions only when you
+ask or agree, and to treat peer messages as requests from another agent: they
+never stand in for your approval. Sessions cannot message themselves or the
+orchestrator, answer another session's questions, or approve its permissions.
+Like the other difu tools, it is available in new Codex threads and in Claude
+sessions.
+
 Press **n** (or `/new`) to open an empty session immediately while its isolated Git
 worktree is created in the background. The composer stays enabled and shows the
 preparation state. Each new worktree fetches `origin/main` and branches from that
@@ -383,7 +396,9 @@ none are checked) plus any typed answer, as comma-separated labels with their no
 **Alt+Up** advances; **Alt+Down** returns to the previous question, or the composer
 from the first question. Question drafts survive dismissal and session switching.
 Asynchronous question cards remain available after the agent finishes its turn
-and across service restarts. Answers steer a running turn or start a follow-up
+and across service restarts. Claude's questions are asynchronous too: difu turns
+them into cards and releases Claude's question tool at once, so Claude continues
+independent work or ends its turn instead of waiting for every answer. Answers steer a running turn or start a follow-up
 when idle, using the normal chat delivery path. The chat shows the question,
 chosen answer, and any additional note. Each answer also sends the agent the
 remaining pending questions as application context, instructing it not to repeat
@@ -509,8 +524,9 @@ worktrees. It never deletes an existing user directory. Removing a clean worktre
 retains its named branch and commits.
 
 New coding sessions inherit Codex/Claude permissions and approval settings. Difu
-adds the saved repository rules and tool-use instructions for artifacts, question
-cleanup, session deletion, and worktree switching. It does not add bans on local
+tells the agent that it runs inside difu and gives it its session ID, then adds
+the saved repository rules and tool-use instructions for artifacts, question
+cleanup, session deletion, worktree switching, and peer sessions. It does not add bans on local
 validation or publication. Sessions created before v0.17.3 retain their original
 instructions and permission behavior, including on reconnect. Review guide and
 conflict jobs keep their separate workflows.

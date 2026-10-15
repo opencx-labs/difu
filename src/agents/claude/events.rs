@@ -141,7 +141,12 @@ impl Decoder {
                     == Some("session_state_changed") =>
             {
                 self.state = frame.get("state").and_then(Value::as_str).map(String::from);
-                if self.state.as_deref() == Some("running") && session.pending.is_empty() {
+                if self.state.as_deref() == Some("running")
+                    && session
+                        .pending
+                        .iter()
+                        .all(super::super::Pending::is_async_question)
+                {
                     session.status = Status::Running;
                 }
                 self.finish(session);
@@ -242,15 +247,21 @@ impl Decoder {
                         if block.get("type").and_then(Value::as_str) != Some("tool_result") {
                             continue;
                         }
-                        if let Some(tool) = block.get("tool_use_id").and_then(Value::as_str)
-                            && let Some(entry) = session
-                                .entries
-                                .iter_mut()
-                                .find(|entry| entry.id == format!("claude-tool-{tool}"))
+                        let Some(tool) = block.get("tool_use_id").and_then(Value::as_str) else {
+                            continue;
+                        };
+                        // Deferred questions decline the tool call, but nothing failed.
+                        let request = super::question_request(tool);
+                        let deferred = session.answered_questions.contains(&request)
+                            || session.pending.iter().any(|p| p.id == request.as_str());
+                        if let Some(entry) = session
+                            .entries
+                            .iter_mut()
+                            .find(|entry| entry.id == format!("claude-tool-{tool}"))
                         {
                             entry.finished_at = Some(now);
-                            let failed =
-                                block.get("is_error").and_then(Value::as_bool) == Some(true);
+                            let failed = !deferred
+                                && block.get("is_error").and_then(Value::as_bool) == Some(true);
                             if let Some(data) = entry.data.as_object_mut() {
                                 data.insert(
                                     "status".into(),
@@ -301,7 +312,12 @@ impl Decoder {
                 session
                     .pending
                     .retain(|p| Some(&p.id) != frame.get("request_id"));
-                if session.pending.is_empty() && session.turn_id.is_some() {
+                if session
+                    .pending
+                    .iter()
+                    .all(super::super::Pending::is_async_question)
+                    && session.turn_id.is_some()
+                {
                     session.status = Status::Running;
                 }
             }
@@ -403,5 +419,42 @@ mod tests {
                 .iter()
                 .any(|e| e.kind == "unsent or unacknowledged" && e.text == "Keep this draft")
         );
+    }
+    #[test]
+    fn deferred_questions_neither_fail_their_tool_call_nor_block_the_turn() {
+        let mut session = session();
+        session.status = Status::Idle;
+        let mut decoder = Decoder::default();
+        decoder.apply(
+            &mut session,
+            &json!({"type":"assistant","message":{"id":"a","content":[
+                {"type":"tool_use","id":"ask","name":"AskUserQuestion","input":{}},
+                {"type":"tool_use","id":"bash","name":"Bash","input":{"command":"false"}}
+            ]}}),
+        );
+        session.pending.push(super::super::super::Pending {
+            id: json!(super::super::question_request("ask")),
+            method: "item/tool/requestUserInput".into(),
+            params: json!({"difuAsync":true,"questions":[{"id":"0","question":"Scope?"}]}),
+            responded: false,
+        });
+        decoder.apply(
+            &mut session,
+            &json!({"type":"system","subtype":"session_state_changed","state":"running"}),
+        );
+        assert_eq!(session.status, Status::Running);
+        decoder.apply(&mut session, &json!({"type":"user","message":{"content":[
+            {"type":"tool_result","tool_use_id":"ask","content":"Answered later","is_error":true},
+            {"type":"tool_result","tool_use_id":"bash","content":"exit 1","is_error":true}
+        ]}}));
+        let status = |id: &str| {
+            session
+                .entries
+                .iter()
+                .find(|e| e.id == format!("claude-tool-{id}"))
+                .and_then(|e| e.data.get("status").cloned())
+        };
+        assert_eq!(status("ask"), Some(json!("completed")));
+        assert_eq!(status("bash"), Some(json!("failed")));
     }
 }
