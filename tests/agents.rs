@@ -1899,13 +1899,54 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
         fs::read_to_string(repo.join("tracked.txt"))?,
         "precious local edit\n"
     );
-    // Multi-select answers reach Claude as comma-separated labels.
+    // Claude's questions do not hold its turn: difu keeps them as asynchronous
+    // cards and each answer reaches Claude later as its own chat message.
     control(&storage, &id, message("claude multi question"))?;
-    let asked = wait(&storage, &id, |s| !s.pending.is_empty())?;
+    let asked = wait(&storage, &id, |s| {
+        s.status == Status::Idle && !s.pending.is_empty()
+    })?;
     let question = asked.pending.first().context("Claude question")?;
+    assert!(question.is_async_question());
     assert_eq!(
         question.params.pointer("/questions/0/multiSelect"),
         Some(&serde_json::json!(true))
+    );
+    let protocol = || -> Result<Vec<serde_json::Value>> {
+        Ok(fs::read_to_string(root.join("claude-protocol.jsonl"))?
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect())
+    };
+    let tool = question
+        .params
+        .get("toolUseId")
+        .and_then(serde_json::Value::as_str)
+        .context("Claude tool ID")?;
+    let released = protocol()?
+        .into_iter()
+        .find(|frame| {
+            frame.pointer("/response/request_id")
+                == Some(&serde_json::json!(format!("permission-{tool}")))
+        })
+        .context("Claude question release")?;
+    assert_eq!(
+        released.pointer("/response/response/behavior"),
+        Some(&serde_json::json!("deny"))
+    );
+    assert!(
+        released
+            .pointer("/response/response/message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| message.contains("answer them asynchronously"))
+    );
+    let call = asked
+        .entries
+        .iter()
+        .find(|e| e.id == format!("claude-tool-{tool}"))
+        .context("question tool call")?;
+    assert_eq!(
+        call.data.get("status"),
+        Some(&serde_json::json!("completed"))
     );
     control(
         &storage,
@@ -1916,22 +1957,113 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
             answer: Some("Lint, Build".into()),
         },
     )?;
-    wait(&storage, &id, |s| {
+    let answered = wait(&storage, &id, |s| {
         s.status == Status::Idle && s.pending.is_empty()
     })?;
-    let answered = fs::read_to_string(root.join("claude-protocol.jsonl"))?
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|frame| frame.pointer("/response/request_id") == Some(&question.id))
-        .context("Claude answer")?;
+    assert!(
+        answered
+            .entries
+            .iter()
+            .any(|e| e.kind == "userMessage" && e.text == "> Which checks?\n\nLint, Build")
+    );
+    let delivered = protocol()?
+        .into_iter()
+        .filter(|frame| frame.get("type") == Some(&serde_json::json!("user")))
+        .filter_map(|frame| frame.pointer("/message/content").cloned())
+        .find(|content| content.to_string().contains("Lint, Build"))
+        .context("Claude answer message")?;
+    assert!(
+        delivered
+            .to_string()
+            .contains("Remaining pending questions (0)")
+    );
+
+    // Sessions know they run in difu, spawn peers, and exchange signed messages.
+    let starts = fs::read_to_string(root.join("claude-starts.jsonl"))?;
+    assert!(starts.contains(&format!("This conversation is difu session {id}.")));
+    let peer = |args: serde_json::Value| -> Result<serde_json::Value> {
+        let seen = protocol()?.len();
+        control(&storage, &id, message(&format!("claude peer: {args}")))?;
+        let start = Instant::now();
+        let result = loop {
+            if let Some(result) = protocol()?.into_iter().skip(seen).find_map(|frame| {
+                (frame.pointer("/response/request_id") == Some(&serde_json::json!("peer-call")))
+                    .then(|| {
+                        frame
+                            .pointer("/response/response/mcp_response/result")
+                            .cloned()
+                    })
+                    .flatten()
+            }) {
+                break result;
+            }
+            ensure!(start.elapsed() < Duration::from_secs(10), "No peer result");
+            std::thread::sleep(Duration::from_millis(30));
+        };
+        wait(&storage, &id, |s| s.status == Status::Idle)?;
+        let text = result
+            .pointer("/content/0/text")
+            .and_then(serde_json::Value::as_str)
+            .context("peer result text")?;
+        Ok(
+            serde_json::json!({"isError":result.get("isError"),"value":serde_json::from_str::<serde_json::Value>(text).unwrap_or(serde_json::json!(text))}),
+        )
+    };
+    let created =
+        peer(serde_json::json!({"action":"create","prompt":"chat only: draft the summary"}))?;
+    assert_eq!(created.get("isError"), Some(&serde_json::json!(false)));
+    let peer_id = created
+        .pointer("/value/id")
+        .and_then(serde_json::Value::as_str)
+        .context("peer id")?
+        .to_owned();
+    let signature = format!("Message from difu session {id} (");
+    let spawned = wait(&storage, &peer_id, |s| {
+        s.status == Status::Idle && s.entries.iter().any(|e| e.kind == "agentMessage")
+    })?;
+    assert_eq!(spawned.job.root(), &repo.canonicalize()?);
+    assert_ne!(spawned.workspace, session(&storage, &id)?.workspace);
+    assert!(spawned.entries.iter().any(|e| e.kind == "userMessage"
+        && e.text.starts_with("chat only: draft the summary")
+        && e.text.contains(&signature)));
+    let started = fs::read_to_string(root.join("protocol.jsonl"))?;
+    assert!(started.lines().any(|line| line.contains("thread/start")
+        && line.contains(&format!("This conversation is difu session {peer_id}."))
+        && line.contains("difu_peer_sessions")));
+    let sent = peer(
+        serde_json::json!({"action":"message","id":peer_id,"text":"chat only: add tests too"}),
+    )?;
     assert_eq!(
-        answered.pointer("/response/response/updatedInput/answers"),
-        Some(&serde_json::json!({"Which checks?": "Lint, Build"}))
+        sent.pointer("/value/delivery"),
+        Some(&serde_json::json!("delivered"))
+    );
+    wait(&storage, &peer_id, |s| {
+        s.status == Status::Idle
+            && s.entries
+                .iter()
+                .filter(|e| e.kind == "agentMessage")
+                .count()
+                == 2
+    })?;
+    let read = peer(serde_json::json!({"action":"messages","id":peer_id,"limit":2}))?;
+    let messages = read
+        .pointer("/value/messages")
+        .and_then(serde_json::Value::as_array)
+        .context("peer messages")?;
+    assert_eq!(messages.len(), 2);
+    assert!(
+        read.pointer("/value/messages/0/text")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(
+                |text| text.starts_with("chat only: add tests too") && text.contains(&signature)
+            )
     );
     assert_eq!(
-        answered.pointer("/response/response/updatedInput/questions/0/multiSelect"),
-        Some(&serde_json::json!(true))
+        read.pointer("/value/messages/1/from"),
+        Some(&serde_json::json!("agent"))
     );
+    let own = peer(serde_json::json!({"action":"message","id":id,"text":"hello"}))?;
+    assert_eq!(own.get("isError"), Some(&serde_json::json!(true)));
 
     let registered = root.join("manual worktree");
     git(

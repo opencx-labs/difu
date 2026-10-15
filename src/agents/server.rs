@@ -1093,6 +1093,7 @@ fn clear_conversation(s: &mut Session) {
     s.artifact_tools = false;
     s.registration_tools = false;
     s.question_tools = false;
+    s.peer_tools = false;
     s.native_setup = true;
     s.guide = None;
     if let Job::Coding(launch) = &mut s.job {

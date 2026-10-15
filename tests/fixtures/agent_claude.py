@@ -60,6 +60,8 @@ for line in sys.stdin:
         if prompt.startswith('claude register worktree: '):
             pending = 'register-worktree'
             emit(dict(type='control_request', request_id=pending, request=dict(subtype='mcp_message', server_name='difu', message=dict(jsonrpc='2.0', id=2, method='tools/call', params=dict(name='difu_register_worktree', arguments=dict(path=prompt.split(': ',1)[1]))))))
+        elif prompt.startswith('claude peer: '):
+            emit(dict(type='control_request', request_id='peer-call', request=dict(subtype='mcp_message', server_name='difu', message=dict(jsonrpc='2.0', id=4, method='tools/call', params=dict(name='difu_peer_sessions', arguments=json.loads(prompt.split(': ', 1)[1]))))))
         elif prompt == 'delete this session':
             pathlib.Path('discard.txt').write_text('dirty self-deletion fixture')
             pending = 'delete-session'
@@ -71,8 +73,8 @@ for line in sys.stdin:
             tool = f'ask-{connection}-{turn}'
             ask = dict(questions=[dict(question='Which checks?', header='Checks', multiSelect=True, options=[dict(label=label, description='') for label in ('Lint', 'Tests', 'Build')])])
             emit(dict(type='assistant', message=dict(id=f'assistant-{connection}-{turn}', content=[dict(type='tool_use', id=tool, name='AskUserQuestion', input=ask)])))
-            pending = tool
-            emit(dict(type='control_request', request_id=tool, request=dict(subtype='can_use_tool', tool_name='AskUserQuestion', input=ask)))
+            pending = f'permission-{tool}'
+            emit(dict(type='control_request', request_id=f'permission-{tool}', request=dict(subtype='can_use_tool', tool_name='AskUserQuestion', input=ask, tool_use_id=tool)))
         elif 'claude tool' in prompt:
             tool = f'tool-{connection}-{turn}'
             emit(dict(type='assistant', message=dict(id=f'assistant-{connection}-{turn}', content=[dict(type='tool_use', id=tool, name='Bash', input=dict(command='echo fixture'))])))
@@ -94,9 +96,14 @@ for line in sys.stdin:
         if frame['response']['request_id'] in ('register-worktree', 'delete-session'):
             assert not frame['response']['response']['mcp_response']['result']['isError']
             continue
+        if frame['response']['request_id'] == 'peer-call':
+            complete()
+            continue
         assert frame['response']['request_id'] == pending
-        allowed = frame['response']['response']['behavior'] == 'allow'
-        emit(dict(type='user', message=dict(role='user', content=[dict(type='tool_result', tool_use_id=pending, content='Allowed' if allowed else 'Denied', is_error=not allowed)])))
+        response = frame['response']['response']
+        allowed = response['behavior'] == 'allow'
+        tool = pending.removeprefix('permission-')
+        emit(dict(type='user', message=dict(role='user', content=[dict(type='tool_result', tool_use_id=tool, content='Allowed' if allowed else response.get('message', 'Denied'), is_error=not allowed)])))
         pending = None
         complete()
     else:
