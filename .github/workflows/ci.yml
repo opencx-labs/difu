@@ -11,6 +11,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: cli
     steps:
       - uses: actions/checkout@v4
       - name: Check release artifact selection and verification

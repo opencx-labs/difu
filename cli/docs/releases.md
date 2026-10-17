@@ -5,7 +5,7 @@ ARM64. Linux binaries use musl to avoid requiring a particular glibc version.
 Packages contain only difu, its license, and README. Rust runs on CI; Git, `gh`,
 and Codex remain user-installed runtime prerequisites.
 
-1. Update the version in `Cargo.toml` and `Cargo.lock` and merge the change after
+1. Update the version in `cli/Cargo.toml` and `cli/Cargo.lock` and merge the change after
    CI passes. Pull requests also validate release packaging when relevant files
    change.
 2. Push a `v<version>` tag pointing to that commit. The **Release packages**

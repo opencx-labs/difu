@@ -4,12 +4,12 @@ on:
   pull_request:
     paths:
       - .github/workflows/release.yml
-      - scripts/**
-      - Cargo.toml
-      - Cargo.lock
-      - src/**
-      - tests/**
-      - prompts/**
+      - cli/scripts/**
+      - cli/Cargo.toml
+      - cli/Cargo.lock
+      - cli/src/**
+      - cli/tests/**
+      - cli/prompts/**
   push:
     tags: ["v*"]
 
@@ -32,7 +32,7 @@ jobs:
         id: reuse
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 scripts/release-artifacts.py reuse dist
+        run: python3 cli/scripts/release-artifacts.py reuse dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: steps.reuse.outputs.reused == 'true'
         id: upload
@@ -72,10 +72,12 @@ jobs:
           sudo apt-get install --yes musl-tools
       - name: Test
         if: github.event_name == 'pull_request'
+        working-directory: cli
         env:
           DIFU_TARGET: ${{ matrix.target }}
         run: cargo test --locked --target "$DIFU_TARGET"
       - name: Build release
+        working-directory: cli
         env:
           DIFU_TARGET: ${{ matrix.target }}
         run: cargo build --locked --release --target "$DIFU_TARGET"
@@ -85,7 +87,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          binary="target/$DIFU_TARGET/release/difu"
+          binary="cli/target/$DIFU_TARGET/release/difu"
           version="$($binary --version)"
           version="${version#difu }"
           if [[ "$GITHUB_REF_TYPE" == tag && "$GITHUB_REF_NAME" != "v$version" ]]; then
@@ -93,7 +95,7 @@ jobs:
             exit 1
           fi
           mkdir -p dist package smoke/empty-path
-          cp "$binary" LICENSE README.md package/
+          cp "$binary" LICENSE cli/README.md package/
           archive="difu-$version-$DIFU_TARGET.tar.gz"
           tar -czf "dist/$archive" -C package difu LICENSE README.md
           tar -xzf "dist/$archive" -C smoke
@@ -126,11 +128,11 @@ jobs:
           merge-multiple: true
       - name: Generate checksums and Homebrew formula
         run: |
-          python3 scripts/prepare-release.py dist
+          python3 cli/scripts/prepare-release.py dist
           ruby -c dist/difu.rb
       - name: Record validated source and package checksums
         id: source
-        run: python3 scripts/release-artifacts.py record dist
+        run: python3 cli/scripts/release-artifacts.py record dist
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         id: upload
         with:
