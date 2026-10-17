@@ -26,6 +26,9 @@ extension PatchLineKind {
 struct PatchLineRow: View {
     let line: PatchLine
     var numbers = false
+    /// Digits in the largest line number of the surrounding patch.
+    var digits = 4
+    @ScaledMetric(relativeTo: .caption) private var digit: CGFloat = 7.5
 
     var body: some View {
         HStack(spacing: 0) {
@@ -34,7 +37,7 @@ struct PatchLineRow: View {
                     Text(line.oldNumber.map(String.init) ?? "")
                     Text(line.newNumber.map(String.init) ?? "")
                 }
-                .frame(width: 34, alignment: .trailing)
+                .frame(width: CGFloat(max(2, digits)) * digit + 6, alignment: .trailing)
                 .foregroundStyle(.tertiary)
                 .padding(.trailing, 4)
             }
@@ -95,7 +98,8 @@ struct FilePatchView: View {
             } else {
                 ScrollView([.horizontal, .vertical]) {
                     LazyVStack(alignment: .leading, spacing: 0) {
-                        ForEach(lines) { PatchLineRow(line: $0, numbers: true) }
+                        let largest = lines.map { max($0.oldNumber ?? 0, $0.newNumber ?? 0) }.max() ?? 0
+                        ForEach(lines) { PatchLineRow(line: $0, numbers: true, digits: String(largest).count) }
                         if file.truncated {
                             Text("Diff truncated — open it on your computer to see the rest.")
                                 .font(.caption)

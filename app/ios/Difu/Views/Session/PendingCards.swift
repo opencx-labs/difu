@@ -26,7 +26,13 @@ struct PendingCard: View {
                     .foregroundStyle(.secondary)
             }
             if let detail = pending.detail, !detail.isEmpty {
-                CodeBlock(text: detail)
+                Text(detail)
+                    .font(.mono)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(10)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.codeBackground, in: RoundedRectangle(cornerRadius: 8))
             }
             content
             if let error {

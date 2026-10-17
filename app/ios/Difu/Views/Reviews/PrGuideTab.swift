@@ -139,6 +139,13 @@ private struct ChapterView: View {
 private struct GuideHunkView: View {
     let hunk: GuideHunk
     @State private var width: CGFloat = 0
+    @ScaledMetric(relativeTo: .caption) private var digit: CGFloat = 7.5
+
+    /// Wide enough for the hunk's largest line number, so columns never merge.
+    private var numberWidth: CGFloat {
+        let largest = hunk.lines.map { max($0.old ?? 0, $0.new ?? 0) }.max() ?? 0
+        return CGFloat(max(2, String(largest).count)) * digit + 6
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -171,8 +178,8 @@ private struct GuideHunkView: View {
 
     private func line(text: String, kind: GuideLine.Kind, old: Int?, new: Int?, color: Color?) -> some View {
         HStack(spacing: 0) {
-            Text(old.map(String.init) ?? "").frame(width: 30, alignment: .trailing)
-            Text(new.map(String.init) ?? "").frame(width: 30, alignment: .trailing)
+            Text(old.map(String.init) ?? "").frame(width: numberWidth, alignment: .trailing)
+            Text(new.map(String.init) ?? "").frame(width: numberWidth, alignment: .trailing)
             Text(text.isEmpty ? " " : text)
                 .foregroundStyle(color ?? foreground(kind))
                 .padding(.leading, 8)

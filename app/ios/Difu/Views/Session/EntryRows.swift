@@ -1,13 +1,21 @@
 import DifuKit
 import SwiftUI
 
-/// One transcript row, drawn according to its role.
-struct EntryRow: View {
+/// One transcript row, drawn according to its role. Rows compare by content
+/// (not their callbacks), so a streaming update redraws only changed rows.
+struct EntryRow: View, Equatable {
     let entry: EntryView
+    /// The session is running; in-progress plan steps animate only then.
+    let active: Bool
     let expanded: Bool
     let loadingFull: Bool
     let toggle: () -> Void
     let loadFull: () -> Void
+
+    static func == (a: EntryRow, b: EntryRow) -> Bool {
+        a.entry == b.entry && a.active == b.active && a.expanded == b.expanded
+            && a.loadingFull == b.loadingFull
+    }
 
     var body: some View {
         switch entry.role {
@@ -24,7 +32,7 @@ struct EntryRow: View {
         case .tool:
             ToolRow(entry: entry, expanded: expanded, loadingFull: loadingFull, toggle: toggle, loadFull: loadFull)
         case .plan:
-            PlanRow(entry: entry)
+            PlanRow(entry: entry, active: active)
         case .error:
             ErrorRow(text: entry.text.isEmpty ? (entry.title ?? "Error") : entry.text)
         case .system, .unknown:
@@ -118,6 +126,7 @@ struct ReasoningRow: View {
 /// A plan checklist.
 struct PlanRow: View {
     let entry: EntryView
+    let active: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -148,7 +157,7 @@ struct PlanRow: View {
             Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
         case .inProgress:
             Image(systemName: "circle.dotted.circle").foregroundStyle(Color.accentColor)
-                .symbolEffect(.pulse)
+                .symbolEffect(.pulse, isActive: active)
         case .pending:
             Image(systemName: "circle").foregroundStyle(.secondary)
         }
