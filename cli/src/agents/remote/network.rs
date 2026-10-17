@@ -1,7 +1,6 @@
 //! Addresses a phone on the same Wi-Fi can use to reach this computer.
 use std::{
     net::IpAddr,
-    process::Command,
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -100,18 +99,12 @@ fn bonjour_name() -> Option<String> {
 
 #[cfg(target_os = "macos")]
 fn scutil(key: &str) -> Option<String> {
-    let output = Command::new("/usr/sbin/scutil")
+    let output = std::process::Command::new("/usr/sbin/scutil")
         .args(["--get", key])
         .output()
         .ok()?;
     let value = String::from_utf8(output.stdout).ok()?.trim().to_owned();
     (output.status.success() && !value.is_empty()).then_some(value)
-}
-#[cfg(not(target_os = "macos"))]
-#[allow(dead_code)]
-fn scutil(_: &str) -> Option<String> {
-    let _ = Command::new;
-    None
 }
 
 fn usable(ip: &IpAddr) -> bool {
