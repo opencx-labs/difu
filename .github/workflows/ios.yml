@@ -1,0 +1,26 @@
+name: iOS
+on:
+  push:
+    branches: ['**']
+    paths:
+      - app/ios/**
+      - .github/workflows/ios.yml
+  pull_request:
+    paths:
+      - app/ios/**
+      - .github/workflows/ios.yml
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test DifuKit
+        working-directory: app/ios/DifuKit
+        run: swift test
+      - name: Build the app without signing
+        run: >-
+          xcodebuild -project app/ios/Difu.xcodeproj -scheme Difu
+          -destination 'generic/platform=iOS' -derivedDataPath build
+          CODE_SIGNING_ALLOWED=NO build
