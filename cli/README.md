@@ -326,7 +326,7 @@ Recalled prompts are editable and never sent automatically.
 
 Type **/** in an empty composer for native commands: `/compact`, `/model`, `/effort`,
 `/skills`, `/status`, `/rules`, `/usage`, `/diff`, `/new`, `/rename`, `/clear`, `/repo`, `/worktree`,
-`/help`, `/voice`, `/tweaks`, `/theme`, and `/actions`.
+`/help`, `/voice`, `/tweaks`, `/theme`, `/remote-control`, and `/actions`.
 Opening a session keeps the composer focused; pending questions remain available
 through the questions control.
 
@@ -1011,6 +1011,35 @@ chapters by concern. The guide groups chapters in this order:
 Each group can contain multiple chapters with a divider between groups. Empty
 groups are omitted. Difu enforces the group order while preserving chapter order
 within each group.
+
+## Remote control (iPhone)
+
+The [difu iOS app](../app/ios/README.md) controls this difu from your iPhone on
+the same Wi-Fi network: the session list, live conversations, messages and photos,
+questions and approvals, models, changes, archive/delete, and Reviews (PR lists,
+overview, diff, guides, comments, reviews, and merging).
+
+Open **Cmd+K → `/remote-control`** and scan the QR code with the app. Opening the
+command turns remote control on: the background agent service listens on a
+random high TCP port on this computer's network interfaces, and keeps listening
+across restarts until you press **d** in the same panel. The QR code
+holds a single-use pairing code that expires after 10 minutes; a new one
+appears while the panel stays open, so you can pair several phones. Each phone
+receives its own long-lived token. The panel lists paired phones and whether they
+are connected; **x** forgets the selected phone and disconnects it immediately.
+
+Traffic uses TLS with a self-signed certificate created for this computer. Its
+fingerprint travels in the QR code and the app pins it, so no certificate
+authority is involved and other devices on the network cannot impersonate your
+computer. Only paired phones can send requests; the pairing code and device
+tokens never appear in logs, and the computer stores only token hashes, in
+`agents/remote/` beside the agent service files.
+
+The app connects through the computer's Bonjour name (`<name>.local`) first, then
+its IP addresses, so it keeps working when the address changes. If it cannot
+connect, check that both devices share a network that allows device-to-device
+traffic (guest and some office networks do not), allow incoming connections for
+difu if macOS asks, and allow **Local Network** access for difu in iOS Settings.
 
 ## Slack control (macOS)
 

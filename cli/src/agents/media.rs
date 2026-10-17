@@ -119,6 +119,35 @@ fn persist(storage: &Storage, session: &str, source: &Path, kind: Kind) -> Resul
         hash: digest,
     })
 }
+/// Save an image sent by the iOS app as a private session copy.
+pub fn store(storage: &Storage, session: &str, bytes: &[u8]) -> Result<Attachment> {
+    ensure!(bytes.len() <= 32 << 20, "Images must be smaller than 32 MB");
+    let extension = match image::guess_format(bytes) {
+        Ok(image::ImageFormat::Png) => "png",
+        Ok(image::ImageFormat::Jpeg) => "jpg",
+        Ok(image::ImageFormat::WebP) => "webp",
+        Ok(image::ImageFormat::Gif) => "gif",
+        _ => anyhow::bail!("Unsupported image format; use PNG, JPEG, WebP or GIF"),
+    };
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()?
+        .into_dimensions()
+        .context("Cannot read attachment image")?;
+    ensure!(w > 0 && h > 0, "Image is empty");
+    let mut copy = tempfile::Builder::new()
+        .prefix("media-")
+        .suffix(&format!(".{extension}"))
+        .tempfile_in(directory(storage, session)?)?;
+    copy.write_all(bytes)?;
+    copy.as_file_mut().sync_all()?;
+    let (_, path) = copy.keep()?;
+    Ok(Attachment {
+        label: String::new(),
+        path,
+        kind: Kind::Image,
+        hash: format!("{:x}", Sha256::digest(bytes)),
+    })
+}
 pub fn validate(storage: &Storage, session: &str, attachment: &Attachment) -> Result<()> {
     let dir = directory(storage, session)?.canonicalize()?;
     let path = attachment

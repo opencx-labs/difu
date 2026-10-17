@@ -124,12 +124,12 @@ fn prose_links(text: &str, width: u16) -> (Vec<Line<'static>>, Vec<Link>) {
 pub(super) fn tool(entry: &Entry) -> bool {
     entry.is_tool()
 }
-pub(super) fn visible(session: &Session, entry: &Entry) -> bool {
+pub(in crate::agents) fn visible(session: &Session, entry: &Entry) -> bool {
     !(entry.text.is_empty() && entry.kind == "reasoning")
         && !(session.is_pending_steering(entry) && session.tool_running())
 }
 
-fn label(entry: &Entry, running: bool) -> String {
+pub(in crate::agents) fn label(entry: &Entry, running: bool) -> String {
     match entry.kind.as_str() {
         "commandExecution" => format!(
             "{} {}",
@@ -175,7 +175,7 @@ fn label(entry: &Entry, running: bool) -> String {
         _ => "Tool activity".into(),
     }
 }
-fn activity_text(session: &Session) -> (String, Option<String>, Option<i64>) {
+pub(in crate::agents) fn activity_text(session: &Session) -> (String, Option<String>, Option<i64>) {
     if session
         .pending
         .iter()

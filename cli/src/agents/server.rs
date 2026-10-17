@@ -186,6 +186,7 @@ struct Worker {
 }
 struct Service {
     store: Arc<Store>,
+    remote: Arc<super::remote::Remote>,
     workers: Mutex<BTreeMap<String, Worker>>,
     action_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     launch_lock: Mutex<()>,
@@ -1019,6 +1020,7 @@ impl Service {
                 &Cancel::default(),
             )?)),
             Request::Defaults { cwd } => super::engine::defaults(&cwd),
+            Request::Remote { command } => Ok(Reply::Remote(self.remote.command(command)?)),
             Request::Skills { id, force } => {
                 let session = self.store.get(&id)?;
                 ensure!(
@@ -1232,7 +1234,9 @@ pub fn run(storage: Storage) -> Result<()> {
         storage::atomic_json(&path, &session)?;
         sessions.insert(session.id.clone(), session);
     }
+    let remote = super::remote::Remote::start(storage.clone());
     let service = Arc::new(Service {
+        remote,
         store: Arc::new(Store {
             home,
             storage,
@@ -1454,6 +1458,7 @@ mod routed_queue_tests {
         ensure_orchestrator(&store)?;
         assert_eq!(store.get(&fresh.id)?.entries.len(), 1);
         let service = Service {
+            remote: super::remote::Remote::start(store.storage.clone()),
             store,
             workers: Mutex::new(BTreeMap::new()),
             action_locks: Mutex::new(BTreeMap::new()),
@@ -1526,6 +1531,10 @@ mod routed_queue_tests {
         session.slack_route = Some(first.clone());
         session.note("agentMessage", "first task output");
         let service = Service {
+            remote: super::remote::Remote::start(Storage {
+                config: temp.path().join("config.json"),
+                cache: temp.path().join("cache"),
+            }),
             store: Arc::new(Store::fixture(temp.path().into(), vec![session])),
             workers: Mutex::new(BTreeMap::new()),
             action_locks: Mutex::new(BTreeMap::new()),
@@ -1683,6 +1692,7 @@ mod clear_tests {
             git(&origin, &["commit", "-am", "advance main"])?;
             let fresh = git(&origin, &["rev-parse", "HEAD"])?;
             let service = Service {
+                remote: super::remote::Remote::start(store.storage.clone()),
                 store: store.clone(),
                 workers: Mutex::new(BTreeMap::new()),
                 action_locks: Mutex::new(BTreeMap::new()),

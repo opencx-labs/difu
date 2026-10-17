@@ -13,6 +13,7 @@ mod patch;
 mod prompt;
 mod prs;
 mod questions;
+mod remote_control;
 mod reveal;
 mod rules;
 mod selection;
@@ -20,7 +21,7 @@ mod sends;
 mod sidebar;
 mod slack;
 mod themes;
-mod transcript;
+pub(in crate::agents) mod transcript;
 mod transcript_window;
 mod tweaks;
 mod usage;
@@ -216,6 +217,7 @@ pub enum Modal {
     Theme {
         selected: usize,
     },
+    Remote,
     Repository(Editor),
     ChangeRepository(Editor),
     Commands {
@@ -360,6 +362,7 @@ pub struct Ui {
     /// Saved colour theme; `/theme` previews others only while open.
     theme: usize,
     slack: slack::State,
+    remote: remote_control::State,
     model_completion: models::State,
     toast_rect: Rect,
     media_pending: Option<(String, mpsc::Receiver<Result<super::media::Paste, String>>)>,
@@ -430,6 +433,7 @@ impl Ui {
             tweaks: config.tweaks,
             theme: crate::theme::index(config.theme.as_deref()),
             slack: slack::State::default(),
+            remote: remote_control::State::default(),
             model_completion: models::State::default(),
             toast_rect: Rect::default(),
             media_pending: None,
@@ -492,6 +496,7 @@ impl Ui {
         self.tick_media();
         self.tick_voice(visible);
         self.tick_slack();
+        self.tick_remote();
         self.tick_theme();
         while let Ok(message) = self.receiver.try_recv() {
             let unchanged = match (&message.kind, &message.result) {
@@ -2148,6 +2153,10 @@ impl Ui {
             self.theme_key(key);
             return;
         }
+        if matches!(self.modal, Some(Modal::Remote)) {
+            self.remote_key(key);
+            return;
+        }
         if self.question_or_queue_key(key) {
             return;
         }
@@ -3410,6 +3419,7 @@ impl Ui {
             Some(Modal::Voice { .. }) => "Voice settings",
             Some(Modal::Tweaks { .. }) => "Tweaks · chat animations",
             Some(Modal::Theme { .. }) => "Theme",
+            Some(Modal::Remote) => "Remote control · iPhone",
             Some(Modal::Repository(_)) => "Choose and remember your default repository",
             Some(Modal::ChangeRepository(_)) => "Change session repository",
             Some(Modal::Menu { .. }) => "Agent actions",
@@ -3506,6 +3516,10 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::Slack(_))) {
             self.draw_slack(frame, area);
+            return;
+        }
+        if matches!(self.modal, Some(Modal::Remote)) {
+            self.draw_remote(frame, area);
             return;
         }
         if matches!(self.modal, Some(Modal::Usage { .. })) {
@@ -3802,6 +3816,7 @@ impl Ui {
                 | Modal::Voice { .. }
                 | Modal::Tweaks { .. }
                 | Modal::Theme { .. }
+                | Modal::Remote
                 | Modal::Commands { .. }
                 | Modal::Status
                 | Modal::Usage { .. }

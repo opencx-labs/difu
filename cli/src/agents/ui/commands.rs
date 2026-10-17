@@ -2,6 +2,10 @@ use super::*;
 
 const COMMANDS: &[(&str, &str)] = &[
     ("slack", "Connect Slack to the difu orchestrator"),
+    (
+        "remote-control",
+        "Pair the difu iPhone app over Wi-Fi and manage phones",
+    ),
     ("voice", "Configure hold-Space dictation and API key"),
     (
         "tweaks",
@@ -373,6 +377,7 @@ impl Ui {
         }
         match name.as_str() {
             "/slack" => self.open_slack(),
+            "/remote-control" => self.open_remote(),
             "/voice" => self.open_voice(),
             "/tweaks" => self.open_tweaks(),
             "/theme" => self.open_theme(),
@@ -422,6 +427,7 @@ impl Ui {
     fn run_command_arguments(&mut self, name: &str, args: &str) {
         match name {
             "/slack" => self.open_slack(),
+            "/remote-control" => self.open_remote(),
             "/rules" => self.open_rules(Some(args.into())),
             "/repo" => self.change_repository(args),
             "/worktree" => self.register_worktree(args),

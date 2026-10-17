@@ -13,6 +13,7 @@ pub(crate) mod pr_cache;
 pub mod provider;
 mod questions;
 mod registration;
+pub mod remote;
 mod rules;
 pub mod server;
 mod shared;
@@ -806,6 +807,10 @@ pub enum Request {
         id: String,
         force: bool,
     },
+    /// Wi-Fi remote control for the iOS app.
+    Remote {
+        command: remote::Command,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
@@ -833,6 +838,7 @@ pub enum Reply {
         effort: String,
         permissions: String,
     },
+    Remote(remote::Status),
     Error(String),
 }
 
