@@ -35,6 +35,10 @@ fn cached() -> (Vec<String>, String) {
 }
 
 fn discover_hosts() -> Vec<String> {
+    // Tests listen on loopback only; that is then the one reachable host.
+    if let Ok(bind) = std::env::var("DIFU_REMOTE_BIND") {
+        return vec![bind];
+    }
     let mut hosts = Vec::new();
     if let Some(name) = bonjour_name() {
         hosts.push(format!("{name}.local"));

@@ -39,6 +39,7 @@ pub struct Connection(Arc<Inner>);
 
 struct Inner {
     storage: Storage,
+    port: u16,
     sender: SyncSender<String>,
     closed: AtomicBool,
     watches: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
@@ -55,9 +56,10 @@ struct Call {
 }
 
 impl Connection {
-    pub fn new(storage: Storage, sender: SyncSender<String>) -> Self {
+    pub fn new(storage: Storage, port: u16, sender: SyncSender<String>) -> Self {
         Self(Arc::new(Inner {
             storage,
+            port,
             sender,
             closed: AtomicBool::new(false),
             watches: Mutex::new(BTreeMap::new()),
@@ -154,6 +156,7 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
             "name": super::network::name(),
             "version": env!("CARGO_PKG_VERSION"),
             "hosts": super::network::hosts(),
+            "port": inner.port,
         })),
         "sessions.list" => Ok(json!({"sessions": inner.summaries()?})),
         "sessions.subscribe" => {

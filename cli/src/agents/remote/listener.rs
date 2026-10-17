@@ -286,7 +286,8 @@ fn run(remote: &Arc<Remote>, device: &str, socket: &mut Socket) -> Result<()> {
         .sock
         .set_read_timeout(Some(Duration::from_millis(25)))?;
     let (sender, outgoing) = mpsc::sync_channel::<String>(512);
-    let connection = super::api::Connection::new(remote.storage.clone(), sender);
+    let port = socket.get_ref().sock.local_addr()?.port();
+    let connection = super::api::Connection::new(remote.storage.clone(), port, sender);
     let mut pinged = Instant::now();
     let mut checked = Instant::now();
     let result = (|| -> Result<()> {

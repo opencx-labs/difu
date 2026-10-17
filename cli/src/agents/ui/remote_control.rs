@@ -105,6 +105,13 @@ impl Ui {
                 self.remote.selected =
                     (self.remote.selected + 1).min(devices.len().saturating_sub(1))
             }
+            KeyCode::Char('c') => {
+                if let Some(link) = self.remote.status.as_ref().and_then(|s| s.pairing.clone()) {
+                    // Universal Clipboard carries it to the iPhone's Paste Pairing Link.
+                    self.clipboard = Some(link);
+                    self.notice = Some(("Pairing link copied".into(), false));
+                }
+            }
             KeyCode::Char('d') if enabled => self.remote_command(Command::Disable, false),
             KeyCode::Char('e') | KeyCode::Char('n') => self.remote_command(Command::Open, false),
             KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
@@ -170,7 +177,7 @@ impl Ui {
         }
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), text_area);
         let hint = if status.enabled {
-            "↑↓ select phone · x forget · n new code · d turn off · Esc close"
+            "c copy link · ↑↓ select phone · x forget · n new code · d turn off · Esc close"
         } else {
             "e turn on · Esc close"
         };
@@ -389,6 +396,8 @@ mod tests {
         assert!(screen.contains("Listening on 192.168.1.2:50123"));
         assert!(screen.contains("Ali's iPhone · connected"));
         assert!(screen.contains('█'));
+        ui.remote_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert_eq!(ui.clipboard.as_deref(), Some("difu://pair?v=1&c=code"));
         Ok(())
     }
 }

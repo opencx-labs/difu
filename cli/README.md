@@ -1024,7 +1024,9 @@ command turns remote control on: the background agent service listens on a
 random high TCP port on this computer's network interfaces, and keeps listening
 across restarts until you press **d** in the same panel. The QR code
 holds a single-use pairing code that expires after 10 minutes; a new one
-appears while the panel stays open, so you can pair several phones. Each phone
+appears while the panel stays open, so you can pair several phones. **c** copies
+the pairing link instead; with Universal Clipboard, paste it into the app's
+**Paste Pairing Link**. Each phone
 receives its own long-lived token. The panel lists paired phones and whether they
 are connected; **x** forgets the selected phone and disconnects it immediately.
 
