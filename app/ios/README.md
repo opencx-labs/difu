@@ -9,6 +9,16 @@ The phone talks to difu's background agent service using the protocol in
 [`docs/remote-protocol.md`](../../docs/remote-protocol.md): a WebSocket over TLS,
 pinned to the certificate fingerprint in the pairing QR code.
 
+<p>
+  <img src="screenshots/sessions.png" width="200" alt="Agents session list">
+  <img src="screenshots/transcript.png" width="200" alt="Live session transcript">
+  <img src="screenshots/approval.png" width="200" alt="Approving a command">
+  <img src="screenshots/pr-guide.png" width="200" alt="PR guide">
+</p>
+
+More in [`screenshots/`](screenshots/), taken in the iOS Simulator against a
+demo difu.
+
 ## Run it on your iPhone
 
 Requirements: Xcode 26 or later with the iOS platform installed
