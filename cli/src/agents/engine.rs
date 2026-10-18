@@ -1,4 +1,5 @@
 mod isolation;
+mod mcp_control;
 mod registration;
 use super::{
     Control, Entry, Job, Pending, Prompt, Reply, Session, Skill, Status,
@@ -781,6 +782,11 @@ fn command(
 ) -> Result<()> {
     let session = store.get(id)?;
     match control {
+        Control::Mcp { action, response } => {
+            let snapshot =
+                mcp_control::execute(rpc, store, id, action, cancel).map_err(|e| format!("{e:#}"));
+            let _ = response.send(snapshot);
+        }
         Control::ReadUsage => {
             let usage = usage_with(rpc, &session, cancel, |v| event(store, id, v))?;
             store.update(id, |s| s.usage = usage)?;
@@ -1372,7 +1378,7 @@ pub fn run(
                 changed = true;
                 let read_only = matches!(
                     command_request.control,
-                    Control::RefreshShells | Control::ReadUsage
+                    Control::RefreshShells | Control::ReadUsage | Control::Mcp { .. }
                 );
                 let result = command(&mut rpc, store, id, command_request.control, cancel);
                 if let Err(error) = &result

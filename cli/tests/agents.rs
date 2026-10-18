@@ -2329,3 +2329,168 @@ fn guidance_wait_survives_frontend_reconnect_and_service_restart_without_permiss
     daemon.stop()?;
     Ok(())
 }
+
+#[test]
+fn mcp_controls_use_live_workers_without_sending_model_turns() -> Result<()> {
+    use difu::agents::mcp;
+    let tmp = tempfile::Builder::new()
+        .prefix("difu-mcp-")
+        .tempdir_in("/tmp")?;
+    let root = tmp.path();
+    let repo = root.join("repo");
+    fs::create_dir(&repo)?;
+    git(&repo, &["init", "-b", "main"])?;
+    fs::write(repo.join("tracked.txt"), "fixture\n")?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-m", "base"])?;
+    git(&repo, &["remote", "add", "origin", "."])?;
+    let bin = root.join("bin");
+    fs::create_dir(&bin)?;
+    for (name, source) in [
+        ("codex", include_str!("fixtures/agent_codex.py")),
+        ("claude", include_str!("fixtures/agent_claude.py")),
+        ("gh", "#!/bin/sh\nprintf '[]\\n'\n"),
+    ] {
+        let file = bin.join(name);
+        fs::write(&file, source)?;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o700))?;
+    }
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").context("PATH")?,
+    )))?;
+    let storage = Storage {
+        config: root.join("config.json"),
+        cache: root.join("cache"),
+    };
+    let mut service = support::Service::start(&storage, |c| {
+        c.env("PATH", &path).env("DIFU_AGENT_FIXTURE", root);
+    })?;
+    for model in ["fixture-model", "claude/sonnet"] {
+        let Reply::Launched(id) = client::request(
+            &storage,
+            Request::Launch {
+                job: Box::new(Job::Coding(Launch {
+                    repository: repo.clone(),
+                    base: "HEAD".into(),
+                    isolated: true,
+                    prompt: String::new(),
+                    model: Some(model.into()),
+                    effort: None,
+                })),
+            },
+        )?
+        else {
+            anyhow::bail!("launch")
+        };
+        wait(&storage, &id, |s| {
+            s.status == Status::Idle && s.workspace_ready
+        })?;
+        let request = |action| -> Result<mcp::Snapshot> {
+            let Reply::Mcp(data) = client::request(
+                &storage,
+                Request::Mcp {
+                    id: id.clone(),
+                    action,
+                },
+            )?
+            else {
+                anyhow::bail!("inventory")
+            };
+            Ok(data)
+        };
+        request(mcp::Action::Refresh)?;
+        // An upgraded/restarted daemon must reconnect MCP without a "continue" prompt.
+        service.stop()?;
+        service = support::Service::start(&storage, |c| {
+            c.env("PATH", &path).env("DIFU_AGENT_FIXTURE", root);
+        })?;
+        let status = request(mcp::Action::Refresh)?;
+        if !model.starts_with("claude") {
+            assert!(
+                status.servers.iter().any(
+                    |s| s.name == "offline" && s.error.as_deref() == Some("Connection refused")
+                )
+            );
+        }
+        assert!(
+            status
+                .servers
+                .iter()
+                .any(|s| s.name == "fixture" && s.status == "connected" && s.tools.len() == 1)
+        );
+        let disabled = request(mcp::Action::Toggle {
+            name: "fixture".into(),
+            enabled: false,
+        })?;
+        assert!(
+            disabled
+                .servers
+                .iter()
+                .any(|s| s.name == "fixture" && s.status == "disabled" && s.tools.is_empty())
+        );
+        assert!(
+            request(mcp::Action::Reconnect {
+                name: "fixture".into()
+            })
+            .is_err()
+        );
+        request(mcp::Action::Toggle {
+            name: "fixture".into(),
+            enabled: true,
+        })?;
+        let reconnected = request(mcp::Action::Reconnect {
+            name: "fixture".into(),
+        })?;
+        assert!(
+            reconnected
+                .servers
+                .iter()
+                .any(|s| s.name == "fixture" && s.status == "connected")
+        );
+        let auth = request(mcp::Action::Authenticate {
+            name: "fixture".into(),
+        })?;
+        assert_eq!(
+            auth.authorization_url.as_deref(),
+            Some("https://auth.example.com/login")
+        );
+        assert!(
+            request(mcp::Action::Toggle {
+                name: "missing".into(),
+                enabled: false
+            })
+            .is_err()
+        );
+        let current = session(&storage, &id)?;
+        assert!(current.turn_id.is_none());
+        assert!(
+            !current
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.kind.as_str(), "userMessage" | "agentMessage"))
+        );
+        assert!(current.error.is_none());
+        if model.starts_with("claude") {
+            fs::write(
+                root.join("mcp-interleave"),
+                "emit approval before MCP response",
+            )?;
+            request(mcp::Action::Refresh)?;
+            let waiting = wait(&storage, &id, |s| {
+                s.pending
+                    .iter()
+                    .any(|p| p.id == serde_json::json!("mcp-interleaved-approval"))
+            })?;
+            assert_eq!(waiting.status, Status::Waiting);
+        }
+    }
+    let protocol = fs::read_to_string(root.join("protocol.jsonl"))?;
+    assert!(!protocol.contains("turn/start"));
+    let claude_protocol = fs::read_to_string(root.join("claude-protocol.jsonl"))?;
+    for line in claude_protocol.lines() {
+        let value: serde_json::Value = serde_json::from_str(line)?;
+        assert_ne!(value.get("type").and_then(|v| v.as_str()), Some("user"));
+    }
+    service.stop()?;
+    Ok(())
+}

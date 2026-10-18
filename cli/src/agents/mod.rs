@@ -6,6 +6,7 @@ mod elicitation;
 mod engine;
 mod guidance;
 mod management;
+pub mod mcp;
 pub mod media;
 mod orchestrator;
 mod peers;
@@ -680,6 +681,11 @@ impl From<Prompt> for String {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Control {
+    #[serde(skip)]
+    Mcp {
+        action: mcp::Action,
+        response: std::sync::mpsc::Sender<Result<mcp::Snapshot, String>>,
+    },
     ReadUsage,
     Message {
         text: String,
@@ -721,6 +727,10 @@ pub enum Control {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
+    Mcp {
+        id: String,
+        action: mcp::Action,
+    },
     OrchestratorThread {
         route: slack::Route,
         title: String,
@@ -814,6 +824,7 @@ pub enum Request {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
+    Mcp(mcp::Snapshot),
     Usage(Value),
     Ok,
     ServiceVersion {

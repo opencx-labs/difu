@@ -200,7 +200,27 @@ impl Connection {
         &mut self,
         request: Value,
         cancel: &Cancel,
+        handle: impl FnMut(&Value) -> Result<Value>,
+    ) -> Result<Value> {
+        self.call_inner(request, cancel, handle, false)
+    }
+    /// Management requests must not answer tool approvals that arrive concurrently.
+    /// Queue them for the worker's normal permission/question handler, while still
+    /// servicing SDK MCP requests needed to complete the management operation.
+    pub fn call_preserving_requests(
+        &mut self,
+        request: Value,
+        cancel: &Cancel,
+        handle: impl FnMut(&Value) -> Result<Value>,
+    ) -> Result<Value> {
+        self.call_inner(request, cancel, handle, true)
+    }
+    fn call_inner(
+        &mut self,
+        request: Value,
+        cancel: &Cancel,
         mut handle: impl FnMut(&Value) -> Result<Value>,
+        preserve_requests: bool,
     ) -> Result<Value> {
         let id = self.request(request)?;
         let start = Instant::now();
@@ -231,6 +251,13 @@ impl Connection {
                 Ok(Ok(frame))
                     if frame.get("type").and_then(Value::as_str) == Some("control_request") =>
                 {
+                    if preserve_requests
+                        && frame.pointer("/request/subtype").and_then(Value::as_str)
+                            != Some("mcp_message")
+                    {
+                        self.backlog.push_back(frame);
+                        continue;
+                    }
                     let request_id = frame
                         .get("request_id")
                         .cloned()

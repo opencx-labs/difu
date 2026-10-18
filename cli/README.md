@@ -325,7 +325,7 @@ With an empty composer, **Up** recalls sent prompts from the current session.
 Recalled prompts are editable and never sent automatically.
 
 Type **/** in an empty composer for native commands: `/compact`, `/model`, `/effort`,
-`/skills`, `/status`, `/rules`, `/usage`, `/diff`, `/new`, `/rename`, `/clear`, `/repo`, `/worktree`,
+`/skills`, `/status`, `/rules`, `/usage`, `/mcp`, `/diff`, `/new`, `/rename`, `/clear`, `/repo`, `/worktree`,
 `/help`, `/voice`, `/tweaks`, `/theme`, `/remote-control`, and `/actions`.
 Opening a session keeps the composer focused; pending questions remain available
 through the questions control.
@@ -352,6 +352,23 @@ Dark, Solarized Light, GitHub Light, Catppuccin Latte, and Gruvbox Light.
 percent remaining for Codex. It reads Claude Code's structured `/usage` data or Codex's account limits
 and session token usage, without sending a model prompt. Use **r** to refresh and
 **↑/↓** or **PgUp/PgDn** to scroll. Provider errors appear in the panel.
+
+**/mcp** manages the selected agent's MCP servers without sending a model prompt.
+It shows live connection states, errors, server details and tools. Select with
+**↑/↓** or the mouse, **Enter** to open, **Esc** to go back, and **r** to refresh.
+Status refreshes automatically while the panel is open. Server actions include
+reconnect, enable/disable and authentication where the provider supports them;
+**o** opens the authentication link. A fresh session can initialize its agent
+connection directly from this panel, before its first message.
+
+Claude controls individual connections and can clear authentication. Codex
+reconnect reloads all MCP connections in that agent; enable/disable saves a
+Codex user configuration setting and reloads the active agent. Other running
+agents refresh separately. Codex connection changes require its current turn to finish first;
+plugin-managed Codex servers are managed through their plugin settings. Difu's
+internal Claude SDK server is visible but cannot be disabled from this panel.
+Older providers that lack these APIs show an error rather than simulated success.
+
 Commands filter as you type. Inline arguments also work: `/rename <title>`,
 `/model <model> [effort]`, `/effort <level>`, `/skills <search>`, `/help <search>`,
 `/actions <search>`, and `/voice on|off`. With no arguments, commands retain their

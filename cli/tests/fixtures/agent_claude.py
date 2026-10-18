@@ -3,6 +3,7 @@
 import json, os, pathlib, subprocess, sys, uuid
 root = pathlib.Path(os.environ['DIFU_AGENT_FIXTURE'])
 connection = uuid.uuid4().hex[:8]
+mcp_enabled = True
 turn = 0
 pending = None
 initializing = None
@@ -42,6 +43,20 @@ for line in sys.stdin:
             else:
                 initializing = frame
                 emit(dict(type='control_request', request_id='difu-tools', request=dict(subtype='mcp_message', server_name='difu', message=dict(jsonrpc='2.0', id=1, method='tools/list'))))
+        elif request['subtype'] == 'mcp_status':
+            if (root/'mcp-interleave').exists():
+                (root/'mcp-interleave').unlink()
+                pending = 'mcp-interleaved-approval'
+                emit(dict(type='control_request', request_id=pending, request=dict(subtype='can_use_tool',tool_name='Bash',input=dict(command='echo preserved approval'))))
+            reply(frame, {'mcpServers':[{'name':'fixture','status':'connected' if mcp_enabled else 'disabled','scope':'project','config':{'type':'http','url':'https://fixture.example.com'},'tools':[{'name':'hello'}] if mcp_enabled else []}]})
+        elif request['subtype'] == 'mcp_toggle':
+            assert request['serverName'] == 'fixture'
+            mcp_enabled = request['enabled']
+            reply(frame,{})
+        elif request['subtype'] == 'mcp_reconnect':
+            assert request['serverName'] == 'fixture' and mcp_enabled
+            reply(frame,{})
+        elif request['subtype'] == 'mcp_authenticate': reply(frame,{'authUrl':'https://auth.example.com/login'})
         elif request['subtype'] == 'get_usage':
             reply(frame, dict(subscription_type='max', rate_limits_available=True, rate_limits=dict(five_hour=dict(utilization=40, resets_at='2027-01-15T08:00:00Z')), session=dict(total_cost_usd=1.25)))
         elif request['subtype'] == 'interrupt':

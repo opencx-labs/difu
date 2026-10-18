@@ -1,5 +1,6 @@
 //! Claude Code adapter. The rest of difu uses Session/Control, never Claude wire frames.
 mod events;
+mod mcp_control;
 mod protocol;
 use super::{
     Control, Entry, Job, Pending, Prompt, Reply, Session, Status,
@@ -419,6 +420,11 @@ fn command(
 ) -> Result<()> {
     let session = store.get(id)?;
     match control {
+        Control::Mcp { action, response } => {
+            let snapshot =
+                mcp_control::execute(store, id, rpc, action, cancel).map_err(|e| format!("{e:#}"));
+            let _ = response.send(snapshot);
+        }
         Control::ReadUsage => {
             let usage = rpc.call(json!({"subtype":"get_usage"}), cancel, |frame| {
                 mcp(store, id, frame)
