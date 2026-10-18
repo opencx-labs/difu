@@ -1,6 +1,6 @@
 [package]
 name = "difu"
-version = "0.20.2"
+version = "0.20.3"
 edition = "2024"
 rust-version = "1.90"
 description = "Your diff shifu: Codex agents and guided pull request reviews"
@@ -47,6 +47,11 @@ security-framework = "3"
 [profile.release]
 lto = "thin"
 strip = true
+
+# Crossterm 0.29.0 loops forever when a terminal disconnects. Keep the released
+# dependency graph and backport only the synchronous dead-TTY fix (see PATCHES.md).
+[patch.crates-io]
+crossterm = { path = "vendor/crossterm" }
 
 [lints.rust]
 unsafe_code = "forbid"
