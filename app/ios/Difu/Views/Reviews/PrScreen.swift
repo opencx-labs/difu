@@ -155,7 +155,7 @@ struct PrStateBadge: View {
         switch state.lowercased() {
         case "merged": ("Merged", "arrow.triangle.merge", .purple)
         case "closed": ("Closed", "xmark.circle", .red)
-        default: draft ? ("Draft", "pencil.circle", .secondary) : ("Open", "arrow.triangle.pull", .green)
+        default: draft ? ("Draft", "pencil.circle", .secondary) : ("Open", "arrow.triangle.pull", Color.success)
         }
     }
 }
@@ -189,7 +189,7 @@ private struct MergeabilityRow: View {
             case "BEHIND": return ("Behind the base branch", "arrow.down.circle", .orange)
             case "UNSTABLE": return ("Mergeable, some checks failing", "exclamationmark.circle", .orange)
             case "DRAFT": return ("Draft — mark ready to merge", "pencil.circle", .secondary)
-            default: return ("Ready to merge", "checkmark.circle.fill", .green)
+            default: return ("Ready to merge", "checkmark.circle.fill", Color.success)
             }
         default: return ("Checking mergeability…", "clock", .secondary)
         }
@@ -211,7 +211,7 @@ private struct ReviewerRow: View {
 
     private var style: (String, Color, String) {
         let state = reviewer.state.lowercased()
-        if state.contains("approved") { return ("checkmark.circle.fill", .green, "Approved") }
+        if state.contains("approved") { return ("checkmark.circle.fill", Color.success, "Approved") }
         if state.contains("changes") { return ("exclamationmark.circle.fill", .red, "Changes requested") }
         if state.contains("comment") { return ("text.bubble", .secondary, "Commented") }
         if state.contains("dismiss") { return ("minus.circle", .secondary, "Dismissed") }
@@ -242,7 +242,7 @@ private struct CheckRow: View {
 
     private var style: (String, Color) {
         switch check.state {
-        case .pass: ("checkmark.circle.fill", .green)
+        case .pass: ("checkmark.circle.fill", Color.success)
         case .fail: ("xmark.circle.fill", .red)
         case .pending, .expected: ("clock.fill", .orange)
         case .skipping: ("forward.circle", .secondary)

@@ -165,7 +165,7 @@ struct DiffFileRow: View {
 
     private var color: Color {
         switch file.status {
-        case .added: .green
+        case .added: Color.success
         case .deleted: .red
         case .renamed: .blue
         case .modified: .orange

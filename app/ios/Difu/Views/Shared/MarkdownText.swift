@@ -62,7 +62,7 @@ private struct MarkdownBlockView: View {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         if let checked = item.checked {
                             Image(systemName: checked ? "checkmark.square.fill" : "square")
-                                .foregroundStyle(checked ? Color.green : .secondary)
+                                .foregroundStyle(checked ? Color.success : .secondary)
                         }
                         if !item.marker.isEmpty {
                             Text(item.marker)

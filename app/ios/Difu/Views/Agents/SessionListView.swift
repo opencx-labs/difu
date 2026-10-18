@@ -124,6 +124,7 @@ struct SessionListView: View {
                         } actions: {
                             Button("New Session") { showingNewSession = true }
                                 .buttonStyle(.borderedProminent)
+                                .foregroundStyle(Color.onAccent)
                                 .disabled(!app.isConnected)
                         }
                     }

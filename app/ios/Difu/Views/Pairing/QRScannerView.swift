@@ -38,6 +38,7 @@ struct ScannerScreen: View {
                             if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
                         }
                         .buttonStyle(.borderedProminent)
+                        .foregroundStyle(Color.onAccent)
                     }
                 }
             }

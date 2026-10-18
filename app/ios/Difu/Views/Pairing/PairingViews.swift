@@ -105,6 +105,7 @@ struct PairingButtons: View {
                     .padding(.vertical, 6)
             }
             .buttonStyle(.borderedProminent)
+            .foregroundStyle(Color.onAccent)
             .controlSize(.large)
 
             Button {

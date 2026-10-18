@@ -7,8 +7,10 @@ extension Font {
     static let monoBody = Font.system(.callout, design: .monospaced)
 }
 
+// `Color.accent` (matrix green), `.onAccent` (ink on accent fills) and
+// `.success` (the terminal's softer green) are generated from the asset catalog.
 extension Color {
-    static let addition = Color.green
+    static let addition = Color.success
     static let deletion = Color.red
     static let codeBackground = Color(.secondarySystemBackground)
     static let cardBackground = Color(.secondarySystemGroupedBackground)
@@ -41,7 +43,7 @@ enum StatusTone: Equatable {
         switch self {
         case .working: .accentColor
         case .needsInput: .orange
-        case .ready: .green
+        case .ready: .success
         case .failed: .red
         case .interrupted, .neutral: .secondary
         }

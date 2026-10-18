@@ -89,7 +89,7 @@ struct ConnectionStatusLabel: View {
         switch app.connection {
         case .connected:
             Label("Connected", systemImage: "circle.fill")
-                .foregroundStyle(.green)
+                .foregroundStyle(Color.success)
                 .labelStyle(StatusLabelStyle())
         case .connecting(let failures, _):
             Label(failures == 0 ? "Connecting…" : "Unreachable", systemImage: "circle.fill")

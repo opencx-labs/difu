@@ -154,7 +154,7 @@ struct PlanRow: View {
     @ViewBuilder private func icon(_ status: PlanStatus) -> some View {
         switch status {
         case .completed:
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.success)
         case .inProgress:
             Image(systemName: "circle.dotted.circle").foregroundStyle(Color.accentColor)
                 .symbolEffect(.pulse, isActive: active)

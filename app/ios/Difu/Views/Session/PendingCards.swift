@@ -207,6 +207,7 @@ struct QuestionForm: View {
                 Task { await submit(answers.joined(separator: ", ")) }
             }
             .buttonStyle(.borderedProminent)
+            .foregroundStyle(Color.onAccent)
             .disabled(selected.isEmpty && other.trimmingCharacters(in: .whitespaces).isEmpty)
         }
     }
@@ -255,7 +256,7 @@ struct ChoiceButtonStyle: ButtonStyle {
         let tint: Color = destructive ? .red : .accentColor
         configuration.label
             .font(.callout.weight(.medium))
-            .foregroundStyle(prominent ? Color.white : tint)
+            .foregroundStyle(prominent ? (destructive ? Color.white : Color.onAccent) : tint)
             .padding(.horizontal, 12)
             .padding(.vertical, 9)
             .frame(maxWidth: .infinity)

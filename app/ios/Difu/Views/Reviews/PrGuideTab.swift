@@ -82,6 +82,7 @@ struct PrGuideTab: View {
             }
         }
         .buttonStyle(.borderedProminent)
+        .foregroundStyle(Color.onAccent)
         .disabled(model.startingGuide)
     }
 

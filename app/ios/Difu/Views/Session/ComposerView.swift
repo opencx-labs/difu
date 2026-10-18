@@ -122,6 +122,7 @@ struct ComposerView: View {
                         .controlSize(.small)
                     Button("Steer") { send(false) }
                         .buttonStyle(.borderedProminent)
+                        .foregroundStyle(Color.onAccent)
                         .controlSize(.small)
                 }
                 .padding(.bottom, 4)
