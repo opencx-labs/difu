@@ -233,6 +233,30 @@ impl Service {
             .workers
             .lock()
             .map_err(|_| anyhow::anyhow!("Worker lock failed"))?;
+        // Every reconnect checks under the worker lock, including messages that
+        // raced with /mcp after a service upgrade. Never replace a live worker.
+        if let Some(worker) = workers
+            .get(id)
+            .filter(|worker| !worker.handle.is_finished())
+        {
+            if let Some(control) = initial {
+                let (reply, _) = mpsc::channel();
+                worker
+                    .sender
+                    .send(Command { control, reply })
+                    .context("Agent disconnected before the request was sent")?;
+            }
+            return Ok(());
+        }
+        if matches!(&initial, Some(Control::Mcp { .. })) {
+            ensure!(
+                session.queue.is_empty()
+                    && session.turn_id.is_none()
+                    && session.pending.is_empty()
+                    && !session.switching_workspace,
+                "Finish or resolve the session's pending work before reconnecting MCP"
+            );
+        }
         let cancel = Cancel::default();
         let (sender, receiver) = crate::wake::channel(cancel.wake());
         let token = cancel.clone();
@@ -716,6 +740,33 @@ impl Service {
                     }
                 }
                 Ok(Reply::Ok)
+            }
+            Request::Mcp { id, action } => {
+                let session = self.store.get(&id)?;
+                ensure!(
+                    matches!(session.job, Job::Coding(_)),
+                    "MCP controls are available for coding sessions"
+                );
+                ensure!(
+                    !session.archived && !session.preparing(),
+                    "Wait until the session is ready before managing MCP servers"
+                );
+                let (inventory, result) = mpsc::channel();
+                self.start(
+                    &id,
+                    Some(Control::Mcp {
+                        action,
+                        response: inventory,
+                    }),
+                )?;
+                Ok(Reply::Mcp(
+                    result
+                        .recv_timeout(Duration::from_secs(60))
+                        .context(
+                            "Agent did not return MCP status; check its connection and refresh",
+                        )?
+                        .map_err(anyhow::Error::msg)?,
+                ))
             }
             Request::Usage { id } => {
                 let session = self.store.get(&id)?;

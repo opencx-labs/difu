@@ -14,6 +14,7 @@ if sys.argv[1:2] == ['exec']:
     output = pathlib.Path(sys.argv[sys.argv.index('--output-last-message')+1])
     output.write_text(json.dumps({'suggestion':'Okay, implement the plan.'} if suggestion else {'title':'Fixture coding session'}))
     sys.exit(0)
+mcp_enabled = True
 turn = 0
 connection = uuid.uuid4().hex[:8]
 sandbox = 'workspace-write'
@@ -39,6 +40,18 @@ for line in sys.stdin:
     if method == 'initialize': reply(request, {'userAgent':'fixture'})
     elif method == 'initialized': pass
     elif method == 'account/rateLimits/read': reply(request, {'rateLimits':{'planType':'pro','primary':{'usedPercent':25,'windowDurationMins':300,'resetsAt':1800000000}}})
+    elif method == 'mcpServerStatus/list':
+        assert params['threadId'] == thread_id
+        if params.get('cursor') == 'page-two':
+            reply(request, {'data':[{'name':'offline','runtimeStatus':'failed','authStatus':'unsupported','toolsError':'Connection refused','tools':{}}], 'nextCursor':None})
+        else:
+            reply(request, {'data':[{'name':'fixture','runtimeStatus':'connected' if mcp_enabled else 'disabled','authStatus':'notLoggedIn','httpOrigin':'https://fixture.example.com','tools':{'hello':{'name':'hello','inputSchema':{'type':'object'}}} if mcp_enabled else {}}], 'nextCursor':'page-two'})
+    elif method == 'config/value/write':
+        assert params['keyPath'] == 'mcp_servers."fixture".enabled'
+        mcp_enabled = params['value']
+        reply(request, {'status':'ok','overriddenMetadata':None})
+    elif method == 'config/mcpServer/reload': reply(request,{})
+    elif method == 'mcpServer/oauth/login': reply(request,{'authorizationUrl':'https://auth.example.com/login'})
     elif method == 'config/read': reply(request, {'config':{'model':'fixture-model','model_reasoning_effort':'high','developer_instructions':'Preserve inherited guidance.'},'origins':{}})
     elif method == 'thread/backgroundTerminals/list':
         reply(request, {'data':[{'command':'fixture shell','cwd':os.getcwd(),'itemId':'shell-item','processId':'123'}], 'nextCursor':None})

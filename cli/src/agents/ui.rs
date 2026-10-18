@@ -6,6 +6,7 @@ mod changes;
 mod commands;
 mod defaults;
 mod inline_questions;
+mod mcp_panel;
 mod media;
 mod models;
 mod panels;
@@ -132,6 +133,7 @@ pub struct Position {
 }
 #[derive(Clone)]
 enum Action {
+    McpSelect(usize),
     Select(String),
     OrchestratorBack,
     Open,
@@ -186,6 +188,7 @@ enum Action {
     DismissNotice,
 }
 pub enum Modal {
+    Mcp(Box<mcp_panel::State>),
     Slack(slack::Settings),
     Transcript {
         entry: String,
@@ -274,6 +277,7 @@ struct ResultMessage {
 }
 #[derive(Clone)]
 enum Task {
+    Mcp(String, u64),
     List,
     Read(String),
     Changes(changes::Source, u64),
@@ -498,6 +502,9 @@ impl Ui {
         self.tick_slack();
         self.tick_remote();
         self.tick_theme();
+        if visible {
+            self.tick_mcp();
+        }
         while let Ok(message) = self.receiver.try_recv() {
             let unchanged = match (&message.kind, &message.result) {
                 (Task::List, Ok(Reply::Sessions(sessions))) => {
@@ -549,7 +556,8 @@ impl Ui {
                 | Task::OpenArtifact
                 | Task::OpenLink
                 | Task::InstallBrowser(..)
-                | Task::Usage(_) => {}
+                | Task::Usage(_)
+                | Task::Mcp(..) => {}
                 Task::WorkspacePaths(id, _) => {
                     self.paths_loading.remove(id);
                 }
@@ -557,6 +565,12 @@ impl Ui {
                     self.sidebar.finished(id);
                 }
                 Task::Skills(..) => self.skills_loading = None,
+            }
+            if let Task::Mcp(id, request) = &message.kind {
+                if let Some(Modal::Mcp(state)) = &mut self.modal {
+                    state.finish(id, *request, message.result);
+                }
+                continue;
             }
             if let Task::Usage(id) = &message.kind {
                 if let Some(Modal::Usage {
@@ -2121,6 +2135,10 @@ impl Ui {
         }
     }
     fn modal_key(&mut self, key: KeyEvent) {
+        if matches!(self.modal, Some(Modal::Mcp(_))) {
+            self.mcp_key(key);
+            return;
+        }
         if matches!(self.modal, Some(Modal::Slack(_))) {
             self.slack_key(key);
             return;
@@ -2469,6 +2487,7 @@ impl Ui {
             Action::BrowserChoice(index) => self.browser_choice(index),
             Action::MenuItem(index) => self.menu_action(index),
             Action::Command(index) => self.run_command(index),
+            Action::McpSelect(index) => self.mcp_select(Some(index)),
             Action::Link(url) => {
                 let sender = self.sender.clone();
                 thread::spawn(move || {
@@ -2554,7 +2573,16 @@ impl Ui {
                 }
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
-                if let Some(Modal::Help(state)) = &mut self.modal {
+                if matches!(self.modal, Some(Modal::Mcp(_))) {
+                    let code = if event.kind == MouseEventKind::ScrollDown {
+                        KeyCode::Down
+                    } else {
+                        KeyCode::Up
+                    };
+                    for _ in 0..3 {
+                        self.mcp_key(KeyEvent::new(code, KeyModifiers::NONE));
+                    }
+                } else if let Some(Modal::Help(state)) = &mut self.modal {
                     state.scroll = state.scroll.saturating_add_signed(
                         if event.kind == MouseEventKind::ScrollDown {
                             3
@@ -3385,6 +3413,11 @@ impl Ui {
         {
             return;
         }
+        if matches!(self.modal, Some(Modal::Mcp(_))) {
+            self.text_selection.clear();
+            self.draw_mcp_overlay(frame);
+            return;
+        }
         if !matches!(self.modal, Some(Modal::Transcript { .. })) {
             self.text_selection.clear();
         }
@@ -3425,6 +3458,7 @@ impl Ui {
             Some(Modal::Menu { .. }) => "Agent actions",
             Some(Modal::Commands { .. }) => "Session commands",
             Some(Modal::Status) => "Session status",
+            Some(Modal::Mcp(_)) => "MCP · ↑/↓ Select · Enter Open · r Refresh · Esc Back",
             Some(Modal::Usage { .. }) => "Provider usage · ↑/↓ Scroll · r Refresh · Esc Close",
             Some(Modal::Pending { .. }) => "Pending questions and approvals",
             Some(Modal::Queue { .. }) => "Queued outgoing messages",
@@ -3520,6 +3554,10 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::Remote)) {
             self.draw_remote(frame, area);
+            return;
+        }
+        if matches!(self.modal, Some(Modal::Mcp(_))) {
+            self.draw_mcp(frame, area);
             return;
         }
         if matches!(self.modal, Some(Modal::Usage { .. })) {
@@ -3819,6 +3857,7 @@ impl Ui {
                 | Modal::Remote
                 | Modal::Commands { .. }
                 | Modal::Status
+                | Modal::Mcp(_)
                 | Modal::Usage { .. }
                 | Modal::Pending { .. }
                 | Modal::Queue { .. }
@@ -3992,6 +4031,26 @@ mod tests {
         ui.sessions.insert(session.id.clone(), session);
         ui.select("one".into());
         ui
+    }
+    #[test]
+    fn mcp_command_is_available_for_both_providers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        for provider in [provider::Provider::Codex, provider::Provider::Claude] {
+            ui.sessions.get_mut("one").context("fixture")?.provider = provider;
+            ui.modal = Some(Modal::Commands {
+                query: Editor::from("mcp"),
+                selected: 0,
+                skills_only: false,
+                files_only: false,
+            });
+            ui.run_palette_command("/mcp", "mcp");
+            assert!(!matches!(ui.modal, Some(Modal::Commands { .. })));
+        }
+        Ok(())
     }
     #[test]
     fn orchestrator_threads_live_in_a_separate_navigable_list() -> Result<()> {

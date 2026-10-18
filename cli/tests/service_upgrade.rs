@@ -133,7 +133,8 @@ fn same_or_newer_service_is_not_restarted() -> Result<()> {
 
 #[test]
 fn legacy_and_older_services_upgrade_once_and_preserve_interrupted_work() -> Result<()> {
-    for version in ["legacy", "0.0.1"] {
+    // Earlier 0.20.0 builds used an incompatible MCP reply shape; they must be upgraded.
+    for version in ["legacy", "0.0.1", "0.20.0"] {
         let (dir, storage) = storage()?;
         let mut old = fixture(&storage, version)?;
         let _cleanup = Cleanup(storage.clone());

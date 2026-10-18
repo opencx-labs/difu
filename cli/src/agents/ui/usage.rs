@@ -166,7 +166,7 @@ fn scalar(key: &str, value: &Value) -> String {
         _ => value.to_string(),
     }
 }
-fn text_lines(text: &str, width: u16, style: Style, output: &mut Vec<Line<'static>>) {
+pub(super) fn text_lines(text: &str, width: u16, style: Style, output: &mut Vec<Line<'static>>) {
     output.extend(
         wrapped(text, width.max(1))
             .into_iter()
