@@ -31,11 +31,8 @@ pub enum Role {
     FocusedEntry,
     SelectedCode,
     FocusedCode,
-    ShimmerPeak,
-    ShimmerNear,
-    ShimmerFar,
 }
-const ROLES: usize = Role::ShimmerFar as usize + 1;
+const ROLES: usize = Role::FocusedCode as usize + 1;
 /// 256-colour indexes reserved for roles. Widgets never draw these indexes
 /// directly; themes resolve them to any colour, including other indexes.
 const BASE: u8 = 100;
@@ -154,9 +151,6 @@ impl Base {
             (Role::FocusedEntry, mix(surface, self.accent, 0.15)),
             (Role::SelectedCode, mix(surface, self.accent, 0.22)),
             (Role::FocusedCode, mix(surface, self.text, 0.06)),
-            (Role::ShimmerPeak, rgb(self.text)),
-            (Role::ShimmerNear, mix(self.dim, self.text, 0.66)),
-            (Role::ShimmerFar, mix(self.dim, self.text, 0.33)),
         ]);
         Theme {
             id,
@@ -192,9 +186,6 @@ fn default() -> Theme {
         (Role::FocusedEntry, rgb(0x102719)),
         (Role::SelectedCode, rgb(0x124022)),
         (Role::FocusedCode, rgb(0x12151b)),
-        (Role::ShimmerPeak, rgb(0xebf0eb)),
-        (Role::ShimmerNear, rgb(0xbec8be)),
-        (Role::ShimmerFar, rgb(0x96a596)),
     ]);
     Theme {
         id: "default",
@@ -271,18 +262,6 @@ fn ansi(light: bool) -> Theme {
             (Role::FocusedEntry, tint(235, 254)),
             (Role::SelectedCode, tint(22, 194)),
             (Role::FocusedCode, tint(234, 255)),
-            (
-                Role::ShimmerPeak,
-                if light { Color::Black } else { Color::White },
-            ),
-            (
-                Role::ShimmerNear,
-                if light { Color::DarkGray } else { Color::Gray },
-            ),
-            (
-                Role::ShimmerFar,
-                if light { Color::Gray } else { Color::DarkGray },
-            ),
         ]),
     }
 }

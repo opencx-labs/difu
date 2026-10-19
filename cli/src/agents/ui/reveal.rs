@@ -84,10 +84,14 @@ impl Typing {
 
 impl Position {
     pub(super) fn animating(&self) -> bool {
+        let now = Instant::now();
         self.sent.is_some()
             || self.clearing.is_some()
             || !self.voice_flaps.is_empty()
             || self.reply.as_ref().is_some_and(|r| r.shown.is_finite())
+            || self.activity.animating(now)
+            || self.waiting.animating(now)
+            || self.boards.values().any(|board| board.animating(now))
     }
 }
 
@@ -226,22 +230,39 @@ pub(super) fn apply(
     }
 }
 
-/// Flips in the queued copy of the message just sent, which waits above the
-/// composer instead of entering the chat.
-pub(super) fn queued(
-    position: &Position,
-    text: &str,
-    line: &mut Line<'static>,
-    now: Instant,
-    width: u16,
-) {
-    if let Some(sent) = position
-        .sent
-        .as_ref()
-        .filter(|sent| sent.text == text && !sent.done(now))
-    {
-        sent.flip(std::slice::from_mut(line), now, width);
+/// Chat entries whose flip this module plays: the newest reply, which flips in
+/// at the reply speed, and the copies of a message being sent.
+pub(super) fn owned(position: &Position, session: &Session) -> HashSet<String> {
+    let mut owned: HashSet<String> = session
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == "agentMessage" && entry.data.get("difuVoice").is_none())
+        .map(|entry| entry.id.clone())
+        .into_iter()
+        .collect();
+    if let Some(sent) = &position.sent {
+        owned.extend(
+            position
+                .outgoing
+                .iter()
+                .filter(|pending| pending.text == sent.text)
+                .map(PendingSend::entry_id),
+        );
+        owned.extend(
+            session
+                .entries
+                .iter()
+                .filter(|entry| {
+                    matches!(
+                        entry.kind.as_str(),
+                        "userMessage" | "sending" | "awaiting connection"
+                    ) && entry.text.as_str() == sent.text
+                })
+                .map(|entry| entry.id.clone()),
+        );
     }
+    owned
 }
 
 /// The composer text still flipping away after a send.
