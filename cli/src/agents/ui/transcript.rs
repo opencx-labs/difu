@@ -502,6 +502,23 @@ pub(super) fn render_entries(
             lines.extend(rows);
             continue;
         }
+        if let Some(role) = super::flap::voice_role(entry) {
+            lines.extend(super::flap::rows(role, width, |width, board| {
+                wrapped(&entry.text, width)
+                    .into_iter()
+                    .map(|text| Line::from(Span::styled(text, board)))
+                    .collect()
+            }));
+            continue;
+        }
+        if entry.data.get("difuVoiceHandoff").is_some() {
+            lines.extend(
+                wrapped(&format!("↳ voice asked the agent: {}", entry.text), width)
+                    .into_iter()
+                    .map(|text| Line::from(Span::styled(text, Style::default().fg(DIM)))),
+            );
+            continue;
+        }
         match entry.kind.as_str() {
             "userMessage"
             | "awaiting connection"

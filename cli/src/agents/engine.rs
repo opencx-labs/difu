@@ -442,11 +442,38 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                 session.status = Status::Running;
             }
         }
+        "thread/realtime/started" => session.voice = true,
+        "thread/realtime/transcript/delta" | "thread/realtime/transcript/done" => {
+            let done = method.ends_with("/done");
+            let text = string(params, if done { "text" } else { "delta" });
+            voice_transcript(session, &string(params, "role"), &text, done);
+        }
+        "thread/realtime/error" => {
+            session.note("error", format!("Voice: {}", string(params, "message")));
+        }
+        "thread/realtime/closed" => {
+            session.voice = false;
+            let now = chrono::Utc::now().timestamp_millis();
+            for entry in &mut session.entries {
+                if entry.data.get("difuVoice").is_some() && entry.finished_at.is_none() {
+                    entry.finished_at = Some(now);
+                }
+            }
+            session.entries.retain(|entry| {
+                entry.data.get("difuVoice").is_none() || !entry.text.trim().is_empty()
+            });
+        }
         "item/started" | "item/completed" => {
             if let Some(item) = params.get("item") {
                 let id = string(item, "id");
                 let mut kind = string(item, "type");
                 let mut text = item_text(item);
+                // Codex frames work the voice hands over; show the request itself.
+                let handoff = (kind == "userMessage").then(|| delegation(&text)).flatten();
+                if let Some(input) = &handoff {
+                    text.clone_from(input);
+                }
+                let entry_id = id.clone();
                 if kind == "userMessage"
                     && !session.entries.iter().any(|entry| entry.id == id)
                     && let Some(entry) = session.entries.iter_mut().find(|entry| {
@@ -490,6 +517,15 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                         finished_at: (method == "item/completed")
                             .then(|| chrono::Utc::now().timestamp_millis()),
                     });
+                }
+                if handoff.is_some()
+                    && let Some(data) = session
+                        .entries
+                        .iter_mut()
+                        .find(|entry| entry.id == entry_id)
+                        .and_then(|entry| entry.data.as_object_mut())
+                {
+                    data.insert("difuVoiceHandoff".into(), json!(true));
                 }
             }
         }
@@ -790,6 +826,11 @@ fn command(
         Control::ReadUsage => {
             let usage = usage_with(rpc, &session, cancel, |v| event(store, id, v))?;
             store.update(id, |s| s.usage = usage)?;
+        }
+        Control::Voice { action, response } => {
+            // Voice failures belong to the terminal that asked, not the session.
+            let result = voice(rpc, store, id, &session, action, cancel);
+            let _ = response.send(result.map_err(|e| format!("{e:#}")));
         }
 
         Control::Message {
@@ -1142,6 +1183,142 @@ fn command(
     }
     Ok(())
 }
+/// Starts or stops Codex's realtime voice on the session's own thread, the way
+/// Codex's TUI does, so the voice can hand work to this agent. Codex streams
+/// the agent's replies back to the voice to speak.
+fn voice(
+    rpc: &mut Connection,
+    store: &Store,
+    id: &str,
+    session: &Session,
+    action: super::VoiceAction,
+    cancel: &Cancel,
+) -> Result<Option<String>> {
+    let thread = session
+        .thread_id
+        .clone()
+        .context("Wait until the session has started before talking to it")?;
+    let offer = match action {
+        super::VoiceAction::Stop => {
+            if session.voice {
+                rpc.call(
+                    "thread/realtime/stop",
+                    json!({"threadId":thread}),
+                    cancel,
+                    |v| event(store, id, v),
+                )?;
+            }
+            return Ok(None);
+        }
+        super::VoiceAction::Start { offer } => offer,
+    };
+    let outcome = |value: &Value| -> Option<Result<String, String>> {
+        let text = |key| value.pointer(key).and_then(Value::as_str).map(String::from);
+        match value.get("method").and_then(Value::as_str) {
+            Some("thread/realtime/sdp") => text("/params/sdp").map(Ok),
+            Some("thread/realtime/error" | "thread/realtime/closed") => {
+                Some(Err(text("/params/message")
+                    .or_else(|| text("/params/reason"))
+                    .unwrap_or_else(|| "closed".into())))
+            }
+            _ => None,
+        }
+    };
+    let mut answer = None;
+    rpc.call(
+        "thread/realtime/start",
+        json!({
+            "threadId": thread,
+            "outputModality": "audio",
+            "version": "v3",
+            "clientManagedHandoffs": false,
+            "includeStartupContext": false,
+            "transport": {"type": "webrtc", "sdp": offer},
+        }),
+        cancel,
+        |value| {
+            answer = answer.take().or_else(|| outcome(&value));
+            event(store, id, value)
+        },
+    )?;
+    // OpenAI's answer follows the acknowledgement as a notification.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while answer.is_none() {
+        cancel.check()?;
+        ensure!(
+            Instant::now() < deadline,
+            "Codex did not answer the voice connection; try again"
+        );
+        match rpc.output.recv_timeout(Duration::from_millis(50)) {
+            Ok(Ok(value)) => {
+                answer = outcome(&value);
+                event(store, id, value)?;
+            }
+            Ok(Err(error)) => anyhow::bail!("{error}"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => anyhow::bail!("Codex disconnected"),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+    match answer {
+        Some(Ok(answer)) => Ok(Some(answer)),
+        Some(Err(failure)) => anyhow::bail!("Codex voice failed: {failure}"),
+        None => anyhow::bail!("Codex did not answer the voice connection; try again"),
+    }
+}
+
+/// The spoken words behind a turn the voice handed to the agent.
+fn delegation(text: &str) -> Option<String> {
+    let body = text
+        .trim()
+        .strip_prefix("<realtime_delegation>")?
+        .strip_suffix("</realtime_delegation>")?;
+    let (_, input) = body.split_once("<input>")?;
+    let (input, _) = input.split_once("</input>")?;
+    Some(
+        input
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&amp;", "&"),
+    )
+}
+
+/// Live voice transcripts become chat messages tagged with `difuVoice`, so
+/// every view treats them as the user's and the voice's words.
+fn voice_transcript(session: &mut Session, role: &str, text: &str, done: bool) {
+    let (kind, role) = match role {
+        "user" => ("userMessage", "user"),
+        "assistant" => ("agentMessage", "assistant"),
+        _ => return,
+    };
+    let now = chrono::Utc::now().timestamp_millis();
+    let open = session.entries.iter_mut().rev().find(|entry| {
+        entry.finished_at.is_none()
+            && entry.data.get("difuVoice").and_then(Value::as_str) == Some(role)
+    });
+    match open {
+        Some(entry) if done => {
+            entry.text = text.trim().to_owned().into();
+            entry.finished_at = Some(now);
+        }
+        Some(entry) => entry.text.push_str(text),
+        None if text.trim().is_empty() => return,
+        None => session.entries.push(Entry {
+            id: format!("voice-{role}-{now}-{}", session.entries.len()),
+            kind: kind.into(),
+            text: text.trim_start().to_owned().into(),
+            data: json!({"difuVoice": role}).into(),
+            started_at: None,
+            finished_at: done.then_some(now),
+        }),
+    }
+    // A segment whose final text is empty was noise; drop it.
+    session.entries.retain(|entry| {
+        entry.data.get("difuVoice").is_none()
+            || entry.finished_at.is_none()
+            || !entry.text.trim().is_empty()
+    });
+}
+
 fn instructions(session: &Session) -> String {
     if session.orchestrator {
         return format!(
@@ -1286,6 +1463,8 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
             }
         }
         s.status = Status::Idle;
+        // A new Codex connection never carries an earlier voice connection.
+        s.voice = false;
     })?;
     store.save(id)?;
     Ok((rpc, resuming))
@@ -1916,6 +2095,94 @@ mod tests {
         assert_eq!(session.turn_id.as_deref(), Some("turn"));
         Ok(())
     }
+    #[test]
+    fn voice_transcripts_become_chat_messages_and_handoffs_show_the_request() {
+        let mut session = Session::new(
+            "test".into(),
+            Job::Coding(super::super::Launch {
+                repository: ".".into(),
+                isolated: true,
+                base: "HEAD".into(),
+                prompt: "task".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        let realtime = |session: &mut Session, method: &str, params: Value| {
+            apply_event(session, &json!({"method":method,"params":params}));
+        };
+        realtime(
+            &mut session,
+            "thread/realtime/started",
+            json!({"threadId":"t","version":"v3"}),
+        );
+        assert!(session.voice);
+        // Duplex chunks interleave; each role keeps its own message.
+        for (role, delta) in [
+            ("user", "Run the"),
+            ("assistant", " On it"),
+            ("user", " tests"),
+        ] {
+            realtime(
+                &mut session,
+                "thread/realtime/transcript/delta",
+                json!({"threadId":"t","role":role,"delta":delta}),
+            );
+        }
+        realtime(
+            &mut session,
+            "thread/realtime/transcript/done",
+            json!({"threadId":"t","role":"user","text":" Run the tests."}),
+        );
+        let voice: Vec<_> = session
+            .entries
+            .iter()
+            .map(|e| (e.kind.as_str(), e.text.as_str(), e.finished_at.is_some()))
+            .collect();
+        assert_eq!(
+            voice,
+            [
+                ("userMessage", "Run the tests.", true),
+                ("agentMessage", "On it", false)
+            ]
+        );
+        assert!(
+            session
+                .entries
+                .iter()
+                .all(|e| e.data.get("difuVoice").is_some())
+        );
+        apply_event(
+            &mut session,
+            &json!({"method":"item/started","params":{"item":{"id":"u1","type":"userMessage","content":[{"type":"text","text":"<realtime_delegation>\n  <input>Run the tests &amp; report</input>\n</realtime_delegation>"}]}}}),
+        );
+        let handoff = session.entries.iter().find(|e| e.id == "u1");
+        assert_eq!(
+            handoff.map(|e| e.text.as_str()),
+            Some("Run the tests & report")
+        );
+        assert!(handoff.is_some_and(|e| e.data.get("difuVoiceHandoff").is_some()));
+        // An empty final is noise; closing finishes whatever is still open.
+        realtime(
+            &mut session,
+            "thread/realtime/transcript/delta",
+            json!({"threadId":"t","role":"user","delta":"  "}),
+        );
+        realtime(
+            &mut session,
+            "thread/realtime/closed",
+            json!({"threadId":"t","reason":"requested"}),
+        );
+        assert!(!session.voice);
+        assert!(
+            session
+                .entries
+                .iter()
+                .filter(|e| e.data.get("difuVoice").is_some())
+                .all(|e| e.finished_at.is_some() && !e.text.trim().is_empty())
+        );
+    }
+
     #[test]
     fn approval_and_streaming_lifecycle() {
         let mut session = Session::new(

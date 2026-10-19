@@ -53,6 +53,7 @@ impl Position {
     pub(super) fn animating(&self) -> bool {
         self.sent.is_some()
             || self.clearing.is_some()
+            || !self.voice_flaps.is_empty()
             || self.reply.as_ref().is_some_and(|r| r.shown.is_finite())
     }
 }
@@ -154,7 +155,7 @@ pub(super) fn mask(lines: &mut [Line<'static>], shown: usize, edge: bool, width:
 }
 
 /// Rows of `id` within the rendered window, when all of them are present.
-fn rows(
+pub(super) fn rows(
     sections: &[transcript::Section],
     start: usize,
     total: usize,
@@ -184,11 +185,12 @@ pub(super) fn apply(
     now: Instant,
 ) {
     let available = lines.len();
+    // Spoken replies use the split-flap reveal instead.
     let latest = session
         .entries
         .iter()
         .rev()
-        .find(|entry| entry.kind == "agentMessage");
+        .find(|entry| entry.kind == "agentMessage" && entry.data.get("difuVoice").is_none());
     if !std::mem::replace(&mut position.replies_seen, true) || tweaks.agent_reply_cps == 0 {
         position.reply = latest.map(|entry| Reply::shown(&entry.id, now));
     } else if let Some(entry) = latest {
