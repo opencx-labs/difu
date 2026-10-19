@@ -3,19 +3,21 @@ name: Release packages
 on:
   pull_request:
     paths:
+      - cli/**
+      - '!cli/docs/**'
+      - '!cli/README.md'
+      - .github/workflows/ci.yml
       - .github/workflows/release.yml
-      - cli/scripts/**
-      - cli/Cargo.toml
-      - cli/Cargo.lock
-      - cli/src/**
-      - cli/vendor/**
-      - cli/tests/**
-      - cli/prompts/**
   push:
     tags: ["v*"]
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A newer push to a pull request supersedes its packages; tag builds always finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   reuse:
@@ -54,7 +56,8 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
-          - os: macos-15-intel
+          # Cross-compiled on Apple silicon: Intel runners are slow and scarce.
+          - os: macos-14
             target: x86_64-apple-darwin
           - os: ubuntu-24.04
             target: x86_64-unknown-linux-musl
@@ -66,17 +69,37 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           targets: ${{ matrix.target }}
+      # Pull request runs reuse their own earlier builds. A tag build that
+      # cannot reuse its PR's packages never restores a cache: it may only
+      # read main's and the tag's, which this workflow never writes.
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          workspaces: cli
+          key: ${{ matrix.target }}
+          save-if: ${{ github.event_name == 'pull_request' }}
+      # Run the existing macOS checks once, on the native ARM package runner.
+      - name: Clippy on macOS
+        if: github.event_name == 'pull_request' && matrix.target == 'aarch64-apple-darwin'
+        working-directory: cli
+        env:
+          DIFU_TARGET: ${{ matrix.target }}
+        run: |
+          rustup component add clippy
+          cargo clippy --locked --all-targets --target "$DIFU_TARGET" -- -D warnings
+      - name: Test on macOS
+        if: github.event_name == 'pull_request' && matrix.target == 'aarch64-apple-darwin'
+        working-directory: cli
+        env:
+          DIFU_TARGET: ${{ matrix.target }}
+        run: cargo test --locked --target "$DIFU_TARGET"
       - name: Install Linux build tools
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install --yes musl-tools
-      - name: Test
-        if: github.event_name == 'pull_request'
-        working-directory: cli
-        env:
-          DIFU_TARGET: ${{ matrix.target }}
-        run: cargo test --locked --target "$DIFU_TARGET"
+      - name: Install Rosetta for the Intel smoke test
+        if: matrix.target == 'x86_64-apple-darwin' && runner.arch == 'ARM64'
+        run: /usr/bin/pgrep -q oahd || sudo softwareupdate --install-rosetta --agree-to-license
       - name: Build release
         working-directory: cli
         env:
