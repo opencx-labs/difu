@@ -1,10 +1,15 @@
 name: Rust
 on:
+  # Pull requests run once; pushes to main keep the shared build cache warm.
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
 permissions:
   contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A newer push to a pull request supersedes its older run.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 jobs:
   check:
     strategy:
@@ -21,7 +26,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # Dependencies compile once on main; pull requests restore them.
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+        with:
+          workspaces: cli
       - run: cargo fmt --all -- --check
       - run: cargo clippy --locked --all-targets -- -D warnings
+      # Release builds run in the release workflow, once per target.
       - run: cargo test --locked
-      - run: cargo build --locked --release
