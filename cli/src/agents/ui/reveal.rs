@@ -1,20 +1,21 @@
-//! Chat animations from `/tweaks`: replies and sent messages type in character
-//! by character, and the composer clears gradually after sending. Masks keep
-//! each hidden character's cell, so wrapping and heights never change.
+//! Chat animations from `/tweaks`, played as Codex's split-flap: replies flip
+//! in at their speed, sent and queued messages flip in over their time, and the
+//! composer's text flips away after sending. None takes longer than the cap.
+//! The flip keeps every character's cell, so wrapping and heights never change.
+use super::flap::{self, Look};
 use super::*;
-use ratatui::style::Color;
+use crate::ui::PURPLE;
 use std::ops::Range;
 
-/// The newest characters of a reply ramp in from the dim text colour.
-const FADE: usize = 4;
-const CURSOR: char = '▌';
-
-/// Progress of the newest reply. `shown` is infinite once it is fully shown.
+/// Progress of the newest reply. `shown` is infinite once it has settled.
 #[derive(Clone, Debug)]
 pub(super) struct Reply {
     entry: String,
     shown: f64,
     at: Instant,
+    started: Instant,
+    /// When each shown character arrived.
+    arrivals: Vec<Instant>,
 }
 impl Reply {
     fn shown(entry: &str, at: Instant) -> Self {
@@ -22,28 +23,62 @@ impl Reply {
             entry: entry.to_owned(),
             shown: f64::INFINITY,
             at,
+            started: at,
+            arrivals: Vec::new(),
         }
     }
 }
 
-/// A message typing into the chat, or the composer text clearing after a send.
+/// A message flipping into the chat or the queue, or the composer's text
+/// flipping away after a send, over a fixed time.
 #[derive(Clone, Debug)]
 pub(super) struct Typing {
     text: String,
     started: Instant,
+    duration: Duration,
 }
 impl Typing {
     pub(super) fn start(text: &str, duration_ms: u32, now: Instant) -> Option<Self> {
         (duration_ms > 0 && !text.is_empty()).then(|| Self {
             text: text.to_owned(),
             started: now,
+            duration: Duration::from_millis(u64::from(duration_ms)),
         })
     }
-    /// Elapsed share of the animation, or None once it is finished.
-    fn progress(&self, duration_ms: u32, now: Instant) -> Option<f64> {
-        let fraction = now.saturating_duration_since(self.started).as_secs_f64()
-            / (f64::from(duration_ms) / 1000.0);
-        (fraction < 1.0).then_some(fraction)
+    /// When character `index` of `total` takes its turn.
+    fn at(&self, index: usize, total: usize) -> Instant {
+        self.started + self.duration.mul_f64(index as f64 / total.max(1) as f64)
+    }
+    fn done(&self, now: Instant) -> bool {
+        now >= self.started + self.duration + flap::LIFETIME
+    }
+    /// Flips this message's rows in, first character first.
+    fn flip(&self, lines: &mut [Line<'static>], now: Instant, width: u16) {
+        let total = flap::glyphs(lines).len();
+        flap::animate(
+            lines,
+            |index| Some(self.at(index, total)),
+            now,
+            self.started,
+            Look {
+                glow: ACCENT,
+                runway: false,
+            },
+            width,
+        );
+    }
+    /// Flips this text's rows away, last character first.
+    pub(super) fn vanish(&self, lines: &mut [Line<'static>], now: Instant) {
+        let total = flap::glyphs(lines).len();
+        flap::vanish(
+            lines,
+            |index| self.at(total.saturating_sub(index + 1), total),
+            now,
+            self.started,
+        );
+    }
+    pub(super) fn text(&self) -> &str {
+        &self.text
     }
 }
 
@@ -53,102 +88,6 @@ impl Position {
             || self.clearing.is_some()
             || !self.voice_flaps.is_empty()
             || self.reply.as_ref().is_some_and(|r| r.shown.is_finite())
-    }
-}
-
-/// Characters a row reveals: everything before its trailing whitespace, so
-/// padding (such as a sent message's full-width background) shows immediately.
-fn content(line: &Line) -> usize {
-    line.spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>()
-        .trim_end()
-        .chars()
-        .count()
-}
-
-pub(super) fn count(lines: &[Line]) -> usize {
-    lines.iter().map(content).sum()
-}
-
-fn push(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
-    match spans.last_mut() {
-        Some(last) if last.style == style => last.content.to_mut().push_str(text),
-        _ => spans.push(Span::styled(text.to_owned(), style)),
-    }
-}
-
-/// `age` 1 is the newest character, closest to the dim colour. Terminal
-/// palette colours (ANSI themes) cannot be blended and keep their style.
-fn fade(style: Style, age: usize) -> Style {
-    let (Color::Rgb(r, g, b), Color::Rgb(dr, dg, db)) = (
-        crate::theme::resolve(style.fg.unwrap_or(TEXT)),
-        crate::theme::resolve(DIM),
-    ) else {
-        return style;
-    };
-    let t = age as f32 / (FADE + 1) as f32;
-    let mix = |from: u8, to: u8| (f32::from(from) + (f32::from(to) - f32::from(from)) * t) as u8;
-    style.fg(Color::Rgb(mix(dr, r), mix(dg, g), mix(db, b)))
-}
-
-/// Show the first `shown` characters of `lines`. Hidden characters become blank
-/// cells of the same width in the row's own style. With `edge`, the newest
-/// characters fade in and a cursor marks where text is still arriving.
-pub(super) fn mask(lines: &mut [Line<'static>], shown: usize, edge: bool, width: u16) {
-    let total = count(lines);
-    let mut index = 0;
-    let mut last_row = None;
-    for (row, line) in lines.iter_mut().enumerate() {
-        let limit = content(line);
-        if limit > 0 {
-            last_row = Some(row);
-        }
-        let mut column = 0;
-        let mut spans = Vec::new();
-        for span in std::mem::take(&mut line.spans) {
-            for character in span.content.chars() {
-                let cells = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
-                if column >= limit {
-                    push(&mut spans, character.encode_utf8(&mut [0; 4]), span.style);
-                } else if index < shown {
-                    let style = if edge && shown - index <= FADE {
-                        fade(span.style, shown - index)
-                    } else {
-                        span.style
-                    };
-                    push(&mut spans, character.encode_utf8(&mut [0; 4]), style);
-                    index += 1;
-                } else {
-                    if edge && index == shown && cells > 0 {
-                        push(&mut spans, &CURSOR.to_string(), Style::default().fg(ACCENT));
-                        push(&mut spans, &" ".repeat(cells - 1), Style::default());
-                    } else {
-                        push(&mut spans, &" ".repeat(cells), Style::default());
-                    }
-                    index += 1;
-                }
-                column += 1;
-            }
-        }
-        line.spans = spans;
-    }
-    // Everything received so far is shown; the cursor waits after it.
-    if edge
-        && shown >= total
-        && let Some(line) = last_row.and_then(|row| lines.get_mut(row))
-        && line.width() < usize::from(width)
-    {
-        let trailing = line
-            .spans
-            .iter()
-            .rposition(|span| !span.content.trim_end().is_empty())
-            .map_or(0, |index| index + 1);
-        line.spans.insert(
-            trailing,
-            Span::styled(CURSOR.to_string(), Style::default().fg(ACCENT)),
-        );
     }
 }
 
@@ -167,9 +106,9 @@ pub(super) fn rows(
     (range.start < range.end && range.end <= available).then_some(range)
 }
 
-/// Advance this frame's animations for the drawn session and mask its newest
-/// reply and just-sent message. Replies already present when a session is first
-/// drawn are shown as they are.
+/// Advance this frame's animations for the drawn session: flip in its newest
+/// reply and just-sent message. Replies already present when a session is
+/// first drawn are shown as they are.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply(
     position: &mut Position,
@@ -183,7 +122,7 @@ pub(super) fn apply(
     now: Instant,
 ) {
     let available = lines.len();
-    // Spoken replies use the split-flap reveal instead.
+    // Spoken replies flip in from their own transcript timing.
     let latest = session
         .entries
         .iter()
@@ -196,39 +135,71 @@ pub(super) fn apply(
         let received = range
             .clone()
             .and_then(|range| lines.get(range))
-            .map_or_else(|| entry.text.chars().count(), count) as f64;
+            .map_or_else(
+                || entry.text.chars().filter(|c| !c.is_whitespace()).count(),
+                |lines| flap::glyphs(lines).len(),
+            ) as f64;
         let reply = match &mut position.reply {
             Some(reply) if reply.entry == entry.id => reply,
             reply => reply.insert(Reply {
                 entry: entry.id.clone(),
                 shown: 0.0,
                 at: now,
+                started: now,
+                arrivals: Vec::new(),
             }),
         };
-        let elapsed = now.saturating_duration_since(reply.at).as_secs_f64();
-        reply.at = now;
-        // The cap bounds how far a reply may trail what has been received.
-        let catch_up = if tweaks.max_animation_ms == 0 {
-            0.0
-        } else {
-            (received - reply.shown) / (f64::from(tweaks.max_animation_ms) / 1000.0)
-        };
-        let rate = f64::from(tweaks.agent_reply_cps).max(catch_up);
-        reply.shown = (reply.shown + rate * elapsed).min(received);
-        let streaming = entry.finished_at.is_none() && session.status.active();
-        if reply.shown >= received && !streaming {
-            reply.shown = f64::INFINITY;
-        } else if let Some(lines) = range.and_then(|range| lines.get_mut(range)) {
-            mask(lines, reply.shown as usize, true, width);
+        if reply.shown.is_finite() {
+            let (from, elapsed) = (reply.at, now.saturating_duration_since(reply.at));
+            let behind = received - reply.shown;
+            // The cap bounds how far a reply may trail what has been received.
+            let catch_up = if tweaks.max_animation_ms == 0 {
+                0.0
+            } else {
+                behind / (f64::from(tweaks.max_animation_ms) / 1000.0)
+            };
+            let rate = f64::from(tweaks.agent_reply_cps).max(catch_up);
+            let before = reply.shown;
+            reply.shown = (reply.shown + rate * elapsed.as_secs_f64()).min(received);
+            reply.at = now;
+            // Each newly shown character arrived when the reveal passed it.
+            while (reply.arrivals.len() as f64) < reply.shown.floor() {
+                let passed = (reply.arrivals.len() as f64 + 1.0 - before) / rate.max(1.0);
+                reply
+                    .arrivals
+                    .push(from + elapsed.min(Duration::from_secs_f64(passed.max(0.0))));
+            }
+            let streaming = entry.finished_at.is_none() && session.status.active();
+            let settled = reply
+                .arrivals
+                .last()
+                .is_none_or(|arrived| now >= *arrived + flap::LIFETIME);
+            if reply.shown >= received && !streaming && settled {
+                reply.shown = f64::INFINITY;
+                reply.arrivals = Vec::new();
+            } else if let Some(lines) = range.and_then(|range| lines.get_mut(range)) {
+                let arrivals = &reply.arrivals;
+                flap::animate(
+                    lines,
+                    |index| arrivals.get(index).copied(),
+                    now,
+                    reply.started,
+                    Look {
+                        glow: PURPLE,
+                        runway: streaming || reply.shown < received,
+                    },
+                    width,
+                );
+            }
         }
     }
     let Some(sent) = &position.sent else {
         return;
     };
-    let Some(fraction) = sent.progress(tweaks.sent_message_ms, now) else {
+    if sent.done(now) {
         position.sent = None;
         return;
-    };
+    }
     // The local copy is replaced by the provider's; animate whichever is newest.
     let newest = session
         .entries
@@ -244,34 +215,47 @@ pub(super) fn apply(
     let range = position
         .outgoing
         .iter()
-        // A failed send shows its retry label at once instead of typing in.
+        // A failed send shows its retry label at once instead of flipping in.
         .filter(|pending| pending.text == sent.text && pending.failed.is_none())
         .map(PendingSend::entry_id)
         .chain(newest)
         .filter_map(|id| rows(sections, start, total, available, &id))
         .max_by_key(|range| range.start);
     if let Some(lines) = range.and_then(|range| lines.get_mut(range)) {
-        let shown = (count(lines) as f64 * fraction).ceil() as usize;
-        mask(lines, shown, false, width);
+        sent.flip(lines, now, width);
     }
 }
 
-/// The composer text still visible while it clears after a send.
-pub(super) fn clearing(position: &mut Position, duration_ms: u32, now: Instant) -> Option<Editor> {
+/// Flips in the queued copy of the message just sent, which waits above the
+/// composer instead of entering the chat.
+pub(super) fn queued(
+    position: &Position,
+    text: &str,
+    line: &mut Line<'static>,
+    now: Instant,
+    width: u16,
+) {
+    if let Some(sent) = position
+        .sent
+        .as_ref()
+        .filter(|sent| sent.text == text && !sent.done(now))
+    {
+        sent.flip(std::slice::from_mut(line), now, width);
+    }
+}
+
+/// The composer text still flipping away after a send.
+pub(super) fn clearing(position: &mut Position, now: Instant) -> Option<Typing> {
     // Typing during the clear finishes it, so input is never blocked.
-    if !position.draft.chars.is_empty() {
+    if !position.draft.chars.is_empty()
+        || position
+            .clearing
+            .as_ref()
+            .is_some_and(|typing| typing.done(now))
+    {
         position.clearing = None;
     }
-    let typing = position.clearing.as_ref()?;
-    let Some(fraction) = typing.progress(duration_ms, now) else {
-        position.clearing = None;
-        return None;
-    };
-    let total = typing.text.chars().count();
-    let keep = total - ((total as f64 * fraction) as usize).min(total);
-    Some(Editor::from(
-        typing.text.chars().take(keep).collect::<String>().as_str(),
-    ))
+    position.clearing.clone()
 }
 
 #[cfg(test)]
@@ -355,52 +339,7 @@ mod tests {
     }
 
     #[test]
-    fn masks_keep_every_cell_and_show_padding_cursor_and_fade() {
-        let user = crate::ui::user_message_style();
-        let original = vec![
-            Line::from(vec![
-                Span::styled("› 日本 ok", user),
-                Span::styled("      ", user),
-            ])
-            .style(user),
-            Line::from(Span::styled("second row", Style::default().fg(TEXT))),
-        ];
-        let width = |lines: &[Line]| lines.iter().map(Line::width).collect::<Vec<_>>();
-        // A hidden wide character keeps both of its cells.
-        let mut lines = original.clone();
-        mask(&mut lines, 3, false, 80);
-        assert_eq!(width(&lines), width(&original));
-        assert_eq!(
-            text(&lines),
-            [format!("› 日{}", " ".repeat(11)), " ".repeat(10)]
-        );
-        // Row padding keeps the sent message's background; the line style stays.
-        assert_eq!(
-            lines.first().and_then(|l| l.spans.last()).map(|s| s.style),
-            Some(user)
-        );
-        assert_eq!(lines.first().map(|l| l.style), Some(user));
-
-        let mut lines = original.clone();
-        mask(&mut lines, 9, true, 80);
-        assert_eq!(width(&lines), width(&original));
-        let row = lines.get(1).cloned().unwrap_or_default();
-        assert_eq!(text(&lines).get(1).map(String::as_str), Some("se▌       "));
-        let newest = row.spans.first().map(|s| s.style.fg);
-        assert_ne!(newest, Some(Some(TEXT)), "newest characters fade in");
-        assert!(
-            row.spans
-                .iter()
-                .any(|s| s.content == "▌" && s.style.fg == Some(ACCENT))
-        );
-
-        let mut lines = original.clone();
-        mask(&mut lines, count(&original), true, 80);
-        assert_eq!(text(&lines).get(1).map(String::as_str), Some("second row▌"));
-    }
-
-    #[test]
-    fn history_shows_at_once_and_new_replies_type_in_then_finish() {
+    fn history_shows_at_once_and_new_replies_flip_in_then_settle() {
         let tweaks = Tweaks::default();
         let t0 = Instant::now();
         let mut session = session(Status::Running);
@@ -412,25 +351,35 @@ mod tests {
         );
         assert!(!position.animating());
 
-        let reply = "a".repeat(400);
+        let reply = "word ".repeat(80).trim_end().to_owned();
         session.note("agentMessage", reply.clone());
-        let shown = |lines: &[String]| lines.last().map_or(0, |l| l.matches('a').count());
+        let words = |lines: &[String]| lines.last().map_or(0, |l| l.matches("word").count());
         let first = frame(&mut position, &session, tweaks, t0);
-        assert_eq!(shown(&first), 0);
-        assert!(first.last().is_some_and(|l| l.starts_with('▌')));
+        assert_eq!(words(&first), 0, "nothing has arrived yet");
+        assert_eq!(
+            first.last().map(|l| l.chars().count()),
+            Some(reply.chars().count()),
+            "hidden characters keep their cells"
+        );
+        assert!(
+            first.last().is_some_and(|l| !l.trim().is_empty()),
+            "a runway flips ahead of the text"
+        );
         assert!(position.animating());
-        // 400 characters arrived at once: catch-up shows all within the 0.5 s
-        // cap, faster than the 200 characters per second base speed.
-        let early = frame(
+        // 320 letters arrived at once: the 500 ms cap brings them all in
+        // faster than the 200 characters per second base speed.
+        let caught_up = frame(
             &mut position,
             &session,
             tweaks,
-            t0 + Duration::from_millis(200),
+            t0 + Duration::from_millis(600),
         );
-        assert_eq!(shown(&early), 160);
-        let caught_up = frame(&mut position, &session, tweaks, t0 + Duration::from_secs(1));
-        assert_eq!(shown(&caught_up), 400);
-        assert!(position.animating(), "cursor waits while the reply streams");
+        let settled = frame(&mut position, &session, tweaks, t0 + Duration::from_secs(1));
+        assert!(words(&caught_up) < 80 && words(&settled) == 80);
+        assert!(
+            position.animating(),
+            "the runway waits while the reply streams"
+        );
 
         if let Some(entry) = session.entries.last_mut() {
             entry.finished_at = Some(1);
@@ -451,36 +400,132 @@ mod tests {
     }
 
     #[test]
-    fn sent_messages_type_in_and_the_composer_clears_over_their_durations() {
+    fn letters_flip_through_the_text_then_glow_and_settle() {
+        let t0 = Instant::now();
+        let original = vec![Line::from(Span::styled(
+            "› hello",
+            Style::default().fg(TEXT),
+        ))];
+        let look = Look {
+            glow: ACCENT,
+            runway: false,
+        };
+        let at = |offset: u64, lines: &[Line<'static>]| {
+            let mut lines = lines.to_vec();
+            flap::animate(
+                &mut lines,
+                |_| Some(t0),
+                t0 + Duration::from_millis(offset),
+                t0,
+                look,
+                80,
+            );
+            lines
+        };
+        assert_eq!(text(&at(10, &original)), ["       "], "blank at first");
+        let flipping = at(100, &original);
+        let letters: String = text(&flipping).concat();
+        assert!(
+            letters.chars().skip(2).all(|c| "helo".contains(c)),
+            "{letters}"
+        );
+        assert!(
+            flipping
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.style.fg == Some(DIM))
+        );
+        let glowing = at(250, &original);
+        assert_eq!(text(&glowing), ["› hello"]);
+        assert!(
+            glowing
+                .iter()
+                .flat_map(|l| &l.spans)
+                .any(|s| s.style.fg == Some(ACCENT))
+        );
+        assert_eq!(
+            at(400, &original),
+            original,
+            "settled text keeps its own style"
+        );
+    }
+
+    #[test]
+    fn sent_messages_flip_in_and_the_composer_flips_away_within_the_cap() {
         let tweaks = Tweaks::default();
         let t0 = Instant::now();
         let mut session = session(Status::Idle);
         session.note("userMessage", "abcdefghij");
+        // 1000 ms each, capped to 500 ms.
         let mut position = Position {
             replies_seen: true,
-            sent: Typing::start("abcdefghij", tweaks.sent_message_ms, t0),
-            clearing: Typing::start("abcdefghij", tweaks.input_clear_ms, t0),
+            sent: Typing::start("abcdefghij", tweaks.capped(tweaks.sent_message_ms), t0),
+            clearing: Typing::start("abcdefghij", tweaks.capped(tweaks.input_clear_ms), t0),
             ..Position::default()
         };
-        let half = t0 + Duration::from_millis(500);
-        assert_eq!(frame(&mut position, &session, tweaks, half), ["abcde     "]);
-        assert_eq!(
-            clearing(&mut position, tweaks.input_clear_ms, half).map(|e| e.text()),
-            Some("abcde".into())
+        let half = t0 + Duration::from_millis(250);
+        let shown = frame(&mut position, &session, tweaks, half);
+        assert!(
+            shown.first().is_some_and(|row| row.ends_with("     ")),
+            "the end has not arrived: {shown:?}"
         );
-        let end = t0 + Duration::from_millis(1000);
+        assert!(
+            shown.first().is_some_and(|row| row.starts_with("ab")),
+            "the start has settled: {shown:?}"
+        );
+        let vanishing = |position: &mut Position, at| {
+            let clearing = clearing(position, at)?;
+            let mut lines = vec![Line::from("abcdefghij")];
+            clearing.vanish(&mut lines, at);
+            Some(text(&lines).concat())
+        };
+        let gone = vanishing(&mut position, half).unwrap_or_default();
+        assert!(gone.starts_with("abc") && gone.ends_with("  "), "{gone:?}");
+        let end = t0 + Duration::from_millis(500) + flap::LIFETIME;
         assert_eq!(frame(&mut position, &session, tweaks, end), ["abcdefghij"]);
-        assert!(clearing(&mut position, tweaks.input_clear_ms, end).is_none());
+        assert!(vanishing(&mut position, end).is_none());
         assert!(!position.animating());
 
         // Typing during the clear ends it so input is never blocked.
         position.clearing = Typing::start("old draft", tweaks.input_clear_ms, t0);
         position.draft = Editor::from("n");
-        assert!(clearing(&mut position, tweaks.input_clear_ms, t0).is_none());
+        assert!(clearing(&mut position, t0).is_none());
         assert!(position.clearing.is_none());
         assert!(
             Typing::start("text", 0, t0).is_none(),
             "0 turns animations off"
         );
+        let uncapped = Tweaks {
+            max_animation_ms: 0,
+            ..tweaks
+        };
+        assert_eq!(uncapped.capped(1000), 1000);
+    }
+
+    #[test]
+    fn a_label_flips_only_the_characters_that_change() {
+        let t0 = Instant::now();
+        let mut board = flap::Board::default();
+        let row = |text: &str| {
+            vec![Line::from(Span::styled(
+                text.to_owned(),
+                Style::default().fg(DIM),
+            ))]
+        };
+        let mut first = row("Working (9s)");
+        board.show(&mut first, t0, ACCENT, 80);
+        assert_eq!(text(&first).concat().trim(), "", "a new label starts blank");
+        let mut settled = row("Working (9s)");
+        board.show(&mut settled, t0 + Duration::from_secs(1), ACCENT, 80);
+        assert_eq!(text(&settled), ["Working (9s)"]);
+        let later = t0 + Duration::from_secs(2);
+        let mut ticked = row("Working (10s)");
+        board.show(&mut ticked, later, ACCENT, 80);
+        assert_eq!(
+            text(&ticked).concat().get(..9),
+            Some("Working ("),
+            "unchanged characters stay put"
+        );
+        assert!(!text(&ticked).concat().contains("10s"));
     }
 }

@@ -5,7 +5,7 @@ use crate::storage::Tweaks;
 const LIMIT: u32 = 10_000;
 const LABELS: [&str; 4] = [
     "Agent reply speed · characters per second",
-    "Sent message types in over · milliseconds",
+    "Sent message flips in over · milliseconds",
     "Input clears over · milliseconds",
     "Longest animation · milliseconds (0 = no cap)",
 ];
@@ -104,7 +104,7 @@ impl Ui {
         let defaults = Tweaks::default();
         frame.render_widget(
             Paragraph::new(format!(
-                "Replies type in at this speed and speed up when they fall behind the stream; sent messages and input clearing take a fixed time whatever their length. None takes longer than the longest animation. 0 turns an animation off.\nDefaults: {} characters per second · {} ms · {} ms · {} ms.\nTab moves between fields · Enter saves · Esc cancels",
+                "Chat text flips in split-flap style. Replies flip in at this speed and speed up when they fall behind the stream; sent and queued messages and input clearing take a fixed time whatever their length. None takes longer than the longest animation. 0 turns an animation off.\nDefaults: {} characters per second · {} ms · {} ms · {} ms.\nTab moves between fields · Enter saves · Esc cancels",
                 defaults.agent_reply_cps,
                 defaults.sent_message_ms,
                 defaults.input_clear_ms,
