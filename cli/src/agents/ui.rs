@@ -5,6 +5,7 @@ mod cache_io;
 mod changes;
 mod commands;
 mod defaults;
+mod flap;
 mod inline_questions;
 mod mcp_panel;
 mod media;
@@ -130,6 +131,8 @@ pub struct Position {
     replies_seen: bool,
     sent: Option<reveal::Typing>,
     clearing: Option<reveal::Typing>,
+    /// Split-flap reveals of voice transcripts, by entry.
+    voice_flaps: HashMap<String, flap::Flap>,
 }
 #[derive(Clone)]
 enum Action {
@@ -159,9 +162,6 @@ enum Action {
     SlackField(usize),
     SlackSave,
     SlackDisable,
-    VoiceField,
-    VoiceSave,
-    VoiceToggle,
     TweaksField(usize),
     TweaksSave,
     ThemeChoice(usize),
@@ -210,10 +210,6 @@ pub enum Modal {
     },
     AgentDefaults(Box<defaults::Settings>),
     RepositoryRules(Box<rules::Settings>),
-    Voice {
-        key: Editor,
-        field: usize,
-    },
     Tweaks {
         fields: [Editor; 3],
         field: usize,
@@ -2104,11 +2100,7 @@ impl Ui {
             Some(Modal::Repository(editor) | Modal::ChangeRepository(editor)) => {
                 editor.insert(text)
             }
-            Some(
-                Modal::Rename(e)
-                | Modal::QueuedEdit { editor: e, .. }
-                | Modal::Voice { key: e, .. },
-            ) => e.insert(text),
+            Some(Modal::Rename(e) | Modal::QueuedEdit { editor: e, .. }) => e.insert(text),
             Some(Modal::Tweaks { fields, field }) => {
                 if let Some(editor) = fields.get_mut(*field) {
                     editor.insert(text);
@@ -2171,10 +2163,6 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::RepositoryRules(_))) {
             self.rules_key(key);
-            return;
-        }
-        if matches!(self.modal, Some(Modal::Voice { .. })) {
-            self.voice_modal_key(key);
             return;
         }
         if matches!(self.modal, Some(Modal::Tweaks { .. })) {
@@ -2469,18 +2457,11 @@ impl Ui {
                     form.field = index;
                 }
             }
-            Action::VoiceSave => self.save_voice_key(),
-            Action::VoiceToggle => self.toggle_voice(),
             Action::TweaksSave => self.save_tweaks(),
             Action::ThemeChoice(index) => self.preview_theme(index),
             Action::TweaksField(index) => {
                 if let Some(Modal::Tweaks { field, .. }) = &mut self.modal {
                     *field = index;
-                }
-            }
-            Action::VoiceField => {
-                if let Some(Modal::Voice { field, .. }) = &mut self.modal {
-                    *field = 0;
                 }
             }
             Action::QuestionTab(field) => {
@@ -3141,7 +3122,6 @@ impl Ui {
         if coding {
             self.restore_media(&id);
         }
-        let voice_status = self.voice_status();
         let composer_height = if self.inline_question() {
             self.question_height(area.width)
                 .min(area.height.saturating_sub(5))
@@ -3157,8 +3137,7 @@ impl Ui {
                 .0
                 .len()
                 .clamp(1, 10) as u16;
-            (lines + 2 + if voice_status.is_some() { 2 } else { 0 })
-                .min(area.height.saturating_sub(3))
+            (lines + 2 + self.voice_rows(area.width)).min(area.height.saturating_sub(3))
         } else {
             0
         };
@@ -3242,6 +3221,16 @@ impl Ui {
             total,
             &mut lines,
             tweaks,
+            body.width,
+            Instant::now(),
+        );
+        flap::apply(
+            position,
+            session,
+            &sections,
+            start,
+            total,
+            &mut lines,
             body.width,
             Instant::now(),
         );
@@ -3373,16 +3362,19 @@ impl Ui {
                 }
                 return;
             }
-            let composer = if voice_status.is_some() {
-                self.draw_voice_preview(
+            let voice = self
+                .voice_rows(composer.width)
+                .min(composer.height.saturating_sub(3));
+            let composer = if voice > 0 {
+                self.draw_voice(
                     frame,
-                    Rect::new(composer.x, composer.y, composer.width, 2),
+                    Rect::new(composer.x, composer.y, composer.width, voice),
                 );
                 Rect::new(
                     composer.x,
-                    composer.y + 2,
+                    composer.y + voice,
                     composer.width,
-                    composer.height.saturating_sub(2),
+                    composer.height - voice,
                 )
             } else {
                 composer
@@ -3397,7 +3389,7 @@ impl Ui {
             editor(
                 frame,
                 composer,
-                voice_status.as_deref().unwrap_or(""),
+                "",
                 clearing.as_ref().unwrap_or(&position.draft),
                 self.focus == Focus::Composer && !self.panels.focused && self.modal.is_none(),
             );
@@ -3464,7 +3456,6 @@ impl Ui {
             Some(Modal::AgentDefaults(_)) => "New agent defaults · Tab fields · Esc cancels",
             Some(Modal::RepositoryRules(_)) => "Repository rules · Tab fields",
             Some(Modal::Slack(_)) => "Slack setup · Tab fields · Esc closes",
-            Some(Modal::Voice { .. }) => "Voice settings",
             Some(Modal::Tweaks { .. }) => "Tweaks · chat animations",
             Some(Modal::Theme { .. }) => "Theme",
             Some(Modal::Remote) => "Remote control · iPhone",
@@ -3554,10 +3545,6 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::Commands { .. })) {
             self.draw_commands(frame, area);
-            return;
-        }
-        if matches!(self.modal, Some(Modal::Voice { .. })) {
-            self.draw_voice_settings(frame, area);
             return;
         }
         if matches!(self.modal, Some(Modal::Tweaks { .. })) {
@@ -3872,7 +3859,6 @@ impl Ui {
                 Modal::AgentDefaults(_)
                 | Modal::RepositoryRules(_)
                 | Modal::Slack(_)
-                | Modal::Voice { .. }
                 | Modal::Tweaks { .. }
                 | Modal::Theme { .. }
                 | Modal::Remote
@@ -3973,7 +3959,7 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
         ("Shift+Enter", "Insert a newline in the composer"),
         (
             "Hold Space",
-            "Voice dictation when enabled with /voice (macOS)",
+            "Talk when enabled with /voice: Codex sessions answer aloud, others take dictation",
         ),
         (
             "Shift+arrows",

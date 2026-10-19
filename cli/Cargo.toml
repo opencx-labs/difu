@@ -41,7 +41,6 @@ unicode-width = "0.2"
 url = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-cpal = "0.16"
 security-framework = "3"
 
 [profile.release]

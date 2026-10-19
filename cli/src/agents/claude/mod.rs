@@ -425,6 +425,11 @@ fn command(
                 mcp_control::execute(store, id, rpc, action, cancel).map_err(|e| format!("{e:#}"));
             let _ = response.send(snapshot);
         }
+        Control::Voice { response, .. } => {
+            let _ = response.send(Err(
+                "Talking to the agent needs a Codex session; Claude sessions use dictation".into(),
+            ));
+        }
         Control::ReadUsage => {
             let usage = rpc.call(json!({"subtype":"get_usage"}), cancel, |frame| {
                 mcp(store, id, frame)
