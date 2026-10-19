@@ -5,8 +5,6 @@ use super::*;
 use ratatui::style::Color;
 use std::ops::Range;
 
-/// Replies speed up so they never trail the provider's stream by more than this.
-const MAX_LAG_SECONDS: f64 = 0.8;
 /// The newest characters of a reply ramp in from the dim text colour.
 const FADE: usize = 4;
 const CURSOR: char = '▌';
@@ -209,8 +207,13 @@ pub(super) fn apply(
         };
         let elapsed = now.saturating_duration_since(reply.at).as_secs_f64();
         reply.at = now;
-        let rate =
-            f64::from(tweaks.agent_reply_cps).max((received - reply.shown) / MAX_LAG_SECONDS);
+        // The cap bounds how far a reply may trail what has been received.
+        let catch_up = if tweaks.max_animation_ms == 0 {
+            0.0
+        } else {
+            (received - reply.shown) / (f64::from(tweaks.max_animation_ms) / 1000.0)
+        };
+        let rate = f64::from(tweaks.agent_reply_cps).max(catch_up);
         reply.shown = (reply.shown + rate * elapsed).min(received);
         let streaming = entry.finished_at.is_none() && session.status.active();
         if reply.shown >= received && !streaming {
@@ -416,15 +419,15 @@ mod tests {
         assert_eq!(shown(&first), 0);
         assert!(first.last().is_some_and(|l| l.starts_with('▌')));
         assert!(position.animating());
-        // 400 characters arrived at once: catch-up shows all within 0.8 s,
-        // faster than the 200 characters per second base speed.
-        let quarter = frame(
+        // 400 characters arrived at once: catch-up shows all within the 0.5 s
+        // cap, faster than the 200 characters per second base speed.
+        let early = frame(
             &mut position,
             &session,
             tweaks,
             t0 + Duration::from_millis(200),
         );
-        assert_eq!(shown(&quarter), 100);
+        assert_eq!(shown(&early), 160);
         let caught_up = frame(&mut position, &session, tweaks, t0 + Duration::from_secs(1));
         assert_eq!(shown(&caught_up), 400);
         assert!(position.animating(), "cursor waits while the reply streams");

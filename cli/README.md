@@ -330,12 +330,13 @@ Opening a session keeps the composer focused; pending questions remain available
 through the questions control.
 
 Replies type in character by character at 200 characters per second, speeding up
-when they fall more than 0.8 seconds behind the stream; replies already in a
-session when you open it appear at once. A sent message types into the chat over
-1 second while the composer clears over 1 second, whatever their length; typing
-during the clear finishes it immediately. **/tweaks** (also in the command
-palette) changes these three values, saved in the difu config; 0 turns an
-animation off.
+so they never trail the stream by more than the longest animation; replies
+already in a session when you open it appear at once. A sent message types into
+the chat over 1 second while the composer clears over 1 second, whatever their
+length; typing during the clear finishes it immediately. No animation takes
+longer than the longest animation, 0.5 seconds by default. **/tweaks** (also in
+the command palette) changes these four values, saved in the difu config; 0 turns
+an animation off, and a longest animation of 0 removes the limit.
 
 **/theme** (also in the command palette) picks a colour theme for all of difu:
 the accent, text, borders, diffs, status colours, and syntax highlighting. Moving

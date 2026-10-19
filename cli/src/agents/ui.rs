@@ -211,7 +211,7 @@ pub enum Modal {
     AgentDefaults(Box<defaults::Settings>),
     RepositoryRules(Box<rules::Settings>),
     Tweaks {
-        fields: [Editor; 3],
+        fields: Box<[Editor; 4]>,
         field: usize,
     },
     Theme {
@@ -4021,6 +4021,7 @@ mod tests {
             agent_reply_cps: 0,
             sent_message_ms: 0,
             input_clear_ms: 0,
+            max_animation_ms: 0,
         };
     }
     fn state(storage: Storage) -> Ui {
@@ -7229,6 +7230,7 @@ mod tests {
         set(&mut ui, "120");
         set(&mut ui, "0");
         set(&mut ui, "20000");
+        set(&mut ui, "300");
         ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(ui.modal, Some(Modal::Tweaks { .. })));
         assert!(
@@ -7238,12 +7240,14 @@ mod tests {
         );
         assert_eq!(ui.tweaks, crate::storage::Tweaks::default());
         ui.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
         set(&mut ui, "750");
         ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let expected = crate::storage::Tweaks {
             agent_reply_cps: 120,
             sent_message_ms: 0,
             input_clear_ms: 750,
+            max_animation_ms: 300,
         };
         assert!(ui.modal.is_none());
         assert_eq!(ui.tweaks, expected);
