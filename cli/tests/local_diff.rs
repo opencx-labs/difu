@@ -250,7 +250,14 @@ fn discovery_skips_dependencies_symlinks_and_nested_repositories_and_lists_workt
         config: root.join("config.json"),
         cache: root.join("cache"),
     };
-    storage.save_config(&config)?;
+    let (roots, repositories) = (
+        config.local_diff_roots.clone(),
+        config.local_diff_repositories.clone(),
+    );
+    storage.update_config(|saved| {
+        saved.local_diff_roots = roots;
+        saved.local_diff_repositories = repositories;
+    })?;
     assert_eq!(
         storage.load_config()?.local_diff_repositories,
         config.local_diff_repositories

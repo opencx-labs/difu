@@ -134,16 +134,15 @@ impl Ui {
             return;
         }
         let text = form.text.text();
-        let result = self.storage.load_config().and_then(|mut config| {
+        let result = self.storage.update_config(|config| {
             if text.trim().is_empty() {
                 config.repository_rules.remove(root);
             } else {
                 config.repository_rules.insert(root.clone(), text);
             }
-            self.storage.save_config(&config)
         });
         match result {
-            Ok(()) => {
+            Ok(_) => {
                 self.close_rules();
                 self.notice = Some(("Repository rules saved for new sessions".into(), false));
             }

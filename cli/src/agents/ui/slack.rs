@@ -78,14 +78,12 @@ impl Ui {
         };
         self.slack.saving = None;
         let result = result.and_then(|settings| {
-            let mut config = self.storage.load_config().map_err(|e| format!("{e:#}"))?;
-            config.slack = Some(settings);
             self.storage
-                .save_config(&config)
+                .update_config(|config| config.slack = Some(settings))
                 .map_err(|e| format!("{e:#}"))
         });
         self.notice = Some(match result {
-            Ok(()) => (
+            Ok(_) => (
                 "Slack enabled · message difu directly, or mention it in your configured channel"
                     .into(),
                 false,
@@ -97,15 +95,13 @@ impl Ui {
         if self.slack.saving.is_some() {
             return;
         }
-        let result = (|| -> anyhow::Result<()> {
-            let mut config = self.storage.load_config()?;
+        let result = self.storage.update_config(|config| {
             if let Some(settings) = &mut config.slack {
                 settings.enabled = false;
             }
-            self.storage.save_config(&config)
-        })();
+        });
         self.notice = Some(match result {
-            Ok(()) => ("Slack disabled".into(), false),
+            Ok(_) => ("Slack disabled".into(), false),
             Err(error) => (format!("{error:#}"), true),
         });
         self.modal = None;

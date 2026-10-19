@@ -79,12 +79,11 @@ impl Ui {
         let Some(choice) = theme::themes().get(selected) else {
             return;
         };
-        let saved = self.storage.load_config().and_then(|mut config| {
-            config.theme = (selected != 0).then(|| choice.id.to_owned());
-            self.storage.save_config(&config)
-        });
+        let saved = self
+            .storage
+            .update_config(|config| config.theme = (selected != 0).then(|| choice.id.to_owned()));
         match saved {
-            Ok(()) => {
+            Ok(_) => {
                 self.theme = selected;
                 theme::select(selected);
                 self.modal = None;

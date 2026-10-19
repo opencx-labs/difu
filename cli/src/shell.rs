@@ -57,10 +57,10 @@ impl Shell {
         self.agents.cancel_voice();
         self.agents_active = agents;
         self.reviews.config.last_tab_agents = agents;
-        let saved = self.reviews.storage.load_config().and_then(|mut config| {
-            config.last_tab_agents = agents;
-            self.reviews.storage.save_config(&config)
-        });
+        let saved = self
+            .reviews
+            .storage
+            .update_config(|config| config.last_tab_agents = agents);
         if let Err(error) = saved {
             self.agents.notice = Some((format!("Could not save the active tab: {error:#}"), true));
         }

@@ -287,10 +287,8 @@ impl Ui {
             return;
         }
         self.voice.enabled = !self.voice.enabled;
-        let result = self.storage.load_config().and_then(|mut c| {
-            c.voice_enabled = self.voice.enabled;
-            self.storage.save_config(&c)
-        });
+        let enabled = self.voice.enabled;
+        let result = self.storage.update_config(|c| c.voice_enabled = enabled);
         if let Err(error) = result {
             self.notice = Some((format!("Could not save voice setting: {error:#}"), true));
         }

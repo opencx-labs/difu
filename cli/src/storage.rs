@@ -163,7 +163,7 @@ impl Storage {
             for name in &config.pinned_repositories {
                 crate::model::validate_repository(name)?;
             }
-            self.save_config(&config)?;
+            atomic_json(&self.config, &config)?;
         }
         Ok(config)
     }
@@ -189,6 +189,32 @@ impl Storage {
         atomic_json(&root.join("repositories.json"), &repos)
     }
 
+    /// Applies `change` to the settings on disk and returns the result.
+    ///
+    /// Every settings writer goes through here. Agents, Reviews, PR panes and
+    /// the background service each keep their own copy of the settings, so
+    /// saving a whole in-memory copy would undo whatever another part of difu
+    /// saved since that copy was loaded.
+    pub fn update_config(&self, change: impl FnOnce(&mut Config)) -> Result<Config> {
+        let _lock = self.config_lock()?;
+        let mut config = self.load_config()?;
+        change(&mut config);
+        atomic_json(&self.config, &config)?;
+        Ok(config)
+    }
+    /// Serialises read-modify-write cycles across difu's processes.
+    fn config_lock(&self) -> Result<nix::fcntl::Flock<fs::File>> {
+        let path = self.config.with_extension("json.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("Cannot open {}", path.display()))?;
+        nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusive)
+            .map_err(|(_, error)| anyhow::anyhow!("Cannot lock difu settings: {error}"))
+    }
+    #[cfg(test)]
     pub fn save_config(&self, config: &Config) -> Result<()> {
         atomic_json(&self.config, config)
     }
