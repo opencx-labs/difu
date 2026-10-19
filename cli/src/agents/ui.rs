@@ -173,6 +173,7 @@ enum Action {
     DefaultOption(usize),
     ModelField(usize),
     ModelOption(usize),
+    PickerOption(usize),
     DefaultSave,
     DefaultRules,
     RulesField(usize),
@@ -260,6 +261,7 @@ pub enum Modal {
         effort: Editor,
         field: usize,
     },
+    ModelPicker(Box<models::Picker>),
     Approval {
         pending: Pending,
         selected: usize,
@@ -1154,7 +1156,7 @@ impl Ui {
             "Continue session",
             "Interrupt / cancel job",
             "Rename session",
-            "Change model / reasoning",
+            "Change model / reasoning · Alt+M",
             if archived {
                 "Unarchive session"
             } else {
@@ -1213,7 +1215,7 @@ impl Ui {
                 }
                 self.modal = Some(Modal::Rename(editor));
             }
-            4 => self.open_model(0),
+            4 => self.open_model_picker(),
             5 => {
                 if let Some(id) = self.selected.clone() {
                     let archived = !self.sessions.get(&id).is_some_and(|s| s.archived);
@@ -1529,6 +1531,14 @@ impl Ui {
         }
         if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('d') {
             self.toggle_changes();
+            return;
+        }
+        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('m') {
+            if matches!(self.modal, Some(Modal::ModelPicker(_))) {
+                self.modal = None;
+            } else {
+                self.open_model_picker();
+            }
             return;
         }
         if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT) {
@@ -2151,6 +2161,10 @@ impl Ui {
             self.model_key(key);
             return;
         }
+        if matches!(self.modal, Some(Modal::ModelPicker(_))) {
+            self.picker_key(key);
+            return;
+        }
         if matches!(self.modal, Some(Modal::AgentDefaults(_))) {
             self.defaults_key(key);
             return;
@@ -2352,6 +2366,7 @@ impl Ui {
             Action::DismissNotice => self.notice = None,
             Action::ModelField(index) => self.model_field(index),
             Action::ModelOption(index) => self.model_option(index),
+            Action::PickerOption(index) => self.picker_option(index),
             Action::DefaultOption(index) => self.default_option(index),
             Action::DefaultField(index) => {
                 if let Some(Modal::AgentDefaults(form)) = &mut self.modal {
@@ -3465,6 +3480,7 @@ impl Ui {
             Some(Modal::QueuedEdit { .. }) => "Edit queued message",
             Some(Modal::Rename(_)) => "Rename session",
             Some(Modal::Model { .. }) => "Session model",
+            Some(Modal::ModelPicker(_)) => "Select model · ↑/↓ Select · ←/→ Effort · Esc Cancel",
             Some(Modal::Approval { .. }) => "Agent needs your input",
             Some(Modal::Resources {
                 artifacts: true, ..
@@ -3522,6 +3538,10 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::Model { .. })) {
             self.draw_model(frame, area);
+            return;
+        }
+        if matches!(self.modal, Some(Modal::ModelPicker(_))) {
+            self.draw_picker(frame, area);
             return;
         }
         if matches!(self.modal, Some(Modal::AgentDefaults(_))) {
@@ -3589,6 +3609,7 @@ impl Ui {
             Some(
                 Modal::Transcript { .. }
                 | Modal::Model { .. }
+                | Modal::ModelPicker(_)
                 | Modal::Resources { .. }
                 | Modal::InstallBrowser { .. },
             ) => {}
@@ -3924,6 +3945,10 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
             "Move shell / artifact between side pane and main area",
         ),
         ("Alt+D", "Open or close Changes with file tree"),
+        (
+            "Alt+M",
+            "Pick a Codex or Claude Code model and reasoning level; Enter also sets the default",
+        ),
         (
             "Enter in composer",
             "Send message; steer active turn immediately",
@@ -5885,6 +5910,114 @@ mod tests {
                 .is_empty()
         );
         assert!(!ui.busy);
+        Ok(())
+    }
+    #[test]
+    fn alt_m_model_picker_snaps_to_the_current_model_and_applies_or_saves_defaults() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let socket = super::super::server::socket(&storage)?;
+        let listener = UnixListener::bind(socket)?;
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                let mut line = String::new();
+                BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+                let request: Request = serde_json::from_str(&line)?;
+                serde_json::to_writer(&mut stream, &Reply::Ok)?;
+                stream.write_all(b"\n")?;
+                tx.send(request)?;
+            }
+            Ok(())
+        });
+        let mut ui = state(storage);
+        ui.skills.insert("one".into(), (Vec::new(), Vec::new()));
+        ui.model_completion.options = vec![
+            crate::model::ModelInfo {
+                id: "fixture-astra".into(),
+                name: "Astra".into(),
+                efforts: vec!["high".into()],
+            },
+            crate::model::ModelInfo {
+                id: "claude/fixture-luna".into(),
+                name: "Claude Code · Luna".into(),
+                efforts: vec!["low".into(), "medium".into()],
+            },
+        ];
+        {
+            let session = ui.sessions.get_mut("one").context("session")?;
+            session.model = Some("claude/fixture-luna".into());
+            session.effort = Some("medium".into());
+        }
+        ui.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+        assert!(matches!(ui.modal, Some(Modal::ModelPicker(_))));
+        let (screen, _) = draw(&mut ui, 100, 30)?;
+        assert!(screen.contains("Select model"));
+        assert!(screen.contains("1. Astra") && screen.contains("2. Claude Code · Luna ✔"));
+        assert!(screen.contains("Medium effort"), "{screen}");
+        // The highlighted row is the session's model, so Enter keeps it and raises the effort.
+        ui.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        let (screen, _) = draw(&mut ui, 100, 30)?;
+        assert!(screen.contains("Low effort"), "{screen}");
+        ui.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        let (screen, _) = draw(&mut ui, 100, 30)?;
+        // Astra does not support "low", so the effort falls back to the model default.
+        assert!(screen.contains("Default effort"), "{screen}");
+        ui.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(ui.modal.is_none());
+        match rx.recv_timeout(Duration::from_secs(5))? {
+            Request::Control {
+                id,
+                control: Control::Model { model, effort },
+            } => {
+                assert_eq!(id, "one");
+                assert_eq!(model.as_deref(), Some("fixture-astra"));
+                assert_eq!(effort.as_deref(), Some("high"));
+            }
+            other => anyhow::bail!("Unexpected request: {other:?}"),
+        }
+        assert!(ui.defaults.model.is_none());
+        ui.busy = false;
+        // Enter saves the pick for new sessions and applies it to the open session.
+        ui.open_commands(false);
+        ui.paste("model");
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(ui.modal, Some(Modal::ModelPicker(_))));
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(ui.modal.is_none());
+        match rx.recv_timeout(Duration::from_secs(5))? {
+            Request::Control {
+                id,
+                control: Control::Model { model, effort },
+            } => {
+                assert_eq!(id, "one");
+                assert_eq!(model.as_deref(), Some("claude/fixture-luna"));
+                assert_eq!(effort.as_deref(), Some("medium"));
+            }
+            other => anyhow::bail!("Unexpected request: {other:?}"),
+        }
+        assert_eq!(ui.defaults.model.as_deref(), Some("claude/fixture-luna"));
+        assert_eq!(ui.defaults.effort.as_deref(), Some("medium"));
+        let saved = ui.storage.load_config()?.agent_defaults;
+        assert_eq!(saved.model.as_deref(), Some("claude/fixture-luna"));
+        assert_eq!(saved.effort.as_deref(), Some("medium"));
+        ui.busy = false;
+        ui.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+        let (screen, _) = draw(&mut ui, 100, 30)?;
+        assert!(screen.contains("claude/fixture-luna · default"), "{screen}");
+        ui.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(matches!(ui.modal, Some(Modal::Model { field: 0, .. })));
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
         Ok(())
     }
     #[test]

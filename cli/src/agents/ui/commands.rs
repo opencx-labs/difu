@@ -383,7 +383,7 @@ impl Ui {
             "/tweaks" => self.open_tweaks(),
             "/theme" => self.open_theme(),
             "/compact" => self.control(Control::Compact),
-            "/model" => self.open_model(0),
+            "/model" => self.open_model_picker(),
             "/effort" => self.open_model(1),
             "/skills" => self.open_commands(true),
             "/status" => self.modal = Some(Modal::Status),
