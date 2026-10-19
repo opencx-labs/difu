@@ -133,8 +133,14 @@ pub struct Position {
     clearing: Option<reveal::Typing>,
     /// Split-flap reveals of voice transcripts, by entry.
     voice_flaps: HashMap<String, flap::Flap>,
-    /// The working indicator's label, flipping as it changes.
+    /// The working indicator, flipping as it changes.
     activity: flap::Board,
+    /// Messages waiting above the composer, flipping in as they are queued.
+    waiting: flap::Board,
+    /// Chat entries flipping as they appear and change, by entry.
+    boards: HashMap<String, flap::Board>,
+    /// Entries present when the session was first drawn, which never flip in.
+    known: Option<HashSet<String>>,
 }
 #[derive(Clone)]
 enum Action {
@@ -3171,9 +3177,9 @@ impl Ui {
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
-        let (mut activity_rows, heading) =
+        let mut activity_rows =
             transcript::activity(session, area.width, chrono::Utc::now().timestamp_millis());
-        let (waiting, queued) = transcript::waiting_rows(
+        let waiting = transcript::waiting_messages(
             session,
             area.width,
             self.positions
@@ -3181,18 +3187,29 @@ impl Ui {
                 .map(|p| p.outgoing.as_slice())
                 .unwrap_or_default(),
         );
-        let waiting_start = activity_rows.len();
+        let working = activity_rows.len();
         activity_rows.extend(waiting);
         if let Some(position) = self.positions.get_mut(&id) {
             let now = Instant::now();
-            match activity_rows.get_mut(..heading) {
-                Some(rows) if heading > 0 => position.activity.show(rows, now, ACCENT, area.width),
-                _ => position.activity = flap::Board::default(),
+            let tweaks = self.tweaks;
+            let (working, waiting) = activity_rows.split_at_mut(working);
+            if working.is_empty() {
+                position.activity = flap::Board::default();
+            } else {
+                position.activity.show(working, now, ACCENT, area.width);
             }
-            for (row, text) in queued {
-                if let Some(line) = activity_rows.get_mut(waiting_start + row) {
-                    reveal::queued(position, &text, line, now, area.width);
-                }
+            // Queued messages flip in over the sent-message time.
+            let sent = Duration::from_millis(u64::from(tweaks.capped(tweaks.sent_message_ms)));
+            // Messages already waiting when the session opens show at once.
+            let opening = position.known.is_none();
+            if waiting.is_empty() {
+                position.waiting = flap::Board::default();
+            } else if sent.is_zero() || opening {
+                position.waiting.settle(waiting, now);
+            } else {
+                position
+                    .waiting
+                    .show_over(waiting, now, ACCENT, area.width, |_| sent);
             }
         }
         let activity_height = (activity_rows.len().min(usize::from(area.height / 3))) as u16;
@@ -3246,6 +3263,17 @@ impl Ui {
             mut total,
             sections,
         } = view;
+        flap::chat(
+            position,
+            session,
+            &sections,
+            start,
+            total,
+            &mut lines,
+            tweaks,
+            body.width,
+            Instant::now(),
+        );
         reveal::apply(
             position,
             session,
@@ -5059,7 +5087,8 @@ mod tests {
         let session = ui.sessions.get_mut("one").context("session")?;
         session.entries.first_mut().context("tool")?.finished_at = Some(2);
         session.touch();
-        let (screen, _) = draw(&mut ui, 150, 40)?;
+        // Moving into the chat, the message flips in.
+        let (screen, _) = draw_settled(&mut ui, 150, 40)?;
         assert_eq!(screen.matches("Follow up").count(), 1);
         assert!(screen.contains("› Follow up"));
         assert!(screen.contains("↳ Next turn"));
@@ -5072,7 +5101,7 @@ mod tests {
             .first_mut()
             .context("outgoing")?
             .text = "Another follow up".into();
-        let (screen, _) = draw(&mut ui, 150, 40)?;
+        let (screen, _) = draw_settled(&mut ui, 150, 40)?;
         assert!(screen.contains("› Another follow up"));
         assert!(!screen.contains("› Follow up"));
         Ok(())
@@ -6622,11 +6651,16 @@ mod tests {
         assert_eq!(ui.summaries.len(), 2); // Hiding never deletes review-job history.
         Ok(())
     }
-    /// Draws once the working indicator's label has flipped in.
+    /// Draws once everything new on screen has flipped in.
     fn draw_settled(ui: &mut Ui, width: u16, height: u16) -> Result<(String, Option<(u16, u16)>)> {
         draw(ui, width, height)?;
         for position in ui.positions.values_mut() {
-            position.activity.age(Duration::from_secs(1));
+            for board in [&mut position.activity, &mut position.waiting]
+                .into_iter()
+                .chain(position.boards.values_mut())
+            {
+                board.age(Duration::from_secs(1));
+            }
         }
         draw(ui, width, height)
     }

@@ -10,6 +10,7 @@ use ratatui::{
     style::{Color, Style},
     text::{Line, Span},
 };
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 pub(super) const FRAME: Duration = Duration::from_millis(45);
@@ -247,15 +248,21 @@ pub(super) fn vanish(
     }
 }
 
-/// A label whose changed characters flip while unchanged ones stay put, like
-/// a departure board: a ticking counter flips only its new digits.
+/// Text whose changed characters flip while unchanged ones stay put, like a
+/// departure board: a ticking counter flips only its new digits.
 #[derive(Default)]
 pub(super) struct Board {
     glyphs: Vec<char>,
     arrivals: Vec<Instant>,
     phase: Option<Instant>,
+    /// When the newest flip has settled.
+    until: Option<Instant>,
 }
+/// A digit that changed this recently updates in place rather than flipping
+/// again, so fast counters such as tool timings stay readable.
+const DIGIT_REFLIP: Duration = Duration::from_secs(1);
 impl Board {
+    /// Flips changes in Codex's short stagger: labels and notes.
     pub(super) fn show(
         &mut self,
         lines: &mut [Line<'static>],
@@ -263,24 +270,21 @@ impl Board {
         glow: Color,
         width: u16,
     ) {
-        let glyphs = glyphs(lines);
-        if glyphs != self.glyphs {
-            let mut changed = 0;
-            self.arrivals = glyphs
-                .iter()
-                .enumerate()
-                .map(|(index, character)| {
-                    match (self.glyphs.get(index), self.arrivals.get(index)) {
-                        (Some(old), Some(at)) if old == character => *at,
-                        _ => {
-                            changed += 1;
-                            now + stagger(changed - 1)
-                        }
-                    }
-                })
-                .collect();
-            self.glyphs = glyphs;
-        }
+        self.show_over(lines, now, glow, width, |changed| {
+            stagger(changed.saturating_sub(1))
+        });
+    }
+    /// Flips changes in reading order, spreading their arrivals over `spread`
+    /// of how many characters changed.
+    pub(super) fn show_over(
+        &mut self,
+        lines: &mut [Line<'static>],
+        now: Instant,
+        glow: Color,
+        width: u16,
+        spread: impl Fn(usize) -> Duration,
+    ) {
+        self.update(glyphs(lines), now, spread);
         let phase = *self.phase.get_or_insert(now);
         let arrivals = &self.arrivals;
         animate(
@@ -295,13 +299,64 @@ impl Board {
             width,
         );
     }
+    /// Takes these rows as they are, without flipping them.
+    pub(super) fn settle(&mut self, lines: &[Line<'static>], now: Instant) {
+        let rested = now.checked_sub(LIFETIME).unwrap_or(now);
+        let glyphs = glyphs(lines);
+        if glyphs != self.glyphs {
+            self.arrivals = vec![rested; glyphs.len()];
+            self.glyphs = glyphs;
+        }
+    }
+    pub(super) fn animating(&self, now: Instant) -> bool {
+        self.until.is_some_and(|until| now < until)
+    }
+    fn is_empty(&self) -> bool {
+        self.glyphs.is_empty() && self.phase.is_none()
+    }
+    fn update(&mut self, glyphs: Vec<char>, now: Instant, spread: impl Fn(usize) -> Duration) {
+        if glyphs == self.glyphs {
+            return;
+        }
+        let changed: Vec<usize> = glyphs
+            .iter()
+            .enumerate()
+            .filter(|(index, character)| {
+                let old = self.glyphs.get(*index);
+                let recent = self
+                    .arrivals
+                    .get(*index)
+                    .is_some_and(|at| now.saturating_duration_since(*at) < DIGIT_REFLIP);
+                match old {
+                    Some(old) if old == *character => false,
+                    Some(old) if old.is_ascii_digit() && character.is_ascii_digit() => !recent,
+                    _ => true,
+                }
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let total = spread(changed.len());
+        let mut arrivals: Vec<Instant> = (0..glyphs.len())
+            .map(|index| self.arrivals.get(index).copied().unwrap_or(now))
+            .collect();
+        for (order, index) in changed.iter().enumerate() {
+            if let Some(arrival) = arrivals.get_mut(*index) {
+                *arrival = now + total.mul_f64(order as f64 / changed.len().max(1) as f64);
+            }
+        }
+        if let Some(last) = changed.last().and_then(|index| arrivals.get(*index)) {
+            self.until = Some(*last + LIFETIME);
+        }
+        self.arrivals = arrivals;
+        self.glyphs = glyphs;
+    }
 }
 
 #[cfg(test)]
 impl Board {
     /// Moves every arrival back, as if `by` had passed.
     pub(super) fn age(&mut self, by: Duration) {
-        for arrival in &mut self.arrivals {
+        for arrival in self.arrivals.iter_mut().chain(self.until.as_mut()) {
             *arrival = arrival.checked_sub(by).unwrap_or(*arrival);
         }
     }
@@ -392,6 +447,84 @@ impl Flap {
         }
         lines
     }
+}
+
+/// Flips every chat entry that appears or changes after the session was first
+/// drawn: tool calls and their details, reasoning, plans, notes and messages.
+/// Entries already there show as they are. The newest reply, a message being
+/// sent and voice transcripts play their own flips.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn chat(
+    position: &mut Position,
+    session: &Session,
+    sections: &[transcript::Section],
+    start: usize,
+    total: usize,
+    lines: &mut [Line<'static>],
+    tweaks: crate::storage::Tweaks,
+    width: u16,
+    now: Instant,
+) {
+    let mut owned = reveal::owned(position, session);
+    let mut users = HashSet::new();
+    for entry in &session.entries {
+        if voice_role(entry).is_some() {
+            owned.insert(entry.id.clone());
+        } else if matches!(
+            entry.kind.as_str(),
+            "userMessage"
+                | "sending"
+                | "awaiting connection"
+                | "unsent"
+                | "unsent or unacknowledged"
+        ) {
+            users.insert(entry.id.as_str());
+        }
+    }
+    let opening = position.known.is_none();
+    let known = position
+        .known
+        .get_or_insert_with(|| session.entries.iter().map(|e| e.id.clone()).collect());
+    // New text arrives at the reply speed, within the longest animation.
+    let cps = tweaks.agent_reply_cps;
+    let spread = |changed: usize| {
+        let paced = Duration::from_secs_f64(changed as f64 / f64::from(cps.max(1)));
+        match tweaks.max_animation_ms {
+            0 => paced,
+            cap => paced.min(Duration::from_millis(u64::from(cap))),
+        }
+    };
+    let available = lines.len();
+    let mut drawn = HashSet::new();
+    for section in sections {
+        let Some(rows) = reveal::rows(sections, start, total, available, &section.id)
+            .and_then(|range| lines.get_mut(range))
+        else {
+            continue;
+        };
+        drawn.insert(section.id.clone());
+        let board = position.boards.entry(section.id.clone()).or_default();
+        let fresh = board.is_empty();
+        if owned.contains(&section.id)
+            || cps == 0
+            || opening
+            || (fresh && known.contains(&section.id))
+        {
+            board.settle(rows, now);
+        } else {
+            let glow = if users.contains(section.id.as_str())
+                || section.id.starts_with("difu-outgoing-")
+            {
+                ACCENT
+            } else {
+                PURPLE
+            };
+            board.show_over(rows, now, glow, width, spread);
+        }
+        known.insert(section.id.clone());
+    }
+    // Entries out of view rest; coming back into view does not flip them.
+    position.boards.retain(|id, _| drawn.contains(id));
 }
 
 /// The surface the dictation preview sits on.
@@ -579,6 +712,80 @@ mod tests {
         assert!(!position.voice_flaps.contains_key("old"));
         let settled = frame(&mut position, start + Duration::from_secs(1));
         assert!(settled.contains("› hello there"), "{settled}");
+    }
+
+    #[test]
+    fn chat_entries_flip_in_when_new_and_flip_only_their_changes() {
+        use crate::agents::{Job, Launch};
+        let mut session = Session::new(
+            "chat".into(),
+            Job::Coding(Launch {
+                repository: "/tmp/project".into(),
+                isolated: true,
+                base: "HEAD".into(),
+                prompt: "Task".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.note("system", "Earlier note");
+        let frame = |position: &mut Position,
+                     session: &Session,
+                     tweaks: crate::storage::Tweaks,
+                     at: Instant| {
+            let (mut lines, sections) = transcript::render(session, position, 60, false);
+            let total = lines.len();
+            chat(
+                position, session, &sections, 0, total, &mut lines, tweaks, 60, at,
+            );
+            plain(&lines)
+        };
+        let tweaks = crate::storage::Tweaks::default();
+        let mut position = Position::default();
+        let t0 = Instant::now();
+        assert!(frame(&mut position, &session, tweaks, t0).contains("Earlier note"));
+        session.note("error", "Build failed");
+        let first = frame(&mut position, &session, tweaks, t0);
+        assert!(first.contains("Earlier note"), "history stays put");
+        assert!(!first.contains("Build failed"), "new text starts blank");
+        assert!(position.animating());
+        let t1 = t0 + Duration::from_secs(1);
+        assert!(frame(&mut position, &session, tweaks, t1).contains("Build failed"));
+        if let Some(entry) = session.entries.last_mut() {
+            entry.text = "Build failed twice".to_owned().into();
+        }
+        let changed = frame(&mut position, &session, tweaks, t1);
+        assert!(changed.contains("Build failed") && !changed.contains("twice"));
+        let t2 = t1 + Duration::from_secs(1);
+        assert!(frame(&mut position, &session, tweaks, t2).contains("Build failed twice"));
+        // A reply speed of 0 turns the flip off.
+        let off = crate::storage::Tweaks {
+            agent_reply_cps: 0,
+            ..tweaks
+        };
+        session.note("error", "Shown at once");
+        assert!(frame(&mut position, &session, off, t2).contains("Shown at once"));
+    }
+
+    #[test]
+    fn fast_counters_update_in_place_between_flips() {
+        let row = |text: &str| vec![Line::from(text.to_owned())];
+        let t0 = Instant::now();
+        let mut board = Board::default();
+        board.settle(&row("Ran ls · done · 1.2s"), t0);
+        let mut ticked = row("Ran ls · done · 1.3s");
+        board.show(&mut ticked, t0 + Duration::from_secs(2), ACCENT, 80);
+        assert!(!plain(&ticked).contains("1.3s"), "a slow tick flips");
+        // Within a second of that flip, the next tick changes in place.
+        let mut fast = row("Ran ls · done · 1.4s");
+        board.show(&mut fast, t0 + Duration::from_millis(2400), ACCENT, 80);
+        assert!(plain(&fast).contains("1.4s"), "{}", plain(&fast));
+        let mut later = row("Ran ls · done · 1.5s");
+        board.show(&mut later, t0 + Duration::from_millis(3100), ACCENT, 80);
+        assert!(
+            !plain(&later).contains("1.5s"),
+            "a second later it flips again"
+        );
     }
 
     #[test]

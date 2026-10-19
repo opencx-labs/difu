@@ -329,18 +329,23 @@ Type **/** in an empty composer for native commands: `/compact`, `/model`, `/eff
 Opening a session keeps the composer focused; pending questions remain available
 through the questions control.
 
-Chat text flips in split-flap style, like Codex's voice transcripts: each
+All chat text flips in split-flap style, like Codex's voice transcripts: each
 character starts blank, flips through letters from the same text, then settles
-with a brief glow. Replies flip in at 200 characters per second, speeding up so
-they never trail the stream by more than the longest animation; replies already
-in a session when you open it appear at once. A sent message flips into the chat,
+with a brief glow. Everything that appears or changes after you open a session
+flips: replies, tool calls and their output, reasoning, plans, notes and
+messages; when an entry changes, only its changed characters flip, and a fast
+counter such as a tool's timing flips at most once a second. Text already in a
+session when you open it appears at once. Replies flip in at 200 characters per
+second, speeding up so they never trail the stream by more than the longest
+animation; other agent content uses the same speed. A sent message flips into the chat,
 or into the queue above the composer, over 1 second while the composer's text
 flips away over 1 second, whatever their length; typing during the clear finishes
 it immediately. No animation takes longer than the longest animation, 0.5 seconds
-by default. The working indicator flips its label as it changes, so its timer
-ticks like a departure board. **/tweaks** (also in the command palette) changes
-these four values, saved in the difu config; 0 turns an animation off, and a
-longest animation of 0 removes the limit.
+by default. The working indicator flips as it changes, so its timer ticks like a
+departure board. **/tweaks** (also in the command palette) changes these four
+values, saved in the difu config; 0 turns an animation off (a reply speed of 0
+turns off the flip for all agent content), and a longest animation of 0 removes
+the limit.
 
 **/theme** (also in the command palette) picks a colour theme for all of difu:
 the accent, text, borders, diffs, status colours, and syntax highlighting. Moving
@@ -509,9 +514,7 @@ follow-up from the latest exchange. It appears only in an empty input. **Right A
 accepts it as editable text; **Tab** keeps its normal focus navigation; **Enter** then sends. Enter on an unaccepted
 suggestion sends nothing. Suggestions never replace a draft and are discarded
 when the conversation moves on. Generation runs in the background without tools;
-on failure the input shows “Ask anything…” instead. Activity shimmer moves
-in a repeating one-way sweep without moving the text. The entire highlight clears
-the last character before the next sweep starts.
+on failure the input shows “Ask anything…” instead.
 
 #### Voice
 
@@ -1213,7 +1216,7 @@ and cleanup. The response schema requires a nonempty chapter assignment for ever
 hunk, including metadata-only changes. Difu reconstructs the ordered chapters and
 validates complete coverage before accepting or caching the guide.
 
-Agent activity stays above the composer with a shimmering status, the current tool
+Agent activity stays above the composer with a split-flap status, the current tool
 or approval review, and pending steering messages underneath. Explicit next-turn
 messages remain a separate editable queue. During a legacy worktree guidance prompt,
 messages and answers are saved until you choose whether to copy the guidance;

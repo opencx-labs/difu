@@ -249,31 +249,10 @@ pub(in crate::agents) fn activity_text(session: &Session) -> (String, Option<Str
     };
     (state.into(), None, session.turn_started_at)
 }
-fn shimmer(text: &str, now: i64) -> Line<'static> {
-    let length = text.chars().count();
-    // Start and finish outside the text so the entire six-character halo clears
-    // the last character before the next sweep enters from the left.
-    let phase = ((now.max(0) as usize / 80) % (length + 12)) as isize - 6;
-    Line::from(
-        text.chars()
-            .enumerate()
-            .map(|(index, ch)| {
-                let distance = (index as isize).abs_diff(phase);
-                let color = match distance {
-                    0..=1 => slot(Role::ShimmerPeak),
-                    2..=3 => slot(Role::ShimmerNear),
-                    4..=5 => slot(Role::ShimmerFar),
-                    _ => DIM,
-                };
-                Span::styled(ch.to_string(), Style::default().fg(color))
-            })
-            .collect::<Vec<_>>(),
-    )
-}
-/// The working indicator, and how many of its rows are the heading.
-pub(super) fn activity(session: &Session, width: u16, now: i64) -> (Vec<Line<'static>>, usize) {
+/// The working indicator: its label and the current step.
+pub(super) fn activity(session: &Session, width: u16, now: i64) -> Vec<Line<'static>> {
     if !session.status.active() {
-        return (Vec::new(), 0);
+        return Vec::new();
     }
     let (state, detail, started) = activity_text(session);
     let seconds = started.map_or(0, |at| now.saturating_sub(at).max(0) / 1000);
@@ -289,9 +268,8 @@ pub(super) fn activity(session: &Session, width: u16, now: i64) -> (Vec<Line<'st
     };
     let mut lines = wrapped(&heading, width)
         .into_iter()
-        .map(|text| shimmer(&text, now))
+        .map(|text| Line::from(Span::styled(text, Style::default().fg(DIM))))
         .collect::<Vec<_>>();
-    let heading = lines.len();
     if let Some(detail) = detail {
         lines.extend(
             wrapped(
@@ -302,24 +280,14 @@ pub(super) fn activity(session: &Session, width: u16, now: i64) -> (Vec<Line<'st
             .map(|text| Line::from(Span::styled(text, Style::default().fg(DIM)))),
         );
     }
-    (lines, heading)
+    lines
 }
-#[cfg(test)]
 pub(super) fn waiting_messages(
     session: &Session,
     width: u16,
     outgoing: &[PendingSend],
 ) -> Vec<Line<'static>> {
-    waiting_rows(session, width, outgoing).0
-}
-/// Messages waiting to be sent, and which row shows each message's text.
-pub(super) fn waiting_rows(
-    session: &Session,
-    width: u16,
-    outgoing: &[PendingSend],
-) -> (Vec<Line<'static>>, Vec<(usize, String)>) {
     let mut rows = Vec::new();
-    let mut texts = Vec::new();
     let mut group = |heading: &str, messages: Vec<&str>| {
         if messages.is_empty() {
             return;
@@ -356,7 +324,6 @@ pub(super) fn waiting_rows(
             } else {
                 crate::ui::crop(&prefix, 0, available)
             };
-            texts.push((rows.len(), text.to_owned()));
             rows.push(Line::from(Span::styled(
                 crate::ui::crop(&format!("  ↳ {preview}"), 0, usize::from(width)),
                 Style::default().fg(DIM),
@@ -395,7 +362,7 @@ pub(super) fn waiting_rows(
         },
         queue,
     );
-    (rows, texts)
+    rows
 }
 
 // Bound input before markdown/syntax parsing, then cap terminal rows after wrapping.
@@ -888,36 +855,6 @@ mod tests {
                     && matches!(action, Action::Link(url) if url == "https://example.com/invoice"))
         );
         assert!(link_hits(&links, Rect::new(40, 8, 12, 2), rows.len()).is_empty());
-    }
-    #[test]
-    fn shimmer_changes_only_color_without_moving_text_or_painting_background() {
-        let first = shimmer("Reviewing approval request", 480);
-        let next = shimmer("Reviewing approval request", 960);
-        assert_eq!(first.to_string(), next.to_string());
-        assert_eq!(first.width(), next.width());
-        assert_ne!(first, next);
-        assert!(first.spans.iter().all(|span| span.style.bg.is_none()));
-        let text = "0123456789abcdefghijk";
-        let cycle = (text.chars().count() as i64 + 12) * 80;
-        assert_eq!(shimmer(text, 0), shimmer(text, 79));
-        assert_ne!(shimmer(text, 0), shimmer(text, 80));
-        assert_eq!(shimmer(text, 0), shimmer(text, cycle));
-        // Both sides of the wrap are fully dim; the halo has left the final glyph.
-        for at in [cycle - 80, cycle] {
-            assert!(
-                shimmer(text, at)
-                    .spans
-                    .iter()
-                    .all(|span| span.style.fg == Some(DIM))
-            );
-        }
-        assert!(
-            shimmer(text, cycle - 160)
-                .spans
-                .last()
-                .is_some_and(|span| span.style.fg != Some(DIM))
-        );
-        assert_ne!(shimmer(text, cycle - 240), shimmer(text, cycle + 240));
     }
     #[test]
     fn fenced_code_keeps_syntax_colors_when_wrapped() {
