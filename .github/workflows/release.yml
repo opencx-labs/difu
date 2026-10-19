@@ -3,13 +3,11 @@ name: Release packages
 on:
   pull_request:
     paths:
+      - cli/**
+      - '!cli/docs/**'
+      - '!cli/README.md'
+      - .github/workflows/ci.yml
       - .github/workflows/release.yml
-      - cli/scripts/**
-      - cli/Cargo.toml
-      - cli/Cargo.lock
-      - cli/src/**
-      - cli/tests/**
-      - cli/prompts/**
   push:
     tags: ["v*"]
 
@@ -79,6 +77,21 @@ jobs:
           workspaces: cli
           key: ${{ matrix.target }}
           save-if: ${{ github.event_name == 'pull_request' }}
+      # Run the existing macOS checks once, on the native ARM package runner.
+      - name: Clippy on macOS
+        if: github.event_name == 'pull_request' && matrix.target == 'aarch64-apple-darwin'
+        working-directory: cli
+        env:
+          DIFU_TARGET: ${{ matrix.target }}
+        run: |
+          rustup component add clippy
+          cargo clippy --locked --all-targets --target "$DIFU_TARGET" -- -D warnings
+      - name: Test on macOS
+        if: github.event_name == 'pull_request' && matrix.target == 'aarch64-apple-darwin'
+        working-directory: cli
+        env:
+          DIFU_TARGET: ${{ matrix.target }}
+        run: cargo test --locked --target "$DIFU_TARGET"
       - name: Install Linux build tools
         if: runner.os == 'Linux'
         run: |
