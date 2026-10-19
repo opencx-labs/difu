@@ -22,8 +22,8 @@ impl Ui {
             return;
         }
         let now = Instant::now();
-        position.clearing = reveal::Typing::start(&text, tweaks.input_clear_ms, now);
-        position.sent = reveal::Typing::start(&text, tweaks.sent_message_ms, now);
+        position.clearing = reveal::Typing::start(&text, tweaks.capped(tweaks.input_clear_ms), now);
+        position.sent = reveal::Typing::start(&text, tweaks.capped(tweaks.sent_message_ms), now);
         let attachments = position.active_attachments();
         let skills = std::mem::take(&mut position.skills);
         position.draft = Editor::default();

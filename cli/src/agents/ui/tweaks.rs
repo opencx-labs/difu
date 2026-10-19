@@ -3,10 +3,11 @@ use super::*;
 use crate::storage::Tweaks;
 
 const LIMIT: u32 = 10_000;
-const LABELS: [&str; 3] = [
+const LABELS: [&str; 4] = [
     "Agent reply speed · characters per second",
-    "Sent message types in over · milliseconds",
+    "Sent message flips in over · milliseconds",
     "Input clears over · milliseconds",
+    "Longest animation · milliseconds (0 = no cap)",
 ];
 
 impl Ui {
@@ -15,10 +16,18 @@ impl Ui {
             agent_reply_cps,
             sent_message_ms,
             input_clear_ms,
+            max_animation_ms,
         } = self.tweaks;
         self.modal = Some(Modal::Tweaks {
-            fields: [agent_reply_cps, sent_message_ms, input_clear_ms]
+            fields: Box::new(
+                [
+                    agent_reply_cps,
+                    sent_message_ms,
+                    input_clear_ms,
+                    max_animation_ms,
+                ]
                 .map(|value| Editor::from(value.to_string().as_str())),
+            ),
             field: 0,
         });
     }
@@ -26,11 +35,11 @@ impl Ui {
         let Some(Modal::Tweaks { fields, field }) = &mut self.modal else {
             return;
         };
-        // Three numbers, then Save.
+        // Four numbers, then Save.
         match key.code {
             KeyCode::Esc => self.modal = None,
-            KeyCode::Tab | KeyCode::Down => *field = (*field + 1) % 4,
-            KeyCode::BackTab | KeyCode::Up => *field = (*field + 3) % 4,
+            KeyCode::Tab | KeyCode::Down => *field = (*field + 1) % 5,
+            KeyCode::BackTab | KeyCode::Up => *field = (*field + 4) % 5,
             KeyCode::Enter => self.save_tweaks(),
             _ => {
                 if let Some(editor) = fields.get_mut(*field) {
@@ -54,7 +63,15 @@ impl Ui {
                     .filter(|v| *v <= LIMIT)
             })
             .collect::<Option<Vec<_>>>();
-        let Some(&[agent_reply_cps, sent_message_ms, input_clear_ms]) = values.as_deref() else {
+        let Some(
+            &[
+                agent_reply_cps,
+                sent_message_ms,
+                input_clear_ms,
+                max_animation_ms,
+            ],
+        ) = values.as_deref()
+        else {
             self.notice = Some((
                 format!("Enter whole numbers from 0 to {LIMIT}; 0 turns an animation off"),
                 true,
@@ -65,6 +82,7 @@ impl Ui {
             agent_reply_cps,
             sent_message_ms,
             input_clear_ms,
+            max_animation_ms,
         };
         let saved = self.storage.update_config(|config| config.tweaks = tweaks);
         match saved {
@@ -86,8 +104,11 @@ impl Ui {
         let defaults = Tweaks::default();
         frame.render_widget(
             Paragraph::new(format!(
-                "Replies type in at this speed and speed up when they fall behind the stream. Sent messages and input clearing take a fixed time whatever their length. 0 turns an animation off.\nDefaults: {} characters per second · {} ms · {} ms.\nTab moves between fields · Enter saves · Esc cancels",
-                defaults.agent_reply_cps, defaults.sent_message_ms, defaults.input_clear_ms
+                "Chat text flips in split-flap style. Replies flip in at this speed and speed up when they fall behind the stream; sent and queued messages and input clearing take a fixed time whatever their length. None takes longer than the longest animation. 0 turns an animation off.\nDefaults: {} characters per second · {} ms · {} ms · {} ms.\nTab moves between fields · Enter saves · Esc cancels",
+                defaults.agent_reply_cps,
+                defaults.sent_message_ms,
+                defaults.input_clear_ms,
+                defaults.max_animation_ms
             ))
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(DIM)),
@@ -105,10 +126,10 @@ impl Ui {
         }
         self.button(
             frame,
-            Rect::new(area.x, area.y.saturating_add(16), area.width, 1),
+            Rect::new(area.x, area.y.saturating_add(19), area.width, 1),
             "Save tweaks",
             Action::TweaksSave,
-            field == 3,
+            field == 4,
         );
     }
 }

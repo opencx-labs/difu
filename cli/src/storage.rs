@@ -42,6 +42,10 @@ pub struct Tweaks {
     pub sent_message_ms: u32,
     /// Milliseconds for the composer to clear after sending.
     pub input_clear_ms: u32,
+    /// The longest any of these may take, in milliseconds: sent messages and
+    /// clearing finish within it, and replies never trail the stream by more.
+    /// Zero removes the cap.
+    pub max_animation_ms: u32,
 }
 impl Default for Tweaks {
     fn default() -> Self {
@@ -49,6 +53,17 @@ impl Default for Tweaks {
             agent_reply_cps: 200,
             sent_message_ms: 1000,
             input_clear_ms: 1000,
+            max_animation_ms: 500,
+        }
+    }
+}
+impl Tweaks {
+    /// `ms`, shortened to the cap.
+    pub fn capped(self, ms: u32) -> u32 {
+        if self.max_animation_ms == 0 {
+            ms
+        } else {
+            ms.min(self.max_animation_ms)
         }
     }
 }
