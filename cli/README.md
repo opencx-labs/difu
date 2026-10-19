@@ -347,7 +347,9 @@ or into the queue above the composer, over 1 second while the composer's text
 flips away over 1 second, whatever their length; typing during the clear finishes
 it immediately. No animation takes longer than the longest animation, 0.5 seconds
 by default. The working indicator flips as it changes, so its timer ticks like a
-departure board. **/tweaks** (also in the command palette) changes these four
+departure board. Each question flips in as it opens, and an answered one flips
+away like the composer's text before the next flips in.
+**/tweaks** (also in the command palette) changes these four
 values, saved in the difu config; 0 turns an animation off (a reply speed of 0
 turns off the flip for all agent content), and a longest animation of 0 removes
 the limit.

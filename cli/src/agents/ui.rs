@@ -349,6 +349,8 @@ pub struct Ui {
     deleting: HashSet<String>,
     question_send: Option<(String, Value, String, usize)>,
     question_reveal: bool,
+    /// The question panel's split-flap.
+    question_flip: inline_questions::Flip,
     question_note_focused: bool,
     hits: Vec<(Rect, Action)>,
     pub viewport: usize,
@@ -423,6 +425,7 @@ impl Ui {
             deleting: HashSet::new(),
             question_send: None,
             question_reveal: true,
+            question_flip: Default::default(),
             question_note_focused: false,
             hits: Vec::new(),
             viewport: 20,
@@ -467,6 +470,7 @@ impl Ui {
     }
     pub fn redraw_interval(&self) -> Option<Duration> {
         if self.voice_active()
+            || self.question_flip.animating(Instant::now())
             || self
                 .selected
                 .as_ref()
@@ -1494,6 +1498,7 @@ impl Ui {
             self.voice_key(key);
             return;
         }
+        self.question_flip.interrupt();
         if self.resource_key(key) || self.panel_key(key) {
             return;
         }
@@ -2664,6 +2669,23 @@ fn scroll_step(key: KeyEvent) -> usize {
     }
 }
 
+#[cfg(test)]
+impl Ui {
+    /// Moves every flip on, as if a second had passed.
+    pub(super) fn settle_flips(&mut self) {
+        let second = Duration::from_secs(1);
+        for position in self.positions.values_mut() {
+            for board in [&mut position.activity, &mut position.waiting]
+                .into_iter()
+                .chain(position.boards.values_mut())
+            {
+                board.age(second);
+            }
+        }
+        self.question_flip.age(second);
+    }
+}
+
 fn inner(rect: Rect) -> Rect {
     Rect::new(
         rect.x.saturating_add(1),
@@ -3172,7 +3194,10 @@ impl Ui {
         if coding {
             self.restore_media(&id);
         }
-        let composer_height = if self.inline_question() {
+        if !self.question_panel() {
+            self.question_flip = Default::default();
+        }
+        let composer_height = if self.question_panel() {
             self.question_height(area.width)
                 .min(area.height.saturating_sub(5))
         } else if matches!(self.modal, Some(Modal::Commands { .. })) {
@@ -3191,7 +3216,7 @@ impl Ui {
         } else {
             0
         };
-        let dock_composer = composer_height > 0 && !self.inline_question() && !area.is_empty();
+        let dock_composer = composer_height > 0 && !self.question_panel() && !area.is_empty();
         if dock_composer {
             // The input's last row shares the pane border; reclaim the old inset.
             area.height = area
@@ -3434,7 +3459,7 @@ impl Ui {
                 area.width,
                 composer_height,
             );
-            if self.inline_question() {
+            if self.question_panel() {
                 self.draw_inline_question(frame, composer);
                 return;
             }
@@ -6676,14 +6701,7 @@ mod tests {
     /// Draws once everything new on screen has flipped in.
     fn draw_settled(ui: &mut Ui, width: u16, height: u16) -> Result<(String, Option<(u16, u16)>)> {
         draw(ui, width, height)?;
-        for position in ui.positions.values_mut() {
-            for board in [&mut position.activity, &mut position.waiting]
-                .into_iter()
-                .chain(position.boards.values_mut())
-            {
-                board.age(Duration::from_secs(1));
-            }
-        }
+        ui.settle_flips();
         draw(ui, width, height)
     }
     fn draw(ui: &mut Ui, width: u16, height: u16) -> Result<(String, Option<(u16, u16)>)> {
@@ -7749,7 +7767,7 @@ mod tests {
             KeyModifiers::ALT,
             crossterm::event::KeyEventKind::Release,
         ));
-        let (screen, _) = draw(&mut ui, 120, 35)?;
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
         assert!(
             screen.contains("1 of 3")
                 && screen.contains("What next?")
@@ -7793,7 +7811,7 @@ mod tests {
         ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
         ui.paste("ustom answer");
         ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
-        let (screen, _) = draw(&mut ui, 120, 35)?;
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
         assert!(screen.contains("2 of 3") && screen.contains("How much detail?"));
         ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
         assert!(
@@ -7956,6 +7974,69 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn questions_flip_in_as_they_open_and_flip_away_once_answered() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        ui.sessions
+            .get_mut("one")
+            .context("session")?
+            .pending
+            .push(Pending {
+                id: serde_json::json!("flip"),
+                method: "item/tool/requestUserInput".into(),
+                responded: true,
+                params: serde_json::json!({"difuAsync":true,"questions":[
+                    {"id":"q","question":"Choose scope","options":[{"label":"Small"}]},
+                    {"id":"q2","question":"Pick a colour","options":[{"label":"Blue"}]}
+                ]}),
+            });
+        ui.open_question(0);
+        let (screen, _) = draw(&mut ui, 120, 35)?;
+        assert!(!screen.contains("Choose scope"), "a question flips in");
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
+        assert!(screen.contains("Choose scope"));
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let (screen, _) = draw(&mut ui, 120, 35)?;
+        assert!(!screen.contains("Pick a colour") && !screen.contains("Choose scope"));
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
+        assert!(screen.contains("Pick a colour"));
+
+        // An answer flips its question away, last character first, and keeps
+        // it away until the answer is through.
+        ui.submit_question(false);
+        let (screen, _) = draw(&mut ui, 120, 35)?;
+        assert!(screen.contains("Pick a colour") && screen.contains("Sending answer…"));
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
+        assert!(!screen.contains("Pick a colour") && screen.contains("Sending answer…"));
+        // An answer that did not go through brings its question back.
+        ui.question_send = None;
+        draw(&mut ui, 120, 35)?;
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
+        assert!(screen.contains("Pick a colour"));
+
+        // A key finishes the flip away at once.
+        ui.submit_question(false);
+        ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
+        assert!(screen.contains("Pick a colour"));
+
+        // The last answered question keeps the panel while it flips away.
+        ui.question_send = None;
+        ui.submit_question(false);
+        ui.question_send = None;
+        ui.modal = None;
+        let (screen, _) = draw(&mut ui, 120, 35)?;
+        assert!(screen.contains("Pick a colour"));
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
+        assert!(!screen.contains("Pick a colour"));
+        Ok(())
+    }
+    #[test]
     fn information_modals_scroll_with_the_wheel_and_cmd_arrows() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut ui = state(Storage {
@@ -8034,7 +8115,7 @@ mod tests {
             ui.selected_question_answer().as_deref(),
             Some("Small\n\nNote: Only change the UI!")
         );
-        let (screen, _) = draw(&mut ui, 120, 35)?;
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
         assert!(screen.contains("Note: Only change the UI!"));
         ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
         ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
@@ -8126,7 +8207,7 @@ mod tests {
             ui.selected_question_answer().as_deref(),
             Some("Lint, Build\n\nNote on Build: CI only")
         );
-        let (screen, _) = draw(&mut ui, 120, 35)?;
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
         for text in [
             "Choose one or more",
             "[x] 1. Lint",
@@ -8142,7 +8223,7 @@ mod tests {
         ui.key(space());
         ui.action(Action::QuestionChoice(1));
         ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        let (screen, _) = draw(&mut ui, 120, 35)?;
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
         assert!(screen.contains("Ship it?") && !screen.contains("[ ]"));
         assert_eq!(ui.selected_question_answer().as_deref(), Some("Yes"));
         ui.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
