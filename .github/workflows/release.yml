@@ -8,6 +8,7 @@ on:
       - cli/Cargo.toml
       - cli/Cargo.lock
       - cli/src/**
+      - cli/vendor/**
       - cli/tests/**
       - cli/prompts/**
   push:
