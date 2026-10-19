@@ -367,10 +367,8 @@ impl Ui {
             && self.panels.visible()
         {
             self.panels.right = !self.panels.right;
-            let result = self.storage.load_config().and_then(|mut c| {
-                c.agent_panel_right = self.panels.right;
-                self.storage.save_config(&c)
-            });
+            let right = self.panels.right;
+            let result = self.storage.update_config(|c| c.agent_panel_right = right);
             if let Err(e) = result {
                 self.notice = Some((format!("Cannot save pane placement: {e:#}"), true));
             }

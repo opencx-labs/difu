@@ -1008,12 +1008,11 @@ impl Ui {
             return;
         };
         order.swap(from, to);
-        let result = self.storage.load_config().and_then(|mut config| {
-            config.session_order.clone_from(&order);
-            self.storage.save_config(&config)
-        });
+        let result = self
+            .storage
+            .update_config(|config| config.session_order.clone_from(&order));
         match result {
-            Ok(()) => {
+            Ok(_) => {
                 if let Some(panels::View::PullRequest { app }) = &mut self.panels.view {
                     app.config.session_order.clone_from(&order);
                 }
@@ -1247,13 +1246,14 @@ impl Ui {
         }
     }
     pub(crate) fn toggle_pin(&mut self, id: &str) {
-        let result = self.storage.load_config().and_then(|mut config| {
-            if !config.pinned_sessions.remove(id) {
-                config.pinned_sessions.insert(id.to_owned());
-            }
-            self.storage.save_config(&config)?;
-            Ok(config.pinned_sessions)
-        });
+        let result = self
+            .storage
+            .update_config(|config| {
+                if !config.pinned_sessions.remove(id) {
+                    config.pinned_sessions.insert(id.to_owned());
+                }
+            })
+            .map(|config| config.pinned_sessions);
         match result {
             Ok(pins) => self.pinned_sessions = pins,
             Err(error) => {
@@ -1302,10 +1302,10 @@ impl Ui {
         }
     }
     fn save_visibility(&mut self) {
-        let result = self.storage.load_config().and_then(|mut config| {
-            config.agent_list_visible = self.list_visible;
-            config.agent_changes_visible = self.changes_visible;
-            self.storage.save_config(&config)
+        let (list, changes) = (self.list_visible, self.changes_visible);
+        let result = self.storage.update_config(|config| {
+            config.agent_list_visible = list;
+            config.agent_changes_visible = changes;
         });
         if let Err(error) = result {
             self.notice = Some((format!("Could not save pane visibility: {error:#}"), true));

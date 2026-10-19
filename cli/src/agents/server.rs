@@ -447,9 +447,9 @@ impl Service {
                     Err(error) => return Err(error),
                 };
                 if remember_repository {
-                    let mut config = self.store.storage.load_config()?;
-                    config.agent_defaults.repository = Some(root.clone());
-                    self.store.storage.save_config(&config)?;
+                    self.store.storage.update_config(|config| {
+                        config.agent_defaults.repository = Some(root.clone())
+                    })?;
                 }
                 let job = Job::Coding(Launch {
                     repository: root,

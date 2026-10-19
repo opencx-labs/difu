@@ -1054,12 +1054,13 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
         fs::read_to_string(repo.join("tracked.txt"))?,
         "precious local edit\n"
     );
-    let mut config = storage.load_config()?;
-    config.repository_rules.insert(
-        repo.canonicalize()?,
-        "Keep repository rule fixture in initial instructions.".into(),
-    );
-    storage.save_config(&config)?;
+    let canonical = repo.canonicalize()?;
+    storage.update_config(|config| {
+        config.repository_rules.insert(
+            canonical,
+            "Keep repository rule fixture in initial instructions.".into(),
+        );
+    })?;
     let removal = launch(&storage, &repo, "remove stale questions")?;
     let current = wait(&storage, &removal, |s| {
         s.status == Status::Idle && s.completed_turn.is_some()
@@ -1583,12 +1584,12 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
     git(&other, &["add", "."])?;
     git(&other, &["commit", "-m", "Other base"])?;
     git(&other, &["remote", "add", "origin", "."])?;
-    let mut config = storage.load_config()?;
-    config.repository_rules.insert(
-        other.canonicalize()?,
-        "Use the destination repository rules.".into(),
-    );
-    storage.save_config(&config)?;
+    let canonical = other.canonicalize()?;
+    storage.update_config(|config| {
+        config
+            .repository_rules
+            .insert(canonical, "Use the destination repository rules.".into());
+    })?;
     git(
         &repo,
         &["worktree", "lock", workspace.to_str().context("path")?],

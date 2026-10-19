@@ -455,9 +455,19 @@ impl App {
         self.sequence = self.sequence.wrapping_add(1);
         self.sequence
     }
-    fn save_config(&mut self) {
-        if let Err(e) = self.storage.save_config(&self.config) {
-            self.notice = Notice::error(format!("Could not save settings: {e:#}"));
+    /// Saves one change and refreshes this view's copy of the settings. Never
+    /// write `self.config` back whole: other views and the background service
+    /// save settings too, and a stale copy would undo their changes.
+    fn update_config(&mut self, what: &str, change: impl FnOnce(&mut Config)) -> bool {
+        match self.storage.update_config(change) {
+            Ok(config) => {
+                self.config = config;
+                true
+            }
+            Err(error) => {
+                self.notice = Notice::error(format!("Could not save {what}: {error:#}"));
+                false
+            }
         }
     }
     pub fn load_inbox(&mut self) {
@@ -1308,16 +1318,13 @@ impl App {
             .collect()
     }
     fn apply_model(&mut self, choice: ModelChoice) {
-        let mut config = self.config.clone();
-        match self.model_purpose {
+        let purpose = self.model_purpose;
+        if !self.update_config("model", |config| match purpose {
             ModelPurpose::Guide => config.model = choice,
             ModelPurpose::Conflicts => config.conflict_model = choice,
-        }
-        if let Err(error) = self.storage.save_config(&config) {
-            self.notice = Notice::error(format!("Could not save model: {error:#}"));
+        }) {
             return;
         }
-        self.config = config;
         self.modal = None;
         self.notice = Notice::success(format!("{} saved", self.model_purpose.label()));
         self.invalidate();
@@ -1738,11 +1745,10 @@ impl App {
                             self.directory = None;
                             self.tree_horizontal = 0;
                             self.scroll = 0;
-                            if let Some(detail) = &r.detail {
-                                self.config
-                                    .repositories
-                                    .insert(detail.key.repository(), root.clone());
-                            }
+                            let clone = r
+                                .detail
+                                .as_ref()
+                                .map(|detail| (detail.key.repository(), root.clone()));
                             r.root = Some(root);
                             r.snapshot = Some(Arc::new(snapshot));
                             r.interaction = Default::default();
@@ -1754,7 +1760,13 @@ impl App {
                             r.expanded.clear();
                             r.guide_error = None;
                             let manual = std::mem::take(&mut r.generation_requested);
-                            self.save_config();
+                            if let Some((repository, root)) = clone
+                                && self.config.repositories.get(&repository) != Some(&root)
+                            {
+                                self.update_config("the repository location", |config| {
+                                    config.repositories.insert(repository, root);
+                                });
+                            }
                             self.generate_for(&id, manual);
                         }
                         Err(error) => {
@@ -2130,22 +2142,18 @@ impl App {
             Action::Cancel => self.cancel(),
             Action::Help => self.modal = Some(Modal::Help(Default::default())),
             Action::ToggleWrap => {
-                let mut config = self.config.clone();
-                config.wrap_diff = !config.wrap_diff;
-                if let Err(error) = self.storage.save_config(&config) {
-                    self.notice =
-                        Notice::error(format!("Could not save wrapping preference: {error:#}"));
+                let wrap = !self.config.wrap_diff;
+                if !self.update_config("wrapping preference", |config| config.wrap_diff = wrap) {
                     return;
                 }
-                self.config = config;
                 self.horizontal = 0;
                 self.workflow.cursor = None;
                 self.workflow.selection = None;
                 self.invalidate();
             }
             Action::ToggleLayout => {
-                self.config.unified = !self.config.unified;
-                self.save_config();
+                let unified = !self.config.unified;
+                self.update_config("layout preference", |config| config.unified = unified);
                 self.invalidate();
             }
             Action::Scroll(delta) => self.move_scroll(delta),
@@ -2798,15 +2806,13 @@ impl App {
         if !self.repository_options.contains(&name) {
             return;
         }
-        let mut config = self.config.clone();
-        if !config.pinned_repositories.remove(&name) {
-            config.pinned_repositories.insert(name);
-        }
-        if let Err(error) = self.storage.save_config(&config) {
-            self.notice = Notice::error(format!("Could not save repository pins: {error:#}"));
+        if !self.update_config("repository pins", |config| {
+            if !config.pinned_repositories.remove(&name) {
+                config.pinned_repositories.insert(name);
+            }
+        }) {
             return;
         }
-        self.config = config;
         self.ensure_repo_selection();
     }
     fn filter_key(&mut self, key: KeyEvent) {
@@ -3000,6 +3006,31 @@ mod tests {
                 .get("file")
                 .is_some_and(|s| s.pending.is_empty() && s.data.is_some())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn a_review_view_never_undoes_settings_saved_elsewhere() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        let mut app = App::new(storage.clone(), Config::default());
+        // Agents, a PR pane or the background service saves after this view loaded.
+        storage.update_config(|config| {
+            config.voice_enabled = true;
+            config.theme = Some("dracula".into());
+            config.pinned_sessions.insert("session".into());
+        })?;
+        app.action(Action::ToggleLayout);
+        app.action(Action::ToggleWrap);
+        let saved = storage.load_config()?;
+        assert!(saved.unified && saved.wrap_diff);
+        assert!(saved.voice_enabled);
+        assert_eq!(saved.theme.as_deref(), Some("dracula"));
+        assert!(saved.pinned_sessions.contains("session"));
+        assert!(app.config.voice_enabled, "the view refreshes its copy");
         Ok(())
     }
 

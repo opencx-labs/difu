@@ -174,15 +174,18 @@ impl App {
             }
             Action::Save => {
                 if let Some(Setup::Select { roots, chosen, .. }) = &self.local.setup {
-                    let mut config = self.config.clone();
-                    config.local_diff_roots = roots.clone();
-                    config.local_diff_repositories = chosen.clone();
-                    if let Err(error) = self.storage.save_config(&config) {
-                        self.local.error =
-                            Some(format!("Could not save tracked repositories: {error:#}"));
-                        return;
+                    let (roots, chosen) = (roots.clone(), chosen.clone());
+                    match self.storage.update_config(|config| {
+                        config.local_diff_roots = roots;
+                        config.local_diff_repositories = chosen;
+                    }) {
+                        Ok(config) => self.config = config,
+                        Err(error) => {
+                            self.local.error =
+                                Some(format!("Could not save tracked repositories: {error:#}"));
+                            return;
+                        }
                     }
-                    self.config = config;
                     self.local.setup = None;
                     self.load_local_repositories();
                 }

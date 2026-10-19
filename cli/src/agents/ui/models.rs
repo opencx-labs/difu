@@ -457,13 +457,12 @@ impl Ui {
         }
         self.modal = None;
         if default {
-            let result = self.storage.load_config().and_then(|mut config| {
+            let result = self.storage.update_config(|config| {
                 config.agent_defaults.model = Some(id.clone());
                 config.agent_defaults.effort = effort.clone();
-                self.storage.save_config(&config)
             });
             match result {
-                Ok(()) => {
+                Ok(_) => {
                     self.defaults.model = Some(id.clone());
                     self.defaults.effort = effort.clone();
                     self.notice = Some((

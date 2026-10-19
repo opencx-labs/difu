@@ -66,12 +66,9 @@ impl Ui {
             sent_message_ms,
             input_clear_ms,
         };
-        let saved = self.storage.load_config().and_then(|mut config| {
-            config.tweaks = tweaks;
-            self.storage.save_config(&config)
-        });
+        let saved = self.storage.update_config(|config| config.tweaks = tweaks);
         match saved {
-            Ok(()) => {
+            Ok(_) => {
                 self.tweaks = tweaks;
                 self.modal = None;
                 self.notice = Some(("Tweaks saved".into(), false));
