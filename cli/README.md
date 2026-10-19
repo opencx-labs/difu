@@ -1064,8 +1064,13 @@ difu if macOS asks, and allow **Local Network** access for difu in iOS Settings.
 
 Open **Cmd+K → `/slack`** to connect your Slack app. Enter its bot token
 (`xoxb-`), Socket Mode app token (`xapp-`), and your Slack member ID. The channel
-ID is optional; leave it blank for direct messages only. Tokens are masked and saved in macOS Keychain; the config contains only
-connection identifiers. The same form shows connection status and disables Slack.
+ID is optional; leave it blank for direct messages only. Tokens are masked and saved in
+macOS Keychain through Apple's `security` tool, so macOS does not ask for your login
+password again after difu updates or restarts; the config contains only connection
+identifiers. Setups saved by older versions move over on their next connection, with
+one last password prompt. difu reconnects on its own whenever Slack is set up and
+enabled. Reopening the form shows the connection and keeps the saved tokens when
+their fields are left blank; it also disables Slack.
 For channel mentions, invite the app to your configured channel.
 
 Enable **App Home → Messages Tab → Allow users to send Slash commands and messages**.
