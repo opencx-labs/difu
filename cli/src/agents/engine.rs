@@ -1224,23 +1224,29 @@ fn voice(
             _ => None,
         }
     };
+    let mut params = json!({
+        "threadId": thread,
+        "outputModality": "audio",
+        "version": "v3",
+        "clientManagedHandoffs": false,
+        "includeStartupContext": false,
+        "transport": {"type": "webrtc", "sdp": offer},
+    });
+    if let Some(context) = &session.provider_context {
+        // A session that just switched to Codex has not received its earlier
+        // conversation yet; give the agent its recent part before it takes
+        // spoken requests. The next typed message still carries all of it.
+        put(
+            &mut params,
+            "realtimeStartInstructions",
+            json!(voice_handoff(context)),
+        )?;
+    }
     let mut answer = None;
-    rpc.call(
-        "thread/realtime/start",
-        json!({
-            "threadId": thread,
-            "outputModality": "audio",
-            "version": "v3",
-            "clientManagedHandoffs": false,
-            "includeStartupContext": false,
-            "transport": {"type": "webrtc", "sdp": offer},
-        }),
-        cancel,
-        |value| {
-            answer = answer.take().or_else(|| outcome(&value));
-            event(store, id, value)
-        },
-    )?;
+    rpc.call("thread/realtime/start", params, cancel, |value| {
+        answer = answer.take().or_else(|| outcome(&value));
+        event(store, id, value)
+    })?;
     // OpenAI's answer follows the acknowledgement as a notification.
     let deadline = Instant::now() + Duration::from_secs(20);
     while answer.is_none() {
@@ -1264,6 +1270,26 @@ fn voice(
         Some(Err(failure)) => anyhow::bail!("Codex voice failed: {failure}"),
         None => anyhow::bail!("Codex did not answer the voice connection; try again"),
     }
+}
+
+/// Codex's own instructions for an agent behind the voice, which custom start
+/// instructions replace, followed by the most recent part of a pending
+/// conversation handoff within Codex's limit for them.
+fn voice_handoff(context: &str) -> String {
+    const START: &str = "Realtime conversation started.\n\nYou are operating as a backend executor behind an intermediary. The user does not talk to you directly. Any response you produce will be consumed by the intermediary and may be summarized before the user sees it.\n\nWhen invoked, you receive the latest conversation transcript and any relevant mode or metadata. The intermediary may invoke you even when backend help is not actually needed. Use the transcript to decide whether you should do work. If backend help is unnecessary, avoid verbose responses that add user-visible latency.\n\nWhen user text is routed from realtime, treat it as a transcript. It may be unpunctuated or contain recognition errors.\n\n- Keep responses concise and action-oriented. Your updates should help the intermediary respond to the user.";
+    // Codex allows 8,192 estimated tokens; stay well inside at ~4 bytes each.
+    const BUDGET: usize = 24_000;
+    let mut start = context.len().saturating_sub(BUDGET);
+    while !context.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = context.get(start..).unwrap_or_default();
+    let omitted = if start > 0 {
+        "(Earlier conversation omitted.)\n"
+    } else {
+        ""
+    };
+    format!("{START}\n\n{omitted}{tail}")
 }
 
 /// The spoken words behind a turn the voice handed to the agent.
@@ -2095,6 +2121,19 @@ mod tests {
         assert_eq!(session.turn_id.as_deref(), Some("turn"));
         Ok(())
     }
+    #[test]
+    fn voice_after_a_provider_switch_carries_the_recent_conversation() {
+        let short = voice_handoff("Difu conversation handoff. Fix the login bug.");
+        assert!(short.starts_with("Realtime conversation started."));
+        assert!(short.ends_with("Difu conversation handoff. Fix the login bug."));
+        assert!(!short.contains("omitted"));
+        let long = format!("Old start {}é recent end", "x".repeat(40_000));
+        let bounded = voice_handoff(&long);
+        assert!(bounded.len() < 26_000);
+        assert!(bounded.contains("(Earlier conversation omitted.)"));
+        assert!(bounded.ends_with("é recent end") && !bounded.contains("Old start"));
+    }
+
     #[test]
     fn voice_transcripts_become_chat_messages_and_handoffs_show_the_request() {
         let mut session = Session::new(

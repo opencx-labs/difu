@@ -142,13 +142,14 @@ impl Ui {
             position.draft = hold.before;
         }
     }
-    /// Codex sessions that have started talk back; others take dictation.
+    /// Ready Codex sessions talk back, including ones just switched from
+    /// Claude that have no Codex thread yet; others take dictation.
     fn voice_mode(&self, id: &str) -> Mode {
         let codex = self.sessions.get(id).is_some_and(|session| {
             matches!(session.job, Job::Coding(_))
                 && session.provider == provider::Provider::Codex
-                && session.thread_id.is_some()
                 && !session.archived
+                && !session.preparing()
         });
         if codex { Mode::Converse } else { Mode::Dictate }
     }
@@ -766,9 +767,10 @@ mod tests {
         assert_eq!(
             ui.voice_mode("voice-test"),
             Mode::Dictate,
-            "not started yet"
+            "still preparing"
         );
-        session.thread_id = Some("thread".into());
+        // Just switched from Claude: idle, with no Codex thread until needed.
+        session.status = Status::Idle;
         ui.sessions.insert(session.id.clone(), session.clone());
         assert_eq!(ui.voice_mode("voice-test"), Mode::Converse);
         session.provider = provider::Provider::Claude;
