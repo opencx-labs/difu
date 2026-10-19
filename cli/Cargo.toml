@@ -1,6 +1,6 @@
 [package]
 name = "difu"
-version = "0.20.3"
+version = "0.21.1"
 edition = "2024"
 rust-version = "1.90"
 description = "Your diff shifu: Codex agents and guided pull request reviews"
@@ -41,7 +41,6 @@ unicode-width = "0.2"
 url = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
-cpal = "0.16"
 security-framework = "3"
 
 [profile.release]

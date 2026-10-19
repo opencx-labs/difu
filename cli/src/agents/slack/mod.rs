@@ -23,6 +23,11 @@ pub struct Settings {
     #[serde(default)]
     pub channel: String,
     pub account: String,
+    /// The tokens are stored through macOS `security`, so reading them never
+    /// asks for the login password after difu updates. Older setups stored
+    /// them in items owned by difu's binary and migrate on first connection.
+    #[serde(default)]
+    pub portable: bool,
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -42,12 +47,14 @@ struct Credentials {
     app: String,
 }
 
+/// Validates and saves a Slack setup. Blank tokens keep the saved ones.
 pub fn configure(
     storage: &Storage,
     bot: String,
     app: String,
     user: String,
     channel: String,
+    saved: Option<Settings>,
 ) -> Result<Settings> {
     ensure!(
         valid_id(&user, &['U', 'W']),
@@ -59,6 +66,13 @@ pub fn configure(
     );
     #[cfg(target_os = "macos")]
     {
+        let (bot, app) = match saved {
+            Some(saved) if bot.is_empty() && app.is_empty() => {
+                let credentials = tokens(&saved)?;
+                (credentials.bot, credentials.app)
+            }
+            _ => (bot, app),
+        };
         let api = api::Api::new(bot.clone(), app.clone())?;
         let identity = api.identity()?;
         api.socket_url()?;
@@ -78,22 +92,29 @@ pub fn configure(
             user,
             channel,
             account,
+            portable: true,
         };
-        let bytes = serde_json::to_vec(&Credentials { bot, app })?;
-        security_framework::passwords::set_generic_password(
-            "app.difu.slack",
-            &settings.account,
-            &bytes,
-        )
-        .map_err(|_| anyhow::anyhow!("Cannot save Slack tokens in macOS Keychain"))?;
+        store(&settings.account, &Credentials { bot, app })?;
         Ok(settings)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (storage, bot, app);
+        let _ = (storage, bot, app, saved);
         anyhow::bail!("Slack is available on macOS in this release")
     }
 }
+
+#[cfg(target_os = "macos")]
+fn store(account: &str, credentials: &Credentials) -> Result<()> {
+    crate::keychain::save(SERVICE, account, &serde_json::to_vec(credentials)?)
+        .map_err(|_| anyhow::anyhow!("Cannot save Slack tokens in macOS Keychain"))
+}
+
+/// Items stored through `security`; legacy difu-owned items use `LEGACY_SERVICE`.
+#[cfg(target_os = "macos")]
+const SERVICE: &str = "app.difu.slack.tokens";
+#[cfg(target_os = "macos")]
+const LEGACY_SERVICE: &str = "app.difu.slack";
 
 fn valid_id(id: &str, prefixes: &[char]) -> bool {
     id.len() > 1
@@ -104,15 +125,38 @@ fn valid_id(id: &str, prefixes: &[char]) -> bool {
 }
 
 #[cfg(target_os = "macos")]
+fn tokens(settings: &Settings) -> Result<Credentials> {
+    let bytes = if settings.portable {
+        crate::keychain::read(SERVICE, &settings.account).ok()
+    } else {
+        security_framework::passwords::get_generic_password(LEGACY_SERVICE, &settings.account).ok()
+    }
+    .ok_or_else(|| {
+        anyhow::anyhow!("Cannot read Slack tokens from Keychain; open /slack to reconnect")
+    })?;
+    serde_json::from_slice(&bytes)
+        .map_err(|_| anyhow::anyhow!("Invalid Slack Keychain entry; open /slack to reconnect"))
+}
+
+#[cfg(target_os = "macos")]
 fn credentials(settings: &Settings) -> Result<api::Api> {
-    let bytes =
-        security_framework::passwords::get_generic_password("app.difu.slack", &settings.account)
-            .map_err(|_| {
-                anyhow::anyhow!("Cannot read Slack tokens from Keychain; open /slack to reconnect")
-            })?;
-    let credentials: Credentials = serde_json::from_slice(&bytes)
-        .map_err(|_| anyhow::anyhow!("Invalid Slack Keychain entry; open /slack to reconnect"))?;
+    let credentials = tokens(settings)?;
     api::Api::new(credentials.bot, credentials.app)
+}
+
+/// Copies a legacy difu-owned item to one stored through `security` under the
+/// same account, so Slack threads keep routing, and marks the setup portable.
+/// macOS asks for the login password this one last time.
+#[cfg(target_os = "macos")]
+pub(super) fn migrate(storage: &Storage, settings: &Settings) -> Result<()> {
+    let credentials = tokens(settings)?;
+    store(&settings.account, &credentials)?;
+    storage.update_config(|config| {
+        if let Some(current) = config.slack.as_mut().filter(|current| *current == settings) {
+            current.portable = true;
+        }
+    })?;
+    Ok(())
 }
 
 pub(super) fn start(
@@ -150,6 +194,7 @@ mod tests {
             user: "UALI".into(),
             channel: "C1".into(),
             account: "keychain-reference".into(),
+            portable: true,
         };
         let direct = Route {
             account: settings.account.clone(),

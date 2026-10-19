@@ -342,6 +342,9 @@ pub struct Session {
     pub error: Option<String>,
     pub result: Option<String>,
     pub guide: Option<Guide>,
+    /// Realtime voice is connected to this session's thread.
+    #[serde(default)]
+    pub voice: bool,
 }
 impl Session {
     pub fn new(id: String, job: Job) -> Self {
@@ -417,6 +420,7 @@ impl Session {
             error: None,
             result: None,
             guide: None,
+            voice: false,
         }
     }
     /// Freeze completed output and pending-request origins before another UI or
@@ -679,12 +683,27 @@ impl From<Prompt> for String {
         value.text().to_owned()
     }
 }
+/// Realtime voice on a Codex session's own thread. The terminal keeps the
+/// microphone and speaker; the service only negotiates and receives text.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum VoiceAction {
+    /// Start with the voice helper's WebRTC offer; the reply carries the answer.
+    Start {
+        offer: String,
+    },
+    Stop,
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Control {
     #[serde(skip)]
     Mcp {
         action: mcp::Action,
         response: std::sync::mpsc::Sender<Result<mcp::Snapshot, String>>,
+    },
+    #[serde(skip)]
+    Voice {
+        action: VoiceAction,
+        response: std::sync::mpsc::Sender<Result<Option<String>, String>>,
     },
     ReadUsage,
     Message {
@@ -767,6 +786,10 @@ pub enum Request {
         id: String,
         control: Control,
     },
+    Voice {
+        id: String,
+        action: VoiceAction,
+    },
     Repository {
         id: String,
         repository: PathBuf,
@@ -825,6 +848,8 @@ pub enum Request {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
     Mcp(mcp::Snapshot),
+    /// The WebRTC answer for `VoiceAction::Start`.
+    Voice(Option<String>),
     Usage(Value),
     Ok,
     ServiceVersion {

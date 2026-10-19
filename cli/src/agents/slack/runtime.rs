@@ -201,6 +201,10 @@ pub(super) fn start(store: Arc<Store>, shutdown: Arc<AtomicBool>) {
 }
 
 fn listen(store: &Arc<Store>, settings: &Settings, stop: &Arc<AtomicBool>) -> Result<()> {
+    if !settings.portable {
+        // The saved setup changes, so the supervisor reconnects with it.
+        return super::migrate(&store.storage, settings);
+    }
     let directory = store.home.join("slack");
     fs::create_dir_all(&directory)?;
     let journal = Arc::new(Journal::open(
@@ -691,6 +695,7 @@ mod tests {
             user: "UALI".into(),
             channel: "C1".into(),
             account: "fixture-account".into(),
+            portable: true,
         })?;
         restored.accept(mention)?;
         assert!(restored.read(|s| s.inbox.is_empty() && s.dispatching.is_none())?);
@@ -730,6 +735,7 @@ mod tests {
             user: "U".into(),
             channel: "C1".into(),
             account: "fixture-account".into(),
+            portable: true,
         };
         journal.recover(&settings)?;
         assert!(!journal.read(|s| s.references.contains_key(orchestrator::ID))?);

@@ -1,24 +1,122 @@
+//! Hold Space to talk. Codex sessions get a spoken conversation with their own
+//! agent; other sessions get dictation into the composer. Both reuse Codex's
+//! voice strip and split-flap transcript reveal.
+use super::flap::{self, Flap};
 use super::*;
-use crate::voice::{Event, Recording};
+use crate::ui::PURPLE;
+use crate::voice::{Event, Role, Session as Voice};
 use crossterm::event::KeyEventKind;
+use ratatui::style::Modifier;
+use std::collections::VecDeque;
+
+/// Holding Space this long turns a press into talking instead of typing.
+const HOLD: Duration = Duration::from_millis(300);
+/// Without key-release reporting, a hold ends when key repeats stop.
+const REPEAT_GAP: Duration = Duration::from_millis(180);
+const METER_FRAMES: usize = 12;
+const METER_NOISE_FLOOR: u16 = 512;
+const METER_FULL_SCALE: u16 = 8192;
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Rows of live dictation shown above the composer.
+const PREVIEW_ROWS: usize = 4;
+/// Speech keeps the speaker "active" this long, bridging gaps between words.
+const SPEAKER_HOLD: Duration = Duration::from_millis(800);
+/// After release, a conversation ends once nothing has happened for this long:
+/// your last words are transcribed, the reply finished, and the agent idle.
+const QUIET: Duration = Duration::from_millis(2500);
+/// A conversation waits at most this long after release for work it handed off.
+const WORK_LIMIT: Duration = Duration::from_secs(120);
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Mode {
+    /// Talk with a Codex session's agent; replies are spoken.
+    Converse,
+    /// Speech becomes text in the composer.
+    Dictate,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Connecting,
+    Listening,
+    /// Space was released: the microphone is muted while dictation finishes
+    /// or the voice replies.
+    Released,
+}
 
 pub(super) struct Hold {
     session: String,
+    mode: Mode,
     before: Editor,
     started: Instant,
     last: Instant,
-    recording: Option<Recording>,
-    finishing: bool,
-    listening: bool,
+    voice: Option<Voice>,
+    /// When talking began, in Unix ms, to recognise turns the voice started.
+    began: i64,
+    phase: Phase,
+    phase_started: Instant,
+    /// Microphone and speaker intensity per 100 ms sample, newest last.
+    levels: VecDeque<(u8, u8)>,
+    speaking: Option<Instant>,
+    released: Option<Instant>,
+    busy: Instant,
+    working: bool,
+    connected: bool,
+    segments: Vec<String>,
     partial: String,
-    level: f32,
+    flap: Flap,
+}
+impl Hold {
+    fn new(session: String, before: Editor) -> Self {
+        let now = Instant::now();
+        Self {
+            session,
+            mode: Mode::Dictate,
+            before,
+            started: now,
+            last: now,
+            voice: None,
+            began: chrono::Utc::now().timestamp_millis(),
+            phase: Phase::Connecting,
+            phase_started: now,
+            levels: VecDeque::new(),
+            speaking: None,
+            released: None,
+            busy: now,
+            working: false,
+            connected: false,
+            segments: Vec::new(),
+            partial: String::new(),
+            flap: Flap::new(Role::User, now),
+        }
+    }
+    fn transcript(&self) -> String {
+        self.segments
+            .iter()
+            .map(String::as_str)
+            .chain((!self.partial.trim().is_empty()).then_some(self.partial.as_str()))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    fn set_phase(&mut self, phase: Phase) {
+        if self.phase != phase {
+            self.phase = phase;
+            self.phase_started = Instant::now();
+        }
+        let now = Instant::now();
+        self.released = (phase == Phase::Released).then_some(now);
+        self.busy = now;
+    }
+    fn speaking(&self) -> bool {
+        self.speaking.is_some_and(|at| at.elapsed() < SPEAKER_HOLD)
+    }
 }
 #[derive(Default)]
 pub(super) struct State {
     pub enabled: bool,
-    pub key: Option<String>,
     hold: Option<Hold>,
-    saving: Option<mpsc::Receiver<Result<String, String>>>,
 }
 impl State {
     pub(super) fn new(enabled: bool) -> Self {
@@ -35,69 +133,94 @@ impl Ui {
     pub fn voice_enabled(&self) -> bool {
         self.voice.enabled
     }
-    pub(super) fn save_voice_key(&mut self) {
-        if self.voice.saving.is_some() {
-            return;
-        }
-        let Some(Modal::Voice { key, .. }) = &self.modal else {
-            return;
-        };
-        let key = key.text().trim().to_owned();
-        if key.is_empty() {
-            self.notice = Some((
-                "Enter an API key, or enable voice using OPENAI_API_KEY / an existing Keychain key"
-                    .into(),
-                true,
-            ));
-            return;
-        }
-        let (tx, rx) = mpsc::channel();
-        self.voice.saving = Some(rx);
-        thread::spawn(move || {
-            let result = crate::voice::save_key(&key)
-                .map(|()| key)
-                .map_err(|e| format!("{e:#}"));
-            let _ = tx.send(result);
-        });
-    }
-
-    pub(super) fn open_voice(&mut self) {
-        self.cancel_voice();
-        self.modal = Some(Modal::Voice {
-            key: Editor::default(),
-            field: 0,
-        });
-    }
     pub fn cancel_voice(&mut self) {
         if let Some(hold) = self.voice.hold.take()
-            && hold.recording.is_some()
+            && hold.voice.is_some()
+            && hold.mode == Mode::Dictate
             && let Some(position) = self.positions.get_mut(&hold.session)
         {
             position.draft = hold.before;
         }
     }
+    /// Codex sessions that have started talk back; others take dictation.
+    fn voice_mode(&self, id: &str) -> Mode {
+        let codex = self.sessions.get(id).is_some_and(|session| {
+            matches!(session.job, Job::Coding(_))
+                && session.provider == provider::Provider::Codex
+                && session.thread_id.is_some()
+                && !session.archived
+        });
+        if codex { Mode::Converse } else { Mode::Dictate }
+    }
+    fn start_voice(&self, id: &str, mode: Mode) -> Voice {
+        if mode == Mode::Dictate {
+            return crate::voice::dictate();
+        }
+        let (storage, start) = (self.storage.clone(), id.to_owned());
+        let (stop_storage, stop) = (self.storage.clone(), id.to_owned());
+        crate::voice::converse(
+            move |offer| {
+                let request = Request::Voice {
+                    id: start,
+                    action: VoiceAction::Start {
+                        offer: offer.to_owned(),
+                    },
+                };
+                match client::request(&storage, request)? {
+                    Reply::Voice(Some(answer)) => Ok(answer),
+                    _ => anyhow::bail!("The agent service returned no voice connection"),
+                }
+            },
+            move || {
+                let request = Request::Voice {
+                    id: stop,
+                    action: VoiceAction::Stop,
+                };
+                let _ = client::request(&stop_storage, request);
+            },
+        )
+    }
     pub(super) fn voice_key(&mut self, key: KeyEvent) -> bool {
         let space = key.code == KeyCode::Char(' ') && key.modifiers.is_empty();
         if key.kind == KeyEventKind::Release {
             if space && let Some(hold) = &mut self.voice.hold {
-                if let Some(recording) = &hold.recording {
-                    recording.finish();
-                    hold.finishing = true;
-                } else {
+                let Some(voice) = &hold.voice else {
                     self.voice.hold = None;
+                    return true;
+                };
+                if hold.phase != Phase::Released {
+                    voice.release();
+                    hold.set_phase(Phase::Released);
                 }
             }
             return true;
         }
         if let Some(hold) = &mut self.voice.hold
-            && hold.recording.is_some()
+            && let Some(voice) = &hold.voice
         {
             if key.code == KeyCode::Esc {
+                let mode = hold.mode;
                 self.cancel_voice();
-            } else if space {
-                hold.last = Instant::now();
+                self.notice = Some((
+                    match mode {
+                        Mode::Converse => "Voice ended".into(),
+                        Mode::Dictate => "Voice cancelled; draft unchanged".into(),
+                    },
+                    false,
+                ));
+                return true;
             }
-            return true;
+            if space {
+                hold.last = Instant::now();
+                // Holding Space while a conversation is still connected talks again at once.
+                if hold.mode == Mode::Converse && hold.phase == Phase::Released {
+                    voice.resume();
+                    hold.set_phase(Phase::Listening);
+                }
+                return true;
+            }
+            // While the voice replies or the agent works, the composer stays usable.
+            return !(hold.mode == Mode::Converse && hold.phase == Phase::Released);
         }
         if !space {
             self.voice.hold = None;
@@ -113,67 +236,34 @@ impl Ui {
         let Some(id) = self.selected.clone() else {
             return false;
         };
-        if let Some(hold) = &mut self.voice.hold {
-            hold.last = Instant::now();
-            if hold.started.elapsed() >= Duration::from_millis(300) {
-                let key = self
-                    .voice
-                    .key
-                    .clone()
-                    .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                    .filter(|s| !s.trim().is_empty());
-                if !cfg!(target_os = "macos") {
-                    self.voice.hold = None;
-                    self.notice = Some((
-                        "Voice dictation is available on macOS in this release".into(),
-                        true,
-                    ));
-                } else {
-                    self.positions.entry(id).or_default().draft = hold.before.clone();
-                    hold.recording = Some(crate::voice::start(key));
-                }
+        if self
+            .voice
+            .hold
+            .as_ref()
+            .is_some_and(|hold| hold.started.elapsed() >= HOLD)
+        {
+            let mode = self.voice_mode(&id);
+            let voice = self.start_voice(&id, mode);
+            if let Some(hold) = &mut self.voice.hold {
+                // The tap's space was provisional; talking replaces it.
+                self.positions.entry(id).or_default().draft = hold.before.clone();
+                hold.last = Instant::now();
+                hold.began = chrono::Utc::now().timestamp_millis();
+                hold.mode = mode;
+                hold.voice = Some(voice);
+                hold.set_phase(Phase::Connecting);
             }
+        } else if let Some(hold) = &mut self.voice.hold {
+            hold.last = Instant::now();
         } else {
             let position = self.positions.entry(id.clone()).or_default();
             let before = position.draft.clone();
             position.draft.insert(" ");
-            self.voice.hold = Some(Hold {
-                session: id,
-                before,
-                started: Instant::now(),
-                last: Instant::now(),
-                recording: None,
-                finishing: false,
-                listening: false,
-                partial: String::new(),
-                level: 0.0,
-            });
+            self.voice.hold = Some(Hold::new(id, before));
         }
         true
     }
     pub(super) fn tick_voice(&mut self, visible: bool) {
-        if let Some(result) = self.voice.saving.as_ref().and_then(|rx| rx.try_recv().ok()) {
-            crate::repaint::request();
-            self.voice.saving = None;
-            match result {
-                Ok(key) => {
-                    self.voice.key = Some(key);
-                    if !self.voice.enabled {
-                        self.toggle_voice();
-                    }
-                    if matches!(self.modal, Some(Modal::Voice { .. })) {
-                        self.modal = None;
-                    }
-                    self.notice = Some((
-                        "API key saved in macOS Keychain · hold Space in the composer to dictate"
-                            .into(),
-                        false,
-                    ));
-                }
-                Err(error) => self.notice = Some((error, true)),
-            }
-        }
-
         if !visible
             || self.focus != Focus::Composer
             || self.modal.is_some()
@@ -189,168 +279,360 @@ impl Ui {
         let Some(hold) = &mut self.voice.hold else {
             return;
         };
-        let Some(recording) = &hold.recording else {
+        let Some(voice) = &hold.voice else {
             if hold.last.elapsed() > Duration::from_millis(800) {
                 self.voice.hold = None;
             }
             return;
         };
         // Legacy terminal protocols have no key-up events. Cessation of repeat ends the hold.
-        if !hold.finishing && hold.last.elapsed() > Duration::from_millis(180) {
-            recording.finish();
-            hold.finishing = true;
+        let released = hold.phase != Phase::Released && hold.last.elapsed() > REPEAT_GAP;
+        if released {
+            voice.release();
         }
-        let mut done = None;
-        while let Ok(event) = recording.events.try_recv() {
+        let mut events = Vec::new();
+        let mut ended = false;
+        loop {
+            match voice.events.try_recv() {
+                Ok(event) => events.push(event),
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    ended = true;
+                    break;
+                }
+            }
+        }
+        if released {
+            hold.set_phase(Phase::Released);
+        }
+        let mut outcome = ended.then_some(Ok(()));
+        for event in events {
             crate::repaint::request();
             match event {
-                Event::Listening => hold.listening = true,
-                Event::Level(level) => hold.level = level,
-                Event::Partial(text) => hold.partial.push_str(&crate::model::clean(&text)),
-                Event::Done(text) => {
-                    done = Some(Ok(text));
-                    break;
+                Event::Listening => {
+                    if hold.phase == Phase::Connecting {
+                        hold.set_phase(Phase::Listening);
+                    }
                 }
-                Event::Error(error) => {
-                    done = Some(Err(error));
-                    break;
+                Event::Levels {
+                    microphone,
+                    speaker,
+                } => {
+                    if hold.levels.len() >= METER_FRAMES {
+                        hold.levels.pop_front();
+                    }
+                    let speaker = intensity(speaker);
+                    hold.levels.push_back((intensity(microphone), speaker));
+                    if speaker > 0 {
+                        hold.speaking = Some(Instant::now());
+                    }
                 }
+                Event::Delta(Role::User, delta) => hold.partial.push_str(&delta),
+                Event::Segment(Role::User, text) => {
+                    hold.segments.push(text);
+                    hold.partial.clear();
+                }
+                Event::Delta(..) | Event::Segment(..) => {}
+                Event::Error(error) => outcome = Some(Err(error)),
             }
         }
-        if let Some(result) = done
-            && let Some(hold) = self.voice.hold.take()
-        {
-            let position = self.positions.entry(hold.session).or_default();
-            position.draft = hold.before;
-            match result {
-                Ok(text) if !text.trim().is_empty() => {
-                    position.draft.insert(&text);
-                    self.notice = Some(("Dictation inserted · Enter to send".into(), false));
-                }
-                Ok(_) => {
-                    self.notice = Some(("No speech transcribed; draft unchanged".into(), false))
-                }
-                Err(error) => self.notice = Some((error, true)),
-            }
+        match hold.mode {
+            Mode::Dictate => self.tick_dictation(outcome),
+            Mode::Converse => self.tick_conversation(outcome),
         }
     }
-    pub(super) fn voice_status(&self) -> Option<String> {
-        self.voice
-            .hold
-            .as_ref()
-            .filter(|h| h.recording.is_some())
-            .map(|h| {
-                if h.finishing {
-                    "Transcribing… · Esc cancels".into()
-                } else if !h.listening {
-                    "Initializing voice… · keep holding Space · Esc cancels".into()
-                } else {
-                    let bars = (h.level * 80.0).clamp(0.0, 12.0) as usize;
-                    format!(
-                        "● Listening {}{} · release Space to insert · Esc cancels",
-                        "▰".repeat(bars),
-                        "▱".repeat(12usize.saturating_sub(bars))
-                    )
-                }
-            })
-    }
-    pub(super) fn draw_voice_preview(&self, frame: &mut Frame, rect: Rect) {
-        if let Some(hold) = &self.voice.hold {
-            frame.render_widget(
-                Paragraph::new(hold.partial.clone())
-                    .style(Style::default().fg(DIM))
-                    .wrap(Wrap { trim: false }),
-                rect,
-            );
-        }
-    }
-    pub(super) fn voice_modal_key(&mut self, key: KeyEvent) {
-        let Some(Modal::Voice { key: value, field }) = &mut self.modal else {
+    fn tick_dictation(&mut self, outcome: Option<Result<(), String>>) {
+        let Some(hold) = &mut self.voice.hold else {
             return;
         };
-        match key.code {
-            KeyCode::Esc => self.modal = None,
-            KeyCode::Tab => *field = (*field + 1) % 3,
-            KeyCode::BackTab => *field = (*field + 2) % 3,
-            KeyCode::Enter if *field == 0 || *field == 1 => self.save_voice_key(),
-            KeyCode::Enter | KeyCode::Char(' ') if *field == 2 => self.toggle_voice(),
-            _ if *field == 0 => value.key(key),
-            _ => {}
+        let transcript = crate::model::clean(&hold.transcript());
+        hold.flap.set(&transcript, Instant::now());
+        let Some(outcome) = outcome else {
+            return;
+        };
+        let Some(hold) = self.voice.hold.take() else {
+            return;
+        };
+        let position = self.positions.entry(hold.session).or_default();
+        position.draft = hold.before;
+        self.notice = Some(match outcome {
+            Err(error) => (error, true),
+            Ok(()) if transcript.is_empty() => ("No speech heard; draft unchanged".into(), false),
+            Ok(()) => {
+                let draft = &mut position.draft;
+                let joined = draft
+                    .cursor
+                    .checked_sub(1)
+                    .and_then(|index| draft.chars.get(index))
+                    .is_some_and(|c| !c.is_whitespace());
+                draft.insert(&if joined {
+                    format!(" {transcript}")
+                } else {
+                    transcript
+                });
+                ("Dictation inserted · Enter to send".into(), false)
+            }
+        });
+    }
+    /// A conversation ends once, after release, nothing has happened for a
+    /// moment: your words are transcribed, the reply has been spoken, and any
+    /// work the voice handed to the agent is done.
+    fn tick_conversation(&mut self, outcome: Option<Result<(), String>>) {
+        let Some(hold) = &mut self.voice.hold else {
+            return;
+        };
+        if let Some(outcome) = outcome {
+            self.voice.hold = None;
+            if let Err(error) = outcome {
+                self.notice = Some((error, true));
+            }
+            return;
         }
+        let Some(session) = self.sessions.get(&hold.session) else {
+            return;
+        };
+        if session.voice {
+            hold.connected = true;
+        } else if hold.connected {
+            self.voice.hold = None;
+            self.notice = Some(("The voice connection closed".into(), false));
+            return;
+        }
+        let transcribing = session
+            .entries
+            .iter()
+            .any(|entry| flap::voice_role(entry).is_some() && entry.finished_at.is_none());
+        hold.working = session.status.active()
+            && session
+                .turn_started_at
+                .is_some_and(|started| started >= hold.began);
+        if transcribing || hold.working || hold.speaking() {
+            hold.busy = Instant::now();
+        }
+        if let Some(released) = hold.released
+            && (hold.busy.elapsed() >= QUIET || released.elapsed() >= WORK_LIMIT)
+        {
+            self.voice.hold = None;
+        }
+    }
+    /// Rows the voice strip (and live dictation) need above the composer.
+    pub(super) fn voice_rows(&self, width: u16) -> u16 {
+        let Some(hold) = self.voice.hold.as_ref().filter(|h| h.voice.is_some()) else {
+            return 0;
+        };
+        if hold.mode == Mode::Converse {
+            return 2;
+        }
+        let preview = hold
+            .flap
+            .lines(
+                width.saturating_sub(2),
+                Instant::now(),
+                flap::preview_board(),
+            )
+            .len()
+            .min(PREVIEW_ROWS);
+        2 + u16::try_from(preview).unwrap_or(0)
+    }
+    /// Codex's voice strip: state and controls, then the microphone and voice
+    /// meters, then (when dictating) the live transcript.
+    pub(super) fn draw_voice(&self, frame: &mut Frame, rect: Rect) {
+        let Some(hold) = self.voice.hold.as_ref().filter(|h| h.voice.is_some()) else {
+            return;
+        };
+        let area = Rect::new(
+            rect.x.saturating_add(1),
+            rect.y,
+            rect.width.saturating_sub(2),
+            rect.height,
+        );
+        if area.is_empty() {
+            return;
+        }
+        let now = Instant::now();
+        let spinner = || {
+            let frame = now
+                .saturating_duration_since(hold.phase_started)
+                .as_millis()
+                / 100;
+            SPINNER
+                .get(usize::try_from(frame).unwrap_or_default() % SPINNER.len())
+                .copied()
+                .unwrap_or("◌")
+        };
+        let live = Style::default().fg(RED).add_modifier(Modifier::BOLD);
+        let dim = Style::default().fg(DIM);
+        let (marker, activity) = match (hold.phase, hold.mode) {
+            (Phase::Connecting, _) => (Span::styled(spinner(), live), "connecting"),
+            (Phase::Listening, _) => (Span::styled("●", live), "listening"),
+            (Phase::Released, Mode::Dictate) => (
+                Span::styled(spinner(), Style::default().fg(ACCENT)),
+                "transcribing",
+            ),
+            (Phase::Released, Mode::Converse) if hold.speaking() => {
+                (Span::styled("◌", dim), "speaking")
+            }
+            (Phase::Released, Mode::Converse) if hold.working => (
+                Span::styled(spinner(), Style::default().fg(ACCENT)),
+                "agent working",
+            ),
+            (Phase::Released, Mode::Converse) => (
+                Span::styled(spinner(), Style::default().fg(ACCENT)),
+                "thinking",
+            ),
+        };
+        let key = Style::default().fg(TEXT).add_modifier(Modifier::BOLD);
+        let mut status = vec![
+            Span::styled("voice ", dim),
+            marker,
+            Span::styled(format!(" {activity}"), Style::default().fg(TEXT)),
+        ];
+        let hint = |verb: &'static str, rest: &'static str, end: &'static str| {
+            vec![
+                Span::styled(verb, dim),
+                Span::styled("space", key),
+                Span::styled(rest, dim),
+                Span::styled("esc", key),
+                Span::styled(end, dim),
+            ]
+        };
+        let controls = match (hold.phase, hold.mode) {
+            (Phase::Released, Mode::Dictate) => {
+                vec![Span::styled("esc", key), Span::styled(" cancel", dim)]
+            }
+            (Phase::Released, Mode::Converse) => hint("hold ", " to reply   ", " end"),
+            (_, Mode::Converse) => hint("release ", " to stop talking   ", " end"),
+            (_, Mode::Dictate) => hint("release ", " to insert   ", " cancel"),
+        };
+        let short = vec![
+            Span::styled("esc", key),
+            Span::styled(
+                if hold.mode == Mode::Converse {
+                    " end"
+                } else {
+                    " cancel"
+                },
+                dim,
+            ),
+        ];
+        let used = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
+        let available = usize::from(area.width);
+        if let Some(controls) = [controls, short]
+            .into_iter()
+            .find(|controls| available > used(&status) + used(controls))
+        {
+            status.push(Span::raw(
+                " ".repeat(available - used(&status) - used(&controls)),
+            ));
+            status.extend(controls);
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(status)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
+        if area.height < 2 {
+            return;
+        }
+        let width = (available.saturating_sub(14) / 2).min(6);
+        let microphone_live = hold.phase == Phase::Listening;
+        let mut meters = vec![Span::styled("  mic ", dim)];
+        meters.extend(meter(
+            hold.levels.iter().map(|(microphone, _)| *microphone),
+            width,
+            ACCENT,
+            !microphone_live,
+        ));
+        if hold.mode == Mode::Converse {
+            meters.push(Span::styled("  codex ", dim));
+            meters.extend(meter(
+                hold.levels.iter().map(|(_, speaker)| *speaker),
+                width,
+                PURPLE,
+                false,
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(meters)),
+            Rect::new(area.x, area.y + 1, area.width, 1),
+        );
+        if hold.mode == Mode::Converse {
+            return;
+        }
+        let lines = hold.flap.lines(area.width, now, flap::preview_board());
+        let shown = lines.len().min(usize::from(area.height.saturating_sub(2)));
+        let tail: Vec<_> = lines.into_iter().rev().take(shown).rev().collect();
+        frame.render_widget(
+            Paragraph::new(tail),
+            Rect::new(
+                area.x,
+                area.y + 2,
+                area.width,
+                u16::try_from(shown).unwrap_or(0),
+            ),
+        );
     }
     pub(super) fn toggle_voice(&mut self) {
-        if !cfg!(target_os = "macos") {
-            self.notice = Some((
-                "Voice dictation is available on macOS in this release".into(),
-                true,
-            ));
+        let enabled = !self.voice.enabled;
+        if enabled && let Err(error) = crate::voice::available() {
+            self.notice = Some((format!("{error:#}"), true));
             return;
         }
-        self.voice.enabled = !self.voice.enabled;
-        let result = self.storage.load_config().and_then(|mut c| {
-            c.voice_enabled = self.voice.enabled;
-            self.storage.save_config(&c)
-        });
-        if let Err(error) = result {
-            self.notice = Some((format!("Could not save voice setting: {error:#}"), true));
+        match self.storage.update_config(|c| c.voice_enabled = enabled) {
+            Ok(_) => {
+                self.voice.enabled = enabled;
+                self.notice = Some(if enabled {
+                    (
+                        "Voice on · hold Space in the composer to talk · uses your Codex login"
+                            .into(),
+                        false,
+                    )
+                } else {
+                    ("Voice off".into(), false)
+                });
+            }
+            Err(error) => {
+                self.notice = Some((format!("Could not save voice setting: {error:#}"), true));
+            }
         }
     }
-    pub(super) fn draw_voice_settings(&mut self, frame: &mut Frame, area: Rect) {
-        let Some(Modal::Voice { key, field }) = &self.modal else {
-            return;
-        };
-        let field = *field;
-        let mut masked = key.clone();
-        masked.chars.fill('•');
-        let explanation = if cfg!(target_os = "macos") {
-            format!(
-                "OpenAI live transcription · automatic language\nVoice: {} · credential: {}\nAudio is streamed only while dictating and never saved to disk.\nTap Space to type; hold to dictate; release inserts without sending.",
-                if self.voice.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                },
-                if self.voice.key.is_some() {
-                    "entered key"
-                } else if std::env::var_os("OPENAI_API_KEY").is_some() {
-                    "OPENAI_API_KEY"
-                } else {
-                    "Keychain (read when dictating)"
-                }
+}
+
+/// Codex's sample-history meter: the newest `width` samples as rising bars.
+fn meter(
+    samples: impl ExactSizeIterator<Item = u8>,
+    width: usize,
+    color: ratatui::style::Color,
+    muted: bool,
+) -> Vec<Span<'static>> {
+    let skip = samples.len().saturating_sub(width);
+    let pad = width.saturating_sub(samples.len());
+    std::iter::repeat_n(0, pad)
+        .chain(samples.skip(skip))
+        .map(|level| {
+            let height = if muted {
+                0
+            } else {
+                usize::from(level).saturating_mul(7).div_ceil(255)
+            };
+            let cell = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+                .get(height)
+                .copied()
+                .unwrap_or("█");
+            Span::styled(
+                cell,
+                Style::default().fg(if height == 0 { DIM } else { color }),
             )
-        } else {
-            "Voice dictation is available on macOS in this release.".into()
-        };
-        frame.render_widget(
-            Paragraph::new(explanation).wrap(Wrap { trim: false }),
-            Rect::new(area.x, area.y, area.width, 7.min(area.height)),
-        );
-        let input = Rect::new(area.x, area.y.saturating_add(8), area.width, 3);
-        editor(frame, input, "OpenAI API key (masked)", &masked, field == 0);
-        self.hits.push((input, Action::VoiceField));
-        self.button(
-            frame,
-            Rect::new(area.x, area.y.saturating_add(12), area.width, 1),
-            if self.voice.saving.is_some() {
-                "Saving to macOS Keychain…"
-            } else {
-                "Save API key in macOS Keychain and enable voice"
-            },
-            Action::VoiceSave,
-            field == 1,
-        );
-        self.button(
-            frame,
-            Rect::new(area.x, area.y.saturating_add(14), area.width, 1),
-            if self.voice.enabled {
-                "Disable voice"
-            } else {
-                "Enable voice"
-            },
-            Action::VoiceToggle,
-            field == 2,
-        );
-    }
+        })
+        .collect()
+}
+
+/// Codex's calibration: peaks below the noise floor read as silence.
+fn intensity(peak: u16) -> u8 {
+    let level = usize::from(peak.saturating_sub(METER_NOISE_FLOOR))
+        .saturating_mul(usize::from(u8::MAX))
+        .div_ceil(usize::from(METER_FULL_SCALE - METER_NOISE_FLOOR))
+        .min(usize::from(u8::MAX));
+    u8::try_from(level).unwrap_or(u8::MAX)
 }
 
 #[cfg(test)]
@@ -374,189 +656,235 @@ mod tests {
             Editor::from("keep this draft");
         Ok((ui, tmp))
     }
-    fn recording(ui: &mut Ui) -> Result<mpsc::Sender<Event>> {
+    fn coding() -> Session {
+        Session::new(
+            "voice-test".into(),
+            Job::Coding(Launch {
+                repository: "/tmp/project".into(),
+                isolated: true,
+                base: "HEAD".into(),
+                prompt: "Task".into(),
+                model: None,
+                effort: None,
+            }),
+        )
+    }
+    fn talking(ui: &mut Ui, mode: Mode) -> Result<mpsc::Sender<Event>> {
         let before = ui
             .positions
             .get("voice-test")
             .context("draft")?
             .draft
             .clone();
-        let (recording, tx) = crate::voice::fixture();
-        ui.voice.hold = Some(Hold {
-            session: "voice-test".into(),
-            before,
-            started: Instant::now(),
-            last: Instant::now(),
-            recording: Some(recording),
-            finishing: false,
-            listening: true,
-            partial: String::new(),
-            level: 0.0,
-        });
+        let (voice, tx) = crate::voice::fixture();
+        let mut hold = Hold::new("voice-test".into(), before);
+        hold.mode = mode;
+        hold.voice = Some(voice);
+        ui.voice.hold = Some(hold);
         Ok(tx)
     }
-    #[test]
-    fn space_tap_and_completed_dictation_never_submit() -> Result<()> {
-        let (mut ui, _tmp) = fixture()?;
-        ui.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
-        ui.key(KeyEvent::new_with_kind(
+    fn draft(ui: &Ui) -> Result<String> {
+        Ok(ui
+            .positions
+            .get("voice-test")
+            .context("draft")?
+            .draft
+            .text())
+    }
+    fn release(ui: &mut Ui) {
+        ui.voice_key(KeyEvent::new_with_kind(
             KeyCode::Char(' '),
             KeyModifiers::NONE,
             KeyEventKind::Release,
         ));
-        assert_eq!(
-            ui.positions
-                .get("voice-test")
-                .context("draft")?
-                .draft
-                .text(),
-            "keep this draft "
-        );
-        let tx = recording(&mut ui)?;
-        tx.send(Event::Partial("hello".into()))?;
-        ui.tick_voice(true);
-        assert_eq!(
-            ui.positions
-                .get("voice-test")
-                .context("draft")?
-                .draft
-                .text(),
-            "keep this draft "
-        );
-        tx.send(Event::Done("hello world".into()))?;
-        ui.tick_voice(true);
-        assert_eq!(
-            ui.positions
-                .get("voice-test")
-                .context("draft")?
-                .draft
-                .text(),
-            "keep this draft hello world"
-        );
-        assert!(!ui.busy);
-        Ok(())
     }
-    #[test]
-    fn cancelling_or_losing_focus_preserves_cursor_selection_and_draft() -> Result<()> {
-        let (mut ui, _tmp) = fixture()?;
-        ui.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
-        let tx = recording(&mut ui)?;
-        tx.send(Event::Partial("discarded".into()))?;
-        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        let p = ui.positions.get("voice-test").context("draft")?;
-        assert_eq!(p.draft.text(), "keep this draft");
-        assert_eq!(p.draft.selected_text().as_deref(), Some("t"));
-        let tx = recording(&mut ui)?;
-        ui.tick_voice(false);
-        assert!(ui.voice.hold.is_none());
-        assert!(tx.send(Event::Done("too late".into())).is_err());
-        assert_eq!(
-            ui.positions
-                .get("voice-test")
-                .context("draft")?
-                .draft
-                .text(),
-            "keep this draft"
-        );
-        Ok(())
-    }
-    #[test]
-    fn composer_renders_voice_setup_live_meter_and_transcribing_states() -> Result<()> {
+    fn screen(ui: &mut Ui, width: u16) -> Result<String> {
         use ratatui::{Terminal, backend::TestBackend};
-
-        for width in [48, 100] {
-            let (mut ui, _tmp) = fixture()?;
-            ui.list_visible = false;
-            let session = Session::new(
-                "voice-test".into(),
-                Job::Coding(Launch {
-                    repository: "/tmp/project".into(),
-                    isolated: true,
-                    base: "HEAD".into(),
-                    prompt: "Task".into(),
-                    model: None,
-                    effort: None,
-                }),
-            );
-            ui.sessions.insert(session.id.clone(), session);
-            let tx = recording(&mut ui)?;
-            ui.voice.hold.as_mut().context("hold")?.listening = false;
-            let screen = |ui: &mut Ui| -> Result<String> {
-                let mut terminal = Terminal::new(TestBackend::new(width, 24))?;
-                terminal.draw(|frame| ui.draw(frame))?;
-                Ok(terminal
-                    .backend()
-                    .buffer()
-                    .content
-                    .iter()
-                    .map(|cell| cell.symbol())
-                    .collect())
-            };
-            let initializing = screen(&mut ui)?;
-            assert!(initializing.contains("Initializing voice…"));
-            assert!(!initializing.contains("Listening"));
-
-            tx.send(Event::Listening)?;
-            tx.send(Event::Level(0.075))?;
-            tx.send(Event::Partial("spoken words".into()))?;
-            ui.voice.hold.as_mut().context("hold")?.last = Instant::now();
-            ui.tick_voice(true);
-            let listening = screen(&mut ui)?;
-            assert!(listening.contains("Listening ▰▰▰▰▰▰▱▱▱▱▱▱"));
-            assert!(listening.contains("spoken words"));
-            assert!(!listening.contains("Initializing voice"));
-
-            tx.send(Event::Level(0.0))?;
-            ui.voice.hold.as_mut().context("hold")?.last = Instant::now();
-            ui.tick_voice(true);
-            assert!(screen(&mut ui)?.contains("Listening ▱▱▱▱▱▱▱▱▱▱▱▱"));
-
-            ui.voice_key(KeyEvent::new_with_kind(
-                KeyCode::Char(' '),
-                KeyModifiers::NONE,
-                KeyEventKind::Release,
-            ));
-            let transcribing = screen(&mut ui)?;
-            assert!(transcribing.contains("Transcribing…"));
-            assert!(!transcribing.contains("Listening"));
-
-            tx.send(Event::Done("spoken words".into()))?;
-            ui.tick_voice(true);
-            let finished = screen(&mut ui)?;
-            assert!(!finished.contains("Transcribing…"));
-            // The completion toast can cover the composer on narrow terminals.
-            assert_eq!(
-                ui.positions
-                    .get("voice-test")
-                    .context("draft")?
-                    .draft
-                    .text(),
-                "keep this draftspoken words"
-            );
-        }
-        Ok(())
-    }
-    #[test]
-    fn credential_input_masks_text_and_never_enters_clipboard_or_config() -> Result<()> {
-        use ratatui::{Terminal, backend::TestBackend};
-        let (mut ui, _tmp) = fixture()?;
-        ui.open_voice();
-        ui.paste("test-secret-not-a-real-key");
-        ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
-        ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
-        assert!(ui.clipboard.is_none());
-        let mut terminal = Terminal::new(TestBackend::new(100, 35))?;
-        terminal.draw(|f| ui.draw(f))?;
-        let text = terminal
+        let mut terminal = Terminal::new(TestBackend::new(width, 24))?;
+        terminal.draw(|frame| ui.draw(frame))?;
+        Ok(terminal
             .backend()
             .buffer()
             .content
             .iter()
-            .map(|c| c.symbol())
-            .collect::<String>();
-        assert!(!text.contains("test-secret"));
-        assert!(text.contains("••••"));
-        assert!(!ui.storage.config.exists());
+            .map(|cell| cell.symbol())
+            .collect())
+    }
+    #[test]
+    fn space_tap_types_and_finished_dictation_inserts_without_sending() -> Result<()> {
+        let (mut ui, _tmp) = fixture()?;
+        ui.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        release(&mut ui);
+        assert_eq!(draft(&ui)?, "keep this draft ");
+        let tx = talking(&mut ui, Mode::Dictate)?;
+        tx.send(Event::Listening)?;
+        tx.send(Event::Delta(Role::User, "hello".into()))?;
+        // The voice's own replies never reach a dictated draft.
+        tx.send(Event::Delta(Role::Assistant, "Hi there!".into()))?;
+        ui.tick_voice(true);
+        assert_eq!(draft(&ui)?, "keep this draft ");
+        tx.send(Event::Segment(Role::User, "hello world".into()))?;
+        tx.send(Event::Delta(Role::User, "again".into()))?;
+        drop(tx);
+        ui.tick_voice(true);
+        assert_eq!(draft(&ui)?, "keep this draft hello world again");
+        assert!(ui.voice.hold.is_none());
+        assert!(!ui.busy);
         Ok(())
+    }
+    #[test]
+    fn cancelling_errors_or_losing_focus_preserve_the_draft() -> Result<()> {
+        let (mut ui, _tmp) = fixture()?;
+        ui.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        let tx = talking(&mut ui, Mode::Dictate)?;
+        tx.send(Event::Delta(Role::User, "discarded".into()))?;
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let p = ui.positions.get("voice-test").context("draft")?;
+        assert_eq!(p.draft.text(), "keep this draft");
+        assert_eq!(p.draft.selected_text().as_deref(), Some("t"));
+        let tx = talking(&mut ui, Mode::Dictate)?;
+        ui.tick_voice(false);
+        assert!(ui.voice.hold.is_none());
+        assert!(
+            tx.send(Event::Segment(Role::User, "too late".into()))
+                .is_err()
+        );
+        let tx = talking(&mut ui, Mode::Dictate)?;
+        tx.send(Event::Delta(Role::User, "half".into()))?;
+        tx.send(Event::Error("Codex voice failed: closed".into()))?;
+        ui.tick_voice(true);
+        assert_eq!(draft(&ui)?, "keep this draft");
+        assert!(ui.notice.as_ref().is_some_and(|(_, error)| *error));
+        Ok(())
+    }
+    #[test]
+    fn codex_sessions_converse_and_others_dictate() -> Result<()> {
+        let (mut ui, _tmp) = fixture()?;
+        assert_eq!(ui.voice_mode("voice-test"), Mode::Dictate);
+        let mut session = coding();
+        ui.sessions.insert(session.id.clone(), session.clone());
+        assert_eq!(
+            ui.voice_mode("voice-test"),
+            Mode::Dictate,
+            "not started yet"
+        );
+        session.thread_id = Some("thread".into());
+        ui.sessions.insert(session.id.clone(), session.clone());
+        assert_eq!(ui.voice_mode("voice-test"), Mode::Converse);
+        session.provider = provider::Provider::Claude;
+        ui.sessions.insert(session.id.clone(), session);
+        assert_eq!(ui.voice_mode("voice-test"), Mode::Dictate);
+        Ok(())
+    }
+    #[test]
+    fn dictation_strip_shows_codex_states_meter_and_transcript() -> Result<()> {
+        for width in [48, 100] {
+            let (mut ui, _tmp) = fixture()?;
+            ui.list_visible = false;
+            let session = coding();
+            ui.sessions.insert(session.id.clone(), session);
+            let tx = talking(&mut ui, Mode::Dictate)?;
+            assert!(screen(&mut ui, width)?.contains("connecting"));
+            tx.send(Event::Listening)?;
+            tx.send(Event::Levels {
+                microphone: 8192,
+                speaker: 0,
+            })?;
+            tx.send(Event::Delta(Role::User, "spoken words".into()))?;
+            ui.voice.hold.as_mut().context("hold")?.last = Instant::now();
+            ui.tick_voice(true);
+            std::thread::sleep(Duration::from_millis(700));
+            let listening = screen(&mut ui, width)?;
+            assert!(listening.contains("● listening"), "{listening}");
+            assert!(listening.contains("mic ▁▁▁▁▁█"), "{listening}");
+            assert!(
+                !listening.contains("codex ▁"),
+                "dictation has no voice meter"
+            );
+            assert!(listening.contains("spoken words"));
+            release(&mut ui);
+            assert!(screen(&mut ui, width)?.contains("transcribing"));
+            drop(tx);
+            ui.tick_voice(true);
+            assert!(!screen(&mut ui, width)?.contains("transcribing"));
+            assert_eq!(draft(&ui)?, "keep this draft spoken words");
+        }
+        Ok(())
+    }
+    #[test]
+    fn conversation_waits_for_the_reply_then_ends_and_never_edits_the_draft() -> Result<()> {
+        let (mut ui, _tmp) = fixture()?;
+        ui.list_visible = false;
+        let mut session = coding();
+        session.thread_id = Some("thread".into());
+        session.voice = true;
+        ui.sessions.insert(session.id.clone(), session.clone());
+        let tx = talking(&mut ui, Mode::Converse)?;
+        tx.send(Event::Listening)?;
+        tx.send(Event::Levels {
+            microphone: 4000,
+            speaker: 8192,
+        })?;
+        ui.voice.hold.as_mut().context("hold")?.last = Instant::now();
+        ui.tick_voice(true);
+        let listening = screen(&mut ui, 100)?;
+        assert!(listening.contains("● listening"), "{listening}");
+        assert!(listening.contains("codex ▁▁▁▁▁█"), "{listening}");
+        assert!(listening.contains("release space to stop talking"));
+        release(&mut ui);
+        // The voice is still answering: the session stays open.
+        ui.tick_voice(true);
+        let replying = screen(&mut ui, 100)?;
+        assert!(replying.contains("speaking"), "{replying}");
+        assert!(replying.contains("hold space to reply"));
+        // Typing works while the voice replies.
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(draft(&ui)?, "keep this draftx");
+        let hold = ui.voice.hold.as_mut().context("hold")?;
+        hold.speaking = None;
+        hold.busy = Instant::now() - QUIET;
+        ui.tick_voice(true);
+        assert!(ui.voice.hold.is_none(), "quiet after the reply ends it");
+        assert_eq!(draft(&ui)?, "keep this draftx");
+        drop(tx);
+        Ok(())
+    }
+    #[test]
+    fn conversation_stays_while_the_agent_works_on_what_the_voice_asked() -> Result<()> {
+        let (mut ui, _tmp) = fixture()?;
+        let mut session = coding();
+        session.thread_id = Some("thread".into());
+        session.voice = true;
+        ui.sessions.insert(session.id.clone(), session.clone());
+        let _tx = talking(&mut ui, Mode::Converse)?;
+        release(&mut ui);
+        session.status = Status::Running;
+        session.turn_started_at = Some(chrono::Utc::now().timestamp_millis() + 1);
+        ui.sessions.insert(session.id.clone(), session.clone());
+        ui.voice.hold.as_mut().context("hold")?.busy = Instant::now() - QUIET;
+        ui.tick_voice(true);
+        assert!(ui.voice.hold.as_ref().is_some_and(|hold| hold.working));
+        assert!(screen(&mut ui, 100)?.contains("agent working"));
+        // A new hold talks again on the same connection.
+        ui.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(
+            ui.voice
+                .hold
+                .as_ref()
+                .is_some_and(|h| h.phase == Phase::Listening)
+        );
+        // Codex closing the voice ends it here too.
+        session.voice = false;
+        ui.sessions.insert(session.id.clone(), session);
+        ui.tick_voice(true);
+        assert!(ui.voice.hold.is_none());
+        Ok(())
+    }
+    #[test]
+    fn meter_follows_codex_calibration() {
+        assert_eq!(intensity(0), 0);
+        assert_eq!(intensity(METER_NOISE_FLOOR), 0);
+        assert_eq!(intensity(METER_FULL_SCALE), 255);
+        assert_eq!(intensity(u16::MAX), 255);
     }
 }

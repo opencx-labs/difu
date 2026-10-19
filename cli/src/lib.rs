@@ -11,6 +11,8 @@ pub mod github;
 pub mod help;
 pub mod hover;
 pub mod images;
+#[cfg(target_os = "macos")]
+pub mod keychain;
 pub mod local_diff;
 pub mod model;
 pub mod navigation;

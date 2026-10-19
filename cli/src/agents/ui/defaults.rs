@@ -186,12 +186,11 @@ impl Ui {
             effort: form.value(2),
             isolated: true,
         };
-        let result = self.storage.load_config().and_then(|mut config| {
-            config.agent_defaults = defaults.clone();
-            self.storage.save_config(&config)
-        });
+        let result = self
+            .storage
+            .update_config(|config| config.agent_defaults = defaults.clone());
         match result {
-            Ok(()) => {
+            Ok(_) => {
                 self.defaults = defaults;
                 self.modal = None;
                 self.notice = Some(("Agent defaults saved for new sessions".into(), false));

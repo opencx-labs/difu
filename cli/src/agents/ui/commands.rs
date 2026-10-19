@@ -6,7 +6,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "remote-control",
         "Pair the difu iPhone app over Wi-Fi and manage phones",
     ),
-    ("voice", "Configure hold-Space dictation and API key"),
+    (
+        "voice",
+        "Turn hold-Space voice on or off; uses your Codex login",
+    ),
     (
         "tweaks",
         "Chat animation speeds for replies, sent messages and input",
@@ -379,11 +382,11 @@ impl Ui {
         match name.as_str() {
             "/slack" => self.open_slack(),
             "/remote-control" => self.open_remote(),
-            "/voice" => self.open_voice(),
+            "/voice" => self.toggle_voice(),
             "/tweaks" => self.open_tweaks(),
             "/theme" => self.open_theme(),
             "/compact" => self.control(Control::Compact),
-            "/model" => self.open_model(0),
+            "/model" => self.open_model_picker(),
             "/effort" => self.open_model(1),
             "/skills" => self.open_commands(true),
             "/status" => self.modal = Some(Modal::Status),

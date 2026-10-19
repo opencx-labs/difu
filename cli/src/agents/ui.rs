@@ -5,6 +5,7 @@ mod cache_io;
 mod changes;
 mod commands;
 mod defaults;
+mod flap;
 mod inline_questions;
 mod mcp_panel;
 mod media;
@@ -130,6 +131,8 @@ pub struct Position {
     replies_seen: bool,
     sent: Option<reveal::Typing>,
     clearing: Option<reveal::Typing>,
+    /// Split-flap reveals of voice transcripts, by entry.
+    voice_flaps: HashMap<String, flap::Flap>,
 }
 #[derive(Clone)]
 enum Action {
@@ -159,9 +162,6 @@ enum Action {
     SlackField(usize),
     SlackSave,
     SlackDisable,
-    VoiceField,
-    VoiceSave,
-    VoiceToggle,
     TweaksField(usize),
     TweaksSave,
     ThemeChoice(usize),
@@ -173,6 +173,7 @@ enum Action {
     DefaultOption(usize),
     ModelField(usize),
     ModelOption(usize),
+    PickerOption(usize),
     DefaultSave,
     DefaultRules,
     RulesField(usize),
@@ -209,10 +210,6 @@ pub enum Modal {
     },
     AgentDefaults(Box<defaults::Settings>),
     RepositoryRules(Box<rules::Settings>),
-    Voice {
-        key: Editor,
-        field: usize,
-    },
     Tweaks {
         fields: [Editor; 3],
         field: usize,
@@ -260,6 +257,7 @@ pub enum Modal {
         effort: Editor,
         field: usize,
     },
+    ModelPicker(Box<models::Picker>),
     Approval {
         pending: Pending,
         selected: usize,
@@ -1006,12 +1004,11 @@ impl Ui {
             return;
         };
         order.swap(from, to);
-        let result = self.storage.load_config().and_then(|mut config| {
-            config.session_order.clone_from(&order);
-            self.storage.save_config(&config)
-        });
+        let result = self
+            .storage
+            .update_config(|config| config.session_order.clone_from(&order));
         match result {
-            Ok(()) => {
+            Ok(_) => {
                 if let Some(panels::View::PullRequest { app }) = &mut self.panels.view {
                     app.config.session_order.clone_from(&order);
                 }
@@ -1154,7 +1151,7 @@ impl Ui {
             "Continue session",
             "Interrupt / cancel job",
             "Rename session",
-            "Change model / reasoning",
+            "Change model / reasoning · Alt+M",
             if archived {
                 "Unarchive session"
             } else {
@@ -1213,7 +1210,7 @@ impl Ui {
                 }
                 self.modal = Some(Modal::Rename(editor));
             }
-            4 => self.open_model(0),
+            4 => self.open_model_picker(),
             5 => {
                 if let Some(id) = self.selected.clone() {
                     let archived = !self.sessions.get(&id).is_some_and(|s| s.archived);
@@ -1245,13 +1242,14 @@ impl Ui {
         }
     }
     pub(crate) fn toggle_pin(&mut self, id: &str) {
-        let result = self.storage.load_config().and_then(|mut config| {
-            if !config.pinned_sessions.remove(id) {
-                config.pinned_sessions.insert(id.to_owned());
-            }
-            self.storage.save_config(&config)?;
-            Ok(config.pinned_sessions)
-        });
+        let result = self
+            .storage
+            .update_config(|config| {
+                if !config.pinned_sessions.remove(id) {
+                    config.pinned_sessions.insert(id.to_owned());
+                }
+            })
+            .map(|config| config.pinned_sessions);
         match result {
             Ok(pins) => self.pinned_sessions = pins,
             Err(error) => {
@@ -1300,10 +1298,10 @@ impl Ui {
         }
     }
     fn save_visibility(&mut self) {
-        let result = self.storage.load_config().and_then(|mut config| {
-            config.agent_list_visible = self.list_visible;
-            config.agent_changes_visible = self.changes_visible;
-            self.storage.save_config(&config)
+        let (list, changes) = (self.list_visible, self.changes_visible);
+        let result = self.storage.update_config(|config| {
+            config.agent_list_visible = list;
+            config.agent_changes_visible = changes;
         });
         if let Err(error) = result {
             self.notice = Some((format!("Could not save pane visibility: {error:#}"), true));
@@ -1529,6 +1527,14 @@ impl Ui {
         }
         if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('d') {
             self.toggle_changes();
+            return;
+        }
+        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('m') {
+            if matches!(self.modal, Some(Modal::ModelPicker(_))) {
+                self.modal = None;
+            } else {
+                self.open_model_picker();
+            }
             return;
         }
         if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT) {
@@ -2094,11 +2100,7 @@ impl Ui {
             Some(Modal::Repository(editor) | Modal::ChangeRepository(editor)) => {
                 editor.insert(text)
             }
-            Some(
-                Modal::Rename(e)
-                | Modal::QueuedEdit { editor: e, .. }
-                | Modal::Voice { key: e, .. },
-            ) => e.insert(text),
+            Some(Modal::Rename(e) | Modal::QueuedEdit { editor: e, .. }) => e.insert(text),
             Some(Modal::Tweaks { fields, field }) => {
                 if let Some(editor) = fields.get_mut(*field) {
                     editor.insert(text);
@@ -2151,16 +2153,16 @@ impl Ui {
             self.model_key(key);
             return;
         }
+        if matches!(self.modal, Some(Modal::ModelPicker(_))) {
+            self.picker_key(key);
+            return;
+        }
         if matches!(self.modal, Some(Modal::AgentDefaults(_))) {
             self.defaults_key(key);
             return;
         }
         if matches!(self.modal, Some(Modal::RepositoryRules(_))) {
             self.rules_key(key);
-            return;
-        }
-        if matches!(self.modal, Some(Modal::Voice { .. })) {
-            self.voice_modal_key(key);
             return;
         }
         if matches!(self.modal, Some(Modal::Tweaks { .. })) {
@@ -2352,6 +2354,7 @@ impl Ui {
             Action::DismissNotice => self.notice = None,
             Action::ModelField(index) => self.model_field(index),
             Action::ModelOption(index) => self.model_option(index),
+            Action::PickerOption(index) => self.picker_option(index),
             Action::DefaultOption(index) => self.default_option(index),
             Action::DefaultField(index) => {
                 if let Some(Modal::AgentDefaults(form)) = &mut self.modal {
@@ -2454,18 +2457,11 @@ impl Ui {
                     form.field = index;
                 }
             }
-            Action::VoiceSave => self.save_voice_key(),
-            Action::VoiceToggle => self.toggle_voice(),
             Action::TweaksSave => self.save_tweaks(),
             Action::ThemeChoice(index) => self.preview_theme(index),
             Action::TweaksField(index) => {
                 if let Some(Modal::Tweaks { field, .. }) = &mut self.modal {
                     *field = index;
-                }
-            }
-            Action::VoiceField => {
-                if let Some(Modal::Voice { field, .. }) = &mut self.modal {
-                    *field = 0;
                 }
             }
             Action::QuestionTab(field) => {
@@ -3126,7 +3122,6 @@ impl Ui {
         if coding {
             self.restore_media(&id);
         }
-        let voice_status = self.voice_status();
         let composer_height = if self.inline_question() {
             self.question_height(area.width)
                 .min(area.height.saturating_sub(5))
@@ -3142,8 +3137,7 @@ impl Ui {
                 .0
                 .len()
                 .clamp(1, 10) as u16;
-            (lines + 2 + if voice_status.is_some() { 2 } else { 0 })
-                .min(area.height.saturating_sub(3))
+            (lines + 2 + self.voice_rows(area.width)).min(area.height.saturating_sub(3))
         } else {
             0
         };
@@ -3227,6 +3221,16 @@ impl Ui {
             total,
             &mut lines,
             tweaks,
+            body.width,
+            Instant::now(),
+        );
+        flap::apply(
+            position,
+            session,
+            &sections,
+            start,
+            total,
+            &mut lines,
             body.width,
             Instant::now(),
         );
@@ -3358,16 +3362,19 @@ impl Ui {
                 }
                 return;
             }
-            let composer = if voice_status.is_some() {
-                self.draw_voice_preview(
+            let voice = self
+                .voice_rows(composer.width)
+                .min(composer.height.saturating_sub(3));
+            let composer = if voice > 0 {
+                self.draw_voice(
                     frame,
-                    Rect::new(composer.x, composer.y, composer.width, 2),
+                    Rect::new(composer.x, composer.y, composer.width, voice),
                 );
                 Rect::new(
                     composer.x,
-                    composer.y + 2,
+                    composer.y + voice,
                     composer.width,
-                    composer.height.saturating_sub(2),
+                    composer.height - voice,
                 )
             } else {
                 composer
@@ -3382,7 +3389,7 @@ impl Ui {
             editor(
                 frame,
                 composer,
-                voice_status.as_deref().unwrap_or(""),
+                "",
                 clearing.as_ref().unwrap_or(&position.draft),
                 self.focus == Focus::Composer && !self.panels.focused && self.modal.is_none(),
             );
@@ -3449,7 +3456,6 @@ impl Ui {
             Some(Modal::AgentDefaults(_)) => "New agent defaults · Tab fields · Esc cancels",
             Some(Modal::RepositoryRules(_)) => "Repository rules · Tab fields",
             Some(Modal::Slack(_)) => "Slack setup · Tab fields · Esc closes",
-            Some(Modal::Voice { .. }) => "Voice settings",
             Some(Modal::Tweaks { .. }) => "Tweaks · chat animations",
             Some(Modal::Theme { .. }) => "Theme",
             Some(Modal::Remote) => "Remote control · iPhone",
@@ -3465,6 +3471,7 @@ impl Ui {
             Some(Modal::QueuedEdit { .. }) => "Edit queued message",
             Some(Modal::Rename(_)) => "Rename session",
             Some(Modal::Model { .. }) => "Session model",
+            Some(Modal::ModelPicker(_)) => "Select model · ↑/↓ Select · ←/→ Effort · Esc Cancel",
             Some(Modal::Approval { .. }) => "Agent needs your input",
             Some(Modal::Resources {
                 artifacts: true, ..
@@ -3524,6 +3531,10 @@ impl Ui {
             self.draw_model(frame, area);
             return;
         }
+        if matches!(self.modal, Some(Modal::ModelPicker(_))) {
+            self.draw_picker(frame, area);
+            return;
+        }
         if matches!(self.modal, Some(Modal::AgentDefaults(_))) {
             self.draw_defaults(frame, area);
             return;
@@ -3534,10 +3545,6 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::Commands { .. })) {
             self.draw_commands(frame, area);
-            return;
-        }
-        if matches!(self.modal, Some(Modal::Voice { .. })) {
-            self.draw_voice_settings(frame, area);
             return;
         }
         if matches!(self.modal, Some(Modal::Tweaks { .. })) {
@@ -3589,6 +3596,7 @@ impl Ui {
             Some(
                 Modal::Transcript { .. }
                 | Modal::Model { .. }
+                | Modal::ModelPicker(_)
                 | Modal::Resources { .. }
                 | Modal::InstallBrowser { .. },
             ) => {}
@@ -3851,7 +3859,6 @@ impl Ui {
                 Modal::AgentDefaults(_)
                 | Modal::RepositoryRules(_)
                 | Modal::Slack(_)
-                | Modal::Voice { .. }
                 | Modal::Tweaks { .. }
                 | Modal::Theme { .. }
                 | Modal::Remote
@@ -3925,6 +3932,10 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
         ),
         ("Alt+D", "Open or close Changes with file tree"),
         (
+            "Alt+M",
+            "Pick a Codex or Claude Code model and reasoning level; Enter also sets the default",
+        ),
+        (
             "Enter in composer",
             "Send message; steer active turn immediately",
         ),
@@ -3948,7 +3959,7 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
         ("Shift+Enter", "Insert a newline in the composer"),
         (
             "Hold Space",
-            "Voice dictation when enabled with /voice (macOS)",
+            "Talk when enabled with /voice: Codex sessions answer aloud, others take dictation",
         ),
         (
             "Shift+arrows",
@@ -5885,6 +5896,114 @@ mod tests {
                 .is_empty()
         );
         assert!(!ui.busy);
+        Ok(())
+    }
+    #[test]
+    fn alt_m_model_picker_snaps_to_the_current_model_and_applies_or_saves_defaults() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let socket = super::super::server::socket(&storage)?;
+        let listener = UnixListener::bind(socket)?;
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                let mut line = String::new();
+                BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+                let request: Request = serde_json::from_str(&line)?;
+                serde_json::to_writer(&mut stream, &Reply::Ok)?;
+                stream.write_all(b"\n")?;
+                tx.send(request)?;
+            }
+            Ok(())
+        });
+        let mut ui = state(storage);
+        ui.skills.insert("one".into(), (Vec::new(), Vec::new()));
+        ui.model_completion.options = vec![
+            crate::model::ModelInfo {
+                id: "fixture-astra".into(),
+                name: "Astra".into(),
+                efforts: vec!["high".into()],
+            },
+            crate::model::ModelInfo {
+                id: "claude/fixture-luna".into(),
+                name: "Claude Code · Luna".into(),
+                efforts: vec!["low".into(), "medium".into()],
+            },
+        ];
+        {
+            let session = ui.sessions.get_mut("one").context("session")?;
+            session.model = Some("claude/fixture-luna".into());
+            session.effort = Some("medium".into());
+        }
+        ui.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+        assert!(matches!(ui.modal, Some(Modal::ModelPicker(_))));
+        let (screen, _) = draw(&mut ui, 100, 30)?;
+        assert!(screen.contains("Select model"));
+        assert!(screen.contains("1. Astra") && screen.contains("2. Claude Code · Luna ✔"));
+        assert!(screen.contains("Medium effort"), "{screen}");
+        // The highlighted row is the session's model, so Enter keeps it and raises the effort.
+        ui.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        let (screen, _) = draw(&mut ui, 100, 30)?;
+        assert!(screen.contains("Low effort"), "{screen}");
+        ui.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE));
+        let (screen, _) = draw(&mut ui, 100, 30)?;
+        // Astra does not support "low", so the effort falls back to the model default.
+        assert!(screen.contains("Default effort"), "{screen}");
+        ui.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert!(ui.modal.is_none());
+        match rx.recv_timeout(Duration::from_secs(5))? {
+            Request::Control {
+                id,
+                control: Control::Model { model, effort },
+            } => {
+                assert_eq!(id, "one");
+                assert_eq!(model.as_deref(), Some("fixture-astra"));
+                assert_eq!(effort.as_deref(), Some("high"));
+            }
+            other => anyhow::bail!("Unexpected request: {other:?}"),
+        }
+        assert!(ui.defaults.model.is_none());
+        ui.busy = false;
+        // Enter saves the pick for new sessions and applies it to the open session.
+        ui.open_commands(false);
+        ui.paste("model");
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(ui.modal, Some(Modal::ModelPicker(_))));
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(ui.modal.is_none());
+        match rx.recv_timeout(Duration::from_secs(5))? {
+            Request::Control {
+                id,
+                control: Control::Model { model, effort },
+            } => {
+                assert_eq!(id, "one");
+                assert_eq!(model.as_deref(), Some("claude/fixture-luna"));
+                assert_eq!(effort.as_deref(), Some("medium"));
+            }
+            other => anyhow::bail!("Unexpected request: {other:?}"),
+        }
+        assert_eq!(ui.defaults.model.as_deref(), Some("claude/fixture-luna"));
+        assert_eq!(ui.defaults.effort.as_deref(), Some("medium"));
+        let saved = ui.storage.load_config()?.agent_defaults;
+        assert_eq!(saved.model.as_deref(), Some("claude/fixture-luna"));
+        assert_eq!(saved.effort.as_deref(), Some("medium"));
+        ui.busy = false;
+        ui.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT));
+        let (screen, _) = draw(&mut ui, 100, 30)?;
+        assert!(screen.contains("claude/fixture-luna · default"), "{screen}");
+        ui.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert!(matches!(ui.modal, Some(Modal::Model { field: 0, .. })));
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
         Ok(())
     }
     #[test]

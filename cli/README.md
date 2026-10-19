@@ -68,8 +68,7 @@ gh auth login
 codex login
 ```
 
-Difu reuses those logins for coding and reviews. Optional voice dictation uses a
-separate OpenAI API key and API billing.
+Difu reuses those logins for coding, reviews and voice; voice needs no API key.
 
 ## Quick start
 
@@ -509,19 +508,34 @@ on failure the input shows “Ask anything…” instead. Activity shimmer moves
 in a repeating one-way sweep without moving the text. The entire highlight clears
 the last character before the next sweep starts.
 
-#### Voice dictation (macOS)
+#### Voice
 
-Open `/voice` to enable hold-Space dictation. Use `OPENAI_API_KEY`, or enter a key
-in the masked settings input to store it in **macOS Keychain**. Difu does not save
-keys in its configuration or write recordings to disk. Transcription uses OpenAI's
-`gpt-live-transcribe` with automatic language detection and separate API billing.
-Microphone permission is required. Voice capture is not available on Linux yet.
+`/voice` turns hold-Space voice on or off (`/voice on|off` also works); the choice
+is saved. Voice runs on Codex's realtime voice with your Codex login, so there is
+no API key, and it needs a Codex install that ships its voice helper (Codex CLI
+0.163 or newer from Homebrew or the release packages). That helper owns the
+microphone and the WebRTC connection; difu receives only levels and text and
+writes no audio to disk. Your terminal needs microphone permission.
 
-Tap Space to type a space; hold it to dictate. The composer shows connection,
-listening, audio levels, and transcription progress. Releasing inserts the final
-transcript at the saved cursor without sending. Esc cancels; failures preserve
-the draft. Terminals without key-release reporting use repeat cessation to detect
-release. Press Enter explicitly to send the resulting message.
+Tap Space to type a space; hold it to talk. Above the composer, Codex's voice strip
+shows the state (connecting, listening, speaking…) with live meters for your
+microphone and the voice. Terminals without key-release reporting end a hold when
+key repeats stop.
+
+In a Codex session that has started, holding Space talks to that session's agent,
+like Codex's `/voice` on the same thread. Your words and the voice's spoken replies
+appear in the chat as you speak, in Codex's split-flap reveal, and stay in the
+session's history. The voice can hand work to the agent; that turn runs in the
+session as usual and shows what was asked. Releasing Space mutes the microphone; the
+voice finishes its reply, waits while work it handed off is running (up to two
+minutes) so it can tell you the result, then disconnects. Hold Space again before
+then to reply at once. Esc ends the conversation. The composer stays usable while the
+voice replies.
+
+Claude sessions, and Codex sessions that have not started yet, take dictation
+instead: your words appear above the composer as you speak, and releasing Space
+inserts them at the cursor without sending. Esc cancels; failures keep the draft
+unchanged. Press Enter to send.
 
 A private local service owns sessions and review jobs. Closing difu or its terminal
 leaves them running, including pending approvals. Reopen difu to reconnect. There
@@ -1064,8 +1078,13 @@ difu if macOS asks, and allow **Local Network** access for difu in iOS Settings.
 
 Open **Cmd+K → `/slack`** to connect your Slack app. Enter its bot token
 (`xoxb-`), Socket Mode app token (`xapp-`), and your Slack member ID. The channel
-ID is optional; leave it blank for direct messages only. Tokens are masked and saved in macOS Keychain; the config contains only
-connection identifiers. The same form shows connection status and disables Slack.
+ID is optional; leave it blank for direct messages only. Tokens are masked and saved in
+macOS Keychain through Apple's `security` tool, so macOS does not ask for your login
+password again after difu updates or restarts; the config contains only connection
+identifiers. Setups saved by older versions move over on their next connection, with
+one last password prompt. difu reconnects on its own whenever Slack is set up and
+enabled. Reopening the form shows the connection and keeps the saved tokens when
+their fields are left blank; it also disables Slack.
 For channel mentions, invite the app to your configured channel.
 
 Enable **App Home → Messages Tab → Allow users to send Slash commands and messages**.

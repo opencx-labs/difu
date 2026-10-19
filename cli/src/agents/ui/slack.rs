@@ -3,6 +3,8 @@ use super::*;
 pub struct Settings {
     fields: Vec<Editor>,
     status: String,
+    /// A saved setup whose tokens blank token fields keep.
+    saved: Option<super::super::slack::Settings>,
     pub(super) field: usize,
 }
 #[derive(Default)]
@@ -29,8 +31,17 @@ impl Ui {
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .and_then(|value| value.get("text").and_then(Value::as_str).map(String::from))
             .unwrap_or_else(|| "Slack is not connected".into());
+        let status = match &settings {
+            Some(saved) if saved.enabled => format!(
+                "{status} · workspace {} · tokens saved in Keychain; leave them blank to keep them",
+                saved.team
+            ),
+            Some(_) => format!("{status} · tokens saved; Save and connect to turn Slack back on"),
+            None => status,
+        };
         self.modal = Some(Modal::Slack(Settings {
             status,
+            saved: settings.clone(),
             fields: vec![
                 Editor::default(),
                 Editor::default(),
@@ -56,13 +67,14 @@ impl Ui {
             return;
         };
         let (bot, app, user, channel) = (bot.clone(), app.clone(), user.clone(), channel.clone());
+        let saved = form.saved.clone();
         let storage = self.storage.clone();
         let (tx, rx) = mpsc::channel();
         self.slack.saving = Some(rx);
         // Drop the editors (including undo history) as soon as Save is pressed.
         self.modal = None;
         thread::spawn(move || {
-            let result = super::super::slack::configure(&storage, bot, app, user, channel)
+            let result = super::super::slack::configure(&storage, bot, app, user, channel, saved)
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(result);
             crate::repaint::request();
@@ -78,14 +90,12 @@ impl Ui {
         };
         self.slack.saving = None;
         let result = result.and_then(|settings| {
-            let mut config = self.storage.load_config().map_err(|e| format!("{e:#}"))?;
-            config.slack = Some(settings);
             self.storage
-                .save_config(&config)
+                .update_config(|config| config.slack = Some(settings))
                 .map_err(|e| format!("{e:#}"))
         });
         self.notice = Some(match result {
-            Ok(()) => (
+            Ok(_) => (
                 "Slack enabled · message difu directly, or mention it in your configured channel"
                     .into(),
                 false,
@@ -97,15 +107,13 @@ impl Ui {
         if self.slack.saving.is_some() {
             return;
         }
-        let result = (|| -> anyhow::Result<()> {
-            let mut config = self.storage.load_config()?;
+        let result = self.storage.update_config(|config| {
             if let Some(settings) = &mut config.slack {
                 settings.enabled = false;
             }
-            self.storage.save_config(&config)
-        })();
+        });
         self.notice = Some(match result {
-            Ok(()) => ("Slack disabled".into(), false),
+            Ok(_) => ("Slack disabled".into(), false),
             Err(error) => (format!("{error:#}"), true),
         });
         self.modal = None;
@@ -144,12 +152,21 @@ impl Ui {
         };
         let field = form.field;
         let fields = form.fields.clone();
+        let saved = form.saved.is_some();
         frame.render_widget(Paragraph::new(format!("{}\nTokens are masked and stored in macOS Keychain.\nOnly the member below can control difu. Channel mentions are optional.", form.status)).wrap(Wrap { trim: false }), Rect::new(area.x, area.y, area.width, 4.min(area.height)));
         for (index, (input, label)) in fields
             .iter()
             .zip([
-                "Bot token · xoxb-",
-                "App token · xapp-",
+                if saved {
+                    "Bot token · saved · blank keeps it"
+                } else {
+                    "Bot token · xoxb-"
+                },
+                if saved {
+                    "App token · saved · blank keeps it"
+                } else {
+                    "App token · xapp-"
+                },
                 "Allowed member ID · U…",
                 "Optional channel ID · C… (blank for DMs only)",
             ])
@@ -221,6 +238,7 @@ mod tests {
             ],
             field: 0,
             status: "Not connected".into(),
+            saved: None,
         }));
         assert!(ui.focused_editor().is_none());
         let mut terminal = Terminal::new(TestBackend::new(100, 24))?;

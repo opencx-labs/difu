@@ -447,9 +447,9 @@ impl Service {
                     Err(error) => return Err(error),
                 };
                 if remember_repository {
-                    let mut config = self.store.storage.load_config()?;
-                    config.agent_defaults.repository = Some(root.clone());
-                    self.store.storage.save_config(&config)?;
+                    self.store.storage.update_config(|config| {
+                        config.agent_defaults.repository = Some(root.clone())
+                    })?;
                 }
                 let job = Job::Coding(Launch {
                     repository: root,
@@ -765,6 +765,35 @@ impl Service {
                         .context(
                             "Agent did not return MCP status; check its connection and refresh",
                         )?
+                        .map_err(anyhow::Error::msg)?,
+                ))
+            }
+            Request::Voice { id, action } => {
+                let session = self.store.get(&id)?;
+                ensure!(
+                    matches!(session.job, Job::Coding(_))
+                        && session.provider == provider::Provider::Codex,
+                    "Talking to the agent needs a Codex coding session"
+                );
+                let live = self
+                    .workers
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Worker lock failed"))?
+                    .get(&id)
+                    .is_some_and(|w| !w.handle.is_finished());
+                if action == VoiceAction::Stop && !live {
+                    return Ok(Reply::Voice(None));
+                }
+                ensure!(
+                    !session.archived && !session.preparing(),
+                    "Wait until the session is ready before talking to it"
+                );
+                let (response, result) = mpsc::channel();
+                self.start(&id, Some(Control::Voice { action, response }))?;
+                Ok(Reply::Voice(
+                    result
+                        .recv_timeout(Duration::from_secs(60))
+                        .context("The agent did not answer the voice request")?
                         .map_err(anyhow::Error::msg)?,
                 ))
             }
