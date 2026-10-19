@@ -270,9 +270,10 @@ fn shimmer(text: &str, now: i64) -> Line<'static> {
             .collect::<Vec<_>>(),
     )
 }
-pub(super) fn activity(session: &Session, width: u16, now: i64) -> Vec<Line<'static>> {
+/// The working indicator, and how many of its rows are the heading.
+pub(super) fn activity(session: &Session, width: u16, now: i64) -> (Vec<Line<'static>>, usize) {
     if !session.status.active() {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
     let (state, detail, started) = activity_text(session);
     let seconds = started.map_or(0, |at| now.saturating_sub(at).max(0) / 1000);
@@ -290,6 +291,7 @@ pub(super) fn activity(session: &Session, width: u16, now: i64) -> Vec<Line<'sta
         .into_iter()
         .map(|text| shimmer(&text, now))
         .collect::<Vec<_>>();
+    let heading = lines.len();
     if let Some(detail) = detail {
         lines.extend(
             wrapped(
@@ -300,14 +302,24 @@ pub(super) fn activity(session: &Session, width: u16, now: i64) -> Vec<Line<'sta
             .map(|text| Line::from(Span::styled(text, Style::default().fg(DIM)))),
         );
     }
-    lines
+    (lines, heading)
 }
+#[cfg(test)]
 pub(super) fn waiting_messages(
     session: &Session,
     width: u16,
     outgoing: &[PendingSend],
 ) -> Vec<Line<'static>> {
+    waiting_rows(session, width, outgoing).0
+}
+/// Messages waiting to be sent, and which row shows each message's text.
+pub(super) fn waiting_rows(
+    session: &Session,
+    width: u16,
+    outgoing: &[PendingSend],
+) -> (Vec<Line<'static>>, Vec<(usize, String)>) {
     let mut rows = Vec::new();
+    let mut texts = Vec::new();
     let mut group = |heading: &str, messages: Vec<&str>| {
         if messages.is_empty() {
             return;
@@ -344,6 +356,7 @@ pub(super) fn waiting_messages(
             } else {
                 crate::ui::crop(&prefix, 0, available)
             };
+            texts.push((rows.len(), text.to_owned()));
             rows.push(Line::from(Span::styled(
                 crate::ui::crop(&format!("  ↳ {preview}"), 0, usize::from(width)),
                 Style::default().fg(DIM),
@@ -382,7 +395,7 @@ pub(super) fn waiting_messages(
         },
         queue,
     );
-    rows
+    (rows, texts)
 }
 
 // Bound input before markdown/syntax parsing, then cap terminal rows after wrapping.

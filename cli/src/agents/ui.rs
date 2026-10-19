@@ -133,6 +133,8 @@ pub struct Position {
     clearing: Option<reveal::Typing>,
     /// Split-flap reveals of voice transcripts, by entry.
     voice_flaps: HashMap<String, flap::Flap>,
+    /// The working indicator's label, flipping as it changes.
+    activity: flap::Board,
 }
 #[derive(Clone)]
 enum Action {
@@ -211,7 +213,7 @@ pub enum Modal {
     AgentDefaults(Box<defaults::Settings>),
     RepositoryRules(Box<rules::Settings>),
     Tweaks {
-        fields: [Editor; 3],
+        fields: Box<[Editor; 4]>,
         field: usize,
     },
     Theme {
@@ -2662,14 +2664,31 @@ fn join_bottom_border(frame: &mut Frame, rect: Rect) {
     }
 }
 fn editor(frame: &mut Frame, rect: Rect, label: &str, value: &Editor, focused: bool) {
+    editor_with(frame, rect, label, value, focused, None);
+}
+/// An editor whose laid-out rows pass through `transform`, such as an
+/// animation. A transformed editor shows no cursor.
+type Rows<'a> = &'a dyn Fn(&mut [Line<'static>]);
+fn editor_with(
+    frame: &mut Frame,
+    rect: Rect,
+    label: &str,
+    value: &Editor,
+    focused: bool,
+    transform: Option<Rows>,
+) {
     let area = panel(frame, rect, label, focused);
     if area.is_empty() {
         return;
     }
-    let (lines, (x, y)) = value.styled_layout(
+    let (mut lines, (x, y)) = value.styled_layout(
         area.width as usize,
         Style::default().bg(ACCENT).fg(crate::ui::INK),
     );
+    if let Some(transform) = transform {
+        transform(&mut lines);
+    }
+    let focused = focused && transform.is_none();
     let offset = y.saturating_sub(area.height.saturating_sub(1) as usize);
     frame.render_widget(
         Paragraph::new(
@@ -3152,16 +3171,30 @@ impl Ui {
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
-        let mut activity_rows =
+        let (mut activity_rows, heading) =
             transcript::activity(session, area.width, chrono::Utc::now().timestamp_millis());
-        activity_rows.extend(transcript::waiting_messages(
+        let (waiting, queued) = transcript::waiting_rows(
             session,
             area.width,
             self.positions
                 .get(&id)
                 .map(|p| p.outgoing.as_slice())
                 .unwrap_or_default(),
-        ));
+        );
+        let waiting_start = activity_rows.len();
+        activity_rows.extend(waiting);
+        if let Some(position) = self.positions.get_mut(&id) {
+            let now = Instant::now();
+            match activity_rows.get_mut(..heading) {
+                Some(rows) if heading > 0 => position.activity.show(rows, now, ACCENT, area.width),
+                _ => position.activity = flap::Board::default(),
+            }
+            for (row, text) in queued {
+                if let Some(line) = activity_rows.get_mut(waiting_start + row) {
+                    reveal::queued(position, &text, line, now, area.width);
+                }
+            }
+        }
         let activity_height = (activity_rows.len().min(usize::from(area.height / 3))) as u16;
         let requests_height = u16::from(!session.pending.is_empty()) + activity_height;
         let (model, effort) = match &session.job {
@@ -3383,17 +3416,24 @@ impl Ui {
                 .composer_suggestion()
                 .unwrap_or("Ask anything…")
                 .to_owned();
-            let clear_ms = self.tweaks.input_clear_ms;
             let position = self.positions.entry(id.clone()).or_default();
-            let clearing = reveal::clearing(position, clear_ms, Instant::now());
-            editor(
-                frame,
-                composer,
-                "",
-                clearing.as_ref().unwrap_or(&position.draft),
-                self.focus == Focus::Composer && !self.panels.focused && self.modal.is_none(),
-            );
-            if position.draft.chars.is_empty() && clearing.is_none() {
+            let now = Instant::now();
+            let focused =
+                self.focus == Focus::Composer && !self.panels.focused && self.modal.is_none();
+            if let Some(clearing) = reveal::clearing(position, now) {
+                editor_with(
+                    frame,
+                    composer,
+                    "",
+                    &Editor::from(clearing.text()),
+                    focused,
+                    Some(&|lines: &mut [Line<'static>]| clearing.vanish(lines, now)),
+                );
+            } else {
+                editor(frame, composer, "", &position.draft, focused);
+            }
+            let clearing = position.clearing.is_some();
+            if position.draft.chars.is_empty() && !clearing {
                 frame.render_widget(
                     Paragraph::new(placeholder).style(Style::default().fg(DIM)),
                     inner(composer),
@@ -4021,6 +4061,7 @@ mod tests {
             agent_reply_cps: 0,
             sent_message_ms: 0,
             input_clear_ms: 0,
+            max_animation_ms: 0,
         };
     }
     fn state(storage: Storage) -> Ui {
@@ -4568,7 +4609,7 @@ mod tests {
         session.status = Status::Starting;
         session.entries.clear();
         ui.paste("Prepare this change");
-        let (screen, _) = draw(&mut ui, 150, 35)?;
+        let (screen, _) = draw_settled(&mut ui, 150, 35)?;
         assert!(screen.contains("Preparing worktree"));
         assert!(screen.contains("Messages sent now will be queued"));
         assert!(screen.contains("Prepare this change"));
@@ -6581,6 +6622,14 @@ mod tests {
         assert_eq!(ui.summaries.len(), 2); // Hiding never deletes review-job history.
         Ok(())
     }
+    /// Draws once the working indicator's label has flipped in.
+    fn draw_settled(ui: &mut Ui, width: u16, height: u16) -> Result<(String, Option<(u16, u16)>)> {
+        draw(ui, width, height)?;
+        for position in ui.positions.values_mut() {
+            position.activity.age(Duration::from_secs(1));
+        }
+        draw(ui, width, height)
+    }
     fn draw(ui: &mut Ui, width: u16, height: u16) -> Result<(String, Option<(u16, u16)>)> {
         let mut terminal = Terminal::new(TestBackend::new(width, height))?;
         terminal.draw(|f| ui.draw(f))?;
@@ -7164,7 +7213,7 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn sending_clears_the_composer_and_types_the_message_into_chat() -> Result<()> {
+    fn sending_flips_the_composer_away_and_the_message_into_chat() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut ui = state(Storage {
             config: temp.path().join("config.json"),
@@ -7180,9 +7229,9 @@ mod tests {
             "animations keep frames coming"
         );
         let (screen, _) = draw(&mut ui, 120, 30)?;
-        // The composer still shows the text it is clearing; the chat copy has
-        // only started typing in.
-        assert_eq!(screen.matches("Typed message").count(), 1);
+        // The composer's text has started flipping away from its end; the chat
+        // copy has only started flipping in.
+        assert!(screen.contains("Typed messa") && !screen.contains("Typed message"));
         assert!(!screen.contains("Ask anything"));
         assert!(
             ui.positions
@@ -7229,6 +7278,7 @@ mod tests {
         set(&mut ui, "120");
         set(&mut ui, "0");
         set(&mut ui, "20000");
+        set(&mut ui, "300");
         ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(ui.modal, Some(Modal::Tweaks { .. })));
         assert!(
@@ -7238,12 +7288,14 @@ mod tests {
         );
         assert_eq!(ui.tweaks, crate::storage::Tweaks::default());
         ui.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
         set(&mut ui, "750");
         ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         let expected = crate::storage::Tweaks {
             agent_reply_cps: 120,
             sent_message_ms: 0,
             input_clear_ms: 750,
+            max_animation_ms: 300,
         };
         assert!(ui.modal.is_none());
         assert_eq!(ui.tweaks, expected);
@@ -7397,7 +7449,7 @@ mod tests {
         let position = ui.positions.get_mut("one").context("position")?;
         position.follow = false;
         position.conversation = 0;
-        let (screen, _) = draw(&mut ui, 200, 60)?;
+        let (screen, _) = draw_settled(&mut ui, 200, 60)?;
         let activity = screen
             .find("Reviewing approval request")
             .context("activity")?;

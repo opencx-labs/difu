@@ -1,11 +1,13 @@
-//! Codex's split-flap reveal for live voice transcripts: each new letter flips
-//! through letters already spoken before settling, then glows briefly in the
-//! speaker's colour. Timings match Codex's realtime transcript cells.
+//! Codex's split-flap reveal, used across the chat: each new character starts
+//! blank, flips through letters from the same text, settles, then glows briefly
+//! in the speaker's colour. It plays over already-rendered rows, so markdown
+//! styles survive and hidden characters keep their cells: layout never moves.
+//! Timings match Codex's realtime transcript cells.
 use super::{Entry, Position, Session, reveal, transcript};
-use crate::ui::{DIM, PANEL, PURPLE, TEXT};
+use crate::ui::{ACCENT, DIM, PANEL, PURPLE, TEXT};
 use crate::voice::Role;
 use ratatui::{
-    style::Style,
+    style::{Color, Style},
     text::{Line, Span},
 };
 use std::time::{Duration, Instant};
@@ -14,16 +16,302 @@ pub(super) const FRAME: Duration = Duration::from_millis(45);
 const ANIMATION: Duration = Duration::from_millis(675);
 const SETTLE: Duration = Duration::from_millis(180);
 const AFTERGLOW: Duration = Duration::from_millis(135);
+/// From a character's arrival until it rests in its own style.
+pub(super) const LIFETIME: Duration = SETTLE.saturating_add(AFTERGLOW);
 const BLANK: Duration = Duration::from_millis(40);
 const SAMPLE: usize = 24;
+const RUNWAY: usize = 3;
+
+/// Codex's arrival stagger for characters that appear together.
+pub(super) fn stagger(index: usize) -> Duration {
+    Duration::from_millis(
+        u64::try_from(index)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(8)
+            .min(56),
+    )
+}
+
+/// The visible characters of rendered rows in reading order. Whitespace,
+/// including row padding, never animates and is not counted.
+pub(super) fn glyphs(lines: &[Line]) -> Vec<char> {
+    lines
+        .iter()
+        .flat_map(|line| line.spans.iter())
+        .flat_map(|span| span.content.chars())
+        .filter(|character| !character.is_whitespace())
+        .collect()
+}
+
+/// Recent letters of a text, which unsettled tiles flip through.
+pub(super) fn sample(glyphs: impl DoubleEndedIterator<Item = char> + Clone) -> Vec<u8> {
+    let ascii = |filter: fn(&char) -> bool| -> Vec<u8> {
+        let mut letters: Vec<u8> = glyphs
+            .clone()
+            .rev()
+            .filter(filter)
+            .filter_map(|c| u8::try_from(c).ok())
+            .take(SAMPLE)
+            .collect();
+        letters.reverse();
+        letters
+    };
+    let letters = ascii(char::is_ascii_alphabetic);
+    if letters.is_empty() {
+        ascii(char::is_ascii_graphic)
+    } else {
+        letters
+    }
+}
+
+fn tile(sample: &[u8], character: char, index: usize, frame: usize) -> char {
+    if sample.is_empty() {
+        return character;
+    }
+    let offset = (character as usize)
+        .wrapping_add(index.wrapping_mul(7))
+        .wrapping_add(frame.wrapping_mul(11));
+    sample
+        .get(offset % sample.len())
+        .map_or(character, |b| char::from(*b))
+}
+
+fn push(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
+    match spans.last_mut() {
+        Some(last) if last.style == style => last.content.to_mut().push_str(text),
+        _ => spans.push(Span::styled(text.to_owned(), style)),
+    }
+}
+
+fn cells(character: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(character).unwrap_or(0)
+}
+
+/// How a split-flap pass looks.
+#[derive(Clone, Copy)]
+pub(super) struct Look {
+    /// The colour a settled character glows in.
+    pub glow: Color,
+    /// Flip a few tiles just ahead of the text, or after it once everything
+    /// has arrived, to show that more is coming.
+    pub runway: bool,
+}
+
+/// The frame of a flip that started at `phase`.
+fn frame(now: Instant, phase: Instant) -> usize {
+    usize::try_from(now.saturating_duration_since(phase).as_millis() / FRAME.as_millis())
+        .unwrap_or(usize::MAX)
+}
+
+/// Plays the split-flap over rendered rows. Visible character `i` (see
+/// [`glyphs`]) arrives at `arrival(i)`; until then its cells stay blank.
+pub(super) fn animate(
+    lines: &mut [Line<'static>],
+    arrival: impl Fn(usize) -> Option<Instant>,
+    now: Instant,
+    phase: Instant,
+    look: Look,
+    width: u16,
+) {
+    let sample = sample(glyphs(lines).into_iter());
+    let frame = frame(now, phase);
+    let mut glyph = 0;
+    let mut runway = if look.runway { RUNWAY } else { 0 };
+    let mut pending = false;
+    let mut last_row = None;
+    for (row, line) in lines.iter_mut().enumerate() {
+        let mut spans = Vec::new();
+        for span in std::mem::take(&mut line.spans) {
+            for character in span.content.chars() {
+                if character.is_whitespace() {
+                    push(&mut spans, character.encode_utf8(&mut [0; 4]), span.style);
+                    continue;
+                }
+                let index = glyph;
+                glyph += 1;
+                let Some(arrived) = arrival(index).filter(|at| *at <= now) else {
+                    pending = true;
+                    if runway > 0 && cells(character) == 1 && !sample.is_empty() {
+                        runway -= 1;
+                        let tile = tile(&sample, character, index, frame);
+                        push(
+                            &mut spans,
+                            tile.encode_utf8(&mut [0; 4]),
+                            span.style.fg(DIM),
+                        );
+                    } else {
+                        push(&mut spans, &" ".repeat(cells(character)), span.style);
+                    }
+                    continue;
+                };
+                last_row = Some(row);
+                let elapsed = now.saturating_duration_since(arrived);
+                if elapsed < BLANK {
+                    push(&mut spans, &" ".repeat(cells(character)), span.style);
+                } else if elapsed < SETTLE {
+                    if character.is_ascii_alphanumeric() {
+                        let tile = tile(&sample, character, index, frame);
+                        push(
+                            &mut spans,
+                            tile.encode_utf8(&mut [0; 4]),
+                            span.style.fg(DIM),
+                        );
+                    } else if character.is_ascii_punctuation() {
+                        push(&mut spans, " ", span.style);
+                    } else {
+                        push(
+                            &mut spans,
+                            character.encode_utf8(&mut [0; 4]),
+                            span.style.fg(DIM),
+                        );
+                    }
+                } else if elapsed < LIFETIME {
+                    push(
+                        &mut spans,
+                        character.encode_utf8(&mut [0; 4]),
+                        span.style.fg(look.glow),
+                    );
+                } else {
+                    push(&mut spans, character.encode_utf8(&mut [0; 4]), span.style);
+                }
+            }
+        }
+        line.spans = spans;
+    }
+    // Everything so far has arrived; flip a few tiles after it.
+    if runway == RUNWAY
+        && look.runway
+        && !pending
+        && !sample.is_empty()
+        && let Some(line) = last_row.and_then(|row| lines.get_mut(row))
+        && line.width() + RUNWAY < usize::from(width)
+    {
+        let tiles: String = (0..RUNWAY)
+            .filter_map(|index| {
+                sample
+                    .get((frame + index) % sample.len())
+                    .map(|b| char::from(*b))
+            })
+            .collect();
+        let after = line
+            .spans
+            .iter()
+            .rposition(|span| !span.content.trim_end().is_empty())
+            .map_or(0, |index| index + 1);
+        line.spans.insert(
+            after,
+            Span::styled(format!(" {tiles}"), Style::default().fg(DIM)),
+        );
+    }
+}
+
+/// The split-flap in reverse: visible character `i` flips at `departure(i)`
+/// and then leaves a blank cell.
+pub(super) fn vanish(
+    lines: &mut [Line<'static>],
+    departure: impl Fn(usize) -> Instant,
+    now: Instant,
+    phase: Instant,
+) {
+    let sample = sample(glyphs(lines).into_iter());
+    let frame = frame(now, phase);
+    let mut glyph = 0;
+    for line in lines.iter_mut() {
+        let mut spans = Vec::new();
+        for span in std::mem::take(&mut line.spans) {
+            for character in span.content.chars() {
+                if character.is_whitespace() {
+                    push(&mut spans, character.encode_utf8(&mut [0; 4]), span.style);
+                    continue;
+                }
+                let index = glyph;
+                glyph += 1;
+                let departed = departure(index);
+                if now < departed {
+                    push(&mut spans, character.encode_utf8(&mut [0; 4]), span.style);
+                } else if now.saturating_duration_since(departed) < SETTLE
+                    && character.is_ascii_alphanumeric()
+                {
+                    let tile = tile(&sample, character, index, frame);
+                    push(
+                        &mut spans,
+                        tile.encode_utf8(&mut [0; 4]),
+                        span.style.fg(DIM),
+                    );
+                } else {
+                    push(&mut spans, &" ".repeat(cells(character)), span.style);
+                }
+            }
+        }
+        line.spans = spans;
+    }
+}
+
+/// A label whose changed characters flip while unchanged ones stay put, like
+/// a departure board: a ticking counter flips only its new digits.
+#[derive(Default)]
+pub(super) struct Board {
+    glyphs: Vec<char>,
+    arrivals: Vec<Instant>,
+    phase: Option<Instant>,
+}
+impl Board {
+    pub(super) fn show(
+        &mut self,
+        lines: &mut [Line<'static>],
+        now: Instant,
+        glow: Color,
+        width: u16,
+    ) {
+        let glyphs = glyphs(lines);
+        if glyphs != self.glyphs {
+            let mut changed = 0;
+            self.arrivals = glyphs
+                .iter()
+                .enumerate()
+                .map(|(index, character)| {
+                    match (self.glyphs.get(index), self.arrivals.get(index)) {
+                        (Some(old), Some(at)) if old == character => *at,
+                        _ => {
+                            changed += 1;
+                            now + stagger(changed - 1)
+                        }
+                    }
+                })
+                .collect();
+            self.glyphs = glyphs;
+        }
+        let phase = *self.phase.get_or_insert(now);
+        let arrivals = &self.arrivals;
+        animate(
+            lines,
+            |index| arrivals.get(index).copied(),
+            now,
+            phase,
+            Look {
+                glow,
+                runway: false,
+            },
+            width,
+        );
+    }
+}
+
+#[cfg(test)]
+impl Board {
+    /// Moves every arrival back, as if `by` had passed.
+    pub(super) fn age(&mut self, by: Duration) {
+        for arrival in &mut self.arrivals {
+            *arrival = arrival.checked_sub(by).unwrap_or(*arrival);
+        }
+    }
+}
 
 pub(super) struct Flap {
     role: Role,
     text: String,
-    /// When each flippable glyph (ASCII letter or digit) arrived, in order.
+    /// When each visible character arrived, in order.
     arrivals: Vec<Instant>,
-    /// Recent letters that unsettled tiles flip through.
-    sample: Vec<u8>,
     updated: Instant,
     phase: Instant,
 }
@@ -34,13 +322,12 @@ impl Flap {
             role,
             text: String::new(),
             arrivals: Vec::new(),
-            sample: Vec::new(),
             updated: now,
             phase: now,
         }
     }
-    /// Replaces the text. Glyphs already shown keep their timing when the new
-    /// text extends the old; new ones arrive in a short stagger.
+    /// Replaces the text. Characters already shown keep their timing when the
+    /// new text extends the old; new ones arrive in a short stagger.
     pub(super) fn set(&mut self, text: &str, now: Instant) {
         if text == self.text {
             return;
@@ -55,32 +342,12 @@ impl Flap {
         } else {
             now
         };
-        let total = text.bytes().filter(u8::is_ascii_alphanumeric).count();
+        let total = text.chars().filter(|c| !c.is_whitespace()).count();
         let existing = self.arrivals.len().min(total);
         self.arrivals.truncate(existing);
         for index in 0..total - existing {
-            let offset = u64::try_from(index)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(8)
-                .min(56);
-            self.arrivals.push(start + Duration::from_millis(offset));
+            self.arrivals.push(start + stagger(index));
         }
-        let mut sample: Vec<u8> = text
-            .bytes()
-            .rev()
-            .filter(u8::is_ascii_alphabetic)
-            .take(SAMPLE)
-            .collect();
-        if sample.is_empty() {
-            sample.extend(
-                text.bytes()
-                    .rev()
-                    .filter(|b| !b.is_ascii_whitespace())
-                    .take(SAMPLE),
-            );
-        }
-        sample.reverse();
-        self.sample = sample;
         self.text = text.to_owned();
         self.updated = now;
     }
@@ -93,88 +360,37 @@ impl Flap {
         if self.text.is_empty() {
             return Vec::new();
         }
-        let width = usize::from(width.max(1));
-        let glow = match self.role {
-            Role::User => crate::ui::ACCENT,
-            Role::Assistant => crate::ui::PURPLE,
-        };
-        let frame = usize::try_from(
-            now.saturating_duration_since(self.phase).as_millis() / FRAME.as_millis(),
+        let mut lines: Vec<Line<'static>> = textwrap::wrap(
+            &self.text,
+            textwrap::Options::new(usize::from(width.max(1))),
         )
-        .unwrap_or(usize::MAX);
-        let wrapped = textwrap::wrap(&self.text, textwrap::Options::new(width));
-        let last = wrapped.len().saturating_sub(1);
-        let mut glyph = 0;
-        let mut lines = Vec::with_capacity(wrapped.len());
-        for (row, text) in wrapped.iter().enumerate() {
-            let mut spans = Vec::new();
-            let mut unsettled = false;
-            for character in text.chars() {
-                if character.is_ascii_alphanumeric() {
-                    let arrival = self.arrivals.get(glyph).copied().unwrap_or(self.updated);
-                    let elapsed = now.saturating_duration_since(arrival);
-                    let (shown, style) = if elapsed < BLANK {
-                        (' ', board.fg(DIM))
-                    } else if elapsed < SETTLE {
-                        (self.tile(character, glyph, frame), board.fg(DIM))
-                    } else if elapsed < SETTLE + AFTERGLOW {
-                        (character, board.fg(glow))
-                    } else {
-                        (character, board)
-                    };
-                    unsettled |= elapsed < SETTLE;
-                    glyph += 1;
-                    spans.push(Span::styled(shown.to_string(), style));
-                } else {
-                    if character.is_whitespace() {
-                        unsettled = false;
-                    }
-                    let shown = if unsettled && character.is_ascii_punctuation() {
-                        ' '
-                    } else {
-                        character
-                    };
-                    spans.push(Span::styled(shown.to_string(), board));
-                }
+        .into_iter()
+        .map(|row| Line::from(Span::styled(row.into_owned(), board)))
+        .collect();
+        let glow = match self.role {
+            Role::User => ACCENT,
+            Role::Assistant => PURPLE,
+        };
+        let runway = self.animating(now)
+            && self
+                .arrivals
+                .first()
+                .is_some_and(|first| now.saturating_duration_since(*first) >= SETTLE);
+        animate(
+            &mut lines,
+            |index| self.arrivals.get(index).copied(),
+            now,
+            self.phase,
+            Look { glow, runway },
+            width,
+        );
+        for line in &mut lines {
+            let padding = usize::from(width).saturating_sub(line.width());
+            if padding > 0 {
+                line.spans.push(Span::styled(" ".repeat(padding), board));
             }
-            let used = textwrap::core::display_width(text);
-            let room = width.saturating_sub(used);
-            if row == last
-                && room > 1
-                && self.animating(now)
-                && !self.sample.is_empty()
-                && self
-                    .arrivals
-                    .first()
-                    .is_some_and(|first| now.saturating_duration_since(*first) >= SETTLE)
-            {
-                let runway: String = (0..room.saturating_sub(1).min(3))
-                    .filter_map(|index| {
-                        self.sample
-                            .get((frame + index) % self.sample.len())
-                            .map(|b| char::from(*b))
-                    })
-                    .collect();
-                spans.push(Span::styled(format!(" {runway}"), board.fg(DIM)));
-            }
-            let used: usize = spans.iter().map(|span| span.width()).sum();
-            if used < width {
-                spans.push(Span::styled(" ".repeat(width - used), board));
-            }
-            lines.push(Line::from(spans));
         }
         lines
-    }
-    fn tile(&self, character: char, index: usize, frame: usize) -> char {
-        if self.sample.is_empty() {
-            return character;
-        }
-        let offset = (character as usize)
-            .wrapping_add(index.wrapping_mul(7))
-            .wrapping_add(frame.wrapping_mul(11));
-        self.sample
-            .get(offset % self.sample.len())
-            .map_or(character, |b| char::from(*b))
     }
 }
 

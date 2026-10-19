@@ -329,13 +329,18 @@ Type **/** in an empty composer for native commands: `/compact`, `/model`, `/eff
 Opening a session keeps the composer focused; pending questions remain available
 through the questions control.
 
-Replies type in character by character at 200 characters per second, speeding up
-when they fall more than 0.8 seconds behind the stream; replies already in a
-session when you open it appear at once. A sent message types into the chat over
-1 second while the composer clears over 1 second, whatever their length; typing
-during the clear finishes it immediately. **/tweaks** (also in the command
-palette) changes these three values, saved in the difu config; 0 turns an
-animation off.
+Chat text flips in split-flap style, like Codex's voice transcripts: each
+character starts blank, flips through letters from the same text, then settles
+with a brief glow. Replies flip in at 200 characters per second, speeding up so
+they never trail the stream by more than the longest animation; replies already
+in a session when you open it appear at once. A sent message flips into the chat,
+or into the queue above the composer, over 1 second while the composer's text
+flips away over 1 second, whatever their length; typing during the clear finishes
+it immediately. No animation takes longer than the longest animation, 0.5 seconds
+by default. The working indicator flips its label as it changes, so its timer
+ticks like a departure board. **/tweaks** (also in the command palette) changes
+these four values, saved in the difu config; 0 turns an animation off, and a
+longest animation of 0 removes the limit.
 
 **/theme** (also in the command palette) picks a colour theme for all of difu:
 the accent, text, borders, diffs, status colours, and syntax highlighting. Moving
