@@ -1,13 +1,14 @@
 //! Codex's split-flap reveal, used across the chat: each new character starts
 //! blank, flips through letters from the same text, settles, then glows briefly
 //! in the speaker's colour. It plays over already-rendered rows, so markdown
-//! styles survive and hidden characters keep their cells: layout never moves.
-//! Timings match Codex's realtime transcript cells.
+//! styles survive and hidden characters keep their cells: wrapping never moves.
+//! In the chat, rows still waiting for their first character take no space, so
+//! entries grow row by row. Timings match Codex's realtime transcript cells.
 use super::{Entry, Position, Session, reveal, transcript};
 use crate::ui::{ACCENT, DIM, PANEL, PURPLE, TEXT};
 use crate::voice::Role;
 use ratatui::{
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 use std::collections::HashSet;
@@ -141,7 +142,12 @@ pub(super) fn animate(
                             span.style.fg(DIM),
                         );
                     } else {
-                        push(&mut spans, &" ".repeat(cells(character)), span.style);
+                        // Marked so [`grow`] can tell waiting rows from blank ones.
+                        push(
+                            &mut spans,
+                            &" ".repeat(cells(character)),
+                            span.style.add_modifier(Modifier::HIDDEN),
+                        );
                     }
                     continue;
                 };
@@ -248,11 +254,122 @@ pub(super) fn vanish(
     }
 }
 
+/// [`glyphs`] row by row.
+fn row_glyphs(lines: &[Line]) -> Vec<Vec<char>> {
+    lines
+        .iter()
+        .map(|line| glyphs(std::slice::from_ref(line)))
+        .collect()
+}
+
+/// How an item of new text lines up with the text it replaces.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Pair {
+    /// Unchanged: the same item as this old one.
+    Same(usize),
+    /// Changed in place of this old one.
+    Replaced(usize),
+    /// New.
+    Inserted,
+}
+
+/// The most items [`align`] compares pairwise; larger changes pair by position.
+const ALIGN_LIMIT: usize = 1 << 18;
+
+/// Lines `new` up against `old` by their longest common subsequence, so text
+/// that only moved keeps its place. Each changed item replaces an old one in
+/// the same gap between unchanged items, in order, or is new.
+fn align<T: PartialEq>(old: &[T], new: &[T]) -> Vec<Pair> {
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+    let (old_rest, new_rest) = (
+        old.get(prefix..).unwrap_or_default(),
+        new.get(prefix..).unwrap_or_default(),
+    );
+    let suffix = old_rest
+        .iter()
+        .rev()
+        .zip(new_rest.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (old_middle, new_middle) = (
+        old_rest.get(..old_rest.len() - suffix).unwrap_or_default(),
+        new_rest.get(..new_rest.len() - suffix).unwrap_or_default(),
+    );
+    let (rows, columns) = (old_middle.len(), new_middle.len());
+    // The old item each new one equals, within the middle.
+    let mut same: Vec<Option<usize>> = vec![None; columns];
+    if rows.saturating_mul(columns) <= ALIGN_LIMIT {
+        // `lengths[i * (columns + 1) + j]`: the common length of the tails
+        // from old item `i` and new item `j`.
+        let stride = columns + 1;
+        let mut lengths = vec![0u32; (rows + 1) * stride];
+        let length =
+            |lengths: &[u32], i: usize, j: usize| lengths.get(i * stride + j).copied().unwrap_or(0);
+        for (i, a) in old_middle.iter().enumerate().rev() {
+            for (j, b) in new_middle.iter().enumerate().rev() {
+                let value = if a == b {
+                    length(&lengths, i + 1, j + 1) + 1
+                } else {
+                    length(&lengths, i + 1, j).max(length(&lengths, i, j + 1))
+                };
+                if let Some(cell) = lengths.get_mut(i * stride + j) {
+                    *cell = value;
+                }
+            }
+        }
+        let (mut i, mut j) = (0, 0);
+        while i < rows && j < columns {
+            if old_middle.get(i) == new_middle.get(j) {
+                if let Some(cell) = same.get_mut(j) {
+                    *cell = Some(i);
+                }
+                i += 1;
+                j += 1;
+            } else if length(&lengths, i + 1, j) >= length(&lengths, i, j + 1) {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+    }
+    // The old index bounding each new item's gap: the next unchanged item's.
+    let mut bounds = vec![rows; columns];
+    let mut bound = rows;
+    for (cell, matched) in bounds.iter_mut().zip(&same).rev() {
+        if let Some(i) = matched {
+            bound = *i;
+        }
+        *cell = bound;
+    }
+    let mut next = 0;
+    let middle = same
+        .iter()
+        .zip(&bounds)
+        .map(|(matched, bound)| match matched {
+            Some(i) => {
+                next = i + 1;
+                Pair::Same(prefix + i)
+            }
+            None if next < *bound => {
+                next += 1;
+                Pair::Replaced(prefix + next - 1)
+            }
+            None => Pair::Inserted,
+        });
+    (0..prefix)
+        .map(Pair::Same)
+        .chain(middle.collect::<Vec<_>>())
+        .chain((0..suffix).map(|index| Pair::Same(old.len() - suffix + index)))
+        .collect()
+}
+
 /// Text whose changed characters flip while unchanged ones stay put, like a
 /// departure board: a ticking counter flips only its new digits.
 #[derive(Default)]
 pub(super) struct Board {
-    glyphs: Vec<char>,
+    /// The visible characters of each row.
+    rows: Vec<Vec<char>>,
+    /// When each visible character arrived, in reading order.
     arrivals: Vec<Instant>,
     phase: Option<Instant>,
     /// When the newest flip has settled.
@@ -284,7 +401,19 @@ impl Board {
         width: u16,
         spread: impl Fn(usize) -> Duration,
     ) {
-        self.update(glyphs(lines), now, spread);
+        self.show_after(lines, now, now, glow, width, spread);
+    }
+    /// Like [`Board::show_over`], with changes waiting to flip until `after`.
+    pub(super) fn show_after(
+        &mut self,
+        lines: &mut [Line<'static>],
+        now: Instant,
+        after: Instant,
+        glow: Color,
+        width: u16,
+        spread: impl Fn(usize) -> Duration,
+    ) {
+        self.update(row_glyphs(lines), now, after.max(now), spread);
         let phase = *self.phase.get_or_insert(now);
         let arrivals = &self.arrivals;
         animate(
@@ -302,53 +431,94 @@ impl Board {
     /// Takes these rows as they are, without flipping them.
     pub(super) fn settle(&mut self, lines: &[Line<'static>], now: Instant) {
         let rested = now.checked_sub(LIFETIME).unwrap_or(now);
-        let glyphs = glyphs(lines);
-        if glyphs != self.glyphs {
-            self.arrivals = vec![rested; glyphs.len()];
-            self.glyphs = glyphs;
+        let rows = row_glyphs(lines);
+        if rows != self.rows {
+            self.arrivals = vec![rested; rows.iter().map(Vec::len).sum()];
+            self.rows = rows;
         }
     }
     pub(super) fn animating(&self, now: Instant) -> bool {
         self.until.is_some_and(|until| now < until)
     }
-    fn is_empty(&self) -> bool {
-        self.glyphs.is_empty() && self.phase.is_none()
+    /// When the last character to flip here arrives.
+    pub(super) fn arrived(&self) -> Option<Instant> {
+        self.until.and_then(|until| until.checked_sub(LIFETIME))
     }
-    fn update(&mut self, glyphs: Vec<char>, now: Instant, spread: impl Fn(usize) -> Duration) {
-        if glyphs == self.glyphs {
+    /// Whether nothing has been shown on this board yet.
+    pub(super) fn is_empty(&self) -> bool {
+        self.rows.iter().all(Vec::is_empty) && self.phase.is_none()
+    }
+    /// Lines the new rows up with the old ones, so characters that only moved,
+    /// such as a tool's output under its finished heading, keep their arrival.
+    /// Changed characters arrive from `start`.
+    fn update(
+        &mut self,
+        rows: Vec<Vec<char>>,
+        now: Instant,
+        start: Instant,
+        spread: impl Fn(usize) -> Duration,
+    ) {
+        if rows == self.rows {
             return;
         }
-        let changed: Vec<usize> = glyphs
+        let starts: Vec<usize> = self
+            .rows
             .iter()
-            .enumerate()
-            .filter(|(index, character)| {
-                let old = self.glyphs.get(*index);
-                let recent = self
-                    .arrivals
-                    .get(*index)
-                    .is_some_and(|at| now.saturating_duration_since(*at) < DIGIT_REFLIP);
-                match old {
-                    Some(old) if old == *character => false,
-                    Some(old) if old.is_ascii_digit() && character.is_ascii_digit() => !recent,
-                    _ => true,
-                }
+            .scan(0, |start, row| {
+                let here = *start;
+                *start += row.len();
+                Some(here)
             })
-            .map(|(index, _)| index)
             .collect();
-        let total = spread(changed.len());
-        let mut arrivals: Vec<Instant> = (0..glyphs.len())
-            .map(|index| self.arrivals.get(index).copied().unwrap_or(now))
-            .collect();
-        for (order, index) in changed.iter().enumerate() {
-            if let Some(arrival) = arrivals.get_mut(*index) {
-                *arrival = now + total.mul_f64(order as f64 / changed.len().max(1) as f64);
+        let arrival = |row: usize, column: usize| {
+            starts
+                .get(row)
+                .and_then(|start| self.arrivals.get(start + column))
+                .copied()
+        };
+        // Each new character's arrival when it stays put; `None` flips it.
+        let mut kept: Vec<Option<Instant>> = Vec::new();
+        for (characters, pair) in rows.iter().zip(align(&self.rows, &rows)) {
+            match pair {
+                Pair::Same(row) => {
+                    kept.extend((0..characters.len()).map(|column| arrival(row, column)));
+                }
+                Pair::Replaced(row) => {
+                    let old = self.rows.get(row).map_or(&[][..], Vec::as_slice);
+                    for (character, pair) in characters.iter().zip(align(old, characters)) {
+                        kept.push(match pair {
+                            Pair::Same(column) => arrival(row, column),
+                            Pair::Replaced(column) => old
+                                .get(column)
+                                .filter(|old| old.is_ascii_digit() && character.is_ascii_digit())
+                                .and(arrival(row, column))
+                                .filter(|at| now.saturating_duration_since(*at) < DIGIT_REFLIP),
+                            Pair::Inserted => None,
+                        });
+                    }
+                }
+                Pair::Inserted => kept.extend(std::iter::repeat_n(None, characters.len())),
             }
         }
-        if let Some(last) = changed.last().and_then(|index| arrivals.get(*index)) {
-            self.until = Some(*last + LIFETIME);
+        let changed = kept.iter().filter(|kept| kept.is_none()).count();
+        let total = spread(changed);
+        let mut order = 0;
+        let mut last = None;
+        self.arrivals = kept
+            .into_iter()
+            .map(|kept| {
+                kept.unwrap_or_else(|| {
+                    let at = start + total.mul_f64(order as f64 / changed.max(1) as f64);
+                    order += 1;
+                    last = Some(at);
+                    at
+                })
+            })
+            .collect();
+        if let Some(last) = last {
+            self.until = Some(last + LIFETIME);
         }
-        self.arrivals = arrivals;
-        self.glyphs = glyphs;
+        self.rows = rows;
     }
 }
 
@@ -449,10 +619,22 @@ impl Flap {
     }
 }
 
+/// How long `changed` characters of agent text take to arrive: the reply
+/// speed, within the longest animation.
+pub(super) fn paced(tweaks: crate::storage::Tweaks, changed: usize) -> Duration {
+    let paced = Duration::from_secs_f64(changed as f64 / f64::from(tweaks.agent_reply_cps.max(1)));
+    match tweaks.max_animation_ms {
+        0 => paced,
+        cap => paced.min(Duration::from_millis(u64::from(cap))),
+    }
+}
+
 /// Flips every chat entry that appears or changes after the session was first
 /// drawn: tool calls and their details, reasoning, plans, notes and messages.
-/// Entries already there show as they are. The newest reply, a message being
-/// sent and voice transcripts play their own flips.
+/// Entries flip in reading order, each waiting for the ones above it, so a
+/// batch of new entries plays one after another. Entries already there show as
+/// they are. The newest reply, a message being sent and voice transcripts play
+/// their own flips; returns when the newest reply's turn comes.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn chat(
     position: &mut Position,
@@ -464,7 +646,7 @@ pub(super) fn chat(
     tweaks: crate::storage::Tweaks,
     width: u16,
     now: Instant,
-) {
+) -> Instant {
     let mut owned = reveal::owned(position, session);
     let mut users = HashSet::new();
     for entry in &session.entries {
@@ -485,21 +667,33 @@ pub(super) fn chat(
     let known = position
         .known
         .get_or_insert_with(|| session.entries.iter().map(|e| e.id.clone()).collect());
-    // New text arrives at the reply speed, within the longest animation.
     let cps = tweaks.agent_reply_cps;
-    let spread = |changed: usize| {
-        let paced = Duration::from_secs_f64(changed as f64 / f64::from(cps.max(1)));
-        match tweaks.max_animation_ms {
-            0 => paced,
-            cap => paced.min(Duration::from_millis(u64::from(cap))),
-        }
-    };
+    let spread = |changed| paced(tweaks, changed);
     let available = lines.len();
     let mut drawn = HashSet::new();
+    let reply = reveal::latest_reply(session);
+    // When everything above the current entry has arrived.
+    let mut cursor = now;
+    let mut reply_turn = now;
     for section in sections {
-        let Some(rows) = reveal::rows(sections, start, total, available, &section.id)
-            .and_then(|range| lines.get_mut(range))
-        else {
+        let rows = reveal::rows(sections, start, total, available, &section.id)
+            .and_then(|range| lines.get_mut(range));
+        if let Some(reply) = reply.filter(|reply| reply.id == section.id)
+            && cps > 0
+            && !opening
+        {
+            reply_turn = cursor;
+            let received = rows.as_deref().map_or_else(
+                || reply.text.chars().filter(|c| !c.is_whitespace()).count(),
+                |rows| glyphs(rows).len(),
+            );
+            let finish = match &position.reply {
+                Some(shown) if shown.entry() == reply.id => shown.finish(received, tweaks, now),
+                _ => Some(cursor + paced(tweaks, received)),
+            };
+            cursor = cursor.max(finish.unwrap_or(cursor));
+        }
+        let Some(rows) = rows else {
             continue;
         };
         drawn.insert(section.id.clone());
@@ -519,12 +713,111 @@ pub(super) fn chat(
             } else {
                 PURPLE
             };
-            board.show_over(rows, now, glow, width, spread);
+            board.show_after(rows, now, cursor, glow, width, spread);
+            cursor = cursor.max(board.arrived().unwrap_or(cursor));
         }
         known.insert(section.id.clone());
     }
     // Entries out of view rest; coming back into view does not flip them.
     position.boards.retain(|id, _| drawn.contains(id));
+    reply_turn
+}
+
+/// Whether a row shows text, only waits for text still to arrive, or is blank.
+#[derive(Clone, Copy, PartialEq)]
+enum Row {
+    Shown,
+    Waiting,
+    Blank,
+}
+fn row(line: &Line) -> Row {
+    if line
+        .spans
+        .iter()
+        .any(|span| span.content.chars().any(|c| !c.is_whitespace()))
+    {
+        Row::Shown
+    } else if line
+        .spans
+        .iter()
+        .any(|span| !span.content.is_empty() && span.style.add_modifier.contains(Modifier::HIDDEN))
+    {
+        Row::Waiting
+    } else {
+        Row::Blank
+    }
+}
+
+/// Drops chat rows whose characters have not begun to arrive, so each entry
+/// grows row by row as it flips in and one waiting its turn takes no space.
+/// Blank rows go with the text below them; an entry's trailing blank rows go
+/// only while all of it waits. Shifts the sections and links below, and
+/// returns how many dropped rows were above row `above`.
+pub(super) fn grow(
+    sections: &mut [transcript::Section],
+    start: usize,
+    total: &mut usize,
+    lines: &mut Vec<Line<'static>>,
+    links: &mut Vec<transcript::Link>,
+    above: usize,
+) -> usize {
+    let mut dropped = vec![false; lines.len()];
+    for (index, section) in sections.iter().enumerate() {
+        let end = sections.get(index + 1).map_or(*total, |next| next.row);
+        let Some(range) = section.row.checked_sub(start).zip(end.checked_sub(start)) else {
+            continue;
+        };
+        let (Some(rows), Some(flags)) = (
+            lines.get(range.0..range.1),
+            dropped.get_mut(range.0..range.1),
+        ) else {
+            continue;
+        };
+        let kinds: Vec<Row> = rows.iter().map(row).collect();
+        if !kinds.contains(&Row::Waiting) {
+            continue;
+        }
+        let mut below = !kinds.contains(&Row::Shown);
+        for (flag, kind) in flags.iter_mut().zip(&kinds).rev() {
+            if *kind != Row::Blank {
+                below = *kind == Row::Waiting;
+            }
+            *flag = below;
+        }
+    }
+    let count = dropped.iter().filter(|dropped| **dropped).count();
+    if count == 0 {
+        return 0;
+    }
+    // Dropped rows before absolute row `row`.
+    let sums: Vec<usize> = std::iter::once(0)
+        .chain(dropped.iter().scan(0, |sum, dropped| {
+            *sum += usize::from(*dropped);
+            Some(*sum)
+        }))
+        .collect();
+    let before = |row: usize| {
+        sums.get(row.saturating_sub(start).min(dropped.len()))
+            .copied()
+            .unwrap_or(count)
+    };
+    for section in sections.iter_mut() {
+        section.row -= before(section.row);
+    }
+    links.retain(|link| {
+        !link
+            .row
+            .checked_sub(start)
+            .and_then(|row| dropped.get(row))
+            .is_some_and(|dropped| *dropped)
+    });
+    for link in links.iter_mut() {
+        link.row -= before(link.row);
+    }
+    let mut flags = dropped.iter();
+    lines.retain(|_| !flags.next().is_some_and(|dropped| *dropped));
+    *total -= count;
+    before(above)
 }
 
 /// The surface the dictation preview sits on.
@@ -786,6 +1079,149 @@ mod tests {
             !plain(&later).contains("1.5s"),
             "a second later it flips again"
         );
+    }
+
+    #[test]
+    fn text_that_only_moved_keeps_its_place() {
+        let chars = |text: &str| text.chars().collect::<Vec<_>>();
+        assert_eq!(
+            align(&chars("abc"), &chars("xacd")),
+            vec![Pair::Inserted, Pair::Same(0), Pair::Same(2), Pair::Inserted]
+        );
+        assert_eq!(
+            align(&chars("1.2s"), &chars("1.3s")),
+            vec![
+                Pair::Same(0),
+                Pair::Same(1),
+                Pair::Replaced(2),
+                Pair::Same(3)
+            ]
+        );
+        let rows = |rows: &[&str]| rows.iter().map(|row| chars(row)).collect::<Vec<_>>();
+        assert_eq!(
+            align(
+                &rows(&["Running ls", "out"]),
+                &rows(&["Ran ls", "out", "more"])
+            ),
+            vec![Pair::Replaced(0), Pair::Same(1), Pair::Inserted]
+        );
+    }
+
+    #[test]
+    fn a_finished_tool_flips_only_its_changed_heading() {
+        let rows = |heading: &str| {
+            vec![
+                Line::from(heading.to_owned()),
+                Line::from("  └ hello world"),
+                Line::from("    second line"),
+            ]
+        };
+        let t0 = Instant::now();
+        let mut board = Board::default();
+        board.settle(&rows("• Running ls · running · 1.2s"), t0);
+        let mut done = rows("• Ran ls · done · 1.5s");
+        board.show(&mut done, t0 + Duration::from_secs(2), ACCENT, 80);
+        let text = plain(&done);
+        assert!(
+            text.contains("└ hello world") && text.contains("second line"),
+            "the output stays put: {text}"
+        );
+        assert!(
+            text.contains(" ls · ") && !text.contains("done"),
+            "only the heading's changes flip: {text}"
+        );
+    }
+
+    #[test]
+    fn new_entries_flip_in_one_after_another_and_grow_as_they_arrive() {
+        use crate::agents::{Job, Launch};
+        let mut session = Session::new(
+            "chat".into(),
+            Job::Coding(Launch {
+                repository: "/tmp/project".into(),
+                isolated: true,
+                base: "HEAD".into(),
+                prompt: "Task".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.note("system", "Earlier note");
+        let tweaks = crate::storage::Tweaks {
+            agent_reply_cps: 100,
+            max_animation_ms: 0,
+            ..Default::default()
+        };
+        let frame = |position: &mut Position, session: &Session, at: Instant| {
+            let (mut lines, mut sections) = transcript::render(session, position, 60, false);
+            let mut total = lines.len();
+            chat(
+                position, session, &sections, 0, total, &mut lines, tweaks, 60, at,
+            );
+            grow(&mut sections, 0, &mut total, &mut lines, &mut Vec::new(), 0);
+            (plain(&lines), lines.len())
+        };
+        let mut position = Position::default();
+        let t0 = Instant::now();
+        let (_, before) = frame(&mut position, &session, t0);
+        session.note("error", "alpha beta gamma");
+        session.note("error", "delta");
+        let (_, waiting) = frame(&mut position, &session, t0);
+        assert_eq!(waiting, before, "entries take no space before their text");
+        // The first note arrives over 140 ms, and the second waits for it.
+        let (middle, _) = frame(&mut position, &session, t0 + Duration::from_millis(250));
+        assert!(!middle.contains("delta"), "{middle}");
+        let (done, _) = frame(&mut position, &session, t0 + Duration::from_secs(2));
+        assert!(
+            done.contains("alpha beta gamma") && done.contains("delta"),
+            "{done}"
+        );
+    }
+
+    #[test]
+    fn rows_waiting_for_text_take_no_space() {
+        let waiting = || {
+            Line::from(Span::styled(
+                "    ",
+                Style::new().add_modifier(Modifier::HIDDEN),
+            ))
+        };
+        let section = |id: &str, row| transcript::Section {
+            id: id.into(),
+            row,
+            tool: false,
+        };
+        let mut sections = vec![
+            section("old", 0),
+            section("growing", 2),
+            section("queued", 5),
+            section("after", 7),
+        ];
+        let mut lines = vec![
+            Line::from("old"),
+            Line::default(),
+            Line::from("partial"),
+            waiting(),
+            Line::default(),
+            waiting(),
+            Line::default(),
+            Line::from("after"),
+        ];
+        let mut total = lines.len();
+        let mut links = vec![transcript::Link {
+            row: 7,
+            column: 0,
+            width: 5,
+            url: "https://example.com".into(),
+        }];
+        let above = grow(&mut sections, 0, &mut total, &mut lines, &mut links, 8);
+        assert_eq!(plain(&lines), "old\n\npartial\n\nafter");
+        assert_eq!(
+            sections.iter().map(|s| s.row).collect::<Vec<_>>(),
+            vec![0, 2, 4, 4]
+        );
+        assert_eq!((total, above), (5, 3));
+        assert_eq!(links.first().map(|link| link.row), Some(4));
     }
 
     #[test]

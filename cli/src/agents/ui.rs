@@ -3283,43 +3283,40 @@ impl Ui {
             .rebase(1, position.conversation as isize - before_measure as isize);
         let transcript_window::View {
             mut lines,
-            links,
+            mut links,
             start,
             mut total,
-            sections,
+            mut sections,
         } = view;
-        flap::chat(
-            position,
-            session,
-            &sections,
-            start,
-            total,
-            &mut lines,
-            tweaks,
-            body.width,
-            Instant::now(),
+        let now = Instant::now();
+        let turn = flap::chat(
+            position, session, &sections, start, total, &mut lines, tweaks, body.width, now,
         );
         reveal::apply(
-            position,
-            session,
-            &sections,
-            start,
-            total,
-            &mut lines,
-            tweaks,
-            body.width,
-            Instant::now(),
+            position, session, &sections, start, total, &mut lines, tweaks, body.width, now, turn,
         );
         flap::apply(
-            position,
-            session,
-            &sections,
-            start,
-            total,
-            &mut lines,
-            body.width,
-            Instant::now(),
+            position, session, &sections, start, total, &mut lines, body.width, now,
         );
+        // Rows still waiting for their first character take no space yet.
+        let dropped = flap::grow(
+            &mut sections,
+            start,
+            &mut total,
+            &mut lines,
+            &mut links,
+            position.conversation,
+        );
+        let maximum = total.saturating_sub(if position.keep_transcript_position {
+            1
+        } else {
+            usize::from(body.height)
+        });
+        position.conversation = if position.follow && !position.keep_transcript_position {
+            maximum
+        } else {
+            position.conversation.saturating_sub(dropped).min(maximum)
+        };
         if session.entries.is_empty() && total == 0 {
             lines.push(Line::from(if session.status == Status::Idle {
                 "Send a message to start."

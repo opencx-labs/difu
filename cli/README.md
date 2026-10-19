@@ -333,9 +333,14 @@ All chat text flips in split-flap style, like Codex's voice transcripts: each
 character starts blank, flips through letters from the same text, then settles
 with a brief glow. Everything that appears or changes after you open a session
 flips: replies, tool calls and their output, reasoning, plans, notes and
-messages; when an entry changes, only its changed characters flip, and a fast
-counter such as a tool's timing flips at most once a second. Text already in a
-session when you open it appears at once. Replies flip in at 200 characters per
+messages; when an entry changes, only its changed characters flip, even when
+they shift (a finished tool flips only its new heading, not its output), and a
+fast counter such as a tool's timing flips at most once a second. Entries flip
+in reading order, each waiting for the ones above it, so a batch of new tool
+calls plays one after another; only the working indicator above the composer
+flips on its own. An entry grows row by row as its text arrives instead of
+taking its full height up front. Text already in a session when you open it
+appears at once. Replies flip in at 200 characters per
 second, speeding up so they never trail the stream by more than the longest
 animation; other agent content uses the same speed. A sent message flips into the chat,
 or into the queue above the composer, over 1 second while the composer's text
