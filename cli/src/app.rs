@@ -2511,12 +2511,17 @@ impl App {
             Modal::Help(mut state) => {
                 let before = state.query.text();
                 let max = state.rows.saturating_sub(state.viewport);
+                let step = if key.modifiers.contains(KeyModifiers::SUPER) {
+                    10
+                } else {
+                    1
+                };
                 match key.code {
                     KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        state.scroll = state.scroll.saturating_sub(1)
+                        state.scroll = state.scroll.saturating_sub(step)
                     }
                     KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        state.scroll = state.scroll.saturating_add(1).min(max)
+                        state.scroll = state.scroll.saturating_add(step).min(max)
                     }
                     KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(state.viewport),
                     KeyCode::PageDown => {

@@ -234,7 +234,9 @@ pub enum Modal {
         skills_only: bool,
         files_only: bool,
     },
-    Status,
+    Status {
+        scroll: usize,
+    },
     Usage {
         id: String,
         provider: provider::Provider,
@@ -2209,13 +2211,26 @@ impl Ui {
                 ..
             }) => {
                 let maximum = rows.len().saturating_sub(*height);
+                let step = scroll_step(key);
                 *scroll = match key.code {
-                    KeyCode::Up => scroll.saturating_sub(1),
-                    KeyCode::Down => scroll.saturating_add(1).min(maximum),
+                    KeyCode::Up => scroll.saturating_sub(step),
+                    KeyCode::Down => scroll.saturating_add(step).min(maximum),
                     KeyCode::PageUp => scroll.saturating_sub(*height),
                     KeyCode::PageDown => scroll.saturating_add(*height).min(maximum),
                     KeyCode::Home => 0,
                     KeyCode::End => maximum,
+                    _ => *scroll,
+                };
+            }
+            Some(Modal::Status { scroll }) => {
+                let step = scroll_step(key);
+                *scroll = match key.code {
+                    KeyCode::Up => scroll.saturating_sub(step),
+                    KeyCode::Down => scroll.saturating_add(step),
+                    KeyCode::PageUp => scroll.saturating_sub(10),
+                    KeyCode::PageDown => scroll.saturating_add(10),
+                    KeyCode::Home => 0,
+                    KeyCode::End => usize::MAX,
                     _ => *scroll,
                 };
             }
@@ -2337,10 +2352,10 @@ impl Ui {
             }
             Some(Modal::Help(state)) => match key.code {
                 KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    state.scroll = state.scroll.saturating_sub(1)
+                    state.scroll = state.scroll.saturating_sub(scroll_step(key))
                 }
                 KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    state.scroll = state.scroll.saturating_add(1)
+                    state.scroll = state.scroll.saturating_add(scroll_step(key))
                 }
                 KeyCode::Char('u') if ctrl => {
                     state.query.clear();
@@ -2548,6 +2563,31 @@ impl Ui {
             }
         }
     }
+    /// Scrolls the open information modal by `rows`, reporting whether there
+    /// was one: a message, usage, status, help or a request for your input.
+    fn scroll_modal(&mut self, rows: isize) -> bool {
+        match &mut self.modal {
+            Some(Modal::Transcript {
+                scroll,
+                rows: lines,
+                height,
+                ..
+            }) => {
+                *scroll = scroll
+                    .saturating_add_signed(rows)
+                    .min(lines.len().saturating_sub(*height));
+            }
+            Some(Modal::Usage {
+                scroll, maximum, ..
+            }) => *scroll = scroll.saturating_add_signed(rows).min(*maximum),
+            Some(Modal::Status { scroll } | Modal::Approval { scroll, .. }) => {
+                *scroll = scroll.saturating_add_signed(rows);
+            }
+            Some(Modal::Help(state)) => state.scroll = state.scroll.saturating_add_signed(rows),
+            _ => return false,
+        }
+        true
+    }
     pub fn mouse(&mut self, event: MouseEvent) {
         if self.notice.is_some() && self.toast_rect.contains((event.column, event.row).into()) {
             if event.kind == MouseEventKind::Down(MouseButton::Left) {
@@ -2586,35 +2626,11 @@ impl Ui {
                     for _ in 0..3 {
                         self.mcp_key(KeyEvent::new(code, KeyModifiers::NONE));
                     }
-                } else if let Some(Modal::Help(state)) = &mut self.modal {
-                    state.scroll = state.scroll.saturating_add_signed(
-                        if event.kind == MouseEventKind::ScrollDown {
-                            3
-                        } else {
-                            -3
-                        },
-                    );
-                } else if let Some(Modal::Transcript {
-                    scroll,
-                    rows,
-                    height,
-                    ..
-                }) = &mut self.modal
-                {
-                    *scroll = scroll
-                        .saturating_add_signed(if event.kind == MouseEventKind::ScrollDown {
-                            3
-                        } else {
-                            -3
-                        })
-                        .min(rows.len().saturating_sub(*height));
-                } else if let Some(Modal::Approval { scroll, .. }) = &mut self.modal {
-                    *scroll =
-                        scroll.saturating_add_signed(if event.kind == MouseEventKind::ScrollDown {
-                            3
-                        } else {
-                            -3
-                        });
+                } else if self.scroll_modal(if event.kind == MouseEventKind::ScrollDown {
+                    3
+                } else {
+                    -3
+                }) {
                 } else if self.modal.is_none() {
                     if let Some((_, Action::Focus(focus))) =
                         self.hits.iter().rev().find(|(r, a)| {
@@ -2636,6 +2652,15 @@ impl Ui {
             }
             _ => {}
         }
+    }
+}
+
+/// Rows an arrow key scrolls a modal: ten with Cmd held.
+fn scroll_step(key: KeyEvent) -> usize {
+    if key.modifiers.contains(KeyModifiers::SUPER) {
+        10
+    } else {
+        1
     }
 }
 
@@ -3531,7 +3556,7 @@ impl Ui {
             Some(Modal::ChangeRepository(_)) => "Change session repository",
             Some(Modal::Menu { .. }) => "Agent actions",
             Some(Modal::Commands { .. }) => "Session commands",
-            Some(Modal::Status) => "Session status",
+            Some(Modal::Status { .. }) => "Session status · ↑/↓ Scroll · Esc Close",
             Some(Modal::Mcp(_)) => "MCP · ↑/↓ Select · Enter Open · r Refresh · Esc Back",
             Some(Modal::Usage { .. }) => "Provider usage · ↑/↓ Scroll · r Refresh · Esc Close",
             Some(Modal::Pending { .. }) => "Pending questions and approvals",
@@ -3639,7 +3664,7 @@ impl Ui {
             self.draw_usage(frame, area);
             return;
         }
-        if matches!(self.modal, Some(Modal::Status)) {
+        if matches!(self.modal, Some(Modal::Status { .. })) {
             self.draw_status(frame, area);
             return;
         }
@@ -3931,7 +3956,7 @@ impl Ui {
                 | Modal::Theme { .. }
                 | Modal::Remote
                 | Modal::Commands { .. }
-                | Modal::Status
+                | Modal::Status { .. }
                 | Modal::Mcp(_)
                 | Modal::Usage { .. }
                 | Modal::Pending { .. }
@@ -5254,7 +5279,7 @@ mod tests {
                     .draft
                     .insert("Keep this draft");
                 // Dismissing a dialog still takes precedence over interruption.
-                ui.modal = Some(Modal::Status);
+                ui.modal = Some(Modal::Status { scroll: 0 });
                 ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
                 assert!(ui.modal.is_none());
                 assert!(ui.interrupting.is_empty());
@@ -5274,12 +5299,12 @@ mod tests {
                 let reply = ui.receiver.recv_timeout(Duration::from_secs(5))?;
                 assert!(matches!(reply.kind, Task::Interrupt(_)));
                 // Completion must not close a newly opened dialog or clear another request's busy flag.
-                ui.modal = Some(Modal::Status);
+                ui.modal = Some(Modal::Status { scroll: 0 });
                 ui.sender.send(reply)?;
                 ui.tick(false);
                 assert!(ui.interrupting.is_empty());
                 assert!(ui.busy);
-                assert!(matches!(ui.modal, Some(Modal::Status)));
+                assert!(matches!(ui.modal, Some(Modal::Status { .. })));
             }
         }
         worker
@@ -7243,7 +7268,7 @@ mod tests {
         position.draft.clear();
         position.draft.insert("/status");
         assert!(ui.command_draft());
-        assert!(matches!(ui.modal, Some(Modal::Status)));
+        assert!(matches!(ui.modal, Some(Modal::Status { .. })));
         Ok(())
     }
     #[test]
@@ -7931,6 +7956,57 @@ mod tests {
         worker
             .join()
             .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
+        Ok(())
+    }
+    #[test]
+    fn information_modals_scroll_with_the_wheel_and_cmd_arrows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        });
+        let wheel = |ui: &mut Ui| {
+            ui.mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+        let cmd_down = KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER);
+        ui.modal = Some(Modal::Usage {
+            id: "one".into(),
+            provider: provider::Provider::Claude,
+            data: None,
+            error: None,
+            scroll: 0,
+            maximum: 30,
+        });
+        wheel(&mut ui);
+        ui.key(cmd_down);
+        ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(matches!(ui.modal, Some(Modal::Usage { scroll: 12, .. })));
+        ui.modal = Some(Modal::Transcript {
+            entry: "missing".into(),
+            scroll: 0,
+            rows: vec![Line::default(); 100],
+            links: Vec::new(),
+            layout: None,
+            height: 10,
+        });
+        wheel(&mut ui);
+        ui.key(cmd_down);
+        assert!(matches!(
+            ui.modal,
+            Some(Modal::Transcript { scroll: 13, .. })
+        ));
+        ui.modal = Some(Modal::Status { scroll: 0 });
+        wheel(&mut ui);
+        ui.key(cmd_down);
+        assert!(matches!(ui.modal, Some(Modal::Status { scroll: 13 })));
+        // Drawing keeps the status within its text.
+        draw(&mut ui, 120, 35)?;
+        assert!(matches!(ui.modal, Some(Modal::Status { scroll: 0 })));
         Ok(())
     }
     #[test]

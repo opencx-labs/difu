@@ -360,7 +360,8 @@ Dark, Solarized Light, GitHub Light, Catppuccin Latte, and Gruvbox Light.
 **/usage** shows labeled quota bars and local reset times: percent used for Claude,
 percent remaining for Codex. It reads Claude Code's structured `/usage` data or Codex's account limits
 and session token usage, without sending a model prompt. Use **r** to refresh and
-**↑/↓** or **PgUp/PgDn** to scroll. Provider errors appear in the panel.
+**↑/↓**, **PgUp/PgDn** or the wheel to scroll, and **Cmd+↑/↓** to move ten
+lines. Provider errors appear in the panel. **/status** scrolls the same way.
 
 **/mcp** manages the selected agent's MCP servers without sending a model prompt.
 It shows live connection states, errors, server details and tools. Select with
@@ -408,7 +409,8 @@ remain available through the actions menu.
 Conversation tools show a compact preview capped at four terminal rows, including
 wrapped commands and output. Click a tool or press Enter on a focused message to
 open its full contents in a modal. Up/Down, PageUp/PageDown, and the wheel scroll
-inside it; Esc returns to the same conversation position. Chat rendering keeps a
+inside it, and Cmd+Up/Down moves ten lines; Esc returns to the same conversation
+position. Chat rendering keeps a
 window of about ten nearby messages (more when needed to fill the viewport),
 loading older messages as you scroll without discarding history. Up/Down focuses
 transcript entries, PageUp/PageDown and the wheel scroll, and End returns to live
