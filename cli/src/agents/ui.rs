@@ -351,6 +351,15 @@ pub struct Ui {
     question_reveal: bool,
     /// The question panel's split-flap.
     question_flip: inline_questions::Flip,
+    /// Sidebar cards flipping as their text changes, by session.
+    sidebar_boards: HashMap<String, flap::Board>,
+    /// Whether the sidebar has listed sessions, which then show at once.
+    sidebar_seen: bool,
+    /// The sidebar's order and selection last drawn.
+    sidebar_order: Vec<String>,
+    sidebar_selected: Option<String>,
+    /// Selection highlights flipping on or off, by session.
+    sidebar_highlights: HashMap<String, flap::Highlight>,
     question_note_focused: bool,
     hits: Vec<(Rect, Action)>,
     pub viewport: usize,
@@ -426,6 +435,11 @@ impl Ui {
             question_send: None,
             question_reveal: true,
             question_flip: Default::default(),
+            sidebar_boards: HashMap::new(),
+            sidebar_seen: false,
+            sidebar_order: Vec::new(),
+            sidebar_selected: None,
+            sidebar_highlights: HashMap::new(),
             question_note_focused: false,
             hits: Vec::new(),
             viewport: 20,
@@ -471,6 +485,11 @@ impl Ui {
     pub fn redraw_interval(&self) -> Option<Duration> {
         if self.voice_active()
             || self.question_flip.animating(Instant::now())
+            || !self.sidebar_highlights.is_empty()
+            || self
+                .sidebar_boards
+                .values()
+                .any(|board| board.animating(Instant::now()))
             || self
                 .selected
                 .as_ref()
@@ -2568,6 +2587,12 @@ impl Ui {
             }
         }
     }
+    /// Flips the whole drawn screen in after a tab switch at `started`;
+    /// returns whether the flip is still playing.
+    pub fn flip_screen(&self, buffer: &mut ratatui::buffer::Buffer, started: Instant) -> bool {
+        let duration = Duration::from_millis(u64::from(self.tweaks.capped(flap::SCREEN_MS)));
+        self.tweaks.agent_reply_cps > 0 && flap::screen(buffer, started, duration, Instant::now())
+    }
     /// Scrolls the open information modal by `rows`, reporting whether there
     /// was one: a message, usage, status, help or a request for your input.
     fn scroll_modal(&mut self, rows: isize) -> bool {
@@ -2682,6 +2707,10 @@ impl Ui {
                 board.age(second);
             }
         }
+        for board in self.sidebar_boards.values_mut() {
+            board.age(second);
+        }
+        self.sidebar_highlights.clear();
         self.question_flip.age(second);
     }
 }
@@ -3018,6 +3047,45 @@ impl Ui {
         }
         let mut visible_pr_sessions = Vec::new();
         let mut offset = 0;
+        let now = Instant::now();
+        // Cards flip as their text changes; those listed first show at once.
+        let settled = !self.sidebar_seen || self.tweaks.agent_reply_cps == 0;
+        let order: Vec<String> = list.iter().map(|session| session.id.clone()).collect();
+        if !settled && order != self.sidebar_order {
+            // A card moving into a slot flips from the text that was there.
+            let previous: Vec<Option<flap::Board>> = self
+                .sidebar_order
+                .iter()
+                .map(|id| self.sidebar_boards.get(id).cloned())
+                .collect();
+            for (index, id) in order.iter().enumerate() {
+                if self.sidebar_order.get(index) != Some(id) {
+                    let seed = previous.get(index).cloned().flatten().unwrap_or_default();
+                    self.sidebar_boards.insert(id.clone(), seed);
+                }
+            }
+        }
+        self.sidebar_order = order;
+        if self.selected != self.sidebar_selected {
+            if !settled {
+                for (id, on) in [
+                    (self.sidebar_selected.clone(), false),
+                    (self.selected.clone(), true),
+                ] {
+                    if let Some(id) = id
+                        && let Some(highlight) = flap::Highlight::start(on, now, self.tweaks)
+                    {
+                        self.sidebar_highlights.insert(id, highlight);
+                    }
+                }
+            }
+            self.sidebar_selected.clone_from(&self.selected);
+        }
+        let listed: HashSet<&str> = list.iter().map(|session| session.id.as_str()).collect();
+        self.sidebar_boards
+            .retain(|id, _| listed.contains(id.as_str()));
+        self.sidebar_highlights
+            .retain(|id, highlight| listed.contains(id.as_str()) && !highlight.done(now));
         for (index, session) in list.iter().enumerate().skip(self.list_scroll) {
             if offset >= usize::from(items.height) {
                 break;
@@ -3143,6 +3211,12 @@ impl Ui {
                     Style::default().fg(prs::color(pr)),
                 )));
             }
+            let board = self.sidebar_boards.entry(session.id.clone()).or_default();
+            if settled {
+                board.settle(&lines, now);
+            } else {
+                board.show(&mut lines, now, ACCENT, row.width);
+            }
             frame.render_widget(
                 Paragraph::new(lines).style(if selected {
                     crate::ui::user_message_style()
@@ -3151,6 +3225,10 @@ impl Ui {
                 }),
                 row,
             );
+            if let Some(highlight) = self.sidebar_highlights.get(&session.id) {
+                let background = crate::ui::user_message_style().bg.unwrap_or(PANEL);
+                highlight.apply(frame.buffer_mut(), row, background, BG, now);
+            }
             if !deleting {
                 self.hits.push((row, Action::Select(session.id.clone())));
             }
@@ -3166,6 +3244,7 @@ impl Ui {
                 items,
             );
         }
+        self.sidebar_seen |= !list.is_empty();
         self.prs.visible.extend(visible_pr_sessions);
     }
     fn draw_conversation(&mut self, frame: &mut Frame, rect: Rect) {
@@ -4567,6 +4646,47 @@ mod tests {
         assert_eq!(ui.filtered().first().map(|s| s.id.as_str()), Some("two"));
         ui.toggle_pin("two");
         assert!(!storage.load_config()?.pinned_sessions.contains("two"));
+        Ok(())
+    }
+
+    #[test]
+    fn sidebar_cards_flip_their_changes_highlight_and_new_order() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        });
+        let first = ui.summaries.first().context("session")?.title.clone();
+        let mut other = ui.summaries.first().context("session")?.clone();
+        other.id = "two".into();
+        other.title = "Second card".into();
+        ui.summaries.push(other);
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert!(
+            screen.contains("Second card") && screen.contains(&first),
+            "the first list shows at once"
+        );
+        ui.summaries.last_mut().context("other")?.title = "Second card renamed".into();
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert!(screen.contains("Second card") && !screen.contains("renamed"));
+        let (screen, _) = draw_settled(&mut ui, 120, 40)?;
+        assert!(screen.contains("Second card renamed"));
+        // Moving the selection flips the highlight off one card and onto the
+        // other, a flap at a time.
+        ui.select("two".into());
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert_eq!(ui.sidebar_highlights.len(), 2);
+        assert!(screen.contains('▀'));
+        let (screen, _) = draw_settled(&mut ui, 120, 40)?;
+        assert!(!screen.contains('▀'));
+        // A card moving into another slot flips from the text that was there.
+        assert_eq!(ui.filtered().first().map(|s| s.id.as_str()), Some("two"));
+        ui.toggle_pin("one");
+        assert_eq!(ui.filtered().first().map(|s| s.id.as_str()), Some("one"));
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert!(!screen.contains("Second card renamed"), "{screen}");
+        let (screen, _) = draw_settled(&mut ui, 120, 40)?;
+        assert!(screen.contains(&format!("◆ {first}")) && screen.contains("Second card renamed"));
         Ok(())
     }
 
@@ -7704,7 +7824,7 @@ mod tests {
         assert!(!screen.contains("Coding · Working"));
         ui.archived = true;
         ui.summaries.first_mut().context("summary")?.archived = true;
-        let (screen, _) = draw(&mut ui, 160, 35)?;
+        let (screen, _) = draw_settled(&mut ui, 160, 35)?;
         assert!(screen.contains("archived"));
         Ok(())
     }

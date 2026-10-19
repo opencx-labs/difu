@@ -27,6 +27,8 @@ pub struct Shell {
     pub agents_active: bool,
     reviews_started: bool,
     palette: Option<palette::Palette>,
+    /// When the last tab switch started flipping the screen in.
+    switched: Option<std::time::Instant>,
 }
 impl Shell {
     pub fn new(storage: Storage, config: Config, pr: Option<PrKey>) -> Self {
@@ -41,6 +43,7 @@ impl Shell {
             agents_active: !reviews_started,
             reviews_started,
             palette: None,
+            switched: None,
         }
     }
     pub fn local(storage: Storage, config: Config, path: std::path::PathBuf) -> Self {
@@ -55,6 +58,9 @@ impl Shell {
     }
     fn switch(&mut self, agents: bool) {
         self.agents.cancel_voice();
+        if self.agents_active != agents {
+            self.switched = Some(std::time::Instant::now());
+        }
         self.agents_active = agents;
         self.reviews.config.last_tab_agents = agents;
         let saved = self
@@ -71,6 +77,9 @@ impl Shell {
         }
     }
     pub fn redraw_interval(&self) -> Option<std::time::Duration> {
+        if self.switched.is_some() {
+            return Some(crate::repaint::FRAME_INTERVAL);
+        }
         if self.agents_active {
             self.agents.redraw_interval()
         } else {
@@ -214,6 +223,12 @@ impl Shell {
             x += width;
         }
         self.draw_palette(frame);
+        // A tab switch flips the whole screen in.
+        if let Some(started) = self.switched
+            && !self.agents.flip_screen(frame.buffer_mut(), started)
+        {
+            self.switched = None;
+        }
     }
     pub fn clipboard(&mut self, output: &mut impl Write) {
         self.reviews.flush_clipboard(output);
@@ -249,6 +264,7 @@ mod tests {
         };
         storage.save_config(&config)?;
         shell.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT));
+        assert!(shell.switched.is_some() && shell.redraw_interval().is_some());
         let saved = storage.load_config()?;
         assert!(!saved.last_tab_agents);
         assert!(saved.wrap_diff);

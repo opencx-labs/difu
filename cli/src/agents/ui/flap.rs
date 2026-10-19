@@ -8,6 +8,7 @@ use super::{Entry, Position, Session, reveal, transcript};
 use crate::ui::{ACCENT, DIM, PANEL, PURPLE, TEXT};
 use crate::voice::Role;
 use ratatui::{
+    buffer::{Buffer, Cell, CellDiffOption},
     style::{Color, Modifier, Style},
     text::{Line, Span},
 };
@@ -99,6 +100,34 @@ pub(super) struct Look {
     pub runway: bool,
 }
 
+/// How a character looks a while after it arrived.
+enum Face {
+    Blank,
+    /// Flipping through letters from the text.
+    Tile,
+    /// Flipping, for characters with no letters to flip through.
+    Dim,
+    Glow,
+    Rest,
+}
+fn face(character: char, elapsed: Duration) -> Face {
+    if elapsed < BLANK {
+        Face::Blank
+    } else if elapsed < SETTLE {
+        if character.is_ascii_alphanumeric() {
+            Face::Tile
+        } else if character.is_ascii_punctuation() {
+            Face::Blank
+        } else {
+            Face::Dim
+        }
+    } else if elapsed < LIFETIME {
+        Face::Glow
+    } else {
+        Face::Rest
+    }
+}
+
 /// The frame of a flip that started at `phase`.
 fn frame(now: Instant, phase: Instant) -> usize {
     usize::try_from(now.saturating_duration_since(phase).as_millis() / FRAME.as_millis())
@@ -152,34 +181,28 @@ pub(super) fn animate(
                     continue;
                 };
                 last_row = Some(row);
-                let elapsed = now.saturating_duration_since(arrived);
-                if elapsed < BLANK {
-                    push(&mut spans, &" ".repeat(cells(character)), span.style);
-                } else if elapsed < SETTLE {
-                    if character.is_ascii_alphanumeric() {
+                let mut buffer = [0; 4];
+                match face(character, now.saturating_duration_since(arrived)) {
+                    Face::Blank => push(&mut spans, &" ".repeat(cells(character)), span.style),
+                    Face::Tile => {
                         let tile = tile(&sample, character, index, frame);
                         push(
                             &mut spans,
-                            tile.encode_utf8(&mut [0; 4]),
-                            span.style.fg(DIM),
-                        );
-                    } else if character.is_ascii_punctuation() {
-                        push(&mut spans, " ", span.style);
-                    } else {
-                        push(
-                            &mut spans,
-                            character.encode_utf8(&mut [0; 4]),
+                            tile.encode_utf8(&mut buffer),
                             span.style.fg(DIM),
                         );
                     }
-                } else if elapsed < LIFETIME {
-                    push(
+                    Face::Dim => push(
                         &mut spans,
-                        character.encode_utf8(&mut [0; 4]),
+                        character.encode_utf8(&mut buffer),
+                        span.style.fg(DIM),
+                    ),
+                    Face::Glow => push(
+                        &mut spans,
+                        character.encode_utf8(&mut buffer),
                         span.style.fg(look.glow),
-                    );
-                } else {
-                    push(&mut spans, character.encode_utf8(&mut [0; 4]), span.style);
+                    ),
+                    Face::Rest => push(&mut spans, character.encode_utf8(&mut buffer), span.style),
                 }
             }
         }
@@ -209,6 +232,122 @@ pub(super) fn animate(
             after,
             Span::styled(format!(" {tiles}"), Style::default().fg(DIM)),
         );
+    }
+}
+
+/// The character a screen cell shows, unless it is blank or part of an image:
+/// image protocols mark their cells, write escapes or use Kitty placeholders.
+fn cell_glyph(cell: &Cell) -> Option<char> {
+    if cell.diff_option != CellDiffOption::None
+        || cell
+            .symbol()
+            .chars()
+            .any(|c| c == '\x1b' || c == '\u{10EEEE}')
+    {
+        return None;
+    }
+    cell.symbol().chars().next().filter(|c| !c.is_whitespace())
+}
+
+/// How long a whole screen takes to flip in, before the longest animation.
+pub(super) const SCREEN_MS: u32 = 500;
+
+/// Flips a whole drawn screen in, in reading order over `duration` from
+/// `started`, as when switching tabs. Backgrounds and images show at once.
+/// Returns whether the flip is still playing.
+pub(super) fn screen(
+    buffer: &mut Buffer,
+    started: Instant,
+    duration: Duration,
+    now: Instant,
+) -> bool {
+    let glyphs: Vec<char> = buffer.content.iter().filter_map(cell_glyph).collect();
+    let sample = sample(glyphs.iter().copied());
+    let total = glyphs.len().max(1);
+    let frame = frame(now, started);
+    let mut index = 0;
+    for cell in &mut buffer.content {
+        let Some(character) = cell_glyph(cell) else {
+            continue;
+        };
+        let arrived = started + duration.mul_f64(index as f64 / total as f64);
+        index += 1;
+        if now < arrived {
+            cell.set_symbol(" ");
+            continue;
+        }
+        match face(character, now.saturating_duration_since(arrived)) {
+            Face::Blank => {
+                cell.set_symbol(" ");
+            }
+            Face::Tile => {
+                cell.set_char(tile(&sample, character, index, frame)).fg = DIM;
+            }
+            Face::Dim => cell.fg = DIM,
+            Face::Glow => cell.fg = ACCENT,
+            Face::Rest => {}
+        }
+    }
+    now < started + duration + LIFETIME
+}
+
+/// How long a selection highlight takes to cross a sidebar card, and how
+/// long each cell's flap takes to fall.
+const HIGHLIGHT: Duration = Duration::from_millis(240);
+const FLAP: Duration = Duration::from_millis(90);
+
+/// A sidebar card's highlight flipping on or off, cell by cell in reading
+/// order: each cell's flap falls with its top half in the new colour.
+#[derive(Clone, Copy)]
+pub(super) struct Highlight {
+    on: bool,
+    started: Instant,
+    duration: Duration,
+}
+impl Highlight {
+    pub(super) fn start(on: bool, now: Instant, tweaks: crate::storage::Tweaks) -> Option<Self> {
+        let ms = u64::try_from(HIGHLIGHT.as_millis()).unwrap_or(u64::MAX);
+        let duration = Duration::from_millis(u64::from(
+            tweaks.capped(u32::try_from(ms).unwrap_or(u32::MAX)),
+        ));
+        (tweaks.agent_reply_cps > 0 && !duration.is_zero()).then_some(Self {
+            on,
+            started: now,
+            duration,
+        })
+    }
+    pub(super) fn done(&self, now: Instant) -> bool {
+        now >= self.started + self.duration + FLAP
+    }
+    /// Plays over a card already drawn in its new colour, `highlight` being
+    /// the selected background and `plain` the other.
+    pub(super) fn apply(
+        &self,
+        buffer: &mut Buffer,
+        area: ratatui::layout::Rect,
+        highlight: Color,
+        plain: Color,
+        now: Instant,
+    ) {
+        let (from, to) = if self.on {
+            (plain, highlight)
+        } else {
+            (highlight, plain)
+        };
+        let total = usize::from(area.width) * usize::from(area.height);
+        for (index, position) in area.positions().enumerate() {
+            let Some(cell) = buffer.cell_mut(position) else {
+                continue;
+            };
+            let at = self.started + self.duration.mul_f64(index as f64 / total.max(1) as f64);
+            if now < at {
+                cell.bg = from;
+            } else if now < at + FLAP {
+                cell.set_symbol("▀");
+                cell.fg = to;
+                cell.bg = from;
+            }
+        }
     }
 }
 
@@ -365,7 +504,7 @@ fn align<T: PartialEq>(old: &[T], new: &[T]) -> Vec<Pair> {
 
 /// Text whose changed characters flip while unchanged ones stay put, like a
 /// departure board: a ticking counter flips only its new digits.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(super) struct Board {
     /// The visible characters of each row.
     rows: Vec<Vec<char>>,
@@ -1222,6 +1361,29 @@ mod tests {
         );
         assert_eq!((total, above), (5, 3));
         assert_eq!(links.first().map(|link| link.row), Some(4));
+    }
+
+    #[test]
+    fn a_switched_screen_flips_in_while_images_show_at_once() {
+        let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 10, 2));
+        buffer.set_string(0, 0, "Agents tab", Style::default());
+        if let Some(cell) = buffer.cell_mut((0, 1)) {
+            cell.set_symbol("\u{10EEEE}");
+        }
+        let text = |buffer: &Buffer| buffer.content.iter().map(Cell::symbol).collect::<String>();
+        let (t0, duration) = (Instant::now(), Duration::from_millis(500));
+        let mut first = buffer.clone();
+        assert!(screen(&mut first, t0, duration, t0));
+        assert!(!text(&first).contains("Agents"), "{}", text(&first));
+        assert!(text(&first).contains('\u{10EEEE}'), "images stay put");
+        let mut settled = buffer.clone();
+        assert!(!screen(
+            &mut settled,
+            t0,
+            duration,
+            t0 + Duration::from_secs(1)
+        ));
+        assert_eq!(text(&settled), text(&buffer));
     }
 
     #[test]

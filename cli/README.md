@@ -349,6 +349,10 @@ it immediately. No animation takes longer than the longest animation, 0.5 second
 by default. The working indicator flips as it changes, so its timer ticks like a
 departure board. Each question flips in as it opens, and an answered one flips
 away like the composer's text before the next flips in.
+Sidebar cards flip their changes too: status, timers, request counts and PRs;
+the selection highlight flips across a card a flap at a time, and a card that
+moves flips from the text that was in its place. Switching between the Agents
+and Reviews tabs flips the whole screen in.
 **/tweaks** (also in the command palette) changes these four
 values, saved in the difu config; 0 turns an animation off (a reply speed of 0
 turns off the flip for all agent content), and a longest animation of 0 removes
