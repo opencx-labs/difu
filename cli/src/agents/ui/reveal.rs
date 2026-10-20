@@ -1,7 +1,8 @@
 //! Chat animations from `/tweaks`, played as Codex's split-flap: replies flip
 //! in at their speed, sent and queued messages flip in over their time, and the
 //! composer's text flips away after sending. None takes longer than the cap.
-//! The flip keeps every character's cell, so wrapping and heights never change.
+//! The flip keeps every character's cell, so wrapping never changes; rows
+//! still waiting for their first character are dropped by [`flap::grow`].
 use super::flap::{self, Look};
 use super::*;
 use crate::ui::PURPLE;
@@ -18,6 +19,22 @@ pub(super) struct Reply {
     arrivals: Vec<Instant>,
 }
 impl Reply {
+    pub(super) fn entry(&self) -> &str {
+        &self.entry
+    }
+    /// When this reply, `received` characters long, will have flipped in; `None`
+    /// once it has settled.
+    pub(super) fn finish(
+        &self,
+        received: usize,
+        tweaks: crate::storage::Tweaks,
+        now: Instant,
+    ) -> Option<Instant> {
+        self.shown.is_finite().then(|| {
+            let remaining = (received as f64 - self.shown).max(0.0).ceil() as usize;
+            self.at.max(now) + flap::paced(tweaks, remaining)
+        })
+    }
     fn shown(entry: &str, at: Instant) -> Self {
         Self {
             entry: entry.to_owned(),
@@ -110,8 +127,19 @@ pub(super) fn rows(
     (range.start < range.end && range.end <= available).then_some(range)
 }
 
+/// The newest written reply. Spoken replies flip in from their own transcript
+/// timing.
+pub(super) fn latest_reply(session: &Session) -> Option<&Entry> {
+    session
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == "agentMessage" && entry.data.get("difuVoice").is_none())
+}
+
 /// Advance this frame's animations for the drawn session: flip in its newest
-/// reply and just-sent message. Replies already present when a session is
+/// reply and just-sent message. A new reply waits until `turn`, when the
+/// entries above it have flipped in. Replies already present when a session is
 /// first drawn are shown as they are.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn apply(
@@ -124,14 +152,10 @@ pub(super) fn apply(
     tweaks: crate::storage::Tweaks,
     width: u16,
     now: Instant,
+    turn: Instant,
 ) {
     let available = lines.len();
-    // Spoken replies flip in from their own transcript timing.
-    let latest = session
-        .entries
-        .iter()
-        .rev()
-        .find(|entry| entry.kind == "agentMessage" && entry.data.get("difuVoice").is_none());
+    let latest = latest_reply(session);
     if !std::mem::replace(&mut position.replies_seen, true) || tweaks.agent_reply_cps == 0 {
         position.reply = latest.map(|entry| Reply::shown(&entry.id, now));
     } else if let Some(entry) = latest {
@@ -148,12 +172,29 @@ pub(super) fn apply(
             reply => reply.insert(Reply {
                 entry: entry.id.clone(),
                 shown: 0.0,
-                at: now,
-                started: now,
+                at: turn.max(now),
+                started: turn.max(now),
                 arrivals: Vec::new(),
             }),
         };
-        if reply.shown.is_finite() {
+        if now < reply.at {
+            // Its turn has not come: the entries above it are still flipping.
+            reply.at = reply.at.max(turn);
+            reply.started = reply.at;
+            if let Some(lines) = range.and_then(|range| lines.get_mut(range)) {
+                flap::animate(
+                    lines,
+                    |_| None,
+                    now,
+                    reply.started,
+                    Look {
+                        glow: PURPLE,
+                        runway: false,
+                    },
+                    width,
+                );
+            }
+        } else if reply.shown.is_finite() {
             let (from, elapsed) = (reply.at, now.saturating_duration_since(reply.at));
             let behind = received - reply.shown;
             // The cap bounds how far a reply may trail what has been received.
@@ -233,11 +274,7 @@ pub(super) fn apply(
 /// Chat entries whose flip this module plays: the newest reply, which flips in
 /// at the reply speed, and the copies of a message being sent.
 pub(super) fn owned(position: &Position, session: &Session) -> HashSet<String> {
-    let mut owned: HashSet<String> = session
-        .entries
-        .iter()
-        .rev()
-        .find(|entry| entry.kind == "agentMessage" && entry.data.get("difuVoice").is_none())
+    let mut owned: HashSet<String> = latest_reply(session)
         .map(|entry| entry.id.clone())
         .into_iter()
         .collect();
@@ -355,7 +392,7 @@ mod tests {
         now: Instant,
     ) {
         apply(
-            position, session, sections, 0, total, lines, tweaks, 80, now,
+            position, session, sections, 0, total, lines, tweaks, 80, now, now,
         );
     }
 
@@ -418,6 +455,36 @@ mod tests {
         session.note("agentMessage", "Shown at once");
         let still = frame(&mut position, &session, off, t0 + Duration::from_secs(3));
         assert_eq!(still.last().map(String::as_str), Some("Shown at once"));
+    }
+
+    #[test]
+    fn a_new_reply_waits_for_the_entries_above_it() {
+        let tweaks = Tweaks::default();
+        let mut session = session(Status::Idle);
+        let mut position = Position::default();
+        let t0 = Instant::now();
+        frame(&mut position, &session, tweaks, t0);
+        session.note("agentMessage", "Done here");
+        if let Some(entry) = session.entries.last_mut() {
+            entry.finished_at = Some(1);
+        }
+        let turn = t0 + Duration::from_secs(1);
+        let at = |position: &mut Position, now: Instant| {
+            let (sections, mut lines) = window(&session);
+            let total = lines.len();
+            apply(
+                position, &session, &sections, 0, total, &mut lines, tweaks, 80, now, turn,
+            );
+            text(&lines)
+        };
+        let waiting = at(&mut position, t0 + Duration::from_millis(500));
+        assert!(
+            waiting.last().is_some_and(|row| row.trim().is_empty()),
+            "{waiting:?}"
+        );
+        assert!(position.animating());
+        let shown = at(&mut position, turn + Duration::from_secs(1));
+        assert_eq!(shown.last().map(String::as_str), Some("Done here"));
     }
 
     #[test]

@@ -628,6 +628,8 @@ mod tests {
             },
         );
         terminal.draw(|f| ui.draw(f))?;
+        ui.settle_flips();
+        terminal.draw(|f| ui.draw(f))?;
         let sidebar = (0..45)
             .map(|y| {
                 (0..38)

@@ -389,7 +389,7 @@ impl Ui {
             "/model" => self.open_model_picker(),
             "/effort" => self.open_model(1),
             "/skills" => self.open_commands(true),
-            "/status" => self.modal = Some(Modal::Status),
+            "/status" => self.modal = Some(Modal::Status { scroll: 0 }),
             "/rules" => self.open_rules(None),
             "/usage" => self.open_usage(),
             "/mcp" => self.open_mcp(),
@@ -656,12 +656,12 @@ impl Ui {
             true,
         );
     }
-    pub(super) fn draw_status(&self, frame: &mut Frame, area: Rect) {
+    pub(super) fn draw_status(&mut self, frame: &mut Frame, area: Rect) {
         let Some(s) = self.selected.as_ref().and_then(|id| self.sessions.get(id)) else {
             return;
         };
         let text = format!(
-            "{}\n\nModel: {} · {}\nState: {:?}\nWorkspace: {}\nBranch: {}\nProvider: {}\nProvider session: {}\n\nPermissions\n{}\n\nUses the selected provider’s installed CLI configuration and native workspace instructions.\n\nEsc Close",
+            "{}\n\nModel: {} · {}\nState: {:?}\nWorkspace: {}\nBranch: {}\nProvider: {}\nProvider session: {}\n\nPermissions\n{}\n\nUses the selected provider’s installed CLI configuration and native workspace instructions.",
             s.title,
             s.model.as_deref().unwrap_or("Inherited"),
             s.effort.as_deref().unwrap_or("Inherited"),
@@ -675,10 +675,21 @@ impl Ui {
             s.thread_id.as_deref().unwrap_or("Not connected"),
             serde_json::to_string_pretty(&s.permissions).unwrap_or_default()
         );
+        let lines = wrapped(&text, area.width);
+        let Some(Modal::Status { scroll }) = &mut self.modal else {
+            return;
+        };
+        *scroll = (*scroll).min(lines.len().saturating_sub(usize::from(area.height)));
         frame.render_widget(
-            Paragraph::new(text)
-                .wrap(Wrap { trim: false })
-                .style(Style::default().fg(TEXT)),
+            Paragraph::new(
+                lines
+                    .into_iter()
+                    .skip(*scroll)
+                    .take(usize::from(area.height))
+                    .map(Line::from)
+                    .collect::<Vec<_>>(),
+            )
+            .style(Style::default().fg(TEXT)),
             area,
         );
     }

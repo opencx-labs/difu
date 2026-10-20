@@ -6,6 +6,70 @@ type QuestionLines = (
     Vec<(usize, usize, Action)>,
 );
 
+/// The inline question's split-flap: each question flips in as it opens, and
+/// an answered one flips away like the composer's text after a send.
+#[derive(Default)]
+pub(super) struct Flip {
+    /// The question on show: session, request and question.
+    shown: Option<(String, String, usize)>,
+    board: flap::Board,
+    /// The rows on show, kept to flip away once answered.
+    drawn: Vec<Line<'static>>,
+    leaving: Option<Leaving>,
+}
+
+/// An answered question's rows flipping away, last character first.
+struct Leaving {
+    session: String,
+    rows: Vec<Line<'static>>,
+    started: Instant,
+    duration: Duration,
+}
+impl Leaving {
+    fn done(&self, now: Instant) -> bool {
+        now >= self.started + self.duration + flap::LIFETIME
+    }
+    fn frame(&self, now: Instant) -> Vec<Line<'static>> {
+        let mut rows = self.rows.clone();
+        let total = flap::glyphs(&rows).len();
+        flap::vanish(
+            &mut rows,
+            |index| {
+                let turn = total.saturating_sub(index + 1) as f64 / total.max(1) as f64;
+                self.started + self.duration.mul_f64(turn)
+            },
+            now,
+            self.started,
+        );
+        rows
+    }
+}
+impl Flip {
+    pub(super) fn animating(&self, now: Instant) -> bool {
+        self.leaving
+            .as_ref()
+            .is_some_and(|leaving| !leaving.done(now))
+            || self.board.animating(now)
+    }
+    /// A key press finishes the flip away, so input is never blocked.
+    pub(super) fn interrupt(&mut self) {
+        if self.leaving.take().is_some() {
+            self.board = flap::Board::default();
+        }
+    }
+}
+
+#[cfg(test)]
+impl Flip {
+    /// Moves the flips back, as if `by` had passed.
+    pub(super) fn age(&mut self, by: Duration) {
+        self.board.age(by);
+        if let Some(leaving) = &mut self.leaving {
+            leaving.started = leaving.started.checked_sub(by).unwrap_or(leaving.started);
+        }
+    }
+}
+
 impl Ui {
     fn question_note_key(&self) -> Option<(String, usize, usize)> {
         let Some(Modal::Approval {
@@ -404,6 +468,15 @@ impl Ui {
         let question_id = question_id.to_owned();
         let index = self.question_index().unwrap_or(0);
         self.remember_answers();
+        let clear = self.tweaks.capped(self.tweaks.input_clear_ms);
+        if clear > 0 && !self.question_flip.drawn.is_empty() {
+            self.question_flip.leaving = Some(Leaving {
+                session: id.clone(),
+                rows: self.question_flip.drawn.clone(),
+                started: Instant::now(),
+                duration: Duration::from_millis(u64::from(clear)),
+            });
+        }
         self.question_send = Some((id.clone(), request.clone(), question_id.clone(), index));
         self.task(
             Task::Question,
@@ -452,9 +525,23 @@ impl Ui {
             self.open_question(if count == 0 { 0 } else { index.min(count - 1) });
         }
     }
+    /// The answered question still flipping away from the selected session.
+    fn question_leaving(&self) -> Option<&Leaving> {
+        self.question_flip
+            .leaving
+            .as_ref()
+            .filter(|leaving| self.selected.as_deref() == Some(leaving.session.as_str()))
+    }
+    /// Whether the question panel replaces the composer: a question is open,
+    /// or the last one answered is still flipping away.
+    pub(super) fn question_panel(&self) -> bool {
+        self.inline_question() || self.question_leaving().is_some()
+    }
     pub(super) fn question_height(&self, width: u16) -> u16 {
         self.question_lines(width)
-            .map(|(lines, _, _)| u16::try_from(lines.len().saturating_add(3)).unwrap_or(u16::MAX))
+            .map(|(lines, _, _)| lines.len())
+            .or_else(|| self.question_leaving().map(|leaving| leaving.rows.len()))
+            .map(|rows| u16::try_from(rows.saturating_add(3)).unwrap_or(u16::MAX))
             .unwrap_or(0)
     }
     fn question_lines(&self, width: u16) -> Option<QuestionLines> {
@@ -681,44 +768,59 @@ impl Ui {
         }
     }
     pub(super) fn draw_inline_question(&mut self, frame: &mut Frame, area: Rect) {
-        let Some((lines, cursor, hits)) = self.question_lines(area.width) else {
+        let now = Instant::now();
+        let available = area.height.saturating_sub(2) as usize;
+        let rows_area = Rect::new(area.x, area.y, area.width, available as u16);
+        let shown = self
+            .question_lines(area.width)
+            .map(|(lines, cursor, hits)| {
+                let scroll = self.question_scroll(lines.len(), cursor, &hits, available);
+                let rows: Vec<_> = lines.into_iter().skip(scroll).take(available).collect();
+                (rows, cursor, hits, scroll)
+            });
+        let key = match (&self.modal, &self.selected) {
+            (Some(Modal::Approval { pending, field, .. }), Some(session)) => {
+                Some((session.clone(), pending.id.to_string(), *field))
+            }
+            _ => None,
+        };
+        let sending = self.question_send.is_some();
+        let tweaks = self.tweaks;
+        let flip = &mut self.question_flip;
+        if let Some((rows, ..)) = &shown {
+            flip.drawn.clone_from(rows);
+        }
+        // The answered question stays away until its answer is through.
+        if flip.leaving.as_ref().is_some_and(|leaving| {
+            (leaving.done(now) && !sending)
+                || self.selected.as_deref() != Some(leaving.session.as_str())
+        }) {
+            flip.leaving = None;
+            flip.board = flap::Board::default();
+        }
+        if let Some(leaving) = &flip.leaving {
+            frame.render_widget(Paragraph::new(leaving.frame(now)), rows_area);
+            if shown.is_some() {
+                self.draw_question_bar(frame, area);
+            }
+            return;
+        }
+        let Some((mut rows, cursor, hits, scroll)) = shown else {
             return;
         };
-        let available = area.height.saturating_sub(2) as usize;
-        let scroll = match &mut self.modal {
-            Some(Modal::Approval {
-                scroll, selected, ..
-            }) => {
-                if self.question_reveal && available > 0 {
-                    let target = cursor.map(|(_, row)| row).or_else(|| {
-                        hits.iter()
-                            .find(|(_, _, action)| matches!(action, Action::QuestionChoice(choice) if choice == selected))
-                            .map(|(row, _, _)| *row)
-                    });
-                    if let Some(target) = target {
-                        if target < *scroll {
-                            *scroll = target;
-                        } else if target >= scroll.saturating_add(available) {
-                            *scroll = target.saturating_sub(available - 1);
-                        }
-                    }
-                }
-                self.question_reveal = false;
-                *scroll = (*scroll).min(lines.len().saturating_sub(available));
-                *scroll
-            }
-            _ => 0,
-        };
-        frame.render_widget(
-            Paragraph::new(
-                lines
-                    .into_iter()
-                    .skip(scroll)
-                    .take(available)
-                    .collect::<Vec<_>>(),
-            ),
-            Rect::new(area.x, area.y, area.width, available as u16),
-        );
+        if flip.shown != key {
+            flip.shown = key;
+            flip.board = flap::Board::default();
+        }
+        if tweaks.agent_reply_cps > 0 && (flip.board.is_empty() || flip.board.animating(now)) {
+            flip.board
+                .show_over(&mut rows, now, crate::ui::PURPLE, area.width, |changed| {
+                    flap::paced(tweaks, changed)
+                });
+        } else {
+            flip.board.settle(&rows, now);
+        }
+        frame.render_widget(Paragraph::new(rows), rows_area);
         for (start, height, action) in hits {
             let top = start.max(scroll);
             let bottom = (start + height).min(scroll + available);
@@ -741,6 +843,41 @@ impl Ui {
         {
             frame.set_cursor_position((area.x + x as u16, area.y + (y - scroll) as u16));
         }
+        self.draw_question_bar(frame, area);
+    }
+    /// Keeps the cursor or highlighted choice in view after it moves.
+    fn question_scroll(
+        &mut self,
+        rows: usize,
+        cursor: Option<(usize, usize)>,
+        hits: &[(usize, usize, Action)],
+        available: usize,
+    ) -> usize {
+        let reveal = std::mem::replace(&mut self.question_reveal, false);
+        let Some(Modal::Approval {
+            scroll, selected, ..
+        }) = &mut self.modal
+        else {
+            return 0;
+        };
+        if reveal && available > 0 {
+            let target = cursor.map(|(_, row)| row).or_else(|| {
+                hits.iter()
+                    .find(|(_, _, action)| matches!(action, Action::QuestionChoice(choice) if choice == selected))
+                    .map(|(row, _, _)| *row)
+            });
+            if let Some(target) = target {
+                if target < *scroll {
+                    *scroll = target;
+                } else if target >= scroll.saturating_add(available) {
+                    *scroll = target.saturating_sub(available - 1);
+                }
+            }
+        }
+        *scroll = (*scroll).min(rows.saturating_sub(available));
+        *scroll
+    }
+    fn draw_question_bar(&mut self, frame: &mut Frame, area: Rect) {
         self.button(
             frame,
             Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),

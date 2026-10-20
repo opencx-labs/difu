@@ -234,7 +234,9 @@ pub enum Modal {
         skills_only: bool,
         files_only: bool,
     },
-    Status,
+    Status {
+        scroll: usize,
+    },
     Usage {
         id: String,
         provider: provider::Provider,
@@ -347,6 +349,17 @@ pub struct Ui {
     deleting: HashSet<String>,
     question_send: Option<(String, Value, String, usize)>,
     question_reveal: bool,
+    /// The question panel's split-flap.
+    question_flip: inline_questions::Flip,
+    /// Sidebar cards flipping as their text changes, by session.
+    sidebar_boards: HashMap<String, flap::Board>,
+    /// Whether the sidebar has listed sessions, which then show at once.
+    sidebar_seen: bool,
+    /// The sidebar's order and selection last drawn.
+    sidebar_order: Vec<String>,
+    sidebar_selected: Option<String>,
+    /// Selection highlights flipping on or off, by session.
+    sidebar_highlights: HashMap<String, flap::Highlight>,
     question_note_focused: bool,
     hits: Vec<(Rect, Action)>,
     pub viewport: usize,
@@ -421,6 +434,12 @@ impl Ui {
             deleting: HashSet::new(),
             question_send: None,
             question_reveal: true,
+            question_flip: Default::default(),
+            sidebar_boards: HashMap::new(),
+            sidebar_seen: false,
+            sidebar_order: Vec::new(),
+            sidebar_selected: None,
+            sidebar_highlights: HashMap::new(),
             question_note_focused: false,
             hits: Vec::new(),
             viewport: 20,
@@ -465,6 +484,12 @@ impl Ui {
     }
     pub fn redraw_interval(&self) -> Option<Duration> {
         if self.voice_active()
+            || self.question_flip.animating(Instant::now())
+            || !self.sidebar_highlights.is_empty()
+            || self
+                .sidebar_boards
+                .values()
+                .any(|board| board.animating(Instant::now()))
             || self
                 .selected
                 .as_ref()
@@ -1492,6 +1517,7 @@ impl Ui {
             self.voice_key(key);
             return;
         }
+        self.question_flip.interrupt();
         if self.resource_key(key) || self.panel_key(key) {
             return;
         }
@@ -2209,13 +2235,26 @@ impl Ui {
                 ..
             }) => {
                 let maximum = rows.len().saturating_sub(*height);
+                let step = scroll_step(key);
                 *scroll = match key.code {
-                    KeyCode::Up => scroll.saturating_sub(1),
-                    KeyCode::Down => scroll.saturating_add(1).min(maximum),
+                    KeyCode::Up => scroll.saturating_sub(step),
+                    KeyCode::Down => scroll.saturating_add(step).min(maximum),
                     KeyCode::PageUp => scroll.saturating_sub(*height),
                     KeyCode::PageDown => scroll.saturating_add(*height).min(maximum),
                     KeyCode::Home => 0,
                     KeyCode::End => maximum,
+                    _ => *scroll,
+                };
+            }
+            Some(Modal::Status { scroll }) => {
+                let step = scroll_step(key);
+                *scroll = match key.code {
+                    KeyCode::Up => scroll.saturating_sub(step),
+                    KeyCode::Down => scroll.saturating_add(step),
+                    KeyCode::PageUp => scroll.saturating_sub(10),
+                    KeyCode::PageDown => scroll.saturating_add(10),
+                    KeyCode::Home => 0,
+                    KeyCode::End => usize::MAX,
                     _ => *scroll,
                 };
             }
@@ -2337,10 +2376,10 @@ impl Ui {
             }
             Some(Modal::Help(state)) => match key.code {
                 KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    state.scroll = state.scroll.saturating_sub(1)
+                    state.scroll = state.scroll.saturating_sub(scroll_step(key))
                 }
                 KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    state.scroll = state.scroll.saturating_add(1)
+                    state.scroll = state.scroll.saturating_add(scroll_step(key))
                 }
                 KeyCode::Char('u') if ctrl => {
                     state.query.clear();
@@ -2548,6 +2587,37 @@ impl Ui {
             }
         }
     }
+    /// Flips the whole drawn screen in after a tab switch at `started`;
+    /// returns whether the flip is still playing.
+    pub fn flip_screen(&self, buffer: &mut ratatui::buffer::Buffer, started: Instant) -> bool {
+        let duration = Duration::from_millis(u64::from(self.tweaks.capped(flap::SCREEN_MS)));
+        self.tweaks.agent_reply_cps > 0 && flap::screen(buffer, started, duration, Instant::now())
+    }
+    /// Scrolls the open information modal by `rows`, reporting whether there
+    /// was one: a message, usage, status, help or a request for your input.
+    fn scroll_modal(&mut self, rows: isize) -> bool {
+        match &mut self.modal {
+            Some(Modal::Transcript {
+                scroll,
+                rows: lines,
+                height,
+                ..
+            }) => {
+                *scroll = scroll
+                    .saturating_add_signed(rows)
+                    .min(lines.len().saturating_sub(*height));
+            }
+            Some(Modal::Usage {
+                scroll, maximum, ..
+            }) => *scroll = scroll.saturating_add_signed(rows).min(*maximum),
+            Some(Modal::Status { scroll } | Modal::Approval { scroll, .. }) => {
+                *scroll = scroll.saturating_add_signed(rows);
+            }
+            Some(Modal::Help(state)) => state.scroll = state.scroll.saturating_add_signed(rows),
+            _ => return false,
+        }
+        true
+    }
     pub fn mouse(&mut self, event: MouseEvent) {
         if self.notice.is_some() && self.toast_rect.contains((event.column, event.row).into()) {
             if event.kind == MouseEventKind::Down(MouseButton::Left) {
@@ -2586,35 +2656,11 @@ impl Ui {
                     for _ in 0..3 {
                         self.mcp_key(KeyEvent::new(code, KeyModifiers::NONE));
                     }
-                } else if let Some(Modal::Help(state)) = &mut self.modal {
-                    state.scroll = state.scroll.saturating_add_signed(
-                        if event.kind == MouseEventKind::ScrollDown {
-                            3
-                        } else {
-                            -3
-                        },
-                    );
-                } else if let Some(Modal::Transcript {
-                    scroll,
-                    rows,
-                    height,
-                    ..
-                }) = &mut self.modal
-                {
-                    *scroll = scroll
-                        .saturating_add_signed(if event.kind == MouseEventKind::ScrollDown {
-                            3
-                        } else {
-                            -3
-                        })
-                        .min(rows.len().saturating_sub(*height));
-                } else if let Some(Modal::Approval { scroll, .. }) = &mut self.modal {
-                    *scroll =
-                        scroll.saturating_add_signed(if event.kind == MouseEventKind::ScrollDown {
-                            3
-                        } else {
-                            -3
-                        });
+                } else if self.scroll_modal(if event.kind == MouseEventKind::ScrollDown {
+                    3
+                } else {
+                    -3
+                }) {
                 } else if self.modal.is_none() {
                     if let Some((_, Action::Focus(focus))) =
                         self.hits.iter().rev().find(|(r, a)| {
@@ -2636,6 +2682,36 @@ impl Ui {
             }
             _ => {}
         }
+    }
+}
+
+/// Rows an arrow key scrolls a modal: ten with Cmd held.
+fn scroll_step(key: KeyEvent) -> usize {
+    if key.modifiers.contains(KeyModifiers::SUPER) {
+        10
+    } else {
+        1
+    }
+}
+
+#[cfg(test)]
+impl Ui {
+    /// Moves every flip on, as if a second had passed.
+    pub(super) fn settle_flips(&mut self) {
+        let second = Duration::from_secs(1);
+        for position in self.positions.values_mut() {
+            for board in [&mut position.activity, &mut position.waiting]
+                .into_iter()
+                .chain(position.boards.values_mut())
+            {
+                board.age(second);
+            }
+        }
+        for board in self.sidebar_boards.values_mut() {
+            board.age(second);
+        }
+        self.sidebar_highlights.clear();
+        self.question_flip.age(second);
     }
 }
 
@@ -2971,6 +3047,45 @@ impl Ui {
         }
         let mut visible_pr_sessions = Vec::new();
         let mut offset = 0;
+        let now = Instant::now();
+        // Cards flip as their text changes; those listed first show at once.
+        let settled = !self.sidebar_seen || self.tweaks.agent_reply_cps == 0;
+        let order: Vec<String> = list.iter().map(|session| session.id.clone()).collect();
+        if !settled && order != self.sidebar_order {
+            // A card moving into a slot flips from the text that was there.
+            let previous: Vec<Option<flap::Board>> = self
+                .sidebar_order
+                .iter()
+                .map(|id| self.sidebar_boards.get(id).cloned())
+                .collect();
+            for (index, id) in order.iter().enumerate() {
+                if self.sidebar_order.get(index) != Some(id) {
+                    let seed = previous.get(index).cloned().flatten().unwrap_or_default();
+                    self.sidebar_boards.insert(id.clone(), seed);
+                }
+            }
+        }
+        self.sidebar_order = order;
+        if self.selected != self.sidebar_selected {
+            if !settled {
+                for (id, on) in [
+                    (self.sidebar_selected.clone(), false),
+                    (self.selected.clone(), true),
+                ] {
+                    if let Some(id) = id
+                        && let Some(highlight) = flap::Highlight::start(on, now, self.tweaks)
+                    {
+                        self.sidebar_highlights.insert(id, highlight);
+                    }
+                }
+            }
+            self.sidebar_selected.clone_from(&self.selected);
+        }
+        let listed: HashSet<&str> = list.iter().map(|session| session.id.as_str()).collect();
+        self.sidebar_boards
+            .retain(|id, _| listed.contains(id.as_str()));
+        self.sidebar_highlights
+            .retain(|id, highlight| listed.contains(id.as_str()) && !highlight.done(now));
         for (index, session) in list.iter().enumerate().skip(self.list_scroll) {
             if offset >= usize::from(items.height) {
                 break;
@@ -3096,6 +3211,12 @@ impl Ui {
                     Style::default().fg(prs::color(pr)),
                 )));
             }
+            let board = self.sidebar_boards.entry(session.id.clone()).or_default();
+            if settled {
+                board.settle(&lines, now);
+            } else {
+                board.show(&mut lines, now, ACCENT, row.width);
+            }
             frame.render_widget(
                 Paragraph::new(lines).style(if selected {
                     crate::ui::user_message_style()
@@ -3104,6 +3225,10 @@ impl Ui {
                 }),
                 row,
             );
+            if let Some(highlight) = self.sidebar_highlights.get(&session.id) {
+                let background = crate::ui::user_message_style().bg.unwrap_or(PANEL);
+                highlight.apply(frame.buffer_mut(), row, background, BG, now);
+            }
             if !deleting {
                 self.hits.push((row, Action::Select(session.id.clone())));
             }
@@ -3119,6 +3244,7 @@ impl Ui {
                 items,
             );
         }
+        self.sidebar_seen |= !list.is_empty();
         self.prs.visible.extend(visible_pr_sessions);
     }
     fn draw_conversation(&mut self, frame: &mut Frame, rect: Rect) {
@@ -3147,7 +3273,10 @@ impl Ui {
         if coding {
             self.restore_media(&id);
         }
-        let composer_height = if self.inline_question() {
+        if !self.question_panel() {
+            self.question_flip = Default::default();
+        }
+        let composer_height = if self.question_panel() {
             self.question_height(area.width)
                 .min(area.height.saturating_sub(5))
         } else if matches!(self.modal, Some(Modal::Commands { .. })) {
@@ -3166,7 +3295,7 @@ impl Ui {
         } else {
             0
         };
-        let dock_composer = composer_height > 0 && !self.inline_question() && !area.is_empty();
+        let dock_composer = composer_height > 0 && !self.question_panel() && !area.is_empty();
         if dock_composer {
             // The input's last row shares the pane border; reclaim the old inset.
             area.height = area
@@ -3258,43 +3387,40 @@ impl Ui {
             .rebase(1, position.conversation as isize - before_measure as isize);
         let transcript_window::View {
             mut lines,
-            links,
+            mut links,
             start,
             mut total,
-            sections,
+            mut sections,
         } = view;
-        flap::chat(
-            position,
-            session,
-            &sections,
-            start,
-            total,
-            &mut lines,
-            tweaks,
-            body.width,
-            Instant::now(),
+        let now = Instant::now();
+        let turn = flap::chat(
+            position, session, &sections, start, total, &mut lines, tweaks, body.width, now,
         );
         reveal::apply(
-            position,
-            session,
-            &sections,
-            start,
-            total,
-            &mut lines,
-            tweaks,
-            body.width,
-            Instant::now(),
+            position, session, &sections, start, total, &mut lines, tweaks, body.width, now, turn,
         );
         flap::apply(
-            position,
-            session,
-            &sections,
-            start,
-            total,
-            &mut lines,
-            body.width,
-            Instant::now(),
+            position, session, &sections, start, total, &mut lines, body.width, now,
         );
+        // Rows still waiting for their first character take no space yet.
+        let dropped = flap::grow(
+            &mut sections,
+            start,
+            &mut total,
+            &mut lines,
+            &mut links,
+            position.conversation,
+        );
+        let maximum = total.saturating_sub(if position.keep_transcript_position {
+            1
+        } else {
+            usize::from(body.height)
+        });
+        position.conversation = if position.follow && !position.keep_transcript_position {
+            maximum
+        } else {
+            position.conversation.saturating_sub(dropped).min(maximum)
+        };
         if session.entries.is_empty() && total == 0 {
             lines.push(Line::from(if session.status == Status::Idle {
                 "Send a message to start."
@@ -3412,7 +3538,7 @@ impl Ui {
                 area.width,
                 composer_height,
             );
-            if self.inline_question() {
+            if self.question_panel() {
                 self.draw_inline_question(frame, composer);
                 return;
             }
@@ -3531,7 +3657,7 @@ impl Ui {
             Some(Modal::ChangeRepository(_)) => "Change session repository",
             Some(Modal::Menu { .. }) => "Agent actions",
             Some(Modal::Commands { .. }) => "Session commands",
-            Some(Modal::Status) => "Session status",
+            Some(Modal::Status { .. }) => "Session status · ↑/↓ Scroll · Esc Close",
             Some(Modal::Mcp(_)) => "MCP · ↑/↓ Select · Enter Open · r Refresh · Esc Back",
             Some(Modal::Usage { .. }) => "Provider usage · ↑/↓ Scroll · r Refresh · Esc Close",
             Some(Modal::Pending { .. }) => "Pending questions and approvals",
@@ -3639,7 +3765,7 @@ impl Ui {
             self.draw_usage(frame, area);
             return;
         }
-        if matches!(self.modal, Some(Modal::Status)) {
+        if matches!(self.modal, Some(Modal::Status { .. })) {
             self.draw_status(frame, area);
             return;
         }
@@ -3931,7 +4057,7 @@ impl Ui {
                 | Modal::Theme { .. }
                 | Modal::Remote
                 | Modal::Commands { .. }
-                | Modal::Status
+                | Modal::Status { .. }
                 | Modal::Mcp(_)
                 | Modal::Usage { .. }
                 | Modal::Pending { .. }
@@ -4520,6 +4646,47 @@ mod tests {
         assert_eq!(ui.filtered().first().map(|s| s.id.as_str()), Some("two"));
         ui.toggle_pin("two");
         assert!(!storage.load_config()?.pinned_sessions.contains("two"));
+        Ok(())
+    }
+
+    #[test]
+    fn sidebar_cards_flip_their_changes_highlight_and_new_order() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        });
+        let first = ui.summaries.first().context("session")?.title.clone();
+        let mut other = ui.summaries.first().context("session")?.clone();
+        other.id = "two".into();
+        other.title = "Second card".into();
+        ui.summaries.push(other);
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert!(
+            screen.contains("Second card") && screen.contains(&first),
+            "the first list shows at once"
+        );
+        ui.summaries.last_mut().context("other")?.title = "Second card renamed".into();
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert!(screen.contains("Second card") && !screen.contains("renamed"));
+        let (screen, _) = draw_settled(&mut ui, 120, 40)?;
+        assert!(screen.contains("Second card renamed"));
+        // Moving the selection flips the highlight off one card and onto the
+        // other, a flap at a time.
+        ui.select("two".into());
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert_eq!(ui.sidebar_highlights.len(), 2);
+        assert!(screen.contains('▀'));
+        let (screen, _) = draw_settled(&mut ui, 120, 40)?;
+        assert!(!screen.contains('▀'));
+        // A card moving into another slot flips from the text that was there.
+        assert_eq!(ui.filtered().first().map(|s| s.id.as_str()), Some("two"));
+        ui.toggle_pin("one");
+        assert_eq!(ui.filtered().first().map(|s| s.id.as_str()), Some("one"));
+        let (screen, _) = draw(&mut ui, 120, 40)?;
+        assert!(!screen.contains("Second card renamed"), "{screen}");
+        let (screen, _) = draw_settled(&mut ui, 120, 40)?;
+        assert!(screen.contains(&format!("◆ {first}")) && screen.contains("Second card renamed"));
         Ok(())
     }
 
@@ -5254,7 +5421,7 @@ mod tests {
                     .draft
                     .insert("Keep this draft");
                 // Dismissing a dialog still takes precedence over interruption.
-                ui.modal = Some(Modal::Status);
+                ui.modal = Some(Modal::Status { scroll: 0 });
                 ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
                 assert!(ui.modal.is_none());
                 assert!(ui.interrupting.is_empty());
@@ -5274,12 +5441,12 @@ mod tests {
                 let reply = ui.receiver.recv_timeout(Duration::from_secs(5))?;
                 assert!(matches!(reply.kind, Task::Interrupt(_)));
                 // Completion must not close a newly opened dialog or clear another request's busy flag.
-                ui.modal = Some(Modal::Status);
+                ui.modal = Some(Modal::Status { scroll: 0 });
                 ui.sender.send(reply)?;
                 ui.tick(false);
                 assert!(ui.interrupting.is_empty());
                 assert!(ui.busy);
-                assert!(matches!(ui.modal, Some(Modal::Status)));
+                assert!(matches!(ui.modal, Some(Modal::Status { .. })));
             }
         }
         worker
@@ -6654,14 +6821,7 @@ mod tests {
     /// Draws once everything new on screen has flipped in.
     fn draw_settled(ui: &mut Ui, width: u16, height: u16) -> Result<(String, Option<(u16, u16)>)> {
         draw(ui, width, height)?;
-        for position in ui.positions.values_mut() {
-            for board in [&mut position.activity, &mut position.waiting]
-                .into_iter()
-                .chain(position.boards.values_mut())
-            {
-                board.age(Duration::from_secs(1));
-            }
-        }
+        ui.settle_flips();
         draw(ui, width, height)
     }
     fn draw(ui: &mut Ui, width: u16, height: u16) -> Result<(String, Option<(u16, u16)>)> {
@@ -7243,7 +7403,7 @@ mod tests {
         position.draft.clear();
         position.draft.insert("/status");
         assert!(ui.command_draft());
-        assert!(matches!(ui.modal, Some(Modal::Status)));
+        assert!(matches!(ui.modal, Some(Modal::Status { .. })));
         Ok(())
     }
     #[test]
@@ -7664,7 +7824,7 @@ mod tests {
         assert!(!screen.contains("Coding · Working"));
         ui.archived = true;
         ui.summaries.first_mut().context("summary")?.archived = true;
-        let (screen, _) = draw(&mut ui, 160, 35)?;
+        let (screen, _) = draw_settled(&mut ui, 160, 35)?;
         assert!(screen.contains("archived"));
         Ok(())
     }
@@ -7727,7 +7887,7 @@ mod tests {
             KeyModifiers::ALT,
             crossterm::event::KeyEventKind::Release,
         ));
-        let (screen, _) = draw(&mut ui, 120, 35)?;
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
         assert!(
             screen.contains("1 of 3")
                 && screen.contains("What next?")
@@ -7771,7 +7931,7 @@ mod tests {
         ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
         ui.paste("ustom answer");
         ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
-        let (screen, _) = draw(&mut ui, 120, 35)?;
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
         assert!(screen.contains("2 of 3") && screen.contains("How much detail?"));
         ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
         assert!(
@@ -7934,6 +8094,120 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn questions_flip_in_as_they_open_and_flip_away_once_answered() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        ui.sessions
+            .get_mut("one")
+            .context("session")?
+            .pending
+            .push(Pending {
+                id: serde_json::json!("flip"),
+                method: "item/tool/requestUserInput".into(),
+                responded: true,
+                params: serde_json::json!({"difuAsync":true,"questions":[
+                    {"id":"q","question":"Choose scope","options":[{"label":"Small"}]},
+                    {"id":"q2","question":"Pick a colour","options":[{"label":"Blue"}]}
+                ]}),
+            });
+        ui.open_question(0);
+        let (screen, _) = draw(&mut ui, 120, 35)?;
+        assert!(!screen.contains("Choose scope"), "a question flips in");
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
+        assert!(screen.contains("Choose scope"));
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let (screen, _) = draw(&mut ui, 120, 35)?;
+        assert!(!screen.contains("Pick a colour") && !screen.contains("Choose scope"));
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
+        assert!(screen.contains("Pick a colour"));
+
+        // An answer flips its question away, last character first, and keeps
+        // it away until the answer is through.
+        ui.submit_question(false);
+        let (screen, _) = draw(&mut ui, 120, 35)?;
+        assert!(screen.contains("Pick a colour") && screen.contains("Sending answer…"));
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
+        assert!(!screen.contains("Pick a colour") && screen.contains("Sending answer…"));
+        // An answer that did not go through brings its question back.
+        ui.question_send = None;
+        draw(&mut ui, 120, 35)?;
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
+        assert!(screen.contains("Pick a colour"));
+
+        // A key finishes the flip away at once.
+        ui.submit_question(false);
+        ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
+        assert!(screen.contains("Pick a colour"));
+
+        // The last answered question keeps the panel while it flips away.
+        ui.question_send = None;
+        ui.submit_question(false);
+        ui.question_send = None;
+        ui.modal = None;
+        let (screen, _) = draw(&mut ui, 120, 35)?;
+        assert!(screen.contains("Pick a colour"));
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
+        assert!(!screen.contains("Pick a colour"));
+        Ok(())
+    }
+    #[test]
+    fn information_modals_scroll_with_the_wheel_and_cmd_arrows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        });
+        let wheel = |ui: &mut Ui| {
+            ui.mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 10,
+                row: 10,
+                modifiers: KeyModifiers::NONE,
+            });
+        };
+        let cmd_down = KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER);
+        ui.modal = Some(Modal::Usage {
+            id: "one".into(),
+            provider: provider::Provider::Claude,
+            data: None,
+            error: None,
+            scroll: 0,
+            maximum: 30,
+        });
+        wheel(&mut ui);
+        ui.key(cmd_down);
+        ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(matches!(ui.modal, Some(Modal::Usage { scroll: 12, .. })));
+        ui.modal = Some(Modal::Transcript {
+            entry: "missing".into(),
+            scroll: 0,
+            rows: vec![Line::default(); 100],
+            links: Vec::new(),
+            layout: None,
+            height: 10,
+        });
+        wheel(&mut ui);
+        ui.key(cmd_down);
+        assert!(matches!(
+            ui.modal,
+            Some(Modal::Transcript { scroll: 13, .. })
+        ));
+        ui.modal = Some(Modal::Status { scroll: 0 });
+        wheel(&mut ui);
+        ui.key(cmd_down);
+        assert!(matches!(ui.modal, Some(Modal::Status { scroll: 13 })));
+        // Drawing keeps the status within its text.
+        draw(&mut ui, 120, 35)?;
+        assert!(matches!(ui.modal, Some(Modal::Status { scroll: 0 })));
+        Ok(())
+    }
+    #[test]
     fn question_notes_stay_with_their_choice_and_submit_only_with_that_answer() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut ui = state(Storage {
@@ -7961,7 +8235,7 @@ mod tests {
             ui.selected_question_answer().as_deref(),
             Some("Small\n\nNote: Only change the UI!")
         );
-        let (screen, _) = draw(&mut ui, 120, 35)?;
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
         assert!(screen.contains("Note: Only change the UI!"));
         ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
         ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
@@ -8053,7 +8327,7 @@ mod tests {
             ui.selected_question_answer().as_deref(),
             Some("Lint, Build\n\nNote on Build: CI only")
         );
-        let (screen, _) = draw(&mut ui, 120, 35)?;
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
         for text in [
             "Choose one or more",
             "[x] 1. Lint",
@@ -8069,7 +8343,7 @@ mod tests {
         ui.key(space());
         ui.action(Action::QuestionChoice(1));
         ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-        let (screen, _) = draw(&mut ui, 120, 35)?;
+        let (screen, _) = draw_settled(&mut ui, 120, 35)?;
         assert!(screen.contains("Ship it?") && !screen.contains("[ ]"));
         assert_eq!(ui.selected_question_answer().as_deref(), Some("Yes"));
         ui.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));

@@ -33,9 +33,10 @@ impl Ui {
         else {
             return;
         };
+        let step = scroll_step(key);
         *scroll = match key.code {
-            KeyCode::Down => scroll.saturating_add(1),
-            KeyCode::Up => scroll.saturating_sub(1),
+            KeyCode::Down => scroll.saturating_add(step),
+            KeyCode::Up => scroll.saturating_sub(step),
             KeyCode::PageDown => scroll.saturating_add(10),
             KeyCode::PageUp => scroll.saturating_sub(10),
             KeyCode::Home => 0,

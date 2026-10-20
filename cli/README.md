@@ -333,16 +333,27 @@ All chat text flips in split-flap style, like Codex's voice transcripts: each
 character starts blank, flips through letters from the same text, then settles
 with a brief glow. Everything that appears or changes after you open a session
 flips: replies, tool calls and their output, reasoning, plans, notes and
-messages; when an entry changes, only its changed characters flip, and a fast
-counter such as a tool's timing flips at most once a second. Text already in a
-session when you open it appears at once. Replies flip in at 200 characters per
+messages; when an entry changes, only its changed characters flip, even when
+they shift (a finished tool flips only its new heading, not its output), and a
+fast counter such as a tool's timing flips at most once a second. Entries flip
+in reading order, each waiting for the ones above it, so a batch of new tool
+calls plays one after another; only the working indicator above the composer
+flips on its own. An entry grows row by row as its text arrives instead of
+taking its full height up front. Text already in a session when you open it
+appears at once. Replies flip in at 200 characters per
 second, speeding up so they never trail the stream by more than the longest
 animation; other agent content uses the same speed. A sent message flips into the chat,
 or into the queue above the composer, over 1 second while the composer's text
 flips away over 1 second, whatever their length; typing during the clear finishes
 it immediately. No animation takes longer than the longest animation, 0.5 seconds
 by default. The working indicator flips as it changes, so its timer ticks like a
-departure board. **/tweaks** (also in the command palette) changes these four
+departure board. Each question flips in as it opens, and an answered one flips
+away like the composer's text before the next flips in.
+Sidebar cards flip their changes too: status, timers, request counts and PRs;
+the selection highlight flips across a card a flap at a time, and a card that
+moves flips from the text that was in its place. Switching between the Agents
+and Reviews tabs flips the whole screen in.
+**/tweaks** (also in the command palette) changes these four
 values, saved in the difu config; 0 turns an animation off (a reply speed of 0
 turns off the flip for all agent content), and a longest animation of 0 removes
 the limit.
@@ -360,7 +371,8 @@ Dark, Solarized Light, GitHub Light, Catppuccin Latte, and Gruvbox Light.
 **/usage** shows labeled quota bars and local reset times: percent used for Claude,
 percent remaining for Codex. It reads Claude Code's structured `/usage` data or Codex's account limits
 and session token usage, without sending a model prompt. Use **r** to refresh and
-**↑/↓** or **PgUp/PgDn** to scroll. Provider errors appear in the panel.
+**↑/↓**, **PgUp/PgDn** or the wheel to scroll, and **Cmd+↑/↓** to move ten
+lines. Provider errors appear in the panel. **/status** scrolls the same way.
 
 **/mcp** manages the selected agent's MCP servers without sending a model prompt.
 It shows live connection states, errors, server details and tools. Select with
@@ -408,7 +420,8 @@ remain available through the actions menu.
 Conversation tools show a compact preview capped at four terminal rows, including
 wrapped commands and output. Click a tool or press Enter on a focused message to
 open its full contents in a modal. Up/Down, PageUp/PageDown, and the wheel scroll
-inside it; Esc returns to the same conversation position. Chat rendering keeps a
+inside it, and Cmd+Up/Down moves ten lines; Esc returns to the same conversation
+position. Chat rendering keeps a
 window of about ten nearby messages (more when needed to fill the viewport),
 loading older messages as you scroll without discarding history. Up/Down focuses
 transcript entries, PageUp/PageDown and the wheel scroll, and End returns to live
