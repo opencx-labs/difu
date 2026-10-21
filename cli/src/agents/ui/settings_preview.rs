@@ -24,6 +24,7 @@ impl SettingsPreview {
         session.entries = vec![
             Entry { id: "sample-user".into(), kind: "userMessage".into(), text: "Please make the greeting clearer.".to_owned().into(), ..Default::default() },
             Entry { id: "sample-tool".into(), kind: "commandExecution".into(), text: "Hello, Difu!\nAll checks passed.\nNo files outside the example changed.\nReady to review.\nExtra tool output.".to_owned().into(), data: serde_json::json!({"command":"cargo test greeting","exitCode":0}).into(), finished_at: Some(1), ..Default::default() },
+            Entry { id: "sample-reasoning".into(), kind:"reasoning".into(), text:"**Inspect paths**\nUnique reasoning detail".into(), ..Default::default() },
             Entry { id: "sample-reply".into(), kind: "agentMessage".into(), text: "The greeting now says **Hello, Difu!**\n\nThe focused check passed. You can review the change before saving.".to_owned().into(), finished_at: Some(1), ..Default::default() },
         ];
         Self {
@@ -52,7 +53,15 @@ impl SettingsPreview {
         id: &crate::settings::SettingId,
         now: Instant,
     ) -> Vec<Line<'static>> {
-        use crate::settings::SettingId;
+        use crate::settings::{Category, SettingId};
+        if *id == SettingId::AutoScroll {
+            return self.scroll_scene(config, width);
+        }
+        if crate::settings::spec(id)
+            .is_some_and(|spec| matches!(spec.category, Category::Layout | Category::Input))
+        {
+            return self.native_scene(config, width, id);
+        }
         use ratatui::{buffer::Buffer, widgets::Widget};
         if !matches!(
             id,
@@ -60,7 +69,9 @@ impl SettingsPreview {
                 | SettingId::ScreenTransitionEffect
                 | SettingId::InputClearDuration
         ) {
-            return self.render(config, width, replay, true);
+            let animate = crate::settings::spec(id)
+                .is_some_and(|spec| spec.preview == crate::settings::Preview::Animation);
+            return self.render(config, width, replay, animate);
         }
         // These scenes own only synthetic rows and effect state. They never touch
         // a live Ui, composer, service request or microphone.
@@ -135,6 +146,135 @@ impl SettingsPreview {
             _ => self.render(config, width, replay, true),
         }
     }
+    fn scroll_scene(&self, config: &Config, width: u16) -> Vec<Line<'static>> {
+        let mut session = self.session.clone();
+        session.entries.clear();
+        for n in 0..12 {
+            session.note("agentMessage", format!("Reading message {n}"));
+        }
+        let mut window = transcript_window::Window::default();
+        window.appearance = config.preferences.appearance.clone();
+        window.conversation = config.preferences.conversation.clone();
+        let mut position = Position::default();
+        // The reader is above the bottom when a new response arrives.
+        window.render(&session, &mut position, width.max(1), 5, false);
+        session.note("agentMessage", "Newest streaming reply");
+        let view = window.render(&session, &mut position, width.max(1), 5, false);
+        view.lines
+            .into_iter()
+            .skip(position.conversation.saturating_sub(view.start))
+            .take(5)
+            .collect()
+    }
+    fn native_scene(
+        &self,
+        config: &Config,
+        width: u16,
+        id: &crate::settings::SettingId,
+    ) -> Vec<Line<'static>> {
+        use crate::settings::{Category, SettingId};
+        use ratatui::{Terminal, backend::TestBackend};
+        // This Ui owns synthetic sessions and an unconnected internal channel.
+        // Draw is the only entry point: no tick, key, service, browser or microphone action.
+        let mut visual = config.clone();
+        visual.preferences.motion.level = crate::settings::Motion::Off;
+        visual.voice_enabled = false;
+        let storage = Storage {
+            config: "/synthetic/difu-settings/config.json".into(),
+            cache: "/synthetic/difu-settings/cache".into(),
+        };
+        let mut ui = Ui::new(storage, &visual);
+        let mut session = self.session.clone();
+        session.title = "Example session".into();
+        session.updated = 100;
+        session.status = Status::Idle;
+        ui.selected = Some(session.id.clone());
+        ui.summaries.push(session.summary());
+        ui.session_order = vec![
+            session.id.clone(),
+            "synthetic-active".into(),
+            "synthetic-recent".into(),
+        ];
+        for (id, title, status, updated) in [
+            ("synthetic-active", "Active session", Status::Running, 200),
+            ("synthetic-recent", "Recent session", Status::Idle, 300),
+        ] {
+            let mut summary = session.summary();
+            summary.id = id.into();
+            summary.title = title.into();
+            summary.status = status;
+            summary.updated = updated;
+            ui.summaries.push(summary);
+        }
+        ui.sessions.insert(session.id.clone(), session);
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        let position = ui.positions.entry("settings-synthetic".into()).or_default();
+        position.media_loaded = true;
+        if *id == SettingId::PasteThreshold {
+            position.draft.paste_with_threshold(
+                &"pasted example ".repeat(45),
+                config.preferences.input.paste_threshold,
+            );
+        } else if crate::settings::spec(id).is_some_and(|spec| spec.category == Category::Input) {
+            position.draft = Editor::from(
+                (1..=22)
+                    .map(|n| format!("composer row {n}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            );
+        } else {
+            position.draft = Editor::from("A synthetic composer draft");
+            ui.panels.view = Some(panels::View::Shell {
+                id: "sample-tool".into(),
+                command: "cargo test greeting".into(),
+            });
+        }
+        let mut terminal = match Terminal::new(TestBackend::new(width.max(40), 30)) {
+            Ok(terminal) => terminal,
+            Err(error) => match error {},
+        };
+        if terminal.draw(|frame| ui.draw(frame)).is_err() {
+            return Vec::new();
+        }
+        let mut rows = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(usize::from(width.max(40)))
+            .map(|cells| {
+                Line::from(
+                    cells
+                        .iter()
+                        .map(|cell| Span::styled(cell.symbol().to_owned(), cell.style()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if *id == SettingId::StartupTab {
+            rows.insert(
+                0,
+                Line::from(format!(
+                    "Launch opens {}",
+                    if crate::shell::Shell::reviews_on_launch(config, false) {
+                        "Reviews"
+                    } else {
+                        "Agents"
+                    }
+                )),
+            );
+        }
+        if *id == SettingId::RunningInput {
+            rows.insert(
+                0,
+                Line::from(format!(
+                    "Primary send while running: {}",
+                    config.preferences.input.running.key()
+                )),
+            );
+        }
+        rows
+    }
     pub fn animating(&self) -> bool {
         self.control_animating || self.position.animating()
     }
@@ -177,13 +317,14 @@ impl SettingsPreview {
         if config.preferences.conversation.tool_display == crate::settings::ToolDisplay::Expanded {
             self.position.expanded.insert("sample-tool".into());
         }
-        let (mut lines, sections, _) = transcript::render_entries_with_appearance(
+        let (mut lines, sections, _) = transcript::render_entries_with_preferences(
             &self.session,
             &self.session.entries,
             &self.position,
             width.max(1),
             false,
             &config.preferences.appearance,
+            &config.preferences.conversation,
         );
         if animate {
             let tweaks = config.preferences.motion.tweaks(config.tweaks);

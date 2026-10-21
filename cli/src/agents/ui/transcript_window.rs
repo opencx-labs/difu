@@ -5,6 +5,7 @@ use super::*;
 #[derive(Default)]
 pub(super) struct Window {
     pub appearance: crate::settings::Appearance,
+    pub conversation: crate::settings::Conversation,
     session: String,
     width: u16,
     last_position: usize,
@@ -18,6 +19,7 @@ pub(super) struct Window {
 #[derive(PartialEq)]
 struct Source {
     appearance: crate::settings::Appearance,
+    conversation: crate::settings::Conversation,
     entry: Entry,
     expanded: bool,
     focused: bool,
@@ -32,8 +34,10 @@ impl Source {
         focused: bool,
         timer: Option<(Status, i64)>,
         appearance: &crate::settings::Appearance,
+        conversation: &crate::settings::Conversation,
     ) -> bool {
         self.appearance == *appearance
+            && self.conversation == *conversation
             && self.entry == *entry
             && self.expanded == position.expanded.contains(&entry.id)
             && self.focused == (focused && position.focused_entry.as_ref() == Some(&entry.id))
@@ -93,6 +97,7 @@ impl Window {
                 }
                 .into(),
                 text: pending.text.clone().into(),
+                timestamp: None,
                 data: serde_json::json!({"difuRetry":pending.failed.is_some()}).into(),
                 ..Entry::default()
             })
@@ -115,7 +120,11 @@ impl Window {
                 sections,
             };
         }
-        let follow = position.follow && !position.keep_transcript_position;
+        let follow = match self.conversation.auto_scroll {
+            crate::settings::AutoScroll::WhenAtBottom => position.follow,
+            crate::settings::AutoScroll::Always => true,
+            crate::settings::AutoScroll::Manual => false,
+        } && !position.keep_transcript_position;
         // Capture the source message before measuring new rows. Discovering older
         // content must never move the text already visible at the top of the pane.
         let anchor = position
@@ -192,20 +201,29 @@ impl Window {
                         )
                     });
                 if !self.sources.get(&section.id).is_some_and(|source| {
-                    source.matches(entry, position, focused, timer, &self.appearance)
+                    source.matches(
+                        entry,
+                        position,
+                        focused,
+                        timer,
+                        &self.appearance,
+                        &self.conversation,
+                    )
                 }) {
-                    let (rows, _, links) = transcript::render_entries_with_appearance(
+                    let (rows, _, links) = transcript::render_entries_with_preferences(
                         session,
                         std::slice::from_ref(entry),
                         position,
                         width,
                         focused,
                         &self.appearance,
+                        &self.conversation,
                     );
                     self.sources.insert(
                         section.id.clone(),
                         Source {
                             appearance: self.appearance.clone(),
+                            conversation: self.conversation.clone(),
                             entry: entry.clone(),
                             expanded: position.expanded.contains(&entry.id),
                             focused: focused && position.focused_entry.as_ref() == Some(&entry.id),

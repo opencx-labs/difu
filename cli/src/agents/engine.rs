@@ -584,6 +584,7 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                     }
                 } else {
                     session.entries.push(Entry {
+                        timestamp: Some(chrono::Utc::now().timestamp_millis()),
                         id,
                         kind,
                         text: text.into(),
@@ -1449,6 +1450,7 @@ fn voice_transcript(session: &mut Session, role: &str, text: &str, done: bool) {
         Some(entry) => entry.text.push_str(text),
         None if text.trim().is_empty() => return,
         None => session.entries.push(Entry {
+            timestamp: Some(chrono::Utc::now().timestamp_millis()),
             id: format!("voice-{role}-{now}-{}", session.entries.len()),
             kind: kind.into(),
             text: text.trim_start().to_owned().into(),

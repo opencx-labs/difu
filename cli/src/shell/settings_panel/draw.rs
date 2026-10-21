@@ -291,16 +291,13 @@ impl Panel {
                 self.preview
                     .render_control(&visual, inner.width, self.replay, &spec.id)
             }
-            Preview::Conversation | Preview::Appearance | Preview::Layout => {
-                self.preview
-                    .render(&visual, inner.width, self.replay, false)
-            }
-            Preview::Input => vec![
-                Line::from("› A synthetic composer draft"),
-                Line::from("Voice preview never opens the microphone."),
-                Line::from("Ready Codex sessions: conversation."),
-                Line::from("Dictation: release inserts; Enter sends."),
-            ],
+            Preview::Conversation | Preview::Layout | Preview::Input => self
+                .preview
+                .render_control(&visual, inner.width, self.replay, &spec.id),
+            Preview::Appearance => self
+                .preview
+                .render(&visual, inner.width, self.replay, false),
+
             Preview::Shortcut => vec![
                 Line::from("Safe binding editor and tester"),
                 Line::from("Enter opens keyboard integration."),

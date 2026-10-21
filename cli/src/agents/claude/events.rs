@@ -86,6 +86,7 @@ fn block_entry(
         }
     } else {
         session.entries.push(Entry {
+            timestamp: Some(chrono::Utc::now().timestamp_millis()),
             id: id.clone(),
             kind: entry_kind.into(),
             text: content.into(),
@@ -690,5 +691,26 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("genuine fatal"))
         );
+    }
+    #[test]
+    fn assistant_receipt_timestamps_survive_full_frame_reconciliation() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let mut session = session();
+        let mut decoder = Decoder::default();
+        let before = chrono::Utc::now().timestamp_millis();
+        let frame = json!({"type":"assistant","message":{"id":"timed","content":[{"type":"text","text":"New assistant words"}]}});
+        decoder.apply(&mut session, &frame);
+        let receipt = session
+            .entries
+            .last()
+            .and_then(|e| e.timestamp)
+            .context("receipt time")?;
+        assert!((before..=chrono::Utc::now().timestamp_millis()).contains(&receipt));
+        decoder.apply(&mut session, &frame);
+        assert_eq!(
+            session.entries.last().context("entry")?.timestamp,
+            Some(receipt)
+        );
+        Ok(())
     }
 }

@@ -367,8 +367,12 @@ impl Ui {
             && self.panels.visible()
         {
             self.panels.right = !self.panels.right;
+            self.preferences.layout.helper_placement = None;
             let right = self.panels.right;
-            let result = self.storage.update_config(|c| c.agent_panel_right = right);
+            let result = self.storage.update_config(|c| {
+                c.agent_panel_right = right;
+                c.preferences.layout.helper_placement = None;
+            });
             if let Err(e) = result {
                 self.notice = Some((format!("Cannot save pane placement: {e:#}"), true));
             }
@@ -451,10 +455,7 @@ impl Ui {
             }
             KeyCode::Home => self.panels.scroll = 0,
             KeyCode::End => self.panels.scroll = usize::MAX,
-            KeyCode::Tab => {
-                self.panels.focused = false;
-                self.focus = Focus::Composer;
-            }
+            KeyCode::Tab => self.cycle_focus(false),
             _ => {}
         }
         true

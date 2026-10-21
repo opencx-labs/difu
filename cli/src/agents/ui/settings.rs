@@ -13,7 +13,8 @@ impl Ui {
         self.defaults = config.agent_defaults.clone();
         self.list_visible = config.agent_list_visible;
         self.changes_visible = config.agent_changes_visible;
-        self.panels.right = config.agent_panel_right;
+        self.panels.right = config.preferences.layout.helper(config.agent_panel_right)
+            != crate::settings::HelperPlacement::Main;
         self.theme = crate::theme::index(config.theme.as_deref());
         self.voice.enabled = config.voice_enabled;
         crate::theme::select(self.theme);
@@ -86,6 +87,18 @@ impl Ui {
         let changed =
             self.preferences.motion != config.preferences.motion || self.tweaks != config.tweaks;
         self.preferences.appearance = config.preferences.appearance.clone();
+        // Follow policy changes behavior as content arrives; only the synthetic
+        // sample may preview it. Keep the live reading anchor until Save.
+        let committed_scroll = self.preferences.conversation.auto_scroll;
+        self.preferences.conversation = config.preferences.conversation.clone();
+        self.preferences.conversation.auto_scroll = committed_scroll;
+        self.preferences.layout = config.preferences.layout.clone();
+        self.preferences.input.composer_max_height = config.preferences.input.composer_max_height;
+        self.preferences.input.paste_threshold = config.preferences.input.paste_threshold;
+        self.list_visible = config.agent_list_visible;
+        self.changes_visible = config.agent_changes_visible;
+        self.panels.right = config.preferences.layout.helper(config.agent_panel_right)
+            != crate::settings::HelperPlacement::Main;
         self.preferences.motion = config.preferences.motion.clone();
         self.tweaks = config.tweaks;
         if changed {

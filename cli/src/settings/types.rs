@@ -96,6 +96,15 @@ pub struct Layout {
     pub session_sort: SessionSort,
     pub startup_tab: StartupTab,
 }
+impl Layout {
+    pub(crate) fn helper(&self, legacy_right: bool) -> HelperPlacement {
+        self.helper_placement.unwrap_or(if legacy_right {
+            HelperPlacement::Right
+        } else {
+            HelperPlacement::Main
+        })
+    }
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Code {

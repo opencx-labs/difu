@@ -303,12 +303,7 @@ pub fn get(config: &Config, id: &SettingId) -> SettingValue {
             config
                 .preferences
                 .layout
-                .helper_placement
-                .unwrap_or(if config.agent_panel_right {
-                    HelperPlacement::Right
-                } else {
-                    HelperPlacement::Main
-                })
+                .helper(config.agent_panel_right)
                 .key()
                 .into(),
         ),

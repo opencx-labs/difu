@@ -5,6 +5,17 @@ impl Ui {
         std::mem::take(&mut self.send_repaint)
     }
 
+    /// Primary-send policy; explicit Queue and programmatic sends retain their semantics.
+    pub(super) fn send_primary(&mut self) {
+        let running = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.sessions.get(id))
+            .is_some_and(|s| s.turn_id.is_some());
+        self.send(
+            running && self.preferences.input.running == crate::settings::RunningInput::Queue,
+        );
+    }
     pub(super) fn send(&mut self, queue: bool) {
         if self.busy || self.media_pending.is_some() || self.command_draft() {
             return;

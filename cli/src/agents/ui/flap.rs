@@ -1121,6 +1121,7 @@ mod tests {
             ("live", "userMessage", "user", "hello there", None),
         ] {
             session.entries.push(Entry {
+                timestamp: None,
                 id: id.into(),
                 kind: kind.into(),
                 text: text.to_owned().into(),

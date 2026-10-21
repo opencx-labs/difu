@@ -142,7 +142,7 @@ impl Status {
         }
     }
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Entry {
     pub id: String,
     pub kind: String,
@@ -151,8 +151,24 @@ pub struct Entry {
     pub data: shared::Shared<Value>,
     #[serde(default)]
     pub started_at: Option<i64>,
+    /// Receipt time for new entries; historical records without it remain undated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<i64>,
     #[serde(default)]
     pub finished_at: Option<i64>,
+}
+impl Default for Entry {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: String::new(),
+            text: String::new().into(),
+            data: Value::Null.into(),
+            started_at: None,
+            finished_at: None,
+            timestamp: Some(chrono::Utc::now().timestamp_millis()),
+        }
+    }
 }
 impl Entry {
     pub fn replace_data(&mut self, mut data: Value) {

@@ -414,7 +414,10 @@ impl Ui {
         let (sender, receiver) = mpsc::channel();
         Self {
             preferences: config.preferences.clone(),
-            panels: panels::Panels::new(config.agent_panel_right),
+            panels: panels::Panels::new(
+                config.preferences.layout.helper(config.agent_panel_right)
+                    != crate::settings::HelperPlacement::Main,
+            ),
             prs: prs::State::load(&storage),
             defaults: config.agent_defaults.clone(),
             selected: None,
@@ -1007,9 +1010,17 @@ impl Ui {
                         .contains(&b.id)
                         .cmp(&self.pinned_sessions.contains(&a.id))
                 })
+                .then_with(|| match self.preferences.layout.session_sort {
+                    crate::settings::SessionSort::Manual => std::cmp::Ordering::Equal,
+                    crate::settings::SessionSort::Recent => b.updated.cmp(&a.updated),
+                    crate::settings::SessionSort::ActiveFirst => b
+                        .status
+                        .active()
+                        .cmp(&a.status.active())
+                        .then_with(|| b.updated.cmp(&a.updated)),
+                })
                 .then_with(|| positions.get(&a.id).cmp(&positions.get(&b.id)))
-                // Session IDs start with their creation timestamp. New sessions
-                // appear first; updates and status changes never affect order.
+                // Keep the creation-ID fallback stable inside each ordering group.
                 .then_with(|| b.id.cmp(&a.id))
         });
         if self.orchestrator_list
@@ -1378,11 +1389,15 @@ impl Ui {
             _ => None,
         }
     }
-    fn save_visibility(&mut self) {
+    fn save_visibility(&mut self, moved_helper: bool) {
         let (list, changes) = (self.list_visible, self.changes_visible);
         let result = self.storage.update_config(|config| {
             config.agent_list_visible = list;
             config.agent_changes_visible = changes;
+            if moved_helper {
+                config.agent_panel_right = true;
+                config.preferences.layout.helper_placement = None;
+            }
         });
         if let Err(error) = result {
             self.notice = Some((format!("Could not save pane visibility: {error:#}"), true));
@@ -1397,13 +1412,15 @@ impl Ui {
                 Focus::Conversation
             };
         }
-        self.save_visibility();
+        self.save_visibility(false);
     }
     pub fn toggle_changes(&mut self) {
         self.panels.focused = false;
         self.changes_visible = !self.changes_visible;
-        if self.changes_visible && self.panels.view.is_some() {
+        let moved_helper = self.changes_visible && self.panels.view.is_some() && !self.panels.right;
+        if moved_helper {
             self.panels.right = true;
+            self.preferences.layout.helper_placement = None;
         }
         self.drilled = true;
         self.focus = if self.changes_visible {
@@ -1412,7 +1429,7 @@ impl Ui {
             Focus::Composer
         };
         self.changes_at = None;
-        self.save_visibility();
+        self.save_visibility(moved_helper);
     }
     fn composer_suggestion(&self) -> Option<&str> {
         let id = self.selected.as_ref()?;
@@ -1838,7 +1855,9 @@ impl Ui {
                 }
                 KeyCode::Tab | KeyCode::BackTab => self.cycle_focus(key.code == KeyCode::BackTab),
                 KeyCode::Enter if ctrl => self.send(true),
-                KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => self.send(false),
+                KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    self.send_primary()
+                }
                 _ => {
                     if let Some(id) = self.selected.clone() {
                         self.positions.entry(id).or_default().draft.key(key);
@@ -1974,16 +1993,18 @@ impl Ui {
         }
     }
     fn cycle_focus(&mut self, backwards: bool) {
-        let helper = self.drilled && self.panels.right && self.panels.visible();
+        let helper = self.drilled && self.panels.visible();
         // Visible panes cycle in screen order: sessions, composer, helper canvas.
         let mut targets = Vec::new();
         if self.list_visible {
             targets.push(0);
         }
-        if self.changes_visible && self.drilled {
-            targets.extend([3, 4]);
-        } else {
-            targets.push(1);
+        if !(helper && !self.panels.right) {
+            if self.changes_visible && self.drilled {
+                targets.extend([3, 4]);
+            } else {
+                targets.push(1);
+            }
         }
         if helper {
             targets.push(2);
@@ -2242,7 +2263,11 @@ impl Ui {
             Some(Modal::Help(state)) => state.query.insert(text),
             None if self.focus == Focus::Composer => {
                 if let Some(id) = self.selected.clone() {
-                    self.positions.entry(id).or_default().draft.paste(text);
+                    self.positions
+                        .entry(id)
+                        .or_default()
+                        .draft
+                        .paste_with_threshold(text, self.preferences.input.paste_threshold);
                 }
             }
             _ => {}
@@ -2988,31 +3013,52 @@ impl Ui {
         );
         self.viewport = content.height.saturating_sub(2) as usize;
         let list_width = if self.list_visible {
-            (content.width / 4)
-                .clamp(20, 38)
-                .min(content.width.saturating_sub(20))
+            let requested = self.preferences.layout.sidebar_width;
+            if requested == 0 {
+                (content.width / 4).clamp(20, 38)
+            } else {
+                requested.clamp(20, 40) as u16
+            }
+            .min(content.width.saturating_sub(20))
         } else {
             0
         };
         let panel = self.panels.visible();
-        let changes_width = if self.drilled && panel && self.panels.right {
+        let bottom = panel
+            && self.panels.right
+            && self.preferences.layout.helper_placement
+                == Some(crate::settings::HelperPlacement::Bottom);
+        let changes_width = if self.drilled && panel && self.panels.right && !bottom {
             (content.width.saturating_sub(list_width) / 2).max(12)
         } else {
             0
         };
         let list = Rect::new(content.x, content.y, list_width, content.height);
-        let conversation = Rect::new(
+        let mut conversation = Rect::new(
             content.x + list_width,
             content.y,
             content.width.saturating_sub(list_width + changes_width),
             content.height,
         );
-        let changes = Rect::new(
-            conversation.right(),
-            content.y,
-            changes_width,
-            content.height,
-        );
+        let changes = if bottom {
+            let height = (content.height / 2)
+                .max(4)
+                .min(content.height.saturating_sub(4));
+            conversation.height = conversation.height.saturating_sub(height);
+            Rect::new(
+                conversation.x,
+                conversation.bottom(),
+                conversation.width,
+                height,
+            )
+        } else {
+            Rect::new(
+                conversation.right(),
+                content.y,
+                changes_width,
+                content.height,
+            )
+        };
         self.prs.visible.clear();
         if list_width > 0 {
             self.draw_list(frame, list);
@@ -3024,7 +3070,7 @@ impl Ui {
         } else {
             self.draw_conversation(frame, conversation);
         }
-        if changes_width > 0 {
+        if changes.width > 0 && changes.height > 0 {
             self.draw_panel(frame, changes);
         }
         let mut x = conversation.x;
@@ -3435,7 +3481,10 @@ impl Ui {
                 .layout(usize::from(area.width.saturating_sub(2)))
                 .0
                 .len()
-                .clamp(1, 10) as u16;
+                .clamp(
+                    1,
+                    self.preferences.input.composer_max_height.clamp(3, 20) as usize,
+                ) as u16;
             (lines + 3 + self.voice_rows(area.width)).min(area.height.saturating_sub(3))
         } else {
             0
@@ -3529,8 +3578,10 @@ impl Ui {
         position.transcript_viewport = Some((body.width, body.height, session.version));
         let before_measure = position.conversation;
         let tweaks = self.preferences.motion.tweaks(self.tweaks);
-        let appearance_changed = self.transcript_window.appearance != self.preferences.appearance;
+        let appearance_changed = self.transcript_window.appearance != self.preferences.appearance
+            || self.transcript_window.conversation != self.preferences.conversation;
         self.transcript_window.appearance = self.preferences.appearance.clone();
+        self.transcript_window.conversation = self.preferences.conversation.clone();
         let view = self.transcript_window.render(
             session,
             position,
@@ -3577,7 +3628,12 @@ impl Ui {
         } else {
             usize::from(body.height)
         });
-        position.conversation = if position.follow && !position.keep_transcript_position {
+        position.conversation = if match self.preferences.conversation.auto_scroll {
+            crate::settings::AutoScroll::WhenAtBottom => position.follow,
+            crate::settings::AutoScroll::Always => true,
+            crate::settings::AutoScroll::Manual => false,
+        } && !position.keep_transcript_position
+        {
             maximum
         } else {
             position.conversation.saturating_sub(dropped).min(maximum)

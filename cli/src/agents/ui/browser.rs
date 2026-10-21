@@ -690,4 +690,124 @@ mod tests {
         assert_eq!(resize.get("rows"), Some(&json!(20)));
         Ok(())
     }
+    #[test]
+    fn helper_placements_preserve_browser_key_paste_and_local_mouse_routing() -> Result<()> {
+        use super::super::{Focus, Position, Ui, panels};
+        use crate::{
+            editor::Editor,
+            settings::HelperPlacement,
+            storage::{Config, Storage},
+        };
+        let directory = tempfile::tempdir_in("/tmp")?;
+        let listener = UnixListener::bind(directory.path().join("socket"))?;
+        listener.set_nonblocking(true)?;
+        let child = ChildGroup::spawn(Command::new("sleep").arg("30"))?;
+        let browser = Browser {
+            child,
+            engine: None,
+            _directory: tempfile::tempdir_in("/tmp")?,
+            listener,
+            stream: None,
+            initialized: false,
+            input: Vec::new(),
+            output: Vec::new(),
+            area: Rect::default(),
+            cell: [10, 20],
+            image: 0x700002,
+            grid: None,
+            error: None,
+            focused: true,
+            visible: true,
+        };
+        let mut config = Config {
+            agent_list_visible: false,
+            ..Default::default()
+        };
+        let mut ui = Ui::new(
+            Storage {
+                config: directory.path().join("config.json"),
+                cache: directory.path().into(),
+            },
+            &config,
+        );
+        ui.selected = Some("synthetic".into());
+        ui.positions.insert(
+            "synthetic".into(),
+            Position {
+                draft: Editor::from("Keep draft"),
+                media_loaded: true,
+                ..Default::default()
+            },
+        );
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        ui.panels.focused = true;
+        ui.panels.view = Some(panels::View::Artifact {
+            path: "/synthetic/example.html".into(),
+            title: "Example artifact".into(),
+            browser: Some(Box::new(browser)),
+            error: None,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(120, 40))?;
+        for placement in [
+            HelperPlacement::Right,
+            HelperPlacement::Bottom,
+            HelperPlacement::Main,
+        ] {
+            config.preferences.layout.helper_placement = Some(placement);
+            config.agent_panel_right = placement != HelperPlacement::Main;
+            ui.apply_settings(&config);
+            terminal.draw(|frame| ui.draw(frame))?;
+            assert!(ui.browser_input(), "{placement:?}");
+            let area = match &mut ui.panels.view {
+                Some(panels::View::Artifact {
+                    browser: Some(browser),
+                    ..
+                }) => {
+                    browser.output.clear();
+                    browser.area
+                }
+                _ => anyhow::bail!("browser view lost"),
+            };
+            ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            ui.paste("browser source");
+            ui.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: area.x + 2,
+                row: area.y + 2,
+                modifiers: KeyModifiers::NONE,
+            });
+            let events = match &ui.panels.view {
+                Some(panels::View::Artifact {
+                    browser: Some(browser),
+                    ..
+                }) => std::str::from_utf8(&browser.output)?
+                    .lines()
+                    .map(serde_json::from_str::<Value>)
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+                _ => anyhow::bail!("browser view lost"),
+            };
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.get("type") == Some(&json!("key"))
+                        && e.get("text") == Some(&json!("x"))),
+                "{placement:?}"
+            );
+            assert!(events.iter().any(|e| e.get("type") == Some(&json!("paste"))
+                && e.get("text") == Some(&json!("browser source"))));
+            assert!(events.iter().any(|e| e.get("type") == Some(&json!("mouse"))
+                && e.get("x") == Some(&json!(25))
+                && e.get("y") == Some(&json!(50))));
+            assert_eq!(
+                ui.positions
+                    .get("synthetic")
+                    .context("position")?
+                    .draft
+                    .text(),
+                "Keep draft"
+            );
+        }
+        Ok(())
+    }
 }
