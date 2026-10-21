@@ -39,7 +39,7 @@ pub(crate) const REMOVE_BG: Color = slot(Role::RemoveBg);
 pub struct TextRow {
     pub style: Style,
     pub hunk: Option<String>,
-    pub image: Option<crate::images::PreviewRow>,
+    pub images: Vec<crate::images::PreviewRow>,
     pub spans: Vec<Span<'static>>,
     pub action: Option<Action>,
     pub target: Option<crate::workflow::Target>,
@@ -156,7 +156,7 @@ pub(crate) fn text(value: impl Into<String>, color: Color) -> TextRow {
         action: None,
         target: None,
         code_links: Vec::new(),
-        image: None,
+        images: Vec::new(),
         hunk: None,
         style: Style::default(),
     }
@@ -170,7 +170,7 @@ pub(crate) fn bold(value: impl Into<String>, color: Color) -> TextRow {
         action: None,
         target: None,
         code_links: Vec::new(),
-        image: None,
+        images: Vec::new(),
         hunk: None,
         style: Style::default(),
     }
@@ -186,7 +186,7 @@ pub(crate) fn link(value: impl Into<String>, action: Action) -> TextRow {
         action: Some(action),
         target: None,
         code_links: Vec::new(),
-        image: None,
+        images: Vec::new(),
         hunk: None,
         style: Style::default(),
     }
@@ -628,7 +628,7 @@ pub(crate) fn code_rows(
                 rows.push(TextRow {
                     spans,
                     code_links: links,
-                    image: None,
+                    images: Vec::new(),
                     hunk: None,
                     style: Style::default(),
                     action: None,
@@ -647,7 +647,7 @@ pub(crate) fn code_rows(
                 rows.push(TextRow {
                     spans: code(Some(line), old, width, offset),
                     code_links: code_links(path, Some(line), old, width, offset, 0),
-                    image: None,
+                    images: Vec::new(),
                     hunk: None,
                     style: Style::default(),
                     action: None,
@@ -846,7 +846,7 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
             }
             return doc;
         }
-        for row in crate::overview::rows_with_images(review, width, app.images.supported()) {
+        for row in crate::overview::rows_with_images(review, width, &app.images) {
             append(&mut doc.rows, row);
         }
         return doc;
