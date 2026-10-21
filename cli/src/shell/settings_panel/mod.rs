@@ -234,14 +234,23 @@ impl Panel {
         self.visual_config.as_ref().unwrap_or(self.draft.config())
     }
     pub fn animating(&self) -> bool {
-        self.rows()
-            .get(self.selected)
-            .is_some_and(|spec| spec.preview == Preview::Animation)
-            && self.preview_config().preferences.motion.level == Motion::Full
-            && ((self.preview_config().tweaks.agent_reply_cps > 0
-                && self.preview_config().preferences.motion.reply_tool)
-                || (self.preview_config().tweaks.sent_message_ms > 0
-                    && self.preview_config().preferences.motion.sent_message))
-            && self.preview.animating()
+        let rows = self.rows();
+        let Some(spec) = rows.get(self.selected) else {
+            return false;
+        };
+        let config = self.preview_config();
+        let motion = &config.preferences.motion;
+        let enabled = match spec.id {
+            SettingId::SidebarEffect => motion.sidebar() && config.tweaks.agent_reply_cps > 0,
+            SettingId::ScreenTransitionEffect => {
+                motion.screen() && config.tweaks.agent_reply_cps > 0
+            }
+            SettingId::InputClearDuration => motion.sent() && config.tweaks.input_clear_ms > 0,
+            _ => {
+                (motion.reply() && config.tweaks.agent_reply_cps > 0)
+                    || (motion.sent() && config.tweaks.sent_message_ms > 0)
+            }
+        };
+        spec.preview == Preview::Animation && enabled && self.preview.animating()
     }
 }

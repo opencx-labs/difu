@@ -24,12 +24,18 @@ struct Leaving {
     rows: Vec<Line<'static>>,
     started: Instant,
     duration: Duration,
+    /// Keep the answered rows suppressed until delivery resolves, even when
+    /// a preference refresh stops their visual effect immediately.
+    settled: bool,
 }
 impl Leaving {
     fn done(&self, now: Instant) -> bool {
-        now >= self.started + self.duration + flap::LIFETIME
+        self.settled || now >= self.started + self.duration + flap::LIFETIME
     }
     fn frame(&self, now: Instant) -> Vec<Line<'static>> {
+        if self.settled {
+            return Vec::new();
+        }
         let mut rows = self.rows.clone();
         let total = flap::glyphs(&rows).len();
         flap::vanish(
@@ -45,6 +51,14 @@ impl Leaving {
     }
 }
 impl Flip {
+    pub(super) fn settle_opening(&mut self) {
+        self.board = flap::Board::default();
+    }
+    pub(super) fn settle_leaving(&mut self) {
+        if let Some(leaving) = &mut self.leaving {
+            leaving.settled = true;
+        }
+    }
     pub(super) fn animating(&self, now: Instant) -> bool {
         self.leaving
             .as_ref()
@@ -476,6 +490,7 @@ impl Ui {
                 rows: self.question_flip.drawn.clone(),
                 started: Instant::now(),
                 duration: Duration::from_millis(u64::from(clear)),
+                settled: false,
             });
         }
         self.question_send = Some((id.clone(), request.clone(), question_id.clone(), index));
@@ -896,5 +911,106 @@ impl Ui {
             Action::SubmitQuestion(false),
             false,
         );
+    }
+}
+
+#[cfg(test)]
+mod settings_refresh_tests {
+    use super::*;
+    use anyhow::Context;
+    #[test]
+    fn committed_refresh_settles_clearing_without_redisplaying_an_inflight_answer()
+    -> anyhow::Result<()> {
+        for change in 0..5 {
+            let dir = tempfile::tempdir()?;
+            let storage = Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().into(),
+            };
+            let mut ui = Ui::new(storage.clone(), &Config::default());
+            let mut session = Session::new(
+                "one".into(),
+                super::super::super::Job::Coding(super::super::super::Launch {
+                    repository: "/synthetic/settings-preview".into(),
+                    isolated: false,
+                    base: "HEAD".into(),
+                    prompt: "Sample".into(),
+                    model: None,
+                    effort: None,
+                }),
+            );
+            session.status = Status::Idle;
+            session.pending.push(Pending {id: serde_json::json!("request"), method: "item/tool/requestUserInput".into(), responded: true, params: serde_json::json!({"difuAsync":true,"questions":[{"id":"q","question":"Choose scope","options":[{"label":"Small"}]}]})});
+            ui.sessions.insert("one".into(), session);
+            ui.selected = Some("one".into());
+            ui.drilled = true;
+            ui.open_question(0);
+            ui.positions.entry("one".into()).or_default().draft.chars =
+                "Unsent draft".chars().collect();
+            let now = Instant::now();
+            ui.question_flip.leaving = Some(Leaving {
+                session: "one".into(),
+                rows: vec![Line::from("Choose scope")],
+                started: now,
+                duration: Duration::from_secs(10),
+                settled: false,
+            });
+            let pending = Some(("one".into(), serde_json::json!("request"), "q".into(), 0));
+            ui.question_send = pending.clone();
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 12))?;
+            terminal.draw(|f| ui.draw_inline_question(f, f.area()))?;
+            assert!(ui.question_flip.animating(Instant::now()));
+            storage.update_config(|config| match change {
+                0 => config.preferences.motion.sent_message = false,
+                1 => config.tweaks.input_clear_ms = 0,
+                2 => config.preferences.motion.level = crate::settings::Motion::Off,
+                3 => config.preferences.motion.level = crate::settings::Motion::Reduced,
+                _ => config.tweaks.agent_reply_cps = 0,
+            })?;
+            ui.apply_settings(&storage.refresh_settings()?);
+            terminal.draw(|f| ui.draw_inline_question(f, f.area()))?;
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(
+                !ui.question_flip.animating(Instant::now()),
+                "refresh {change} must finish clearing"
+            );
+            assert!(
+                !screen.contains("Choose scope"),
+                "refresh {change} must keep the answered question hidden"
+            );
+            assert!(screen.contains("Sending answer"));
+            assert_eq!(ui.question_send, pending);
+            assert_eq!(
+                ui.positions
+                    .get("one")
+                    .context("position")?
+                    .draft
+                    .chars
+                    .iter()
+                    .collect::<String>(),
+                "Unsent draft"
+            );
+            // A failed delivery makes the retained answer available for retry.
+            ui.question_send = None;
+            terminal.draw(|f| ui.draw_inline_question(f, f.area()))?;
+            ui.question_flip.age(Duration::from_secs(2));
+            terminal.draw(|f| ui.draw_inline_question(f, f.area()))?;
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(screen.contains("Choose scope"));
+            assert_eq!(ui.selected_question_answer().as_deref(), Some("Small"));
+        }
+        Ok(())
     }
 }

@@ -54,7 +54,10 @@ impl Ui {
             self.sidebar_highlights.clear();
         }
         if motion.level != crate::settings::Motion::Full || self.tweaks.agent_reply_cps == 0 {
-            self.question_flip = Default::default();
+            self.question_flip.settle_opening();
+        }
+        if !motion.sent() || self.tweaks.input_clear_ms == 0 || self.tweaks.agent_reply_cps == 0 {
+            self.question_flip.settle_leaving();
         }
         for position in self.positions.values_mut() {
             if !motion.reply() || self.tweaks.agent_reply_cps == 0 {

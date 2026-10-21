@@ -287,13 +287,13 @@ impl Panel {
         let visual = self.preview_config().clone();
         let lines = match spec.preview {
             Preview::Diff => diff_preview(&visual, inner.width),
-            Preview::Conversation | Preview::Animation | Preview::Appearance | Preview::Layout => {
-                self.preview.render(
-                    &visual,
-                    inner.width,
-                    self.replay,
-                    spec.preview == Preview::Animation,
-                )
+            Preview::Animation => {
+                self.preview
+                    .render_control(&visual, inner.width, self.replay, &spec.id)
+            }
+            Preview::Conversation | Preview::Appearance | Preview::Layout => {
+                self.preview
+                    .render(&visual, inner.width, self.replay, false)
             }
             Preview::Input => vec![
                 Line::from("› A synthetic composer draft"),

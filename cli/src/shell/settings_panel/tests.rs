@@ -378,3 +378,73 @@ fn narrow_footer_keeps_details_scroll_and_navigation_instructions_visible() -> R
     }
     Ok(())
 }
+
+#[test]
+fn motion_controls_route_to_dedicated_synthetic_previews() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(130, 40))?;
+    for (id, label, scene) in [
+        (
+            SettingId::SidebarEffect,
+            "Sidebar effects",
+            "Session sidebar",
+        ),
+        (
+            SettingId::ScreenTransitionEffect,
+            "Screen transitions",
+            "Switch to Changes",
+        ),
+        (
+            SettingId::InputClearDuration,
+            "Input clearing duration",
+            "Composer after send",
+        ),
+    ] {
+        let mut panel = Panel::new(&storage, Some(Category::Motion))?;
+        panel.query = label.into();
+        assert_eq!(panel.rows().first().map(|s| &s.id), Some(&id));
+        // These effects must run even when the generic transcript has no effect.
+        panel
+            .draft
+            .set(SettingId::ReplyToolEffect, SettingValue::Bool(false))?;
+        panel
+            .draft
+            .set(SettingId::SentDuration, SettingValue::Number(0))?;
+        terminal.draw(|frame| panel.draw(frame))?;
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains(scene), "{label} should show {scene}");
+        assert!(panel.animating(), "{label} needs repainting");
+        panel.replay = panel
+            .replay
+            .checked_sub(std::time::Duration::from_secs(2))
+            .context("earlier replay")?;
+        terminal.draw(|frame| panel.draw(frame))?;
+        assert!(!panel.animating(), "{label} must finish");
+        let outcome = panel.key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &storage,
+        );
+        assert!(outcome.action.is_none() && outcome.saved.is_none() && !outcome.close);
+        terminal.draw(|frame| panel.draw(frame))?;
+        assert!(panel.animating(), "{label} Ctrl+P must replay the effect");
+        panel.draft.set(
+            id.clone(),
+            if id == SettingId::InputClearDuration {
+                SettingValue::Number(0)
+            } else {
+                SettingValue::Bool(false)
+            },
+        )?;
+        terminal.draw(|frame| panel.draw(frame))?;
+        assert!(!panel.animating());
+        assert!(!storage.config.exists(), "preview never saves config");
+    }
+    Ok(())
+}
