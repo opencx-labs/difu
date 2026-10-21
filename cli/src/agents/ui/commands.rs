@@ -1,6 +1,10 @@
 use super::*;
 
 const COMMANDS: &[(&str, &str)] = &[
+    (
+        "settings",
+        "Preferences, keyboard shortcuts, notifications and connections",
+    ),
     ("slack", "Connect Slack to the difu orchestrator"),
     (
         "remote-control",
@@ -381,6 +385,11 @@ impl Ui {
         };
         if !args.is_empty() {
             self.run_command_arguments(&name, &args);
+            return;
+        }
+        if let Some(category) = crate::shell::settings_panel::command_category(&name) {
+            self.settings_requested = Some(category);
+            self.modal = None;
             return;
         }
         match name.as_str() {

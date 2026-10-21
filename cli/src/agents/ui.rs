@@ -23,6 +23,8 @@ mod reveal;
 mod rules;
 mod selection;
 mod sends;
+mod settings;
+pub(crate) mod settings_preview;
 mod sidebar;
 mod slack;
 mod themes;
@@ -324,6 +326,7 @@ enum Task {
 }
 
 pub struct Ui {
+    pub(crate) settings_requested: Option<crate::settings::Category>,
     panels: panels::Panels,
     prs: prs::State,
     pub defaults: crate::storage::AgentDefaults,
@@ -474,6 +477,7 @@ impl Ui {
             skills_loading: None,
             workspace_paths: HashMap::new(),
             paths_loading: HashSet::new(),
+            settings_requested: None,
             voice: voice::State::new(config.voice_enabled),
             tweaks: config.tweaks,
             theme: crate::theme::index(config.theme.as_deref()),
@@ -7961,7 +7965,7 @@ mod tests {
                 .iter()
                 .any(|(name, _, _)| name == "/tweaks")
         );
-        ui.run_palette_command("/tweaks", "/tweaks");
+        ui.open_tweaks();
         let (screen, _) = draw(&mut ui, 120, 40)?;
         assert!(screen.contains("Agent reply speed") && screen.contains("200"));
         let set = |ui: &mut Ui, value: &str| {
@@ -8022,7 +8026,7 @@ mod tests {
         // Moving previews live; Esc returns to the saved theme. The picker
         // leaves the conversation visible so the preview shows on it.
         ui.drilled = true;
-        ui.run_palette_command("/theme", "/theme");
+        ui.open_theme();
         let (screen, _) = draw(&mut ui, 120, 40)?;
         assert!(
             screen.contains("Default")
@@ -8047,13 +8051,13 @@ mod tests {
         assert_eq!(storage.load_config()?.theme, None);
 
         // A preview never outlives the picker, however it closes.
-        ui.run_palette_command("/theme", "/theme");
+        ui.open_theme();
         key(&mut ui, KeyCode::Down);
         ui.modal = None;
         ui.tick(false);
         assert_eq!(theme::active().id, "default");
 
-        ui.run_palette_command("/theme", "/theme");
+        ui.open_theme();
         for _ in 0..theme::index(Some("dracula")) {
             key(&mut ui, KeyCode::Down);
         }
@@ -8065,7 +8069,7 @@ mod tests {
         assert_eq!(theme::active().id, "dracula", "a saved theme stays");
 
         // Choosing Default goes back to the original colours and clears the setting.
-        ui.run_palette_command("/theme", "/theme");
+        ui.open_theme();
         key(&mut ui, KeyCode::Home);
         key(&mut ui, KeyCode::Enter);
         assert_eq!(theme::active().id, "default");

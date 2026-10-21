@@ -541,7 +541,7 @@ impl Shell {
         let mut matched = items.into_iter().filter_map(|item| {
             if commands_first {
                 match &item.action {
-                    Action::AgentCommand(name) if !session_context || !name.starts_with('/') => return None,
+                    Action::AgentCommand(name) if settings_panel::command_category(name).is_none() && (!session_context || !name.starts_with('/')) => return None,
                     Action::AgentMenu(_) if !session_context => return None,
                     Action::ReviewHome(_) | Action::ReviewCommand(_) if session_context => return None,
                     _ => {}
@@ -567,6 +567,10 @@ impl Shell {
         matched.sort_by_key(|(score, category, item)| {
             (
                 commands_first && matches!(item.action, Action::Session(_) | Action::Preview(_)),
+                commands_first
+                    && !session_context
+                    && query.trim() == "/"
+                    && matches!(item.action, Action::AgentCommand(_)),
                 !matches!(item.action, Action::Session(_)),
                 *score,
                 *category,
@@ -738,6 +742,10 @@ impl Shell {
                 app.action(ReviewAction::SetView(View::Overview));
             }
             Action::AgentCommand(name) => {
+                if let Some(category) = settings_panel::command_category(&name) {
+                    self.open_settings(Some(category));
+                    return;
+                }
                 self.switch(true);
                 self.agents.run_palette_command(&name, &query);
             }
@@ -1277,10 +1285,8 @@ mod tests {
             Some(Action::ReviewHome(_) | Action::ReviewCommand(_))
         ));
         let has_unrelated_controls = items.iter().any(|item| {
-            matches!(
-                item.action,
-                Action::AgentMenu(_) | Action::AgentCommand(_) | Action::ReviewHome(0)
-            )
+            matches!(item.action, Action::AgentMenu(_) | Action::ReviewHome(0))
+                || matches!(&item.action, Action::AgentCommand(name) if settings_panel::command_category(name).is_none())
         });
         assert!(!has_unrelated_controls);
         query(&mut shell, "/PR controls");
@@ -1388,6 +1394,27 @@ mod tests {
         assert!(!shell.reviews.home);
         assert_eq!(shell.reviews.view, View::Overview);
         assert_eq!(shell.reviews.key(), Some(key.id()));
+        Ok(())
+    }
+    #[test]
+    fn settings_command_is_available_in_reviews_without_switching_tabs() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut shell = fixture(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        })?;
+        shell.agents_active = false;
+        query(&mut shell, "/settings");
+        let index = shell
+            .palette_items()
+            .iter()
+            .position(
+                |item| matches!(&item.action, Action::AgentCommand(name) if name == "/settings"),
+            )
+            .context("global Settings command")?;
+        shell.activate_palette(index);
+        assert!(shell.settings.is_some());
+        assert!(!shell.agents_active);
         Ok(())
     }
 }

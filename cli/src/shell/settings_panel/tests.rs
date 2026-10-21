@@ -1,0 +1,322 @@
+use super::*;
+use anyhow::{Context, Result};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+fn storage(dir: &tempfile::TempDir) -> Storage {
+    Storage {
+        config: dir.path().join("config.json"),
+        cache: dir.path().into(),
+    }
+}
+#[test]
+fn intent_search_and_modified_filter_follow_draft_edits() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut panel = Panel::new(&storage(&dir), None)?;
+    panel.query = "stop flashing".into();
+    assert_eq!(
+        panel.rows().first().map(|s| &s.id),
+        Some(&SettingId::Motion)
+    );
+    panel.query = "change question key".into();
+    assert_eq!(
+        panel.rows().first().map(|s| &s.id),
+        Some(&SettingId::Shortcut("question.open".into()))
+    );
+    panel.query = "nothing matches this phrase".into();
+    assert!(panel.rows().is_empty());
+    panel.query.clear();
+    panel.modified_only = true;
+    assert!(panel.rows().is_empty());
+    panel
+        .draft
+        .set(SettingId::WrapDiff, SettingValue::Bool(true))?;
+    assert_eq!(
+        panel
+            .rows()
+            .iter()
+            .map(|s| s.id.clone())
+            .collect::<Vec<_>>(),
+        vec![SettingId::WrapDiff]
+    );
+    Ok(())
+}
+#[test]
+fn save_conflict_retains_draft_and_discard_reads_latest() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, None)?;
+    panel
+        .draft
+        .set(SettingId::ReplySpeed, SettingValue::Number(15))?;
+    storage.update_config(|c| c.tweaks.agent_reply_cps = 40)?;
+    panel.save(&storage);
+    assert!(panel.error.is_some());
+    assert_eq!(
+        panel.draft.value(&SettingId::ReplySpeed),
+        SettingValue::Number(15)
+    );
+    panel.discard(&storage);
+    assert_eq!(
+        panel.draft.value(&SettingId::ReplySpeed),
+        SettingValue::Number(40)
+    );
+    assert!(panel.draft.edited().is_empty());
+    panel
+        .draft
+        .set(SettingId::WrapDiff, SettingValue::Bool(true))?;
+    assert!(panel.save(&storage).is_some());
+    assert!(storage.load_config()?.wrap_diff);
+    Ok(())
+}
+#[test]
+fn section_reset_export_and_escape_never_lose_unsaved_work() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, Some(Category::Code))?;
+    panel
+        .draft
+        .set(SettingId::WrapDiff, SettingValue::Bool(true))?;
+    panel
+        .draft
+        .set(SettingId::VoiceEnabled, SettingValue::Bool(true))?;
+    panel.reset_section();
+    assert_eq!(
+        panel.draft.value(&SettingId::WrapDiff),
+        SettingValue::Bool(false)
+    );
+    assert_eq!(panel.draft.edited().len(), 1);
+    assert!(
+        !panel
+            .key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &storage)
+            .close
+    );
+    assert!(panel.confirm_discard);
+    panel.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &storage);
+    assert!(!panel.confirm_discard);
+    panel.export(&storage)?;
+    let path = panel.export_path.as_ref().context("export path")?;
+    let exported: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    assert!(exported.get("input.voice").is_some());
+    assert!(exported.get("connections.providers").is_none());
+    assert!(!storage.config.exists());
+    Ok(())
+}
+#[test]
+fn narrow_panel_keeps_search_selection_details_and_actions_reachable() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, Some(Category::Code))?;
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(38, 18))?;
+    terminal.draw(|frame| panel.draw(frame))?;
+    let content = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(content.contains("Settings"));
+    assert!(content.contains("Ctrl+S"));
+    panel.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &storage);
+    panel.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &storage);
+    assert!(!panel.draft.edited().is_empty());
+    terminal.draw(|frame| panel.draw(frame))?;
+    assert_eq!(panel.draft.edited().len(), 1);
+    Ok(())
+}
+#[test]
+fn numeric_validation_keeps_draft_and_editor_until_a_valid_value_is_entered() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, Some(Category::Motion))?;
+    panel.query = "Reply speed".into();
+    panel.search_focused = false;
+    panel.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &storage);
+    panel.edit = Some("not a number".into());
+    panel.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &storage);
+    assert!(panel.error.is_some());
+    assert!(panel.draft.edited().is_empty());
+    assert!(panel.edit.is_some());
+    panel.edit = Some("0".into());
+    panel.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &storage);
+    assert!(panel.error.is_none());
+    assert_eq!(panel.draft.config().tweaks.agent_reply_cps, 0);
+    assert!(panel.edit.is_none());
+    Ok(())
+}
+#[test]
+fn keyboard_can_read_full_details_in_a_narrow_terminal() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, Some(Category::Input))?;
+    panel.key(
+        KeyEvent::new(KeyCode::Char('i'), KeyModifiers::CONTROL),
+        &storage,
+    );
+    assert!(panel.details_expanded);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(38, 18))?;
+    terminal.draw(|frame| panel.draw(frame))?;
+    panel.key(
+        KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL),
+        &storage,
+    );
+    assert!(panel.details_scroll > 0);
+    panel.key(
+        KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        &storage,
+    );
+    assert_eq!(panel.category, Category::Keyboard);
+    assert_eq!(panel.details_scroll, 0);
+    Ok(())
+}
+#[test]
+fn browsing_every_section_and_real_previews_never_creates_config_or_exports() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, None)?;
+    for size in [(1, 1), (38, 18), (90, 30), (140, 40)] {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(size.0, size.1))?;
+        for category in Category::ALL {
+            panel.category = category;
+            terminal.draw(|frame| panel.draw(frame))?;
+        }
+    }
+    assert!(!storage.config.exists());
+    assert!(!storage.cache.join("preference-exports").exists());
+    assert!(panel.draft.edited().is_empty());
+    Ok(())
+}
+#[test]
+fn real_diff_renderer_switches_between_split_and_unified_preview() {
+    let mut config = crate::storage::Config::default();
+    let split = draw::diff_preview(&config, 80)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<String>();
+    config.unified = true;
+    let unified = draw::diff_preview(&config, 80)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<String>();
+    assert!(split.contains('│'));
+    assert!(!unified.contains('│'));
+    assert!(unified.contains("Hello, Difu!"));
+    assert!(unified.contains("Hi"));
+}
+#[test]
+fn supplied_shortcuts_rank_exact_aliases_before_other_label_matches() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut panel = Panel::new(&storage(&dir), None)?;
+    let mut spec = SettingSpec::shortcut("synthetic.action", "Example action");
+    spec.aliases = &["voice"];
+    panel.set_shortcuts(vec![spec]);
+    panel.query = "VOICE".into();
+    assert_eq!(
+        panel.rows().first().map(|s| s.id.clone()),
+        Some(SettingId::Shortcut("synthetic.action".into()))
+    );
+    Ok(())
+}
+#[test]
+fn real_transcript_preview_uses_expansion_and_motion_draft_values() {
+    use crate::agents::ui::settings_preview::SettingsPreview;
+    let replay = Instant::now();
+    let mut sample = SettingsPreview::new(replay);
+    let mut config = crate::storage::Config::default();
+    let compact = sample
+        .render(&config, 65, replay, false)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<String>();
+    config.preferences.conversation.tool_display = ToolDisplay::Expanded;
+    let expanded = sample
+        .render(&config, 65, replay, false)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<String>();
+    assert!(!compact.contains("Extra tool output"));
+    assert!(expanded.contains("Extra tool output"));
+    config.preferences.motion.level = Motion::Off;
+    let off = sample
+        .render(&config, 65, replay, true)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<String>();
+    assert_eq!(expanded, off);
+}
+#[test]
+fn preview_test_request_is_explicit_and_never_edits_or_saves() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, Some(Category::Notifications))?;
+    let outcome = panel.key(
+        KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        &storage,
+    );
+    assert_eq!(outcome.preview_test, Some(Preview::Notification));
+    assert!(outcome.action.is_none());
+    assert!(panel.draft.edited().is_empty());
+    assert!(!storage.config.exists());
+    Ok(())
+}
+#[test]
+fn provider_choice_hook_cycles_both_ways_including_automatic() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, Some(Category::AgentDefaults))?;
+    panel.query = "Default model".into();
+    panel.search_focused = false;
+    panel.set_dynamic_choices(
+        SettingId::DefaultModel,
+        vec!["first".into(), "second".into()],
+    );
+    panel.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &storage);
+    assert_eq!(
+        panel.draft.value(&SettingId::DefaultModel),
+        SettingValue::Text(Some("second".into()))
+    );
+    panel.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &storage);
+    assert_eq!(
+        panel.draft.value(&SettingId::DefaultModel),
+        SettingValue::Text(None)
+    );
+    panel.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &storage);
+    assert_eq!(
+        panel.draft.value(&SettingId::DefaultModel),
+        SettingValue::Text(Some("first".into()))
+    );
+    assert!(!storage.config.exists());
+    Ok(())
+}
+#[test]
+fn keyboard_section_reset_clears_overrides_even_before_full_registry_arrives() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, Some(Category::Keyboard))?;
+    panel.draft.set(
+        SettingId::Shortcut("future.action".into()),
+        SettingValue::Shortcut(Some(KeyChord::character('x'))),
+    )?;
+    panel.reset_section();
+    assert!(
+        panel
+            .draft
+            .config()
+            .preferences
+            .keyboard
+            .bindings
+            .is_empty()
+    );
+    assert!(panel.draft.edited().is_empty());
+    Ok(())
+}
+#[test]
+fn disabled_reply_animation_does_not_request_periodic_preview_repaints() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut panel = Panel::new(&storage(&dir), Some(Category::Motion))?;
+    panel
+        .draft
+        .set(SettingId::ReplySpeed, SettingValue::Number(0))?;
+    assert!(!panel.animating());
+    Ok(())
+}
