@@ -21,6 +21,9 @@ pub(super) struct Options<'a> {
     pub resume: Option<&'a str>,
     pub instructions: &'a str,
     pub mode: Mode,
+    pub permission_mode: Option<&'a str>,
+    pub allow_bypass: bool,
+    pub settings: Option<&'a Value>,
 }
 pub(super) enum Mode {
     /// A difu session, with difu's MCP tools.
@@ -31,6 +34,59 @@ pub(super) enum Mode {
     /// but hooks, MCP servers and session persistence stay off.
     Commands,
 }
+/// Preserve native control rejection codes so callers can distinguish unsupported
+/// features from a temporary transport or internal failure.
+#[derive(Debug)]
+pub(super) struct ControlError {
+    code: Option<String>,
+    message: String,
+}
+impl ControlError {
+    fn from_response(response: &Value) -> Self {
+        Self {
+            code: response
+                .get("error_code")
+                .and_then(Value::as_str)
+                .map(String::from),
+            message: response
+                .get("error")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(String::from)
+                        .unwrap_or_else(|| value.to_string())
+                })
+                .unwrap_or_else(|| "Control request rejected".into()),
+        }
+    }
+    pub fn rejects_auto_mode(&self) -> bool {
+        matches!(
+            self.code.as_deref(),
+            Some(
+                "invalid_mode"
+                    | "auto_mode_settings"
+                    | "auto_mode_circuit_breaker"
+                    | "auto_mode_fast_mode"
+                    | "auto_mode_model"
+                    | "auto_mode_unavailable"
+            )
+        )
+    }
+}
+impl std::fmt::Display for ControlError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "Claude: {}", self.message)
+    }
+}
+impl std::error::Error for ControlError {}
+#[derive(Debug)]
+pub(super) struct MissingConversation(pub String);
+impl std::fmt::Display for MissingConversation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "No conversation found with session ID: {}", self.0)
+    }
+}
+impl std::error::Error for MissingConversation {}
 pub(super) struct Connection {
     _child: ChildGroup,
     input: ChildStdin,
@@ -38,6 +94,8 @@ pub(super) struct Connection {
     backlog: VecDeque<Value>,
     next: u64,
     stderr: Arc<Mutex<VecDeque<u8>>>,
+    stderr_complete: mpsc::Receiver<()>,
+    resume_id: Option<String>,
 }
 impl Connection {
     pub fn stop(&mut self) -> Result<()> {
@@ -63,6 +121,15 @@ impl Connection {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(mode) = options.permission_mode {
+            command.arg("--permission-mode").arg(mode);
+        }
+        if options.allow_bypass {
+            command.arg("--allow-dangerously-skip-permissions");
+        }
+        if let Some(settings) = options.settings.filter(|v| v.is_object()) {
+            command.arg("--settings").arg(settings.to_string());
+        }
         if let Some(model) = options.model {
             command.arg(format!("--model={model}"));
         }
@@ -109,6 +176,7 @@ impl Connection {
         let output = child.child.stdout.take().context("Missing Claude stdout")?;
         // Keep a bounded diagnostic tail while draining so stderr cannot block stdout.
         let stderr_tail = Arc::new(Mutex::new(VecDeque::new()));
+        let (stderr_done, stderr_complete) = mpsc::channel();
         if let Some(mut stderr) = child.child.stderr.take() {
             let tail = stderr_tail.clone();
             thread::spawn(move || {
@@ -124,6 +192,7 @@ impl Connection {
                         }
                     }
                 }
+                let _ = stderr_done.send(());
             });
         }
         let (sender, receiver) = crate::wake::channel(cancel.wake());
@@ -156,9 +225,16 @@ impl Connection {
             backlog: VecDeque::new(),
             next: 0,
             stderr: stderr_tail,
+            stderr_complete,
+            resume_id: options.resume.map(String::from),
         })
     }
     fn disconnected(&self, message: &str) -> anyhow::Error {
+        // stdout EOF can race the diagnostic reader on a native startup error.
+        // Wait briefly for its final stderr before classifying a missing ID.
+        let _ = self
+            .stderr_complete
+            .recv_timeout(Duration::from_millis(100));
         let detail = self
             .stderr
             .lock()
@@ -169,6 +245,12 @@ impl Connection {
                     .to_owned()
             })
             .unwrap_or_default();
+        if let Some(id) = &self.resume_id {
+            let expected = format!("No conversation found with session ID: {id}");
+            if detail.lines().any(|line| line.trim() == expected) {
+                return MissingConversation(id.clone()).into();
+            }
+        }
         anyhow::anyhow!(
             "{message}{}",
             if detail.is_empty() {
@@ -238,11 +320,12 @@ impl Connection {
                             .and_then(Value::as_str)
                             == Some(id.as_str()) =>
                 {
-                    ensure!(
-                        frame.pointer("/response/subtype").and_then(Value::as_str) != Some("error"),
-                        "Claude: {}",
-                        frame.pointer("/response/error").unwrap_or(&Value::Null)
-                    );
+                    if frame.pointer("/response/subtype").and_then(Value::as_str) == Some("error") {
+                        return Err(ControlError::from_response(
+                            frame.get("response").unwrap_or(&Value::Null),
+                        )
+                        .into());
+                    }
                     return Ok(frame
                         .pointer("/response/response")
                         .cloned()
@@ -292,4 +375,29 @@ impl Connection {
 pub(super) fn user_message(id: &str, session: Option<&str>, content: Value) -> Value {
     json!({"type":"user","uuid":id,"session_id":session.unwrap_or_default(),
         "parent_tool_use_id":null,"message":{"role":"user","content":content}})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn only_typed_auto_availability_rejections_disable_retry() {
+        for code in [
+            "auto_mode_model",
+            "auto_mode_unavailable",
+            "auto_mode_settings",
+            "invalid_mode",
+        ] {
+            assert!(
+                ControlError::from_response(&json!({"error_code":code,"error":"refused"}))
+                    .rejects_auto_mode()
+            );
+        }
+        for response in [
+            json!({"error_code":"internal_error","error":"Auto mode request interrupted"}),
+            json!({"error":"Auto mode not available"}),
+        ] {
+            assert!(!ControlError::from_response(&response).rejects_auto_mode());
+        }
+    }
 }

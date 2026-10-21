@@ -46,6 +46,8 @@ impl Provider {
 pub struct NativeSession {
     pub thread_id: Option<String>,
     pub through: usize,
+    #[serde(default)]
+    pub permission_state: super::permissions::State,
     pub permissions: Value,
     pub inherited_permissions: Value,
     pub artifact_tools: bool,
@@ -89,6 +91,7 @@ pub fn switch(
                     .get(session.provider.key())
                     .map_or(0, |native| native.through)
             },
+            permission_state: session.permission_state.clone(),
             permissions: session.permissions.clone(),
             inherited_permissions: session.inherited_permissions.clone(),
             artifact_tools: session.artifact_tools,
@@ -120,6 +123,7 @@ pub fn switch(
     ));
     session.provider = provider;
     session.thread_id = target.thread_id;
+    session.permission_state = target.permission_state;
     session.permissions = target.permissions;
     session.inherited_permissions = target.inherited_permissions;
     session.artifact_tools = target.artifact_tools;
@@ -129,6 +133,7 @@ pub fn switch(
     session.usage = Value::Null;
     session.token_usage = Value::Null;
     session.completed_turn = None;
+    super::plan::invalidate(session);
     session.suggestion = None;
     session.suggestion_attempted = None;
     session.model = model.clone();
@@ -170,6 +175,16 @@ mod tests {
     fn an_unused_provider_still_receives_full_context_on_return() -> Result<()> {
         let mut session = session();
         session.question_tools = true;
+        session.permission_state.mode = Some("plan".into());
+        session.permission_state.pending_preset =
+            Some(super::super::permissions::CodexPreset::Auto);
+        super::super::permissions::audit(
+            &mut session.permission_state,
+            super::super::permissions::PermissionEventKind::ControlRequested,
+            None,
+            None,
+            Some("ReadUsage"),
+        );
         switch(
             &mut session,
             Provider::Claude,
@@ -178,6 +193,8 @@ mod tests {
         )?;
         assert!(session.thread_id.is_none());
         assert!(!session.question_tools);
+        assert!(session.permission_state.mode.is_none());
+        assert!(session.permission_state.permission_events.is_empty());
         switch(
             &mut session,
             Provider::Codex,
@@ -186,6 +203,12 @@ mod tests {
         )?;
         assert_eq!(session.thread_id.as_deref(), Some("codex-thread"));
         assert!(session.question_tools);
+        assert_eq!(session.permission_state.mode.as_deref(), Some("plan"));
+        assert_eq!(session.permission_state.permission_events.len(), 1);
+        assert_eq!(
+            session.permission_state.pending_preset,
+            Some(super::super::permissions::CodexPreset::Auto)
+        );
         switch(
             &mut session,
             Provider::Claude,

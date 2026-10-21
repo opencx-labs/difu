@@ -1,7 +1,17 @@
 //! Translate Claude stream frames into difu's durable transcript.
+use super::super::permissions::{self, PermissionEventKind};
 use super::super::{Entry, Session, Status};
 use serde_json::{Value, json};
 use std::collections::HashMap;
+
+struct Interruption {
+    turn: Option<String>,
+    send_next: bool,
+    requests: Vec<(Value, Option<String>)>,
+    native_cancel: bool,
+}
+const PERMISSION_CANCEL_DIAGNOSTIC: &str =
+    "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use";
 
 #[derive(Default)]
 pub(super) struct Decoder {
@@ -10,6 +20,7 @@ pub(super) struct Decoder {
     input: HashMap<String, String>,
     state: Option<String>,
     result_received: bool,
+    interruption: Option<Interruption>,
 }
 fn text(value: &Value) -> String {
     if let Some(text) = value.as_str() {
@@ -86,6 +97,39 @@ fn block_entry(
     id
 }
 impl Decoder {
+    pub fn interrupting(&mut self, session: &Session, send_next: bool) {
+        let requests = session
+            .pending
+            .iter()
+            .filter(|p| p.params.get("claudeInput").is_some())
+            .map(|p| {
+                (
+                    p.id.clone(),
+                    p.params
+                        .get("tool")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Some(current) = &mut self.interruption
+            && current.turn == session.turn_id
+        {
+            current.send_next = send_next;
+            for request in requests {
+                if !current.requests.iter().any(|(id, _)| id == &request.0) {
+                    current.requests.push(request);
+                }
+            }
+        } else if session.turn_id.is_some() || !requests.is_empty() {
+            self.interruption = Some(Interruption {
+                turn: session.turn_id.clone(),
+                send_next,
+                requests,
+                native_cancel: false,
+            });
+        }
+    }
     pub fn sending(&mut self) {
         self.result_received = false;
     }
@@ -121,12 +165,38 @@ impl Decoder {
     pub fn apply(&mut self, session: &mut Session, frame: &Value) {
         let now = chrono::Utc::now().timestamp_millis();
         if frame.get("parent_tool_use_id").is_none_or(Value::is_null)
+            && matches!(
+                frame.get("type").and_then(Value::as_str),
+                Some("user" | "assistant" | "result")
+            )
+        {
+            session.permission_state.claude_turn_acknowledged = true;
+        }
+        if frame.get("parent_tool_use_id").is_none_or(Value::is_null)
             && let Some(id) = frame
                 .get("session_id")
                 .and_then(Value::as_str)
                 .filter(|id| !id.is_empty())
         {
             session.thread_id = Some(id.into());
+        }
+        if let Some(mode) = frame
+            .get("permissionMode")
+            .or_else(|| frame.get("permission_mode"))
+            .and_then(Value::as_str)
+        {
+            session.permission_state.mode = Some(mode.into());
+            session.permissions = json!({"provider":"Claude Code","permissionMode":mode});
+            if mode == "bypassPermissions" {
+                session.permission_state.bypass_enabled = true;
+            }
+            if mode == "auto" {
+                super::super::permissions::set_capability(
+                    &mut session.permission_state,
+                    "auto",
+                    json!(true),
+                );
+            }
         }
         match frame.get("type").and_then(Value::as_str) {
             Some("system") if frame.get("subtype").and_then(Value::as_str) == Some("init") => {
@@ -284,9 +354,92 @@ impl Decoder {
                 session.finish_steering_wait();
             }
             Some("result") if frame.get("parent_tool_use_id").is_none_or(Value::is_null) => {
-                self.result_received = true;
                 let failed = frame.get("is_error").and_then(Value::as_bool) == Some(true);
-                if failed {
+                let interruption = self.interruption.take();
+                let cancelled = interruption.as_ref().is_some_and(|intent| {
+                    intent.turn == session.turn_id
+                        && (!failed
+                            || (intent.native_cancel
+                                && frame.get("subtype").and_then(Value::as_str)
+                                    == Some("error_during_execution")
+                                && frame.get("errors").and_then(Value::as_array).is_some_and(
+                                    |errors| {
+                                        !errors.is_empty()
+                                            && errors.iter().all(|error| {
+                                                error.as_str() == Some(PERMISSION_CANCEL_DIAGNOSTIC)
+                                            })
+                                    },
+                                )))
+                });
+                if let Some(denials) = frame.get("permission_denials").and_then(Value::as_array) {
+                    for denial in denials {
+                        session
+                            .permission_state
+                            .denials
+                            .push(super::super::permissions::Denial {
+                                tool: denial
+                                    .get("tool_name")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("tool")
+                                    .into(),
+                                detail: denial
+                                    .get("tool_input")
+                                    .map(Value::to_string)
+                                    .unwrap_or_default(),
+                                reason: denial
+                                    .get("reason")
+                                    .and_then(Value::as_str)
+                                    .map(String::from),
+                            });
+                    }
+                    let excess = session.permission_state.denials.len().saturating_sub(100);
+                    session.permission_state.denials.drain(..excess);
+                }
+                self.result_received = true;
+                if cancelled {
+                    if let Some(intent) = interruption {
+                        if failed {
+                            session
+                                .permission_state
+                                .cancellation_diagnostics
+                                .push(PERMISSION_CANCEL_DIAGNOSTIC.into());
+                            let excess = session
+                                .permission_state
+                                .cancellation_diagnostics
+                                .len()
+                                .saturating_sub(16);
+                            session
+                                .permission_state
+                                .cancellation_diagnostics
+                                .drain(..excess);
+                        }
+                        if intent.requests.is_empty() {
+                            permissions::audit(
+                                &mut session.permission_state,
+                                PermissionEventKind::ResultCancelled,
+                                None,
+                                None,
+                                Some("result"),
+                            );
+                        }
+                        for (request, tool) in intent.requests {
+                            permissions::audit(
+                                &mut session.permission_state,
+                                PermissionEventKind::ResultCancelled,
+                                Some(&request),
+                                tool.as_deref(),
+                                Some("result"),
+                            );
+                        }
+                        session.error = None;
+                        session.status = if intent.send_next {
+                            Status::Idle
+                        } else {
+                            Status::Interrupted
+                        };
+                        self.state = Some("idle".into());
+                    }
+                } else if failed {
                     let error = frame
                         .get("errors")
                         .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
@@ -297,6 +450,13 @@ impl Decoder {
                     session.error = Some(error.clone());
                     session.note("error", error);
                     session.status = Status::Failed;
+                    permissions::audit(
+                        &mut session.permission_state,
+                        PermissionEventKind::ResultFailed,
+                        None,
+                        None,
+                        Some("result"),
+                    );
                     self.state = Some("idle".into());
                     for entry in &mut session.entries {
                         if entry.kind == "sending" {
@@ -309,6 +469,31 @@ impl Decoder {
             }
 
             Some("control_cancel_request") => {
+                let pending = session
+                    .pending
+                    .iter()
+                    .find(|p| Some(&p.id) == frame.get("request_id"))
+                    .cloned();
+                permissions::audit(
+                    &mut session.permission_state,
+                    PermissionEventKind::NativeCancel,
+                    frame.get("request_id"),
+                    pending
+                        .as_ref()
+                        .and_then(|p| p.params.get("tool"))
+                        .and_then(Value::as_str),
+                    Some("control_cancel_request"),
+                );
+                let mut stopping = false;
+                if let Some(intent) = &mut self.interruption
+                    && intent
+                        .requests
+                        .iter()
+                        .any(|(id, _)| Some(id) == frame.get("request_id"))
+                {
+                    intent.native_cancel = true;
+                    stopping = !intent.send_next;
+                }
                 session
                     .pending
                     .retain(|p| Some(&p.id) != frame.get("request_id"));
@@ -317,6 +502,7 @@ impl Decoder {
                     .iter()
                     .all(super::super::Pending::is_async_question)
                     && session.turn_id.is_some()
+                    && !stopping
                 {
                     session.status = Status::Running;
                 }
@@ -421,6 +607,20 @@ mod tests {
         );
     }
     #[test]
+    fn native_mode_notifications_and_result_denials_are_observed() {
+        let mut session = session();
+        let mut decoder = Decoder::default();
+        decoder.apply(&mut session,&json!({"type":"system","subtype":"session_state_changed","permissionMode":"plan","state":"running"}));
+        assert_eq!(session.permission_state.mode.as_deref(), Some("plan"));
+        decoder.apply(&mut session,&json!({"type":"system","subtype":"session_state_changed","permissionMode":"bypassPermissions","state":"running"}));
+        assert!(session.permission_state.bypass_enabled);
+        decoder.apply(&mut session,&json!({"type":"result","is_error":false,"permission_denials":[{"tool_name":"Bash","tool_input":{"command":"restricted"},"reason":"Native policy denied"}]}));
+        assert_eq!(session.permission_state.denials.len(), 1);
+        assert!(session.permission_state.denials.first().is_some_and(
+            |d| d.tool == "Bash" && d.reason.as_deref() == Some("Native policy denied")
+        ));
+    }
+    #[test]
     fn deferred_questions_neither_fail_their_tool_call_nor_block_the_turn() {
         let mut session = session();
         session.status = Status::Idle;
@@ -456,5 +656,39 @@ mod tests {
         };
         assert_eq!(status("ask"), Some(json!("completed")));
         assert_eq!(status("bash"), Some(json!("failed")));
+    }
+    #[test]
+    fn permission_cancel_diagnostic_requires_explicit_matching_interruption() {
+        for explicit in [false, true] {
+            let mut session = session();
+            let mut decoder = Decoder::default();
+            if explicit {
+                decoder.interrupting(&session, false);
+            }
+            decoder.apply(&mut session,&json!({"type":"result","subtype":"error_during_execution","is_error":true,"errors":[PERMISSION_CANCEL_DIAGNOSTIC]}));
+            assert_eq!(session.status, Status::Failed);
+            assert!(session.error.is_some());
+        }
+        let mut session = session();
+        let mut decoder = Decoder::default();
+        session.pending.push(super::super::super::Pending {
+            id: json!("approval"),
+            method: "item/tool/requestUserInput".into(),
+            params: json!({"claudeInput":{},"tool":"Bash"}),
+            responded: false,
+        });
+        decoder.interrupting(&session, false);
+        decoder.apply(
+            &mut session,
+            &json!({"type":"control_cancel_request","request_id":"approval"}),
+        );
+        decoder.apply(&mut session,&json!({"type":"result","subtype":"error_during_execution","is_error":true,"errors":[PERMISSION_CANCEL_DIAGNOSTIC,"A genuine fatal error"]}));
+        assert_eq!(session.status, Status::Failed);
+        assert!(
+            session
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("genuine fatal"))
+        );
     }
 }

@@ -255,12 +255,15 @@ The session list previews conversations; use **Cmd+K** to search sessions. Selec
 session scrolls to its latest messages; scrolling up afterward keeps your reading
 position through background updates. **Enter** opens a session;
 **Esc** interrupts the active agent and keeps the chat open, or returns to the
-list when idle. **Alt+[** toggles the agents list. **Alt+]** hides or reopens the
+list when idle. While a synchronous permission is unanswered, **Esc** opens or
+dismisses that approval without stopping the agent; use **/actions → Interrupt**
+to stop it explicitly. **Alt+[** toggles the agents list. **Alt+]** hides or reopens the
 selected helper canvas, preserving its contents. **Alt+D** opens Changes in
 the main area with a file tree and a syntax-highlighted diff; **Esc** returns to
 chat. The right helper canvas hosts shells, artifacts, and session PRs. **Tab** and
 **Shift+Tab** cycle between visible panes: sessions, chat (or file tree and diff),
-and the helper canvas. **Esc** closes a focused canvas. Visibility is remembered.
+and the helper canvas. In the active chat composer, **Shift+Tab** changes the
+provider mode instead; **Tab** continues to the next pane. **Esc** closes a focused canvas. Visibility is remembered.
 Changes and the sidebar counts follow the active worktree. With an open PR, they
 show staged, unstaged, and non-ignored untracked changes against HEAD. Without an
 open PR, they also include commits since the merge base with the repository's
@@ -324,7 +327,7 @@ With an empty composer, **Up** recalls sent prompts from the current session.
 Recalled prompts are editable and never sent automatically.
 
 Type **/** in an empty composer for native commands: `/compact`, `/model`, `/effort`,
-`/skills`, `/status`, `/rules`, `/usage`, `/mcp`, `/diff`, `/new`, `/rename`, `/clear`, `/repo`, `/worktree`,
+`/skills`, `/status`, `/rules`, `/usage`, `/mcp`, `/permissions`, `/diff`, `/new`, `/rename`, `/clear`, `/repo`, `/worktree`,
 `/help`, `/voice`, `/tweaks`, `/theme`, `/remote-control`, and `/actions`.
 Opening a session keeps the composer focused; pending questions remain available
 through the questions control.
@@ -390,6 +393,74 @@ plugin-managed Codex servers are managed through their plugin settings. Difu's
 internal Claude SDK server is visible but cannot be disabled from this panel.
 Older providers that lack these APIs show an error rather than simulated success.
 
+After Codex completes a plan, **Implement this plan?** offers three explicit choices:
+**Yes, implement this plan**, **Yes, clear context and implement**, and
+**No, stay in Plan mode**. The first continues the same native conversation;
+the second starts fresh native context from the plan in the same workspace,
+preserving files and the Difu chat. Staying in Plan mode sends no message.
+The active mode updates after the provider confirms the choice.
+
+The compact prompt opens automatically when the selected chat has no draft,
+attachments, active dictation, or outgoing messages. Otherwise, **Plan ready ·
+Review implementation choices** remains visible above the composer. Click it to
+review the choices while keeping the draft. **↑/↓** selects, **Enter** confirms,
+and **Esc** dismisses without choosing. The Plan ready control or **/actions →
+Review completed plan** reopens it. This also works for the Difu orchestrator. Failed choices remain available to retry.
+
+**/permissions** opens provider-native modes and permission settings without a
+model prompt. The composer shows the current mode, approval preset and pending
+changes. **Shift+Tab** in the composer cycles Codex Default/Plan or Claude's
+native mode sequence; it preserves the draft and attachments. Claude bypass
+enters the shortcut cycle only after explicitly enabling it in this panel.
+Changing Codex mode updates the native thread setting immediately and preserves
+its approval preset, without sending a message or restarting the conversation.
+An already-running Codex turn retains its own mode; later turns use the selected
+setting. Permission preset changes that require an idle agent remain marked pending.
+
+After Codex completes a proposed plan, **Implement this plan?** offers its three
+native choices: implement in the current conversation, clear context and
+implement, or stay in Plan mode. Both implementation choices switch to Regular
+mode only after your explicit selection. Clearing context starts a fresh native
+conversation from the approved plan while keeping the same Difu chat, workspace,
+files, model, and permissions; the earlier chat remains visible.
+If you are drafting a message or another dialog is open, **Plan ready · Review
+implementation choices** lets you open the prompt without losing your input.
+Escape dismisses the prompt; the same row reopens it. A newer message or plan
+invalidates the old choice so it cannot start stale work.
+The plan stays visible above a full-width bottom selector. Codex's selection
+builder is adapted from its open-source CLI; its license and notice are included
+under `third_party/codex`.
+
+Claude's native **ExitPlanMode** request opens **Ready to code?** with the full
+plan and its own choices: use Auto mode, manually approve edits, or tell Claude
+what to change. Feedback keeps Claude in Plan mode. These choices answer the
+existing native request in the same conversation, without granting unrelated
+tool permissions.
+
+Codex shows separate modes and **Ask for approval**, **Approve for me**,
+**Full Access**, and **Read Only** presets. An unrecognized configuration is
+shown as **Custom**; unavailable options explain the provider or managed-policy
+restriction. Claude shows **Mode**, **Recently denied**, **Allow**, **Ask**,
+**Deny**, **Auto mode**, and **Workspace** tabs. Recently denied contains only
+observed denials in this Difu session. Each settings entry shows its source and
+scope; managed rules, built-in auto defaults and the original workspace are
+read-only.
+
+In the panel, **Tab / Shift+Tab** or **Left / Right** change tabs, **Up / Down**
+selects, **Enter** applies a mode or edits a rule, **/** searches, and **r**
+refreshes. Use **a** to add, **e** to edit, and **d** to delete with confirmation.
+New rules default to Session; choose Project, Local, or User with the scope
+field's arrows. Existing entries are edited in their original scope. Auto-mode
+custom entries use User scope, with a kind picker for allow, soft deny, hard
+deny, and environment descriptions. **Tab** moves through form fields,
+**Ctrl+Enter** saves, **Ctrl+R** refreshes a failed form while retaining its draft,
+and **Shift+Enter** adds a newline in environment text.
+**Esc** cancels the form or closes the panel. Settings saves preserve other
+configuration and reject stale revisions; refresh before retrying a conflict.
+Claude applies settings requiring reconnection when idle with approvals resolved;
+the pending reload remains visible until applied. Native provider errors stay
+visible and failed saves preserve the form.
+
 Commands filter as you type. Inline arguments also work: `/rename <title>`,
 `/model <model> [effort]`, `/effort <level>`, `/skills <search>`, `/help <search>`,
 `/actions <search>`, and `/voice on|off`. With no arguments, commands retain their
@@ -405,7 +476,7 @@ session worktree. Selecting one inserts `/name` for Claude Code to run with the
 message; difu's own command wins when the names match. Discovery starts the
 Claude CLI without hooks, MCP servers, or a saved session. `/actions` (or Esc then /)
 opens searchable session controls: continue, interrupt, rename, change model,
-archive/unarchive, toggle panes, and delete a chat with its worktree.
+archive/unarchive, toggle panes, permissions and modes, and delete a chat with its worktree.
 
 In Agents, `/` commands, `$` workspace skills, and `@` workspace files and folders
 appear above the message input. Choose a suggestion with arrows and Enter;
@@ -463,8 +534,9 @@ at every depth, including nested package-manager stores and skill dependencies.
 Sessions created before v0.17.3 retain their existing guidance-copy approval flow.
 
  **?** opens
-searchable shortcut help. **Tab / Shift+Tab** cycle through the visible sessions list, chat input or
-Changes tree/diff, and helper canvas. **Cmd+Up/Down** focuses and navigates message blocks. The focused block has a dim
+searchable shortcut help. **Tab** cycles through the visible sessions list, chat input or
+Changes tree/diff, and helper canvas. **Shift+Tab** cycles backward outside the
+composer; in the composer it changes the provider permission mode. **Cmd+Up/Down** focuses and navigates message blocks. The focused block has a dim
 background; moving down past the final block returns to the input. Typing while
 reading messages focuses the composer and inserts your text; navigation and
 modified shortcuts keep their existing behavior. **f** filters sessions, and **r**
@@ -485,8 +557,10 @@ Waiting messages appear below the activity line, with a bright heading and inden
 previews. Messages sent during a tool call appear there immediately, before the
 service replies, and stay out of the transcript until Codex echoes them or accepts
 them and the running tools finish. Each message appears in only one place.
-**Esc** in the chat interrupts and sends waiting messages immediately;
-accepted steering is retained in the conversation without being resent. While a
+**Esc** in the chat interrupts and sends waiting messages immediately unless a
+synchronous permission is unanswered. In that case, **Esc** opens the approval
+and messages stay queued; dismissing or repeating Escape never answers or cancels
+that permission. Use **/actions → Interrupt** to stop explicitly. Accepted steering is retained in the conversation without being resent. While a
 legacy repository-guidance permission is unanswered, messages remain queued until it is
 answered. With no waiting messages, Esc interrupts an active agent; when idle,
 it returns to the session list.

@@ -154,7 +154,10 @@ pub(super) fn prepare_answer(
 }
 
 pub(super) fn save_answer(store: &super::server::Store, id: &str, updated: Pending) -> Result<()> {
-    store.update(id, |session| record_answer(session, updated))?;
+    store.update(id, |session| {
+        record_answer(session, updated);
+        super::plan::reconcile(session);
+    })?;
     store.save(id)
 }
 

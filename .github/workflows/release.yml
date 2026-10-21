@@ -120,8 +120,9 @@ jobs:
           fi
           mkdir -p dist package smoke/empty-path
           cp "$binary" LICENSE cli/README.md package/
+          cp -R cli/third_party package/third_party
           archive="difu-$version-$DIFU_TARGET.tar.gz"
-          tar -czf "dist/$archive" -C package difu LICENSE README.md
+          tar -czf "dist/$archive" -C package difu LICENSE README.md third_party
           tar -xzf "dist/$archive" -C smoke
           # The downloaded executable must start without a compiler or helpers.
           test "$(env PATH="$PWD/smoke/empty-path" "$PWD/smoke/difu" --version)" = "difu $version"

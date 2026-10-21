@@ -3,6 +3,7 @@ use super::*;
 mod browser;
 mod cache_io;
 mod changes;
+mod codex_plan_picker;
 mod commands;
 mod defaults;
 mod flap;
@@ -12,6 +13,8 @@ mod media;
 mod models;
 mod panels;
 mod patch;
+mod permissions_panel;
+mod plan_prompt;
 mod prompt;
 mod prs;
 mod questions;
@@ -145,6 +148,13 @@ pub struct Position {
 #[derive(Clone)]
 enum Action {
     McpSelect(usize),
+    PermissionTab(usize),
+    PermissionItem(usize),
+    PermissionField(usize),
+    PermissionSave,
+    PermissionSearch,
+    OpenPlan,
+    PlanChoice(usize),
     Select(String),
     OrchestratorBack,
     Open,
@@ -198,6 +208,8 @@ enum Action {
 }
 pub enum Modal {
     Mcp(Box<mcp_panel::State>),
+    Permissions(Box<permissions_panel::State>),
+    Plan(Box<plan_prompt::Prompt>),
     Slack(slack::Settings),
     Transcript {
         entry: String,
@@ -286,6 +298,8 @@ struct ResultMessage {
 #[derive(Clone)]
 enum Task {
     Mcp(String, u64),
+    Permissions(String, u64),
+    DecidePlan(String, String),
     List,
     Read(String),
     Changes(changes::Source, u64),
@@ -348,6 +362,7 @@ pub struct Ui {
     interrupting: HashSet<String>,
     deleting: HashSet<String>,
     question_send: Option<(String, Value, String, usize)>,
+    plans: plan_prompt::State,
     question_reveal: bool,
     /// The question panel's split-flap.
     question_flip: inline_questions::Flip,
@@ -433,6 +448,7 @@ impl Ui {
             interrupting: HashSet::new(),
             deleting: HashSet::new(),
             question_send: None,
+            plans: Default::default(),
             question_reveal: true,
             question_flip: Default::default(),
             sidebar_boards: HashMap::new(),
@@ -535,6 +551,7 @@ impl Ui {
         self.tick_theme();
         if visible {
             self.tick_mcp();
+            self.tick_permissions();
         }
         while let Ok(message) = self.receiver.try_recv() {
             let unchanged = match (&message.kind, &message.result) {
@@ -550,6 +567,10 @@ impl Ui {
             };
             if !unchanged {
                 crate::repaint::request();
+            }
+            if let Task::DecidePlan(id, plan_id) = &message.kind {
+                self.finish_plan_choice(id, plan_id, message.result);
+                continue;
             }
             if let Task::Send(id, token) = &message.kind {
                 self.finish_send(id, *token, message.result);
@@ -588,7 +609,9 @@ impl Ui {
                 | Task::OpenLink
                 | Task::InstallBrowser(..)
                 | Task::Usage(_)
-                | Task::Mcp(..) => {}
+                | Task::Mcp(..)
+                | Task::Permissions(..)
+                | Task::DecidePlan(..) => {}
                 Task::WorkspacePaths(id, _) => {
                     self.paths_loading.remove(id);
                 }
@@ -596,6 +619,10 @@ impl Ui {
                     self.sidebar.finished(id);
                 }
                 Task::Skills(..) => self.skills_loading = None,
+            }
+            if let Task::Permissions(id, request) = &message.kind {
+                self.finish_permissions(id, *request, message.result);
+                continue;
             }
             if let Task::Mcp(id, request) = &message.kind {
                 if let Some(Modal::Mcp(state)) = &mut self.modal {
@@ -937,6 +964,7 @@ impl Ui {
                 self.task(Task::Changes(source, self.change_request), request, false);
             }
         }
+        self.tick_plan_prompt(visible);
     }
     fn filtered(&self) -> Vec<Summary> {
         let mut sessions = self
@@ -1179,7 +1207,7 @@ impl Ui {
             .sessions
             .get(self.selected.as_deref().unwrap_or_default())
             .is_some_and(|s| s.archived);
-        vec![
+        let mut entries = vec![
             "New coding agent",
             "Continue session",
             "Interrupt / cancel job",
@@ -1211,10 +1239,17 @@ impl Ui {
                 "Pin session"
             },
             "Repository rules",
-        ]
+            "Permissions and mode · Shift+Tab",
+        ];
+        if self.plan_available() {
+            entries.push("Review completed plan");
+        }
+        entries
     }
     pub(crate) fn menu_action(&mut self, index: usize) {
         match index {
+            20 => self.open_plan_prompt(),
+            19 => self.open_permissions(),
             18 => self.open_rules(None),
             17 => {
                 if let Some(id) = self.selected.clone() {
@@ -1373,6 +1408,9 @@ impl Ui {
             return None;
         }
         let session = self.sessions.get(id)?;
+        if self.plan_available() {
+            return None;
+        }
         session
             .suggestion
             .as_ref()
@@ -1387,6 +1425,10 @@ impl Ui {
             .and_then(|s| s.pending.get(index))
             .cloned()
         {
+            if pending.params.get("difuClaudePlan").is_some() {
+                self.open_plan_prompt();
+                return;
+            }
             let count = pending
                 .params
                 .get("questions")
@@ -1477,6 +1519,8 @@ impl Ui {
             },
             Some(Modal::Menu { query, .. } | Modal::Commands { query, .. }) => Some(query),
             Some(Modal::Help(state)) => Some(&state.query),
+            Some(Modal::Permissions(state)) => state.editor(),
+            Some(Modal::Plan(state)) => state.editor(),
             Some(Modal::Rename(editor) | Modal::QueuedEdit { editor, .. }) => Some(editor),
             Some(Modal::Model {
                 model,
@@ -1546,6 +1590,10 @@ impl Ui {
             && let Some(editor) = self.focused_editor()
         {
             self.clipboard = editor.selected_text();
+            return;
+        }
+        if matches!(self.modal, Some(Modal::Plan(_))) {
+            self.plan_key(key);
             return;
         }
         if self.question_key(key) {
@@ -1647,6 +1695,12 @@ impl Ui {
             && matches!(self.focus, Focus::Composer | Focus::Conversation)
             && let Some(session) = self.selected.as_ref().and_then(|id| self.sessions.get(id))
         {
+            // An unanswered synchronous permission must survive incidental or
+            // repeated Escape events. Open its explicit decision instead.
+            if let Some(index) = synchronous_permission_index(session) {
+                self.pending(index);
+                return;
+            }
             if session.can_send_waiting() {
                 self.interrupt_chat(Control::InterruptAndSend);
                 return;
@@ -1692,6 +1746,15 @@ impl Ui {
             }
         }
         if self.focus == Focus::Composer && self.drilled {
+            if key.code == KeyCode::BackTab
+                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+                && !self.changes_visible
+                && !self.panels.focused
+                && !self.question_panel()
+            {
+                self.cycle_permission_mode();
+                return;
+            }
             if key.modifiers.is_empty()
                 && key.code == KeyCode::Right
                 && let Some(suggestion) = self.composer_suggestion().map(str::to_owned)
@@ -2123,6 +2186,8 @@ impl Ui {
             return;
         }
         match &mut self.modal {
+            Some(Modal::Permissions(state)) => state.paste(text),
+            Some(Modal::Plan(state)) => state.paste(text),
             Some(Modal::Slack(_)) => self.slack_paste(text),
             Some(Modal::RepositoryRules(_)) => self.rules_paste(text),
             Some(Modal::AgentDefaults(form)) => {
@@ -2171,6 +2236,10 @@ impl Ui {
         }
     }
     fn modal_key(&mut self, key: KeyEvent) {
+        if matches!(self.modal, Some(Modal::Permissions(_))) {
+            self.permissions_key(key);
+            return;
+        }
         if matches!(self.modal, Some(Modal::Mcp(_))) {
             self.mcp_key(key);
             return;
@@ -2454,6 +2523,8 @@ impl Ui {
             Action::ChangePr(index) => self.select_change_pr(index),
             Action::Approval(index) => self.pending(index),
             Action::Pending => self.open_questions(),
+            Action::OpenPlan => self.open_plan_prompt(),
+            Action::PlanChoice(index) => self.choose_plan(index),
             Action::InlineQuestion(index) => self.open_question(index),
             Action::SubmitQuestion(skip) => self.submit_question(skip),
             Action::QuestionNote(choice) => {
@@ -2531,6 +2602,15 @@ impl Ui {
             Action::MenuItem(index) => self.menu_action(index),
             Action::Command(index) => self.run_command(index),
             Action::McpSelect(index) => self.mcp_select(Some(index)),
+            Action::PermissionTab(index) => self.permissions_tab(index),
+            Action::PermissionItem(index) => self.permissions_select(Some(index)),
+            Action::PermissionField(index) => self.permissions_field(index),
+            Action::PermissionSave => {
+                self.permissions_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL))
+            }
+            Action::PermissionSearch => {
+                self.permissions_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            }
             Action::Link(url) => {
                 let sender = self.sender.clone();
                 thread::spawn(move || {
@@ -2610,6 +2690,12 @@ impl Ui {
             Some(Modal::Usage {
                 scroll, maximum, ..
             }) => *scroll = scroll.saturating_add_signed(rows).min(*maximum),
+            Some(Modal::Plan(prompt)) => {
+                prompt.scroll = prompt
+                    .scroll
+                    .saturating_add_signed(rows)
+                    .min(prompt.maximum)
+            }
             Some(Modal::Status { scroll } | Modal::Approval { scroll, .. }) => {
                 *scroll = scroll.saturating_add_signed(rows);
             }
@@ -2647,7 +2733,16 @@ impl Ui {
                 }
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
-                if matches!(self.modal, Some(Modal::Mcp(_))) {
+                if matches!(self.modal, Some(Modal::Permissions(_))) {
+                    let code = if event.kind == MouseEventKind::ScrollDown {
+                        KeyCode::Down
+                    } else {
+                        KeyCode::Up
+                    };
+                    for _ in 0..3 {
+                        self.permissions_key(KeyEvent::new(code, KeyModifiers::NONE));
+                    }
+                } else if matches!(self.modal, Some(Modal::Mcp(_))) {
                     let code = if event.kind == MouseEventKind::ScrollDown {
                         KeyCode::Down
                     } else {
@@ -2682,6 +2777,31 @@ impl Ui {
             }
             _ => {}
         }
+    }
+}
+
+fn synchronous_permission_index(session: &Session) -> Option<usize> {
+    session.pending.iter().position(|pending| {
+        !pending.responded
+            && !pending.is_async_question()
+            && (super::elicitation::is_form(pending)
+                || matches!(
+                    pending.method.as_str(),
+                    "item/commandExecution/requestApproval"
+                        | "item/fileChange/requestApproval"
+                        | "item/permissions/requestApproval"
+                        | "mcpServer/elicitation/request"
+                ))
+    })
+}
+
+/// Presentation only: retain the provider diagnostic in session/error history.
+fn provider_error_text(error: &str) -> &str {
+    match error {
+        r#"["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"]"# => {
+            "Claude ended this turn without a final response."
+        }
+        _ => error,
     }
 }
 
@@ -3273,6 +3393,10 @@ impl Ui {
         if coding {
             self.restore_media(&id);
         }
+        if matches!(self.modal, Some(Modal::Plan(_))) {
+            self.draw_plan_prompt(frame, area);
+            return;
+        }
         if !self.question_panel() {
             self.question_flip = Default::default();
         }
@@ -3291,11 +3415,13 @@ impl Ui {
                 .0
                 .len()
                 .clamp(1, 10) as u16;
-            (lines + 2 + self.voice_rows(area.width)).min(area.height.saturating_sub(3))
+            (lines + 3 + self.voice_rows(area.width)).min(area.height.saturating_sub(3))
         } else {
             0
         };
-        let dock_composer = composer_height > 0 && !self.question_panel() && !area.is_empty();
+        let dock_composer = composer_height > 0
+            && matches!(self.modal, Some(Modal::Commands { .. }))
+            && !area.is_empty();
         if dock_composer {
             // The input's last row shares the pane border; reclaim the old inset.
             area.height = area
@@ -3342,7 +3468,9 @@ impl Ui {
             }
         }
         let activity_height = (activity_rows.len().min(usize::from(area.height / 3))) as u16;
-        let requests_height = u16::from(!session.pending.is_empty()) + activity_height;
+        let plan_ready = self.plan_available();
+        let requests_height =
+            u16::from(!session.pending.is_empty()) + activity_height + u16::from(plan_ready);
         let (model, effort) = match &session.job {
             Job::Guide { model, .. } | Job::Conflict { model, .. } => {
                 (model.model.as_str(), model.effort.as_str())
@@ -3436,7 +3564,7 @@ impl Ui {
                 .any(|e| e.kind == "error" && &e.text == error)
             && start + lines.len() == total
         {
-            let extra = wrapped(error, body.width)
+            let extra = wrapped(provider_error_text(error), body.width)
                 .into_iter()
                 .map(|text| Line::from(Span::styled(text, Style::default().fg(RED))))
                 .collect::<Vec<_>>();
@@ -3488,7 +3616,10 @@ impl Ui {
         let approval_count = session
             .pending
             .iter()
-            .filter(|p| p.method != "item/tool/requestUserInput")
+            .filter(|p| {
+                !p.responded
+                    && (p.method != "item/tool/requestUserInput" || super::elicitation::is_form(p))
+            })
             .count();
         if pending {
             let questions = self.question_index().map_or_else(
@@ -3512,6 +3643,17 @@ impl Ui {
                     area.x + offset,
                     body.bottom() + activity_height,
                     area.width - offset,
+                    1,
+                ),
+            );
+        }
+        if plan_ready {
+            self.draw_plan_affordance(
+                frame,
+                Rect::new(
+                    area.x,
+                    body.bottom() + activity_height + u16::from(pending),
+                    area.width,
                     1,
                 ),
             );
@@ -3549,6 +3691,24 @@ impl Ui {
                 }
                 return;
             }
+            let status_y = composer.bottom().saturating_sub(1);
+            if let Some(session) = self.sessions.get(&id) {
+                frame.render_widget(
+                    Paragraph::new(permissions_panel::composer_status(session)),
+                    Rect::new(
+                        composer.x.saturating_add(1),
+                        status_y,
+                        composer.width.saturating_sub(2),
+                        1,
+                    ),
+                );
+            }
+            let composer = Rect::new(
+                composer.x,
+                composer.y,
+                composer.width,
+                composer.height.saturating_sub(1),
+            );
             let voice = self
                 .voice_rows(composer.width)
                 .min(composer.height.saturating_sub(3));
@@ -3614,6 +3774,14 @@ impl Ui {
         {
             return;
         }
+        if matches!(self.modal, Some(Modal::Plan(_))) {
+            return;
+        }
+        if matches!(self.modal, Some(Modal::Permissions(_))) {
+            self.text_selection.clear();
+            self.draw_permissions_overlay(frame);
+            return;
+        }
         if matches!(self.modal, Some(Modal::Mcp(_))) {
             self.text_selection.clear();
             self.draw_mcp_overlay(frame);
@@ -3658,6 +3826,8 @@ impl Ui {
             Some(Modal::Menu { .. }) => "Agent actions",
             Some(Modal::Commands { .. }) => "Session commands",
             Some(Modal::Status { .. }) => "Session status · ↑/↓ Scroll · Esc Close",
+            Some(Modal::Permissions(_)) => "Permissions",
+            Some(Modal::Plan(_)) => "Implement this plan?",
             Some(Modal::Mcp(_)) => "MCP · ↑/↓ Select · Enter Open · r Refresh · Esc Back",
             Some(Modal::Usage { .. }) => "Provider usage · ↑/↓ Scroll · r Refresh · Esc Close",
             Some(Modal::Pending { .. }) => "Pending questions and approvals",
@@ -4059,6 +4229,8 @@ impl Ui {
                 | Modal::Commands { .. }
                 | Modal::Status { .. }
                 | Modal::Mcp(_)
+                | Modal::Permissions(_)
+                | Modal::Plan(_)
                 | Modal::Usage { .. }
                 | Modal::Pending { .. }
                 | Modal::Queue { .. }
@@ -4102,7 +4274,11 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
         ),
         (
             "Enter / Esc",
-            "Open session / interrupt agent and send waiting messages; go back when idle",
+            "Open session / interrupt active work; unanswered permissions open for review",
+        ),
+        (
+            "Esc with permission pending",
+            "Open or dismiss approval; use Actions to stop the agent",
         ),
         ("Cmd+K", "Search sessions, pull requests and commands"),
         (
@@ -4111,7 +4287,7 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
         ),
         (
             "Tab / Shift+Tab",
-            "Cycle sessions, chat or tree/diff, and helper canvas",
+            "Cycle visible panes; Shift+Tab in composer changes permission mode",
         ),
         ("Drag · Ctrl+C / Cmd+C", "Select and copy conversation text"),
         (
@@ -4151,6 +4327,10 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
             "Commands, workspace skills, and file suggestions above input",
         ),
         ("Shift+Enter", "Insert a newline in the composer"),
+        (
+            "Shift+Tab (composer)",
+            "Cycle the provider permission mode; /permissions opens settings",
+        ),
         (
             "Hold Space",
             "Talk when enabled with /voice: Codex sessions answer aloud, others take dictation",
@@ -4237,6 +4417,177 @@ mod tests {
         ui.sessions.insert(session.id.clone(), session);
         ui.select("one".into());
         ui
+    }
+    #[test]
+    fn permissions_command_and_actions_open_for_both_providers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        for provider in [provider::Provider::Codex, provider::Provider::Claude] {
+            ui.sessions.get_mut("one").context("session")?.provider = provider;
+            ui.run_palette_command("/permissions", "permissions");
+            assert!(matches!(ui.modal, Some(Modal::Permissions(_))));
+            assert!(
+                ui.palette_commands()
+                    .iter()
+                    .any(|(name, _, _)| name == "/permissions")
+            );
+            ui.modal = None;
+            let index = ui
+                .menu_entries()
+                .iter()
+                .position(|label| label.starts_with("Permissions"))
+                .context("permissions menu")?;
+            ui.menu_action(index);
+            assert!(matches!(ui.modal, Some(Modal::Permissions(_))));
+        }
+        Ok(())
+    }
+    #[test]
+    fn native_incomplete_turn_diagnostic_is_humanized_only_for_error_display() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        let diagnostic =
+            r#"["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use"]"#;
+        for kind in ["error", "userMessage", "system"] {
+            let session = ui.sessions.get_mut("one").context("session")?;
+            session.entries.clear();
+            session.error = Some(diagnostic.into());
+            session.note(kind, diagnostic);
+            let rendered = transcript::render(session, &Position::default(), 160, false)
+                .0
+                .iter()
+                .map(Line::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if kind == "error" {
+                assert!(rendered.contains("Claude ended this turn without a final response."));
+                assert!(!rendered.contains("ede_diagnostic"));
+            } else {
+                assert!(rendered.contains("ede_diagnostic"));
+            }
+            assert_eq!(session.error.as_deref(), Some(diagnostic));
+            assert_eq!(session.entries.first().context("entry")?.text, diagnostic);
+        }
+        let other =
+            r#"["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=other"]"#;
+        assert_eq!(provider_error_text(other), other);
+        Ok(())
+    }
+    #[test]
+    fn composer_permission_status_is_inset_above_the_outer_border() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        still(&mut ui);
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.provider = provider::Provider::Claude;
+        session.permission_state.mode = Some("auto".into());
+        for (width, height) in [(104, 32), (48, 12), (22, 10)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height))?;
+            terminal.draw(|frame| ui.draw_conversation(frame, frame.area()))?;
+            let buffer = terminal.backend().buffer();
+            assert_eq!(
+                buffer.cell((2, height - 2)).context("status")?.symbol(),
+                "A"
+            );
+            assert_eq!(buffer.cell((2, height - 2)).context("status")?.fg, ACCENT);
+            assert_eq!(
+                buffer
+                    .cell((1, height - 2))
+                    .context("status inset")?
+                    .symbol(),
+                " "
+            );
+            for x in 1..width - 1 {
+                assert_eq!(
+                    buffer
+                        .cell((x, height - 1))
+                        .context("outer border")?
+                        .symbol(),
+                    "─"
+                );
+            }
+            let input_y = height - 4;
+            assert_eq!(
+                buffer
+                    .cell((2, input_y))
+                    .context("input alignment")?
+                    .symbol(),
+                "A"
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn composer_backtab_changes_mode_without_sending_or_losing_attachments() -> Result<()> {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let listener = UnixListener::bind(super::super::server::socket(&storage)?)?;
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || -> Result<()> {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept()?;
+                let mut line = String::new();
+                BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+                let request: Request = serde_json::from_str(&line)?;
+                serde_json::to_writer(&mut stream, &Reply::Ok)?;
+                stream.write_all(b"\n")?;
+                tx.send(request)?;
+            }
+            Ok(())
+        });
+        let mut ui = state(storage);
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        let p = ui.positions.get_mut("one").context("position")?;
+        p.draft.insert("Unsent text ");
+        p.draft.insert_attachment("[image 1]");
+        let attachment = super::super::media::Attachment {
+            label: "image 1".into(),
+            path: "image.png".into(),
+            kind: super::super::media::Kind::Image,
+            hash: "fixture".into(),
+        };
+        p.attachments.push(attachment.clone());
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::SHIFT] {
+            ui.key(KeyEvent::new(KeyCode::BackTab, modifiers));
+            assert!(
+                matches!(rx.recv_timeout(Duration::from_secs(5))?, Request::Permissions { id, action: super::super::permissions::Action::CycleMode } if id == "one")
+            );
+            assert_eq!(ui.focus, Focus::Composer);
+            let p = ui.positions.get("one").context("position")?;
+            assert_eq!(p.draft.text(), "Unsent text [image 1]");
+            assert_eq!(p.attachments.as_slice(), std::slice::from_ref(&attachment));
+            assert!(p.outgoing.is_empty());
+        }
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(ui.focus, Focus::List);
+        ui.modal = Some(Modal::Model {
+            model: Editor::default(),
+            effort: Editor::default(),
+            field: 1,
+        });
+        ui.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert!(matches!(ui.modal, Some(Modal::Model { field: 0, .. })));
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
+        Ok(())
     }
     #[test]
     fn mcp_command_is_available_for_both_providers() -> Result<()> {
@@ -5385,6 +5736,155 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn native_synchronous_approval_escape_opens_the_request_without_interrupting() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        for method in [
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
+        ] {
+            let session = ui.sessions.get_mut("one").context("session")?;
+            session.status = Status::Waiting;
+            session.pending = vec![Pending {
+                id: serde_json::json!(method),
+                method: method.into(),
+                params: serde_json::json!({}),
+                responded: false,
+            }];
+            session.queue = vec!["Keep queued".into()];
+            ui.modal = None;
+            for _ in 0..3 {
+                ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                assert!(ui.interrupting.is_empty());
+            }
+            assert!(
+                matches!(&ui.modal, Some(Modal::Approval { pending, .. }) if pending.id == serde_json::json!(method))
+            );
+            assert_eq!(ui.sessions.get("one").context("session")?.queue.len(), 1);
+        }
+        Ok(())
+    }
+    #[test]
+    fn synchronous_claude_approval_survives_escape_and_only_explicit_actions_are_sent() -> Result<()>
+    {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let listener = UnixListener::bind(super::super::server::socket(&storage)?)?;
+        let (tx, rx) = mpsc::channel();
+        let worker = thread::spawn(move || -> Result<()> {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept()?;
+                let mut line = String::new();
+                BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+                let request: Request = serde_json::from_str(&line)?;
+                serde_json::to_writer(&mut stream, &Reply::Ok)?;
+                stream.write_all(b"\n")?;
+                tx.send(request)?;
+            }
+            Ok(())
+        });
+        // Same raw can_use_tool approval shape constructed by the Claude adapter.
+        let mut pending = Pending {
+            id: serde_json::json!("claude-permission"),
+            method: "mcpServer/elicitation/request".into(),
+            params: serde_json::json!({"serverName":"Claude Code","message":"Allow mcp__clickhouse__list_databases?","claudeInput":{},"tool":"mcp__clickhouse__list_databases","requestedSchema":{"type":"object","properties":{}}}),
+            responded: false,
+        };
+        super::super::elicitation::normalize(&mut pending);
+        assert!(super::super::elicitation::is_form(&pending));
+        assert!(!pending.is_async_question());
+        let mut ui = state(storage);
+        ui.drilled = true;
+        ui.positions
+            .get_mut("one")
+            .context("position")?
+            .draft
+            .insert("Keep this draft");
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.provider = provider::Provider::Claude;
+        session.status = Status::Waiting;
+        session.pending.push(pending.clone());
+        session.queue.push("Send this later".into());
+        let queued = transcript::waiting_messages(session, 100, &[])
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(queued.contains("esc opens approval"));
+        assert!(!queued.contains("interrupt and send"));
+        for focus in [Focus::Composer, Focus::Conversation] {
+            ui.focus = focus;
+            ui.modal = None;
+            for kind in [
+                crossterm::event::KeyEventKind::Press,
+                crossterm::event::KeyEventKind::Repeat,
+                crossterm::event::KeyEventKind::Repeat,
+            ] {
+                ui.key(KeyEvent::new_with_kind(
+                    KeyCode::Esc,
+                    KeyModifiers::NONE,
+                    kind,
+                ));
+                assert!(ui.interrupting.is_empty());
+                assert!(rx.try_recv().is_err());
+            }
+            // A fragmented legacy Alt+Up can arrive as Escape, then the remaining
+            // Up event; this protects the decoded Escape without claiming its origin.
+            ui.modal = None;
+            ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+            assert!(ui.interrupting.is_empty());
+            assert!(
+                matches!(&ui.modal, Some(Modal::Approval { pending, .. }) if pending.id == serde_json::json!("claude-permission"))
+            );
+        }
+        assert_eq!(
+            ui.positions.get("one").context("position")?.draft.text(),
+            "Keep this draft"
+        );
+        assert_eq!(ui.sessions.get("one").context("session")?.pending.len(), 1);
+        // Selecting Allow once sends the native question answer, never an interrupt.
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5))?, Request::Control { id, control: Control::AnswerQuestion { request, question, answer: Some(answer) } } if id == "one" && request == serde_json::json!("claude-permission") && question == "difu-decision" && answer == "Allow once")
+        );
+        ui.question_send = None;
+        ui.busy = false;
+        ui.menu_action(2);
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5))?, Request::Control { id, control: Control::Interrupt } if id == "one")
+        );
+        // A normal asynchronous user question retains the existing global Escape behavior.
+        ui.modal = None;
+        ui.busy = false;
+        ui.sessions.get_mut("one").context("session")?.queue.clear();
+        ui.sessions.get_mut("one").context("session")?.pending = vec![Pending {
+            id: serde_json::json!("async"),
+            method: "item/tool/requestUserInput".into(),
+            params: serde_json::json!({"difuAsync":true,"questions":[{"id":"q","question":"Continue?","options":[{"label":"Yes"}]}]}),
+            responded: false,
+        }];
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            matches!(rx.recv_timeout(Duration::from_secs(5))?, Request::Control { id, control: Control::Interrupt } if id == "one")
+        );
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("fixture panicked"))??;
+        Ok(())
+    }
     #[test]
     fn escape_interrupts_active_chat_even_while_busy_and_preserves_draft() -> Result<()> {
         use std::io::{BufRead, BufReader, Write};
@@ -7851,6 +8351,110 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn decoded_alt_up_and_question_header_keep_the_current_idle_session_and_draft() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        still(&mut ui);
+        ui.drilled = true;
+        let session = ui.sessions.get_mut("one").context("session")?;
+        session.provider = provider::Provider::Claude;
+        session.status = Status::Idle;
+        session.pending = vec![Pending {
+            id: serde_json::json!("async-question"),
+            method: "item/tool/requestUserInput".into(),
+            params: serde_json::json!({"difuAsync":true,"questions":[{"id":"next","question":"What should happen next?","options":[{"label":"Continue"},{"label":"Wait"}]}]}),
+            responded: false,
+        }];
+        let mut other = session.clone();
+        other.id = "two".into();
+        other.title = "Other chat".into();
+        other.pending.clear();
+        ui.summaries = vec![other.summary(), session.summary()];
+        ui.sessions.insert("two".into(), other);
+        ui.session_order = vec!["two".into(), "one".into()];
+        ui.positions
+            .entry("one".into())
+            .or_default()
+            .draft
+            .insert("Keep the current draft");
+        ui.positions
+            .entry("two".into())
+            .or_default()
+            .draft
+            .insert("Other chat draft");
+        for focus in [Focus::Composer, Focus::List] {
+            ui.focus = focus;
+            ui.modal = None;
+            ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+            assert_eq!(ui.selected.as_deref(), Some("one"));
+            assert!(
+                matches!(&ui.modal, Some(Modal::Approval { pending, .. }) if pending.id == serde_json::json!("async-question"))
+            );
+            assert_eq!(
+                ui.positions
+                    .get("one")
+                    .context("current draft")?
+                    .draft
+                    .text(),
+                "Keep the current draft"
+            );
+            assert_eq!(
+                ui.positions.get("two").context("other draft")?.draft.text(),
+                "Other chat draft"
+            );
+        }
+        ui.modal = None;
+        ui.focus = Focus::Composer;
+        let (screen, _) = draw(&mut ui, 120, 35)?;
+        assert!(screen.contains("1 question(s) · 0 approval(s)"));
+        let header = ui
+            .hits
+            .iter()
+            .find_map(|(rect, action)| matches!(action, Action::Pending).then_some(*rect))
+            .context("question header")?;
+        let point = (header.x + header.width.min(6).saturating_sub(1), header.y);
+        assert!(!ui.hits.iter().any(
+            |(rect, action)| rect.contains(point.into()) && matches!(action, Action::Select(_))
+        ));
+        ui.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: point.0,
+            row: point.1,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(ui.selected.as_deref(), Some("one"));
+        assert!(
+            matches!(&ui.modal, Some(Modal::Approval { pending, .. }) if pending.id == serde_json::json!("async-question"))
+        );
+        assert_eq!(
+            ui.positions
+                .get("one")
+                .context("current draft")?
+                .draft
+                .text(),
+            "Keep the current draft"
+        );
+        assert_eq!(
+            ui.positions.get("two").context("other draft")?.draft.text(),
+            "Other chat draft"
+        );
+        assert!(!ui.busy && ui.interrupting.is_empty() && ui.question_send.is_none());
+        assert!(
+            ui.positions
+                .values()
+                .all(|position| position.outgoing.is_empty())
+        );
+        assert!(ui.receiver.try_recv().is_err());
+        assert_eq!(
+            ui.sessions.get("one").context("session")?.status,
+            Status::Idle
+        );
+        Ok(())
+    }
     #[test]
     fn async_questions_open_three_tabs_and_keep_answer_drafts() -> Result<()> {
         let temp = tempfile::tempdir()?;
