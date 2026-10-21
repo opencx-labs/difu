@@ -1266,4 +1266,274 @@ mod settings_integration_tests {
         );
         Ok(())
     }
+    fn check_reading_intent_across_detail_preview(kind: &str) -> Result<()> {
+        use crate::agents::{Entry, Job, Launch, Session, Status, ui::Focus};
+        use crate::settings::{AutoScroll, Motion, ToolDisplay};
+        let (_dir, mut shell) = fixture()?;
+        let mut config = Config {
+            agent_list_visible: false,
+            ..Default::default()
+        };
+        config.preferences.motion.level = Motion::Off;
+        config.preferences.conversation.auto_scroll = AutoScroll::Manual;
+        config.preferences.conversation.tool_display = ToolDisplay::Expanded;
+        config.preferences.conversation.reasoning_expanded = true;
+        shell.reviews.storage.save_config(&config)?;
+        shell.apply_committed_settings(config);
+        let mut session = Session::new(
+            "reader".into(),
+            Job::Coding(Launch {
+                repository: "/synthetic/project".into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: "Read output".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.status = Status::Idle;
+        session.note("agentMessage", "Before the long entry");
+        let text = (0..80)
+            .map(|n| format!("reading item {n:02}"))
+            .collect::<Vec<_>>()
+            .join(if kind == "reasoning" {
+                "
+
+"
+            } else {
+                "
+"
+            });
+        session.entries.push(Entry {
+            id: "long-entry".into(),
+            kind: kind.into(),
+            text: text.into(),
+            data: serde_json::json!({"command":"echo values"}).into(),
+            ..Default::default()
+        });
+        for n in 0..6 {
+            session.note("agentMessage", format!("Trailing message {n}"));
+        }
+        shell.agents.selected = Some(session.id.clone());
+        shell.agents.sessions.insert(session.id.clone(), session);
+        shell.agents.drilled = true;
+        shell.agents.focus = Focus::Conversation;
+        let position = shell.agents.positions.entry("reader".into()).or_default();
+        position.scroll_anchor = Some(("long-entry".into(), 40));
+        position.draft = crate::editor::Editor::from("Keep this draft");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))?;
+        terminal.draw(|frame| shell.draw(frame))?;
+        let original = shell
+            .agents
+            .positions
+            .get("reader")
+            .context("position")?
+            .scroll_anchor
+            .clone();
+        assert_eq!(original, Some(("long-entry".into(), 40)));
+        let original_row = shell
+            .agents
+            .positions
+            .get("reader")
+            .context("position")?
+            .conversation;
+        let (x, y) = terminal
+            .backend()
+            .buffer()
+            .content
+            .chunks(120)
+            .enumerate()
+            .find_map(|(y, row)| {
+                let line = row.iter().map(|c| c.symbol()).collect::<String>();
+                line.find("reading item").and_then(|at| {
+                    line.get(..at)
+                        .map(|prefix| (prefix.chars().count() as u16, y as u16))
+                })
+            })
+            .context("mid-entry reading row")?;
+        for (kind, column) in [
+            (MouseEventKind::Down(MouseButton::Left), x),
+            (MouseEventKind::Drag(MouseButton::Left), x + 15),
+            (MouseEventKind::Up(MouseButton::Left), x + 15),
+        ] {
+            shell.agents.mouse(MouseEvent {
+                kind,
+                column,
+                row: y,
+                modifiers: KeyModifiers::NONE,
+            });
+        }
+        assert!(shell.agents.copy_chat_selection());
+        let copied = shell.agents.clipboard.take().context("selected source")?;
+        assert!(copied.contains("reading item"));
+        let (id, collapsed, expanded) = if kind == "reasoning" {
+            (
+                SettingId::ReasoningExpanded,
+                SettingValue::Bool(false),
+                SettingValue::Bool(true),
+            )
+        } else {
+            (
+                SettingId::ToolDisplay,
+                SettingValue::Choice("collapsed".into()),
+                SettingValue::Choice("expanded".into()),
+            )
+        };
+        shell.open_settings(Some(Category::Conversation));
+        shell
+            .settings
+            .as_mut()
+            .context("panel")?
+            .draft
+            .set(id.clone(), collapsed.clone())?;
+        terminal.draw(|frame| shell.draw(frame))?;
+        assert!(
+            shell
+                .agents
+                .positions
+                .get("reader")
+                .context("position")?
+                .conversation
+                < original_row,
+            "preview must actually clamp the live display"
+        );
+        let session = shell.agents.sessions.get_mut("reader").context("session")?;
+        session
+            .entries
+            .iter_mut()
+            .find(|entry| entry.id == "long-entry")
+            .context("long entry")?
+            .text
+            .push_str("\n\nIncoming continuation after the original reading point");
+        session.note("agentMessage", "Incoming while the preview is collapsed");
+        terminal.draw(|frame| shell.draw(frame))?;
+        shell.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| shell.draw(frame))?;
+        let position = shell.agents.positions.get("reader").context("position")?;
+        assert_eq!(
+            position.scroll_anchor, original,
+            "Discard restores the original intra-entry offset for {kind}"
+        );
+        assert_eq!(position.conversation, original_row);
+        assert_eq!(position.draft.text(), "Keep this draft");
+        assert!(shell.agents.copy_chat_selection());
+        assert_eq!(shell.agents.clipboard.as_ref(), Some(&copied));
+        // Saving a collapse keeps the latent source intent; navigation replaces it.
+        shell
+            .settings
+            .as_mut()
+            .context("panel")?
+            .draft
+            .set(id.clone(), collapsed.clone())?;
+        terminal.draw(|frame| shell.draw(frame))?;
+        shell.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| shell.draw(frame))?;
+        assert_eq!(
+            crate::settings::get(&shell.reviews.storage.load_config()?, &id),
+            collapsed
+        );
+        assert_eq!(
+            shell
+                .agents
+                .positions
+                .get("reader")
+                .context("position")?
+                .scroll_anchor,
+            original
+        );
+        assert!(shell.agents.copy_chat_selection());
+        assert_eq!(shell.agents.clipboard.as_ref(), Some(&copied));
+        shell
+            .settings
+            .as_mut()
+            .context("panel")?
+            .draft
+            .set(id.clone(), expanded.clone())?;
+        terminal.draw(|frame| shell.draw(frame))?;
+        assert_eq!(
+            shell
+                .agents
+                .positions
+                .get("reader")
+                .context("position")?
+                .conversation,
+            original_row,
+            "a saved collapse keeps its latent reading intent for later expansion"
+        );
+        shell.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| shell.draw(frame))?;
+        assert_eq!(
+            crate::settings::get(&shell.reviews.storage.load_config()?, &id),
+            collapsed
+        );
+        shell.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(shell.settings.is_none());
+        shell.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        terminal.draw(|frame| shell.draw(frame))?;
+        let navigated = shell
+            .agents
+            .positions
+            .get("reader")
+            .context("position")?
+            .scroll_anchor
+            .clone();
+        assert_ne!(navigated, original);
+        assert_eq!(
+            shell
+                .agents
+                .positions
+                .get("reader")
+                .context("position")?
+                .conversation,
+            0
+        );
+        shell.open_settings(Some(Category::Conversation));
+        shell
+            .settings
+            .as_mut()
+            .context("panel")?
+            .draft
+            .set(id.clone(), expanded)?;
+        terminal.draw(|frame| shell.draw(frame))?;
+        shell.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| shell.draw(frame))?;
+        assert_eq!(
+            shell
+                .agents
+                .positions
+                .get("reader")
+                .context("position")?
+                .scroll_anchor,
+            navigated,
+            "later expansion must not resurrect a replaced reading intent"
+        );
+        assert_eq!(
+            shell
+                .agents
+                .positions
+                .get("reader")
+                .context("position")?
+                .conversation,
+            0
+        );
+        assert_eq!(
+            shell
+                .agents
+                .positions
+                .get("reader")
+                .context("position")?
+                .draft
+                .text(),
+            "Keep this draft"
+        );
+        Ok(())
+    }
+    #[test]
+    fn reading_intent_survives_tool_preview_discard_and_saved_navigation() -> Result<()> {
+        check_reading_intent_across_detail_preview("commandExecution")
+    }
+    #[test]
+    fn reading_intent_survives_reasoning_preview_discard_and_saved_navigation() -> Result<()> {
+        check_reading_intent_across_detail_preview("reasoning")
+    }
 }

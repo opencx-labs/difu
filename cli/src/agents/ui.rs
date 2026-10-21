@@ -123,6 +123,8 @@ pub struct Position {
     saved_attachments: Vec<super::media::Attachment>,
     pub expanded: HashSet<String>,
     pub focused_entry: Option<String>,
+    /// Reading intent: entry ID and unclamped intra-entry row. `conversation`
+    /// is the current bounded display row; navigation clears/replaces this intent.
     pub scroll_anchor: Option<(String, usize)>,
     transcript_viewport: Option<(u16, u16, u64)>,
     keep_transcript_position: bool,

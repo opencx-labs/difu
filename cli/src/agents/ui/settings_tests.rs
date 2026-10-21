@@ -1115,3 +1115,78 @@ fn opening_changes_moves_a_main_helper_to_right_and_survives_refresh() -> anyhow
     }
     Ok(())
 }
+
+#[test]
+fn reading_intent_survives_density_height_clamps_and_missing_entries() -> anyhow::Result<()> {
+    use crate::settings::{Density, ToolDisplay};
+    let mut session = Session::new(
+        "reader".into(),
+        Job::Coding(Launch {
+            repository: ".".into(),
+            isolated: false,
+            base: "HEAD".into(),
+            prompt: "Read".into(),
+            model: None,
+            effort: None,
+        }),
+    );
+    session.status = Status::Idle;
+    for n in 0..4 {
+        session.note("agentMessage", format!("Prefix {n}"));
+    }
+    session.entries.push(Entry {
+        id: "long-entry".into(),
+        kind: "commandExecution".into(),
+        text: (0..40)
+            .map(|n| format!("source row {n}"))
+            .collect::<Vec<_>>()
+            .join(
+                "
+",
+            )
+            .into(),
+        data: serde_json::json!({"command":"echo values"}).into(),
+        ..Default::default()
+    });
+    let mut window = transcript_window::Window::default();
+    window.conversation.tool_display = ToolDisplay::Expanded;
+    let mut position = Position {
+        scroll_anchor: Some(("long-entry".into(), 30)),
+        ..Default::default()
+    };
+    window.render(&session, &mut position, 80, 5, false);
+    let original = position.scroll_anchor.clone();
+    let original_row = position.conversation;
+    assert_eq!(original, Some(("long-entry".into(), 30)));
+    window.appearance.density = Density::Compact;
+    window.render(&session, &mut position, 80, 30, false);
+    assert!(position.conversation < original_row);
+    session.note("agentMessage", "Incoming while the viewport is taller");
+    window.render(&session, &mut position, 80, 30, false);
+    window.appearance.density = Density::Comfortable;
+    window.render(&session, &mut position, 80, 5, false);
+    assert_eq!(
+        position.scroll_anchor, original,
+        "temporary global-height clamping must not replace the source offset"
+    );
+    assert_eq!(position.conversation, original_row);
+    // An intentional follow replaces the latent source anchor.
+    position.follow = true;
+    window.render(&session, &mut position, 80, 5, false);
+    assert_ne!(position.scroll_anchor, original);
+    position.follow = false;
+    position.scroll_anchor = original;
+    session.entries.retain(|entry| entry.id != "long-entry");
+    let view = window.render(&session, &mut position, 80, 5, false);
+    assert!(
+        position
+            .scroll_anchor
+            .as_ref()
+            .is_some_and(|(id, _)| view.sections.iter().any(|section| &section.id == id))
+    );
+    session.entries.clear();
+    window.render(&session, &mut position, 80, 5, false);
+    assert!(position.scroll_anchor.is_none());
+    assert_eq!(position.conversation, 0);
+    Ok(())
+}

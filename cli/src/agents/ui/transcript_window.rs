@@ -112,6 +112,9 @@ impl Window {
         let (mut sections, _) = self.sections(&visible);
         let mut total;
         if sections.is_empty() {
+            position.conversation = 0;
+            position.scroll_anchor = None;
+            self.last_position = 0;
             return View {
                 lines: Vec::new(),
                 links: Vec::new(),
@@ -125,6 +128,14 @@ impl Window {
             crate::settings::AutoScroll::Always => true,
             crate::settings::AutoScroll::Manual => false,
         } && !position.keep_transcript_position;
+        // Reflow can shorten an entry or move the viewport's maximum above it.
+        // Clamp only the display position, retaining the reader's source intent
+        // until navigation/following replaces it or the source disappears.
+        let retained_anchor = position
+            .scroll_anchor
+            .as_ref()
+            .filter(|(id, _)| !follow && entries.contains_key(id.as_str()))
+            .cloned();
         // Capture the source message before measuring new rows. Discovering older
         // content must never move the text already visible at the top of the pane.
         let anchor = position
@@ -293,11 +304,13 @@ impl Window {
             usize::from(height)
         });
         position.conversation = position.conversation.min(maximum);
-        position.scroll_anchor = sections
-            .iter()
-            .rev()
-            .find(|s| s.row <= position.conversation)
-            .map(|s| (s.id.clone(), position.conversation - s.row));
+        position.scroll_anchor = retained_anchor.or_else(|| {
+            sections
+                .iter()
+                .rev()
+                .find(|s| s.row <= position.conversation)
+                .map(|s| (s.id.clone(), position.conversation - s.row))
+        });
         self.last_position = position.conversation;
         let keep: HashSet<_> = sections
             .get(first..end)
