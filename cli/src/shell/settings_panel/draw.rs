@@ -103,7 +103,7 @@ impl Panel {
             Constraint::Length(2),
             Constraint::Min(0),
             Constraint::Length(2),
-            Constraint::Length(if full.width < 65 { 3 } else { 2 }),
+            Constraint::Length(if full.width < 65 { 4 } else { 3 }),
         ])
         .areas(inside);
         frame.render_widget(
@@ -172,7 +172,9 @@ impl Panel {
         };
         let rows = self.rows();
         self.selected = self.selected.min(rows.len().saturating_sub(1));
-        let visible = usize::from(list.height.saturating_sub(2));
+        let narrow_list = full.width < 70;
+        let row_height = if narrow_list { 2 } else { 1 };
+        let visible = usize::from(list.height.saturating_sub(2) / row_height);
         let start = self.selected.saturating_sub(visible.saturating_sub(1));
         let lines = if rows.is_empty() {
             vec![Line::styled(
@@ -184,7 +186,7 @@ impl Panel {
                 .enumerate()
                 .skip(start)
                 .take(visible)
-                .map(|(index, spec)| {
+                .flat_map(|(index, spec)| {
                     let selected = index == self.selected;
                     let value = if selected {
                         self.edit
@@ -194,24 +196,36 @@ impl Panel {
                     } else {
                         display(self.draft.value(&spec.id), &spec.id)
                     };
-                    Line::styled(
-                        format!(
-                            "{}{} {}: {}",
-                            if selected { "›" } else { " " },
-                            if self.draft.edited().contains(&spec.id) {
-                                "●"
-                            } else {
-                                " "
-                            },
-                            spec.label,
-                            value
-                        ),
-                        if selected {
-                            Style::default().fg(INK).bg(ACCENT)
+                    let style = if selected {
+                        Style::default().fg(INK).bg(ACCENT)
+                    } else {
+                        Style::default().fg(TEXT)
+                    };
+                    let marker = format!(
+                        "{}{}",
+                        if selected { "›" } else { " " },
+                        if self.draft.edited().contains(&spec.id) {
+                            "●"
                         } else {
-                            Style::default().fg(TEXT)
-                        },
-                    )
+                            " "
+                        }
+                    );
+                    if narrow_list {
+                        let value_label = if selected && self.edit.is_some() {
+                            "Editing"
+                        } else {
+                            "Current"
+                        };
+                        vec![
+                            Line::styled(format!("{marker} {}", spec.label), style),
+                            Line::styled(format!("   {value_label}: {value}"), style),
+                        ]
+                    } else {
+                        vec![Line::styled(
+                            format!("{marker} {}: {value}", spec.label),
+                            style,
+                        )]
+                    }
                 })
                 .collect()
         };
@@ -240,12 +254,30 @@ impl Panel {
                 .wrap(Wrap { trim: false }),
             status,
         );
-        frame.render_widget(Paragraph::new("Ctrl+S Save · Ctrl+D Discard · Ctrl+R Reset section\nCtrl+E Export · Ctrl+M Modified · Ctrl+P Replay · Ctrl+T Test · Ctrl+I Details · Ctrl+↑/↓ Scroll · Tab Search/Settings · Esc Close").style(Style::default().fg(DIM)).wrap(Wrap { trim: false }), footer);
+        let help = if full.width < 65 {
+            "^S Save ^D Discard ^R Reset\n^E Export ^M Modified ^P Replay\n^T Test ^I Details ^↑/↓ Scroll\nTab Focus PgUp/Dn Sections Esc Close"
+        } else {
+            "Ctrl+S Save · Ctrl+D Discard · Ctrl+R Reset · Ctrl+E Export\nCtrl+M Modified · Ctrl+P Replay · Ctrl+T Test · Ctrl+I Details\nCtrl+↑/↓ Scroll · Tab Focus · PgUp/Dn Sections · Esc Close"
+        };
+        frame.render_widget(
+            Paragraph::new(help)
+                .style(Style::default().fg(DIM))
+                .wrap(Wrap { trim: false }),
+            footer,
+        );
     }
     fn draw_details(&mut self, frame: &mut Frame, area: Rect, spec: &SettingSpec) {
         frame.render_widget(block(" Details & preview ".into()), area);
         let inner = area.inner(ratatui::layout::Margin::new(1, 1));
+        let value = self
+            .edit
+            .as_ref()
+            .map(|text| format!("Editing: {text}▏"))
+            .unwrap_or_else(|| {
+                format!("Current: {}", display(self.draft.value(&spec.id), &spec.id))
+            });
         let mut details = vec![
+            Line::styled(value, Style::default().fg(ACCENT)),
             Line::styled(spec.label, Style::default().fg(ACCENT)),
             Line::from(spec.effect.label()),
             Line::from(spec.description),

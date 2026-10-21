@@ -121,6 +121,9 @@ impl Shell {
             self.reviews.redraw_interval()
         }
     }
+    fn reconcile_settings_action(&mut self) {
+        self.settings_action_open &= self.settings.is_some() && self.agents.modal.is_some();
+    }
     pub fn tick(&mut self) {
         self.tick_focused(true);
     }
@@ -128,6 +131,7 @@ impl Shell {
         let selected = self.palette_selection();
         self.agents
             .tick(focused && (self.agents_active || self.palette.is_some()));
+        self.reconcile_settings_action();
         self.tick_palette();
         self.restore_palette_selection(selected);
         self.take_settings_request();
@@ -147,6 +151,7 @@ impl Shell {
         }
     }
     pub fn key(&mut self, key: KeyEvent) {
+        self.reconcile_settings_action();
         if key.kind == KeyEventKind::Release {
             if self.agents_active {
                 self.agents.key(key);
@@ -238,6 +243,7 @@ impl Shell {
         }
     }
     pub fn mouse(&mut self, mouse: MouseEvent) {
+        self.reconcile_settings_action();
         if self.settings_action_open {
             self.agents.mouse(mouse);
             if self.agents.modal.is_none() {
@@ -271,8 +277,10 @@ impl Shell {
         }
     }
     pub fn paste(&mut self, text: String) {
+        self.reconcile_settings_action();
         if self.settings_action_open {
             self.agents.paste(&text);
+            self.reconcile_settings_action();
             return;
         }
         if let Some(panel) = &mut self.settings {
@@ -541,6 +549,71 @@ mod settings_integration_tests {
         assert_eq!(
             std::fs::read_to_string(&shell.reviews.storage.config)?,
             "{malformed"
+        );
+        Ok(())
+    }
+    fn settings_after_async_action_close() -> Result<(tempfile::TempDir, Shell)> {
+        let (dir, mut shell) = fixture()?;
+        shell.agents.selected = Some("retained".into());
+        shell.agents.drilled = true;
+        shell.agents.focus = crate::agents::ui::Focus::Composer;
+        let position = shell.agents.positions.entry("retained".into()).or_default();
+        position.draft = crate::editor::Editor::from("Unsent draft");
+        position.conversation = 17;
+        position.selection = Some(4);
+        shell.open_settings(None);
+        shell.settings_action(SettingId::Rules);
+        assert!(shell.settings_action_open && shell.agents.modal.is_some());
+        // An asynchronous Ui completion clears its modal without a modal key event.
+        shell.agents.modal = None;
+        Ok((dir, shell))
+    }
+    #[test]
+    fn async_action_close_returns_key_and_paste_to_settings_without_touching_composer() -> Result<()>
+    {
+        for paste_first in [false, true] {
+            let (_dir, mut shell) = settings_after_async_action_close()?;
+            if paste_first {
+                shell.paste("pasted query".into());
+            } else {
+                shell.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            }
+            let position = shell.agents.positions.get("retained").context("position")?;
+            assert_eq!(position.draft.text(), "Unsent draft");
+            assert_eq!(position.conversation, 17);
+            assert_eq!(position.selection, Some(4));
+            assert_eq!(shell.agents.selected.as_deref(), Some("retained"));
+            assert!(!shell.settings_action_open);
+            assert_eq!(
+                shell.settings.as_ref().context("panel")?.query,
+                if paste_first { "pasted query" } else { "x" }
+            );
+        }
+        Ok(())
+    }
+    #[test]
+    fn async_action_close_is_reconciled_after_tick_and_before_mouse_input() -> Result<()> {
+        let (_dir, mut shell) = settings_after_async_action_close()?;
+        shell.tick_focused(false);
+        assert!(!shell.settings_action_open);
+        let (_other, mut shell) = settings_after_async_action_close()?;
+        shell.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 1,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(!shell.settings_action_open);
+        assert_eq!(shell.agents.selected.as_deref(), Some("retained"));
+        assert_eq!(
+            shell
+                .agents
+                .positions
+                .get("retained")
+                .context("position")?
+                .draft
+                .text(),
+            "Unsent draft"
         );
         Ok(())
     }

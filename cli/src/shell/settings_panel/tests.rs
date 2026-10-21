@@ -115,7 +115,7 @@ fn narrow_panel_keeps_search_selection_details_and_actions_reachable() -> Result
         .map(|c| c.symbol())
         .collect::<String>();
     assert!(content.contains("Settings"));
-    assert!(content.contains("Ctrl+S"));
+    assert!(content.contains("^S Save"));
     panel.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &storage);
     panel.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &storage);
     assert!(!panel.draft.edited().is_empty());
@@ -318,5 +318,63 @@ fn disabled_reply_animation_does_not_request_periodic_preview_repaints() -> Resu
         .draft
         .set(SettingId::ReplySpeed, SettingValue::Number(0))?;
     assert!(!panel.animating());
+    Ok(())
+}
+
+fn narrow_screen(panel: &mut Panel) -> Result<String> {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(38, 18))?;
+    terminal.draw(|frame| panel.draw(frame))?;
+    Ok(terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect())
+}
+#[test]
+fn narrow_long_label_controls_show_current_value_in_list_and_expanded_details() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    for (id, query) in [
+        (
+            SettingId::QuestionOverridesSelection,
+            "Question key overrides text selection",
+        ),
+        (
+            SettingId::QuestionNotification,
+            "Question and approval notifications",
+        ),
+    ] {
+        let mut panel = Panel::new(&storage, None)?;
+        panel.query = query.into();
+        for expanded in [false, true] {
+            panel.details_expanded = expanded;
+            panel.draft.set(id.clone(), SettingValue::Bool(false))?;
+            assert!(narrow_screen(&mut panel)?.contains("Current: Off"));
+            panel.draft.set(id.clone(), SettingValue::Bool(true))?;
+            assert!(narrow_screen(&mut panel)?.contains("Current: On"));
+        }
+    }
+    Ok(())
+}
+#[test]
+fn narrow_details_show_in_progress_numeric_value() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut panel = Panel::new(&storage(&dir), Some(Category::Motion))?;
+    panel.query = "Reply speed".into();
+    panel.details_expanded = true;
+    panel.edit = Some("123".into());
+    assert!(narrow_screen(&mut panel)?.contains("Editing: 123"));
+    Ok(())
+}
+#[test]
+fn narrow_footer_keeps_details_scroll_and_navigation_instructions_visible() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut panel = Panel::new(&storage(&dir), None)?;
+    let screen = narrow_screen(&mut panel)?;
+    for hint in ["Details", "Scroll", "PgUp/Dn", "Tab Focus", "Esc"] {
+        assert!(screen.contains(hint), "missing visible instruction: {hint}");
+    }
     Ok(())
 }
