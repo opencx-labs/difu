@@ -181,6 +181,8 @@ impl Ui {
             return;
         };
         let defaults = AgentDefaults {
+            provider: self.defaults.provider,
+            starting_mode: self.defaults.starting_mode.clone(),
             repository: form.value(0).map(std::path::PathBuf::from),
             model: form.value(1),
             effort: form.value(2),

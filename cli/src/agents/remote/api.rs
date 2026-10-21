@@ -349,6 +349,8 @@ fn new_session(inner: &Inner, params: &Value) -> Result<Value> {
     let saved = config(&inner.storage).agent_defaults;
     let repository: Option<PathBuf> = optional(params, "repository")?;
     let defaults = AgentDefaults {
+        provider: saved.provider,
+        starting_mode: saved.starting_mode,
         repository: repository.or(saved.repository),
         model: optional::<String>(params, "model")?
             .filter(|m| !m.is_empty())

@@ -15,6 +15,8 @@ use std::{
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentDefaults {
+    pub provider: Option<crate::agents::provider::Provider>,
+    pub starting_mode: Option<String>,
     pub repository: Option<PathBuf>,
     pub model: Option<String>,
     pub effort: Option<String>,
@@ -23,11 +25,20 @@ pub struct AgentDefaults {
 impl Default for AgentDefaults {
     fn default() -> Self {
         Self {
+            provider: None,
+            starting_mode: None,
             repository: None,
             model: None,
             effort: None,
             isolated: true,
         }
+    }
+}
+
+impl AgentDefaults {
+    pub fn resolved_provider(&self) -> crate::agents::provider::Provider {
+        self.provider
+            .unwrap_or_else(|| crate::agents::provider::Provider::for_model(self.model.as_deref()))
     }
 }
 
@@ -70,6 +81,8 @@ impl Tweaks {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
+    #[serde(default)]
+    pub preferences: crate::settings::Preferences,
     #[serde(default)]
     pub slack: Option<crate::agents::slack::Settings>,
     #[serde(default)]
@@ -118,6 +131,7 @@ fn enabled() -> bool {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            preferences: crate::settings::Preferences::default(),
             slack: None,
             local_diff_roots: Vec::new(),
             local_diff_repositories: BTreeSet::new(),
@@ -163,8 +177,11 @@ impl Storage {
         })
     }
     pub fn load_config(&self) -> Result<Config> {
+        self.config_document().map(|(config, _)| config)
+    }
+    fn config_document(&self) -> Result<(Config, serde_json::Value)> {
         if !self.config.exists() {
-            return Ok(Config::default());
+            return Ok((Config::default(), serde_json::json!({})));
         }
         let value: serde_json::Value = serde_json::from_slice(&fs::read(&self.config)?)
             .context("Cannot read difu config.json; fix its JSON or move it aside")?;
@@ -178,9 +195,8 @@ impl Storage {
             for name in &config.pinned_repositories {
                 crate::model::validate_repository(name)?;
             }
-            atomic_json(&self.config, &config)?;
         }
-        Ok(config)
+        Ok((config, value))
     }
     pub fn load_repositories(&self) -> Result<Option<Vec<String>>> {
         let current = crate::github::store::root(self).join("repositories.json");
@@ -211,10 +227,37 @@ impl Storage {
     /// saving a whole in-memory copy would undo whatever another part of difu
     /// saved since that copy was loaded.
     pub fn update_config(&self, change: impl FnOnce(&mut Config)) -> Result<Config> {
+        self.try_update_config(|config| {
+            change(config);
+            Ok(())
+        })
+    }
+    /// Fallible, locked read/modify/write. Neither rejected changes nor parse failures write.
+    pub fn try_update_config(
+        &self,
+        change: impl FnOnce(&mut Config) -> Result<()>,
+    ) -> Result<Config> {
         let _lock = self.config_lock()?;
         let mut config = self.load_config()?;
-        change(&mut config);
+        change(&mut config)?;
         atomic_json(&self.config, &config)?;
+        Ok(config)
+    }
+    /// Preserve unknown fields by patching only differences made through typed settings adapters.
+    /// A no-op callback never rewrites a valid legacy document or creates a missing config file.
+    pub(crate) fn try_patch_config(
+        &self,
+        change: impl FnOnce(&mut Config) -> Result<()>,
+    ) -> Result<Config> {
+        let _lock = self.config_lock()?;
+        let (mut config, mut document) = self.config_document()?;
+        let before = serde_json::to_value(&config)?;
+        change(&mut config)?;
+        let after = serde_json::to_value(&config)?;
+        if before != after {
+            patch_typed_changes(&mut document, &before, &after);
+            atomic_json(&self.config, &document)?;
+        }
         Ok(config)
     }
     /// Serialises read-modify-write cycles across difu's processes.
@@ -284,6 +327,37 @@ impl Storage {
     }
     pub fn save_guide(&self, key: &str, guide: &Guide) -> Result<()> {
         atomic_json(&self.cache.join(format!("{key}.json")), guide)
+    }
+}
+
+/// Apply differences between two typed Config serializations, retaining unknown raw leaves.
+/// Callers supply typed callbacks, never user-provided JSON paths or values.
+fn patch_typed_changes(
+    target: &mut serde_json::Value,
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+) {
+    use serde_json::Value;
+    if before == after {
+        return;
+    }
+    if let (Value::Object(previous), Value::Object(updated)) = (before, after) {
+        if !target.is_object() {
+            *target = Value::Object(serde_json::Map::new());
+        }
+        if let Some(object) = target.as_object_mut() {
+            for key in previous.keys().filter(|key| !updated.contains_key(*key)) {
+                object.remove(key);
+            }
+            for (key, value) in updated {
+                let old = previous.get(key).unwrap_or(&Value::Null);
+                if old != value {
+                    patch_typed_changes(object.entry(key).or_insert(Value::Null), old, value);
+                }
+            }
+        }
+    } else {
+        *target = after.clone();
     }
 }
 
@@ -371,6 +445,21 @@ mod tests {
             storage.load_repositories()?,
             Some(vec!["owner/first".into(), "owner/second".into()])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn loading_legacy_settings_does_not_write_before_a_transaction() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let storage = Storage {
+            config: directory.path().join("config.json"),
+            cache: directory.path().into(),
+        };
+        let original = r#"{"review_repositories":{"owner/repo":true},"theme":"nord"}"#;
+        fs::write(&storage.config, original)?;
+        let config = storage.load_config()?;
+        assert!(config.pinned_repositories.contains("owner/repo"));
+        assert_eq!(fs::read_to_string(&storage.config)?, original);
         Ok(())
     }
 
