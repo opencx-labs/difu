@@ -157,6 +157,6 @@ pub(super) fn transition(
         ),
         false,
         cancel,
-        true,
+        TurnKind::Internal,
     )
 }

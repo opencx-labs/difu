@@ -55,7 +55,7 @@ fn append_prose(lines: &mut Vec<Line<'static>>, links: &mut Vec<Link>, text: &st
     }));
     lines.extend(rows);
 }
-fn prose_links(text: &str, width: u16) -> (Vec<Line<'static>>, Vec<Link>) {
+pub(super) fn prose_links(text: &str, width: u16) -> (Vec<Line<'static>>, Vec<Link>) {
     let mut links = Vec::new();
     let mut rows = Vec::new();
     let mut normal = String::new();
@@ -299,7 +299,11 @@ pub(super) fn waiting_messages(
         )];
         if session.can_send_waiting() {
             spans.push(Span::styled(
-                " (press esc to interrupt and send immediately)",
+                if synchronous_permission_index(session).is_some() {
+                    " (permission needed; esc opens approval)"
+                } else {
+                    " (press esc to interrupt and send immediately)"
+                },
                 Style::default().fg(DIM),
             ));
         }
@@ -563,15 +567,28 @@ pub(super) fn render_entries(
                         );
                     }
                 } else {
-                    append_prose(&mut lines, &mut links, &entry.text, width);
+                    // Older sessions stored the whole proposed-plan item as text.
+                    let text = entry
+                        .data
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&entry.text);
+                    append_prose(&mut lines, &mut links, text, width);
                 }
             }
-            "error" | "system" => lines.extend(wrapped(&entry.text, width).into_iter().map(|s| {
-                Line::from(Span::styled(
-                    s,
-                    Style::default().fg(if entry.kind == "error" { RED } else { DIM }),
-                ))
-            })),
+            "error" | "system" => {
+                let text = if entry.kind == "error" {
+                    provider_error_text(&entry.text)
+                } else {
+                    &entry.text
+                };
+                lines.extend(wrapped(text, width).into_iter().map(|s| {
+                    Line::from(Span::styled(
+                        s,
+                        Style::default().fg(if entry.kind == "error" { RED } else { DIM }),
+                    ))
+                }));
+            }
             _ => {
                 let review_status = entry.data.pointer("/review/status").and_then(Value::as_str);
                 let failed = matches!(review_status, Some("denied" | "timedOut"))
@@ -828,6 +845,47 @@ pub(super) fn render_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn saved_proposed_plan_renders_markdown_and_keeps_step_plans() {
+        let mut session = Session::new(
+            "test".into(),
+            Job::Coding(Launch {
+                repository: ".".into(),
+                isolated: true,
+                base: "HEAD".into(),
+                prompt: "Plan only".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        let data = serde_json::json!({"id":"p","type":"plan","text":"# Houseplant\n\n- Fold a paper hat\n- Remove it afterward"});
+        session.entries.push(Entry {
+            id: "p".into(),
+            kind: "plan".into(),
+            text: data.to_string().into(),
+            data: data.into(),
+            finished_at: Some(1),
+            ..Entry::default()
+        });
+        session.entries.push(Entry {
+            id: "steps".into(),
+            kind: "plan".into(),
+            data: serde_json::json!({"plan":[{"step":"Inspect workspace","status":"completed"}]})
+                .into(),
+            ..Entry::default()
+        });
+        let (rows, _) = render(&session, &Position::default(), 90, false);
+        let text = rows
+            .iter()
+            .map(Line::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("Houseplant"));
+        assert!(text.contains("Fold a paper hat"));
+        assert!(text.contains("✓ Inspect workspace"));
+        assert!(!text.contains("\"type\":\"plan\""));
+        assert!(!text.contains("\\n"));
+    }
     #[test]
     fn links_keep_targets_and_viewport_coordinates() {
         let (rows, links) = prose_links("Open [the invoice](https://example.com/invoice)", 12);

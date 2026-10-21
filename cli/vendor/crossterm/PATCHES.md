@@ -22,6 +22,14 @@ Two synchronous input fixes are backported from the approach in
 `src/terminal/sys/unix.rs` also drops redundant parentheses flagged by the
 current compiler; this has no behavior change.
 
+Meta-prefixed CSI/SS3 keys are decoded as one Alt-modified key. Previously
+`ESC ESC [ A` and `ESC ESC O A` emitted Escape before the arrow was decoded.
+`src/event/sys/unix/parse.rs` retains the double-Escape prefix, and the synchronous
+mio parser gives ambiguous Escape prefixes up to 25 ms to finish across reads.
+The wait respects the caller's poll timeout, including zero; a genuine Escape
+still arrives after the grace period. Short incomplete reads return to mio
+instead of blocking on another stdin read. No terminal configuration is changed.
+
 See [upstream issue #793](https://github.com/crossterm-rs/crossterm/issues/793).
 Difu uses the synchronous mio backend; this backport does not fix the optional
 `use-dev-tty` or `event-stream` backends, which difu does not enable.
@@ -30,3 +38,8 @@ Difu uses the synchronous mio backend; this backport does not fix the optional
 without a hangup signal, and preserves normal Ctrl+C input. Remove this patch
 and directory once a compatible upstream release fixes these paths and passes
 the regression tests. Do not replace this with a patch to the local Cargo cache.
+
+`tests/terminal_meta.rs` sends CSI/SS3 Meta arrows through a real PTY and the public
+poll/read API, including split reads, short/zero poll deadlines, ordinary Up,
+and a genuine Escape followed by a separate Up. The split-read grace is scoped
+to the synchronous mio backend; optional backends remain outside Difu's coverage.

@@ -248,7 +248,10 @@ impl Service {
             }
             return Ok(());
         }
-        if matches!(&initial, Some(Control::Mcp { .. })) {
+        if matches!(
+            &initial,
+            Some(Control::Mcp { .. } | Control::Permissions { .. })
+        ) {
             ensure!(
                 session.queue.is_empty()
                     && session.turn_id.is_none()
@@ -275,7 +278,11 @@ impl Service {
                     } else {
                         initial
                     };
-                    match session.job {
+                    let permission_response = match &initial {
+                        Some(Control::Permissions { response, .. }) => Some(response.clone()),
+                        _ => None,
+                    };
+                    let output = match session.job {
                         Job::Coding(_) => match store.get(&id_owned)?.provider {
                             provider::Provider::Codex => {
                                 super::engine::run(&store, &id_owned, receiver, &token, initial)
@@ -285,7 +292,13 @@ impl Service {
                             }
                         },
                         _ => run_review(&store, &id_owned, &token),
+                    };
+                    if let Err(error) = &output
+                        && let Some(response) = permission_response
+                    {
+                        let _ = response.send(Err(format!("{error:#}")));
                     }
+                    output
                 })();
                 if let Err(error) = output {
                     let message = format!("{error:#}");
@@ -376,6 +389,7 @@ impl Service {
             | Request::Repository { id, .. }
             | Request::Clear { id }
             | Request::RegisterWorktree { id, .. }
+            | Request::Permissions { id, .. }
             | Request::Usage { id }
             | Request::Rename { id, .. } => Some(id.clone()),
             _ => None,
@@ -629,6 +643,9 @@ impl Service {
                         if target != updated.provider {
                             provider::switch(&mut updated, target, model.clone(), effort.clone())?;
                         } else {
+                            if updated.model != *model {
+                                updated.permission_state.capabilities = Value::Null;
+                            }
                             updated.model = model.clone();
                             updated.effort = effort.clone();
                             updated.status = Status::Idle;
@@ -645,6 +662,20 @@ impl Service {
                 }
                 let async_response = matches!(&control, Control::Respond { request, .. } | Control::AnswerQuestion { request, .. }
                     if session.pending.iter().any(|p| p.id == *request && p.is_async_question()));
+                if let Control::DecidePlan {
+                    plan_id,
+                    choice: super::plan::Choice::ContinuePlanning,
+                } = &control
+                {
+                    // Staying in Plan consumes only the local proposal, including
+                    // after restart. It never needs to launch or resume Codex.
+                    let mut claimed = None;
+                    self.store
+                        .update(&id, |s| claimed = Some(super::plan::claim(s, plan_id)))?;
+                    claimed.context("Plan decision was not validated")??;
+                    self.store.save(&id)?;
+                    return Ok(Reply::Ok);
+                }
                 let sends_message = matches!(
                     control,
                     Control::Message { .. } | Control::MessageWithAttachments { .. }
@@ -667,6 +698,29 @@ impl Service {
                     .map_err(|_| anyhow::anyhow!("Worker lock failed"))?
                     .get(&id)
                     .is_some_and(|w| !w.handle.is_finished());
+                if !live && matches!(control, Control::DecidePlan { .. }) {
+                    // Reconnect the existing native conversation without Resume's
+                    // synthetic continuation prompt, then validate on its worker.
+                    ensure!(
+                        session.plan_prompt.is_some() && session.status == Status::Idle,
+                        "That plan choice is no longer available"
+                    );
+                    self.start(&id, None)?;
+                    let sender = self
+                        .workers
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Worker lock failed"))?
+                        .get(&id)
+                        .context("Plan worker did not start")?
+                        .sender
+                        .clone();
+                    let (reply, result) = mpsc::channel();
+                    sender
+                        .send(Command { control, reply })
+                        .context("Agent disconnected before the plan choice was sent")?;
+                    result.recv_timeout(Duration::from_secs(60)).context("Agent did not acknowledge the plan choice; inspect the session before retrying")??;
+                    return Ok(Reply::Ok);
+                }
                 if !live && let Control::Model { model, effort } = &control {
                     self.store.update(&id, |s| {
                         s.model = model.clone();
@@ -727,6 +781,7 @@ impl Service {
                             s.error = None;
                             if let Control::Message { text, skills, attachments, .. }
                                 | Control::MessageWithAttachments { text, skills, attachments, .. } = &control {
+                                super::plan::invalidate(s);
                                 s.note("awaiting connection", text);
                                 if let Some(entry) = s.entries.last_mut() {
                                     entry.data = serde_json::json!({"prompt":Prompt::WithSkills {
@@ -740,6 +795,27 @@ impl Service {
                     }
                 }
                 Ok(Reply::Ok)
+            }
+            Request::Permissions { id, action } => {
+                let session = self.store.get(&id)?;
+                ensure!(
+                    matches!(session.job, Job::Coding(_)),
+                    "Permission controls require a coding session"
+                );
+                ensure!(
+                    !session.archived && !session.preparing(),
+                    "Wait until the session is ready before changing permissions"
+                );
+                let (response, result) = mpsc::channel();
+                self.start(&id, Some(Control::Permissions { action, response }))?;
+                Ok(Reply::Permissions {
+                    snapshot: result
+                        .recv_timeout(Duration::from_secs(60))
+                        .map_err(|_| {
+                            self.store.get(&id).ok().filter(|s|s.status==Status::Failed).and_then(|s|s.error).map(anyhow::Error::msg).unwrap_or_else(||anyhow::anyhow!("The agent connection stopped before returning permissions; reconnect and retry"))
+                        })?
+                        .map_err(anyhow::Error::msg)?,
+                })
             }
             Request::Mcp { id, action } => {
                 let session = self.store.get(&id)?;
@@ -967,7 +1043,12 @@ impl Service {
                 if archived {
                     self.stop_worker(&id)?;
                 }
-                self.store.update(&id, |s| s.archived = archived)?;
+                self.store.update(&id, |s| {
+                    s.archived = archived;
+                    if archived {
+                        super::plan::invalidate(s);
+                    }
+                })?;
                 self.store.save(&id)?;
                 Ok(Reply::Ok)
             }
@@ -1069,6 +1150,7 @@ impl Service {
                 self.store.update(&id, |s| {
                     s.archived = true;
                     s.workspace_removed = true;
+                    super::plan::invalidate(s);
                     s.note("system", "Worktree removed; branch and commits retained");
                 })?;
                 self.store.save(&id)?;
@@ -1124,6 +1206,7 @@ impl Service {
 /// A replacement worktree drops the previous workspace's requests, artifacts and
 /// PR associations. Queued prompts remain visible as unsent messages.
 fn reset_workspace(s: &mut Session, candidate: Session, revision: u64) {
+    super::plan::invalidate(s);
     s.status = Status::Idle;
     s.turn_id = None;
     s.turn_started_at = None;
@@ -1160,6 +1243,7 @@ fn reset_workspace(s: &mut Session, candidate: Session, revision: u64) {
 /// Keep the session's identity, provider, model and manual name, but nothing it
 /// learned: the next message starts a new native thread with no handoff context.
 fn clear_conversation(s: &mut Session) {
+    super::plan::invalidate(s);
     s.entries.clear();
     s.slack_route = None;
     s.slack_after = 0;
@@ -1170,6 +1254,7 @@ fn clear_conversation(s: &mut Session) {
     s.token_usage = Value::Null;
     s.usage = Value::Null;
     s.answered_questions.clear();
+    s.permission_state = super::permissions::State::default();
     s.permissions = Value::Null;
     s.inherited_permissions = Value::Null;
     s.artifact_tools = false;
@@ -1311,6 +1396,7 @@ pub fn run(storage: Storage) -> Result<()> {
             }
         }
         session.restore_async_questions();
+        super::plan::reconcile(&mut session);
         storage::atomic_json(&path, &session)?;
         sessions.insert(session.id.clone(), session);
     }
@@ -1730,6 +1816,11 @@ mod clear_tests {
                 .provider_threads
                 .insert("claude".into(), Default::default());
             session.provider_context = Some("old handoff".into());
+            session.permission_state.mode = Some("plan".into());
+            session.permission_state.pending_preset =
+                Some(super::super::permissions::CodexPreset::Auto);
+            session.permission_state.claude_settings =
+                serde_json::json!({"permissions":{"allow":["Read(/tmp/**)"]}});
             session.note("userMessage", "earlier private context");
             session.queue.push(Prompt::from("queued for the old task"));
             session.answered_questions.insert("old-question".into());
@@ -1829,6 +1920,11 @@ mod clear_tests {
             );
             assert!(cleared.thread_id.is_none() && cleared.provider_context.is_none());
             assert!(cleared.provider_threads.is_empty());
+            assert!(
+                cleared.permission_state.mode.is_none()
+                    && cleared.permission_state.pending_preset.is_none()
+            );
+            assert!(cleared.permission_state.claude_settings.is_null());
             assert!(cleared.queue.is_empty() && cleared.pending.is_empty());
             assert!(cleared.answered_questions.is_empty() && cleared.artifacts.is_empty());
             assert!(cleared.token_usage.is_null());

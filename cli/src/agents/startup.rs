@@ -50,8 +50,8 @@ pub(super) fn prepare(
                 cancel.cancel();
                 Ok(())
             }
-            control @ Control::Mcp { .. } => {
-                // MCP management can initialize a provider without a user/model turn.
+            control @ (Control::Mcp { .. } | Control::Permissions { .. }) => {
+                // Native management can initialize a provider without a user/model turn.
                 store.update(id, |s| s.status = Status::Starting)?;
                 let _ = command.reply.send(Ok(()));
                 return Ok(Some(control));

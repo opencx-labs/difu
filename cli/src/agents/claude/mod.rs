@@ -1,6 +1,8 @@
 //! Claude Code adapter. The rest of difu uses Session/Control, never Claude wire frames.
 mod events;
 mod mcp_control;
+mod permissions_control;
+mod plan_control;
 mod protocol;
 use super::{
     Control, Entry, Job, Pending, Prompt, Reply, Session, Status,
@@ -26,6 +28,9 @@ pub(super) fn models(cancel: &Cancel) -> Result<Vec<ModelInfo>> {
             resume: None,
             instructions: "",
             mode: Mode::Models,
+            permission_mode: None,
+            allow_bypass: false,
+            settings: None,
         },
         cancel,
     )?;
@@ -70,6 +75,13 @@ pub(super) fn usage(store: &Store, id: &str, session: &Session, cancel: &Cancel)
             resume: session.thread_id.as_deref(),
             instructions: "",
             mode: Mode::Session,
+            permission_mode: session
+                .permission_state
+                .pending_mode
+                .as_deref()
+                .or(session.permission_state.mode.as_deref()),
+            allow_bypass: session.permission_state.bypass_enabled,
+            settings: Some(&session.permission_state.claude_settings),
         },
         cancel,
     )?;
@@ -208,8 +220,16 @@ fn request(store: &Store, id: &str, rpc: &mut Connection, frame: &Value) -> Resu
         responded: false,
     };
     super::elicitation::normalize(&mut pending);
+    plan_control::decorate(&mut pending, &store.get(id)?);
     store.update(id, |s| {
         if !s.pending.iter().any(|p| p.id == pending.id) {
+            super::permissions::audit(
+                &mut s.permission_state,
+                super::permissions::PermissionEventKind::RequestSurfaced,
+                Some(&pending.id),
+                Some(name),
+                Some("can_use_tool"),
+            );
             s.pending.push(pending);
         }
         s.status = Status::Waiting;
@@ -307,6 +327,28 @@ fn respond(
         json!({"behavior":"deny","message":"The user declined this tool call."})
     };
     store.update(id, |s| {
+        super::permissions::audit(
+            &mut s.permission_state,
+            super::permissions::PermissionEventKind::AnswerAction,
+            Some(&pending.id),
+            pending.params.get("tool").and_then(Value::as_str),
+            Some(&format!("Respond({action})")),
+        );
+        if action != "accept" {
+            s.permission_state.denials.push(super::permissions::Denial {
+                tool: pending
+                    .params
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .into(),
+                detail: input.to_string(),
+                reason: Some("The user declined this tool call".into()),
+            });
+            if s.permission_state.denials.len() > 100 {
+                s.permission_state.denials.remove(0);
+            }
+        }
         if let Some(pending) = s.pending.iter_mut().find(|p| &p.id == request) {
             pending.responded = true;
         }
@@ -384,6 +426,7 @@ fn send(
         }
     }
     store.update(id, |s| {
+        s.permission_state.claude_turn_attempted=true;
         s.entries.retain(|entry| !(entry.kind == "awaiting connection" && entry.text == prompt.text()));
         s.entries.push(Entry { id: message_id.clone(), kind: "sending".into(), text: prompt.text().into(),
             data: json!({"prompt":prompt,"attachments":prompt.attachments(),"difuSteeringTurn":s.turn_id}).into(), ..Entry::default() });
@@ -420,6 +463,25 @@ fn command(
 ) -> Result<()> {
     let session = store.get(id)?;
     match control {
+        Control::DecideClaudePlan { request, choice } => {
+            plan_control::decide(store, id, rpc, &request, choice, cancel)?
+        }
+        Control::DecidePlan { .. } => {
+            anyhow::bail!("This plan action belongs to a Codex conversation")
+        }
+        Control::Permissions { action, response } => {
+            let result = permissions_control::execute(store, id, rpc, action, cancel)
+                .and_then(|mut snapshot| {
+                    permissions_control::reload(store, id, rpc, decoder, cancel)?;
+                    let current = store.get(id)?;
+                    snapshot.active_mode = current.permission_state.mode;
+                    snapshot.pending_mode = current.permission_state.pending_mode;
+                    snapshot.reload_pending = current.permission_state.reload_pending;
+                    Ok(snapshot)
+                })
+                .map_err(|e| format!("{e:#}"));
+            let _ = response.send(result);
+        }
         Control::Mcp { action, response } => {
             let snapshot =
                 mcp_control::execute(store, id, rpc, action, cancel).map_err(|e| format!("{e:#}"));
@@ -431,9 +493,20 @@ fn command(
             ));
         }
         Control::ReadUsage => {
-            let usage = rpc.call(json!({"subtype":"get_usage"}), cancel, |frame| {
-                mcp(store, id, frame)
+            store.update(id, |s| {
+                super::permissions::audit(
+                    &mut s.permission_state,
+                    super::permissions::PermissionEventKind::ControlRequested,
+                    None,
+                    None,
+                    Some("ReadUsage"),
+                )
             })?;
+            store.save(id)?;
+            let usage =
+                rpc.call_preserving_requests(json!({"subtype":"get_usage"}), cancel, |frame| {
+                    mcp(store, id, frame)
+                })?;
             store.update(id, |s| s.usage = usage)?;
         }
 
@@ -527,7 +600,39 @@ fn command(
         }
         Control::Interrupt | Control::InterruptAndSend => {
             let send_next = matches!(control, Control::InterruptAndSend);
-            rpc.call(json!({"subtype":"interrupt"}), cancel, |frame| {
+            decoder.interrupting(&session, send_next);
+            store.update(id, |s| {
+                let name = if send_next {
+                    "InterruptAndSend"
+                } else {
+                    "Interrupt"
+                };
+                let requests = session
+                    .pending
+                    .iter()
+                    .filter(|p| p.params.get("claudeInput").is_some())
+                    .collect::<Vec<_>>();
+                if requests.is_empty() {
+                    super::permissions::audit(
+                        &mut s.permission_state,
+                        super::permissions::PermissionEventKind::InterruptRequested,
+                        None,
+                        None,
+                        Some(name),
+                    );
+                }
+                for pending in requests {
+                    super::permissions::audit(
+                        &mut s.permission_state,
+                        super::permissions::PermissionEventKind::InterruptRequested,
+                        Some(&pending.id),
+                        pending.params.get("tool").and_then(Value::as_str),
+                        Some(name),
+                    );
+                }
+            })?;
+            store.save(id)?;
+            rpc.call_preserving_requests(json!({"subtype":"interrupt"}), cancel, |frame| {
                 mcp(store, id, frame)
             })?;
             store.update(id, |s| {
@@ -610,6 +715,40 @@ pub(super) fn instructions(session: &Session) -> String {
 }
 
 fn connect(store: &Store, id: &str, session: &Session, cancel: &Cancel) -> Result<Connection> {
+    let state = &session.permission_state;
+    ensure!(
+        session.thread_id.is_some()
+            || (!state.claude_turn_attempted && !state.claude_turn_acknowledged),
+        "Claude's native conversation ID is unknown after a sent request; the conversation was retained and no prompt was replayed"
+    );
+    let known_empty = state.claude_session_started
+        && !state.claude_turn_attempted
+        && !state.claude_turn_acknowledged;
+    let resume = if known_empty {
+        None
+    } else {
+        session.thread_id.as_deref()
+    };
+    match connect_once(store, id, session, resume, cancel) {
+        Err(error)
+            if resume.is_some()
+                && error
+                    .downcast_ref::<protocol::MissingConversation>()
+                    .is_some_and(|missing| Some(missing.0.as_str()) == resume)
+                && super::permissions::legacy_empty(session) =>
+        {
+            connect_once(store, id, session, None, cancel)
+        }
+        result => result,
+    }
+}
+fn connect_once(
+    store: &Store,
+    id: &str,
+    session: &Session,
+    resume: Option<&str>,
+    cancel: &Cancel,
+) -> Result<Connection> {
     let instructions = instructions(session);
     let mut rpc = Connection::open(
         Options {
@@ -632,17 +771,54 @@ fn connect(store: &Store, id: &str, session: &Session, cancel: &Cancel) -> Resul
                     None
                 }
             }),
-            resume: session.thread_id.as_deref(),
+            resume,
             instructions: &instructions,
             mode: Mode::Session,
+            permission_mode: session
+                .permission_state
+                .pending_mode
+                .as_deref()
+                .or(session.permission_state.mode.as_deref()),
+            allow_bypass: session.permission_state.bypass_enabled,
+            settings: Some(&session.permission_state.claude_settings),
         },
         cancel,
     )?;
-    rpc.call(json!({"subtype":"initialize"}), cancel, |frame| {
+    let initialized = rpc.call(json!({"subtype":"initialize"}), cancel, |frame| {
         mcp(store, id, frame)
     })?;
+    let observed = initialized
+        .get("current_permission_mode")
+        .and_then(Value::as_str)
+        .map(String::from);
+    if let Some(requested) = session.permission_state.pending_mode.as_deref() {
+        ensure!(
+            observed.as_deref() == Some(requested),
+            "Claude did not confirm requested mode {requested}"
+        );
+    }
     store.update(id, |s| {
+        if resume.is_none() {
+            s.thread_id = None;
+        }
+        s.permission_state.claude_session_started = true;
+        if resume.is_some() {
+            s.permission_state.claude_turn_acknowledged = true;
+        }
+        if let Some(mode) = observed {
+            s.permission_state.mode = Some(mode.clone());
+            s.permission_state.pending_mode = None;
+            s.permissions = json!({"provider":"Claude Code","permissionMode":mode});
+            if mode == "bypassPermissions" {
+                s.permission_state.bypass_enabled = true;
+            }
+            if mode == "auto" {
+                super::permissions::set_capability(&mut s.permission_state, "auto", json!(true));
+            }
+        }
+        s.permission_state.reload_pending = false;
         s.status = Status::Idle;
+        s.error = None;
         s.artifact_tools = true;
         s.registration_tools = true;
         s.question_tools = true;
@@ -829,6 +1005,7 @@ pub(super) fn run(
         if store.inspect(id, |s| !s.registration_requests.is_empty())? {
             transition(store, id, &mut rpc, &mut decoder, &controls, cancel)?;
         }
+        permissions_control::reload(store, id, &mut rpc, &mut decoder, cancel)?;
         send_queued(store, id, &mut rpc, &mut decoder)?;
     }
     store.save(id)
@@ -846,6 +1023,9 @@ pub(super) fn skills(cwd: &std::path::Path) -> Result<Reply> {
             resume: None,
             instructions: "",
             mode: Mode::Commands,
+            permission_mode: None,
+            allow_bypass: false,
+            settings: None,
         },
         &cancel,
     )?;

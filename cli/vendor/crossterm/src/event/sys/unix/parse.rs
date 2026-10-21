@@ -74,7 +74,16 @@ pub(crate) fn parse_event(
                         }
                     }
                     b'[' => parse_csi(buffer),
-                    b'\x1B' => Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into())))),
+                    // A Meta-prefixed CSI/SS3 sequence starts with two Esc bytes.
+                    // Keep that prefix until the rest is available; recurse below
+                    // once it is complete so the key receives the Alt modifier.
+                    b'\x1B' if buffer.len() == 2 => {
+                        if input_available {
+                            Ok(None)
+                        } else {
+                            Ok(Some(InternalEvent::Event(Event::Key(KeyCode::Esc.into()))))
+                        }
+                    }
                     _ => parse_event(&buffer[1..], input_available).map(|event_option| {
                         event_option.map(|event| {
                             if let InternalEvent::Event(Event::Key(key_event)) = event {

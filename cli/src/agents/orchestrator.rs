@@ -182,7 +182,10 @@ pub(super) fn handle(store: &Store, caller: &str, args: &Value) -> Result<Value>
                 ensure!(
                     !matches!(
                         control,
-                        Control::Respond { .. } | Control::AnswerQuestion { .. }
+                        Control::Respond { .. }
+                            | Control::AnswerQuestion { .. }
+                            | Control::DecidePlan { .. }
+                            | Control::DecideClaudePlan { .. }
                     ),
                     "The user must answer questions and permissions directly"
                 );
@@ -270,6 +273,62 @@ fn required(args: &Value, key: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn plan_choices_require_the_user_and_cannot_be_delegated() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let mut caller = Session::new(
+            "manager".into(),
+            Job::Coding(Launch {
+                repository: home.path().into(),
+                isolated: false,
+                base: String::new(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        caller.orchestrator = true;
+        let store = Store::fixture(home.path().into(), vec![caller]);
+        for choice in [
+            super::super::plan::Choice::Implement,
+            super::super::plan::Choice::FreshContext,
+            super::super::plan::Choice::ContinuePlanning,
+        ] {
+            let control = Control::DecidePlan {
+                plan_id: "approved-only-by-user".into(),
+                choice,
+            };
+            let error = handle(
+                &store,
+                "manager",
+                &json!({"action":"control","id":"other-session","control":control}),
+            )
+            .err()
+            .context("Agent must not approve a plan")?;
+            assert!(error.to_string().contains("user must answer"));
+        }
+        for choice in [
+            super::super::plan::ClaudeChoice::Auto,
+            super::super::plan::ClaudeChoice::Manual,
+            super::super::plan::ClaudeChoice::Feedback {
+                text: "change it".into(),
+            },
+        ] {
+            let control = Control::DecideClaudePlan {
+                request: json!("exit-plan"),
+                choice,
+            };
+            let error = handle(
+                &store,
+                "manager",
+                &json!({"action":"control","id":"other-session","control":control}),
+            )
+            .err()
+            .context("Agent must not decide a Claude plan")?;
+            assert!(error.to_string().contains("user must answer"));
+        }
+        Ok(())
+    }
     #[test]
     fn session_management_is_exposed_only_to_the_orchestrator() {
         let mut session = Session::new(

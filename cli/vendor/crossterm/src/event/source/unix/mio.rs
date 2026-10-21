@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, io, time::Duration};
+use std::{
+    collections::VecDeque,
+    io,
+    time::{Duration, Instant},
+};
 
 use mio::{unix::SourceFd, Events, Interest, Poll, Token};
 use signal_hook_mio::v1_0::Signals;
@@ -20,6 +24,8 @@ const WAKE_TOKEN: Token = Token(2);
 // reading on macOS/Linux -> we don't need bigger buffer and 1k of bytes
 // is enough.
 const TTY_BUFFER_SIZE: usize = 1_024;
+// Resolve a real Esc promptly while allowing its terminal sequence to span reads.
+const ESCAPE_GRACE: Duration = Duration::from_millis(25);
 
 pub(crate) struct UnixInternalEventSource {
     poll: Poll,
@@ -73,7 +79,12 @@ impl EventSource for UnixInternalEventSource {
         let timeout = PollTimeout::new(timeout);
 
         loop {
-            if let Err(e) = self.poll.poll(&mut self.events, timeout.leftover()) {
+            let wait = match (timeout.leftover(), self.parser.escape_leftover()) {
+                (Some(caller), Some(escape)) => Some(caller.min(escape)),
+                (None, Some(escape)) => Some(escape),
+                (caller, None) => caller,
+            };
+            if let Err(e) = self.poll.poll(&mut self.events, wait) {
                 // Mio will throw an interrupted error in case of cursor position retrieval. We need to retry until it succeeds.
                 // Previous versions of Mio (< 0.7) would automatically retry the poll call if it was interrupted (if EINTR was returned).
                 // https://docs.rs/mio/0.7.0/mio/struct.Poll.html#notes
@@ -85,14 +96,20 @@ impl EventSource for UnixInternalEventSource {
             };
 
             if self.events.is_empty() {
-                // No readiness events = timeout
-                return Ok(None);
+                if let Some(event) = self.parser.next() {
+                    return Ok(Some(event));
+                }
+                if timeout.elapsed() {
+                    return Ok(None);
+                }
+                continue;
             }
 
             for token in self.events.iter().map(|x| x.token()) {
                 match token {
                     TTY_TOKEN => {
                         loop {
+                            let short_read;
                             match self.tty_fd.read(&mut self.tty_buffer) {
                                 // A closed tty remains readable. Retrying EOF
                                 // would trap the caller inside this loop forever.
@@ -103,6 +120,7 @@ impl EventSource for UnixInternalEventSource {
                                     ));
                                 }
                                 Ok(read_count) => {
+                                    short_read = read_count < TTY_BUFFER_SIZE;
                                     if read_count > 0 {
                                         self.parser.advance(
                                             &self.tty_buffer[..read_count],
@@ -125,6 +143,12 @@ impl EventSource for UnixInternalEventSource {
 
                             if let Some(event) = self.parser.next() {
                                 return Ok(Some(event));
+                            }
+                            // stdin can be blocking. After consuming the available
+                            // bytes of an incomplete sequence, wait through mio so
+                            // the grace/caller deadline can expire.
+                            if short_read {
+                                break;
                             }
                         }
                     }
@@ -177,6 +201,7 @@ impl EventSource for UnixInternalEventSource {
 struct Parser {
     buffer: Vec<u8>,
     internal_events: VecDeque<InternalEvent>,
+    escape_started: Option<Instant>,
 }
 
 impl Default for Parser {
@@ -199,21 +224,30 @@ impl Default for Parser {
             // method implementation, all events are consumed before the next TTY_BUFFER
             // is processed -> events pushed.
             internal_events: VecDeque::with_capacity(128),
+            escape_started: None,
         }
     }
 }
 
 impl Parser {
     fn advance(&mut self, buffer: &[u8], more: bool) {
+        self.expire_escape();
         for (idx, byte) in buffer.iter().enumerate() {
             let more = idx + 1 < buffer.len() || more;
 
             self.buffer.push(*byte);
+            let escape_prefix = self.buffer == b"\x1B" || self.buffer == b"\x1B\x1B";
+            if escape_prefix {
+                self.escape_started.get_or_insert_with(Instant::now);
+            } else {
+                self.escape_started = None;
+            }
 
-            match parse_event(&self.buffer, more) {
+            match parse_event(&self.buffer, more || escape_prefix) {
                 Ok(Some(ie)) => {
                     self.internal_events.push_back(ie);
                     self.buffer.clear();
+                    self.escape_started = None;
                 }
                 Ok(None) => {
                     // Event can't be parsed, because we don't have enough bytes for
@@ -223,8 +257,22 @@ impl Parser {
                     // Event can't be parsed (not enough parameters, parameter is not a number, ...).
                     // Clear the buffer and continue with another sequence.
                     self.buffer.clear();
+                    self.escape_started = None;
                 }
             }
+        }
+    }
+    fn escape_leftover(&self) -> Option<Duration> {
+        self.escape_started
+            .map(|start| ESCAPE_GRACE.saturating_sub(start.elapsed()))
+    }
+    fn expire_escape(&mut self) {
+        if self.escape_leftover() == Some(Duration::ZERO) {
+            if let Ok(Some(event)) = parse_event(&self.buffer, false) {
+                self.internal_events.push_back(event);
+            }
+            self.buffer.clear();
+            self.escape_started = None;
         }
     }
 }
@@ -233,6 +281,7 @@ impl Iterator for Parser {
     type Item = InternalEvent;
 
     fn next(&mut self) -> Option<Self::Item> {
+        self.expire_escape();
         self.internal_events.pop_front()
     }
 }

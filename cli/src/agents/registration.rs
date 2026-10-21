@@ -113,6 +113,9 @@ pub(super) fn prepare(session: &Session, args: &Value, cancel: &Cancel) -> Resul
     })
 }
 pub(super) fn apply(session: &mut Session, prepared: &Prepared) {
+    if session.workspace.as_ref() != Some(&prepared.workspace.path) {
+        super::plan::invalidate(session);
+    }
     if let Some(path) = &session.workspace {
         let previous = Workspace {
             path: path.clone(),

@@ -25,6 +25,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("status", "Show session, workspace and permissions"),
     ("rules", "Edit repository rules for new sessions"),
     ("mcp", "Manage MCP servers, connections and tools"),
+    (
+        "permissions",
+        "Manage provider modes, approval policies and permissions",
+    ),
     ("usage", "Show provider usage and rate limits"),
     ("diff", "Show current session changes"),
     ("new", "Launch a new coding session"),
@@ -393,6 +397,7 @@ impl Ui {
             "/rules" => self.open_rules(None),
             "/usage" => self.open_usage(),
             "/mcp" => self.open_mcp(),
+            "/permissions" => self.open_permissions(),
             "/worktree" => {
                 self.modal = Some(Modal::Commands {
                     query: Editor::from("worktree "),

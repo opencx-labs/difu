@@ -93,6 +93,6 @@ pub(super) fn transition(
         &Prompt::from(registry::continuation(&session)),
         false,
         cancel,
-        true,
+        TurnKind::Internal,
     )
 }

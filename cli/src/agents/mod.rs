@@ -10,6 +10,8 @@ pub mod mcp;
 pub mod media;
 mod orchestrator;
 mod peers;
+pub mod permissions;
+pub mod plan;
 pub(crate) mod pr_cache;
 pub mod provider;
 mod questions;
@@ -316,8 +318,14 @@ pub struct Session {
     pub usage: Value,
     #[serde(default)]
     pub completed_turn: Option<String>,
+    #[serde(default)]
+    pub plan_prompt: Option<plan::Proposal>,
+    #[serde(default)]
+    pub plan_handled: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    #[serde(default)]
+    pub permission_state: permissions::State,
     pub permissions: Value,
     #[serde(default)]
     pub artifacts: Vec<artifacts::Artifact>,
@@ -403,8 +411,11 @@ impl Session {
             token_usage: Value::Null,
             usage: Value::Null,
             completed_turn: None,
+            plan_prompt: None,
+            plan_handled: None,
             model,
             effort,
+            permission_state: permissions::State::default(),
             permissions: Value::Null,
             artifacts: Vec::new(),
             artifact_tools: false,
@@ -695,6 +706,19 @@ pub enum VoiceAction {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Control {
+    DecideClaudePlan {
+        request: Value,
+        choice: plan::ClaudeChoice,
+    },
+    DecidePlan {
+        plan_id: String,
+        choice: plan::Choice,
+    },
+    #[serde(skip)]
+    Permissions {
+        action: permissions::Action,
+        response: std::sync::mpsc::Sender<Result<permissions::Snapshot, String>>,
+    },
     #[serde(skip)]
     Mcp {
         action: mcp::Action,
@@ -746,6 +770,10 @@ pub enum Control {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
+    Permissions {
+        id: String,
+        action: permissions::Action,
+    },
     Mcp {
         id: String,
         action: mcp::Action,
@@ -847,6 +875,9 @@ pub enum Request {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
+    Permissions {
+        snapshot: permissions::Snapshot,
+    },
     Mcp(mcp::Snapshot),
     /// The WebRTC answer for `VoiceAction::Start`.
     Voice(Option<String>),

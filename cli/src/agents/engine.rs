@@ -1,5 +1,7 @@
 mod isolation;
 mod mcp_control;
+mod permissions_control;
+mod plan_control;
 mod registration;
 use super::{
     Control, Entry, Job, Pending, Prompt, Reply, Session, Skill, Status,
@@ -23,6 +25,32 @@ struct Connection {
     output: mpsc::Receiver<Result<Value, String>>,
     next: u64,
     inherited: String,
+    needs_resume: bool,
+}
+#[derive(Debug)]
+struct RpcError {
+    code: Option<i64>,
+    method: String,
+    detail: Value,
+}
+impl std::fmt::Display for RpcError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Codex {}: {}", self.method, self.detail)
+    }
+}
+impl std::error::Error for RpcError {}
+impl RpcError {
+    fn missing_thread(&self) -> bool {
+        self.method == "thread/resume"
+            && self
+                .detail
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| {
+                    message == "no rollout found"
+                        || message.starts_with("no rollout found for thread ")
+                })
+    }
 }
 impl Connection {
     fn open(cwd: &Path, cancel: &Cancel) -> Result<Self> {
@@ -56,6 +84,7 @@ impl Connection {
             output: receiver,
             next: 1,
             inherited: String::new(),
+            needs_resume: false,
         })
     }
     fn write(&mut self, value: Value) -> Result<()> {
@@ -85,7 +114,12 @@ impl Connection {
                 Ok(Ok(value)) if value.get("method").is_some() => event(value)?,
                 Ok(Ok(value)) if value.get("id").and_then(Value::as_u64) == Some(id) => {
                     if let Some(error) = value.get("error") {
-                        anyhow::bail!("Codex {method}: {error}");
+                        return Err(RpcError {
+                            code: error.get("code").and_then(Value::as_i64),
+                            method: method.into(),
+                            detail: error.clone(),
+                        }
+                        .into());
                     }
                     return value
                         .get("result")
@@ -176,7 +210,7 @@ fn item_text(item: &Value) -> String {
         .and_then(Value::as_str)
         .unwrap_or("activity");
     match kind {
-        "agentMessage" => string(item, "text"),
+        "agentMessage" | "plan" => string(item, "text"),
         "dynamicToolCall"
             if matches!(
                 item.get("tool").and_then(Value::as_str),
@@ -248,6 +282,11 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
         .and_then(Value::as_str)
         .unwrap_or_default();
     let params = event.get("params").unwrap_or(&Value::Null);
+    if matches!(method, "item/started" | "item/completed")
+        && params.pointer("/item/type").and_then(Value::as_str) == Some("userMessage")
+    {
+        session.permission_state.codex_rollout = true;
+    }
     if let Some(id) = event.get("id") {
         let tool = params.get("tool").and_then(Value::as_str);
         if method == "item/tool/call"
@@ -339,7 +378,26 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
         return;
     }
     match method {
+        "thread/settings/updated" => {
+            if params.get("threadId").and_then(Value::as_str) == session.thread_id.as_deref()
+                && let Some(mode) = params
+                    .pointer("/threadSettings/collaborationMode/mode")
+                    .and_then(Value::as_str)
+                && session
+                    .permission_state
+                    .pending_mode
+                    .as_deref()
+                    .is_none_or(|pending| pending == mode)
+            {
+                session.permission_state.mode = Some(mode.into());
+                session.permission_state.pending_mode = None;
+                if mode != "plan" {
+                    super::plan::invalidate(session);
+                }
+            }
+        }
         "turn/started" => {
+            super::plan::invalidate(session);
             session.turn_started_at = Some(chrono::Utc::now().timestamp_millis());
             session.turn_id = params
                 .pointer("/turn/id")
@@ -348,6 +406,7 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
             session.status = Status::Running;
         }
         "turn/completed" => {
+            super::plan::completed(session, params);
             session.completed_turn = params
                 .pointer("/turn/id")
                 .and_then(Value::as_str)
@@ -503,7 +562,23 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                     if !user_message {
                         entry.text = text.into();
                     }
-                    entry.replace_data(item.clone());
+                    let mut data = item.clone();
+                    if entry.kind == "plan"
+                        && let Some(object) = data.as_object_mut()
+                    {
+                        for key in [
+                            "difuPlanObserved",
+                            "difuPlanThread",
+                            "difuPlanTurn",
+                            "difuPlanSucceeded",
+                            "difuPlanLegacySucceeded",
+                        ] {
+                            if let Some(value) = entry.data.get(key) {
+                                object.insert(key.into(), value.clone());
+                            }
+                        }
+                    }
+                    entry.replace_data(data);
                     if method == "item/completed" {
                         entry.finished_at = Some(chrono::Utc::now().timestamp_millis());
                     }
@@ -527,15 +602,24 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                 {
                     data.insert("difuVoiceHandoff".into(), json!(true));
                 }
+                if method == "item/completed" {
+                    super::plan::associate(session, params);
+                }
             }
         }
         "item/agentMessage/delta"
+        | "item/plan/delta"
         | "item/commandExecution/outputDelta"
         | "item/reasoning/summaryTextDelta" => {
             let id = string(params, "itemId");
             let delta = string(params, "delta");
             if let Some(entry) = session.entries.iter_mut().find(|e| e.id == id) {
                 entry.text.push_str(&delta);
+                if method == "item/plan/delta"
+                    && let Some(data) = entry.data.as_object_mut()
+                {
+                    data.insert("text".into(), json!(entry.text.as_str()));
+                }
             }
         }
         "error" => {
@@ -576,6 +660,7 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
     if matches!(method, "item/started" | "item/completed") {
         session.restore_async_questions();
     }
+    super::plan::reconcile(session);
 }
 fn event(store: &Store, id: &str, value: Value) -> Result<()> {
     store.update(id, |s| apply_event(s, &value))
@@ -619,7 +704,12 @@ fn start_turn(
     steer: bool,
     cancel: &Cancel,
 ) -> Result<()> {
-    send_turn(rpc, store, id, prompt, steer, cancel, false)
+    send_turn(rpc, store, id, prompt, steer, cancel, TurnKind::User)
+}
+enum TurnKind<'a> {
+    User,
+    Internal,
+    ApprovedPlan(&'a str),
 }
 fn send_turn(
     rpc: &mut Connection,
@@ -628,13 +718,26 @@ fn send_turn(
     prompt: &Prompt,
     steer: bool,
     cancel: &Cancel,
-    internal: bool,
+    kind: TurnKind<'_>,
 ) -> Result<()> {
+    store.update(id, super::plan::invalidate)?;
+    if !steer {
+        permissions_control::apply_preset(rpc, store, id, cancel)?;
+    }
     let text = prompt.text();
+    let internal = matches!(kind, TurnKind::Internal);
+    let displayed = match kind {
+        TurnKind::ApprovedPlan(caption) => caption,
+        _ => text,
+    };
     if let Prompt::Routed { origin, .. } = prompt {
         store.update(id, |s| s.set_slack_route(origin.clone()))?;
     }
     let session = store.get(id)?;
+    ensure!(
+        steer || session.permission_state.pending_preset.is_none(),
+        "Codex has not confirmed the requested permission preset; no prompt was sent"
+    );
     let thread = session
         .thread_id
         .as_ref()
@@ -702,12 +805,18 @@ fn send_turn(
         if let Some(effort) = &session.effort {
             put(&mut params, "effort", json!(effort))?;
         }
+        if let Some(mode) = permissions_control::collaboration(&session)? {
+            put(&mut params, "collaborationMode", mode)?;
+        }
         "turn/start"
     };
     // Store intent before sending: a lost reply must never trigger automatic replay.
     let mut sending_id = None;
     store.update(id, |s| {
         if !steer {
+            // A lost acknowledgement can leave a real native conversation behind.
+            // Persist this before writing turn/start so reconnect never replaces it.
+            s.permission_state.codex_turn_attempted = true;
             s.status = Status::Starting;
             s.error = None;
         }
@@ -725,7 +834,7 @@ fn send_turn(
             } else {
                 "sending"
             },
-            text,
+            displayed,
         );
         if let Some(entry) = s.entries.last_mut() {
             sending_id = Some(entry.id.clone());
@@ -739,6 +848,9 @@ fn send_turn(
     let result = rpc.call(method, params, cancel, |v| event(store, id, v));
     match result {
         Ok(response) => {
+            if !steer {
+                store.update(id, |s| s.permission_state.codex_rollout = true)?;
+            }
             store.update(id, |s| {
                 // Steering may be acknowledged without a userMessage event.
                 // Record accepted user input immediately; never promote failed sends.
@@ -773,11 +885,11 @@ fn send_turn(
                     .entries
                     .iter_mut()
                     .rev()
-                    .find(|e| e.kind == "sending" && e.text == text)
+                    .find(|e| Some(&e.id) == sending_id.as_ref())
                 {
                     entry.kind = "unsent or unacknowledged".into();
                 } else {
-                    s.note("unsent or unacknowledged", text);
+                    s.note("unsent or unacknowledged", displayed);
                 }
             })?;
             Err(error)
@@ -796,16 +908,10 @@ fn resume_thread(
         session.turn_id.is_none(),
         "The turn is still active; wait for interruption to complete"
     );
-    let mut params = json!({"threadId":session.thread_id,"cwd":session.workspace,"developerInstructions":format!("{}\n\n{}", rpc.inherited, instructions(session))});
-    if let Some(model) = &session.model {
-        put(
-            &mut params,
-            "model",
-            json!(super::provider::Provider::native_model(model)),
-        )?;
-    }
-    isolation::settings(&mut params, session)?;
-    rpc.call("thread/resume", params, cancel, |v| event(store, id, v))?;
+    let params = permissions_control::resume_params(rpc, session, false)?;
+    let response = rpc.call("thread/resume", params, cancel, |v| event(store, id, v))?;
+    rpc.needs_resume = false;
+    permissions_control::record_policy_preserving_pending(store, id, &response)?;
     Ok(())
 }
 
@@ -818,6 +924,17 @@ fn command(
 ) -> Result<()> {
     let session = store.get(id)?;
     match control {
+        Control::DecideClaudePlan { .. } => {
+            anyhow::bail!("This plan request belongs to a Claude conversation")
+        }
+        Control::DecidePlan { plan_id, choice } => {
+            plan_control::decide(rpc, store, id, &plan_id, choice, cancel)?;
+        }
+        Control::Permissions { action, response } => {
+            let result = permissions_control::execute(rpc, store, id, action, cancel)
+                .map_err(|e| format!("{e:#}"));
+            let _ = response.send(result);
+        }
         Control::Mcp { action, response } => {
             let snapshot =
                 mcp_control::execute(rpc, store, id, action, cancel).map_err(|e| format!("{e:#}"));
@@ -846,6 +963,8 @@ fn command(
             attachments,
         } => {
             ensure!(!text.trim().is_empty(), "Message cannot be empty");
+            store.update(id, super::plan::invalidate)?;
+            store.save(id)?;
             if matches!(session.status, Status::Interrupted | Status::Failed) {
                 resume_thread(rpc, store, id, &session, cancel)?;
             }
@@ -1151,7 +1270,7 @@ fn command(
                 "Interrupt or finish the active turn before changing its model"
             );
             // Server validates these settings on thread/resume before persisting them.
-            let mut params = json!({"threadId":session.thread_id,"cwd":session.workspace,"developerInstructions":format!("{}\n\n{}", rpc.inherited, instructions(&session))});
+            let mut params = permissions_control::resume_params(rpc, &session, false)?;
             if let Some(model) = &model {
                 put(
                     &mut params,
@@ -1166,8 +1285,9 @@ fn command(
                     json!({"model_reasoning_effort":effort}),
                 )?;
             }
-            isolation::settings(&mut params, &session)?;
-            let result = rpc.call("thread/resume", params, cancel, |v| event(store, id, v))?;
+            permissions_control::selected_policy(&mut params, &session, false)?;
+            let result = permissions_control::reload_idle(rpc, store, id, params, cancel)?;
+            permissions_control::record_policy_preserving_pending(store, id, &result)?;
             store.update(id, |s| {
                 s.model = result
                     .get("model")
@@ -1393,6 +1513,8 @@ fn instructions(session: &Session) -> String {
     }
 }
 fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool)> {
+    // Capture a legacy turn's durable outcome before reconnect resets live status.
+    store.update(id, super::plan::preserve_legacy_outcome)?;
     if store.get(id)?.thread_id.is_none() {
         store.update(id, |s| {
             s.artifact_tools = true;
@@ -1419,9 +1541,14 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_owned();
-    let resuming = session.thread_id.is_some();
+    // Empty native threads have no durable rollout. Recreate only a known empty
+    // thread; an acknowledged conversation must always resume its original ID.
+    let mut resuming = session.thread_id.is_some()
+        && (session.permission_state.codex_rollout
+            || session.permission_state.codex_turn_attempted
+            || !session.permission_state.codex_thread_started);
     let mut params = json!({"cwd":cwd,"runtimeWorkspaceRoots":[cwd],"developerInstructions":format!("{}\n\n{}", rpc.inherited, instructions(&session))});
-    if let Some(thread) = &session.thread_id {
+    if resuming && let Some(thread) = &session.thread_id {
         put(&mut params, "threadId", json!(thread))?;
     }
     let Job::Coding(launch) = &session.job else {
@@ -1453,16 +1580,50 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
     if resuming {
         isolation::settings(&mut params, &session)?;
     }
+    permissions_control::selected_policy(&mut params, &session, true)?;
     let response = rpc.call(
         if resuming {
             "thread/resume"
         } else {
             "thread/start"
         },
-        params,
+        params.clone(),
         cancel,
         |v| event(store, id, v),
-    )?;
+    );
+    let mut response = match response {
+        Err(error)
+            if resuming
+                && error
+                    .downcast_ref::<RpcError>()
+                    .is_some_and(RpcError::missing_thread)
+                && super::permissions::legacy_empty(&session) =>
+        {
+            resuming = false;
+            if let Some(object) = params.as_object_mut() {
+                object.remove("threadId");
+            }
+            store.update(id, |s| {
+                s.artifact_tools = true;
+                s.registration_tools = true;
+                s.question_tools = true;
+                s.peer_tools = true;
+            })?;
+            let fresh = store.get(id)?;
+            put(
+                &mut params,
+                "developerInstructions",
+                json!(format!("{}\n\n{}", rpc.inherited, instructions(&fresh))),
+            )?;
+            let mut tools = super::orchestrator::tools(&fresh);
+            if !session.native_setup && session.deferred_workspace && launch.isolated {
+                tools.extend(isolation::tools().as_array().cloned().unwrap_or_default());
+            }
+            put(&mut params, "dynamicTools", json!(tools))?;
+            rpc.call("thread/start", params, cancel, |v| event(store, id, v))?
+        }
+        result => result?,
+    };
     if session.waiting_for_workspace() && resuming {
         ensure!(
             response.pointer("/sandbox/type").and_then(Value::as_str) == Some("readOnly"),
@@ -1478,20 +1639,37 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
         if s.deferred_workspace && s.inherited_permissions.is_null() {
             s.inherited_permissions = json!({"sandbox":response.get("sandbox"),"approvalPolicy":response.get("approvalPolicy"),"approvalsReviewer":response.get("approvalsReviewer")});
         }
+        if resuming && !session.permission_state.codex_thread_started {s.permission_state.codex_rollout=true;}
+        s.permission_state.codex_thread_started=true;
+        s.permission_state.pending_mode=None;
+        if !resuming {s.permission_state.mode=Some("default".into());}
+        if response.pointer("/thread/turns").and_then(Value::as_array).is_some_and(|turns|!turns.is_empty()) {s.permission_state.codex_rollout=true;}
         s.thread_id = Some(thread_id); s.model = response.get("model").and_then(Value::as_str).map(String::from);
         s.effort = response.get("reasoningEffort").and_then(Value::as_str).map(String::from);
         s.permissions = json!({"sandbox":response.get("sandbox"),"approvalPolicy":response.get("approvalPolicy"),"approvalsReviewer":response.get("approvalsReviewer")});
         if let Some(turns) = response.pointer("/thread/turns").and_then(Value::as_array) {
             for turn in turns {
                 if let Some(items) = turn.get("items").and_then(Value::as_array) {
-                    for item in items { apply_event(s, &json!({"method":"item/completed","params":{"item":item}})); }
+                    for item in items { apply_event(s, &json!({"method":"item/completed","params":{"item":item,"difuRestored":true}})); }
                 }
             }
         }
         s.status = Status::Idle;
+        s.error = None;
         // A new Codex connection never carries an earlier voice connection.
         s.voice = false;
     })?;
+    permissions_control::record_policy(store, id, &response)?;
+    permissions_control::capabilities(&mut rpc, store, id, cancel)?;
+    permissions_control::restore_mode(
+        &mut rpc,
+        store,
+        id,
+        session.permission_state.mode.as_deref(),
+        &mut response,
+        cancel,
+    )?;
+    store.update(id, super::plan::reconcile)?;
     store.save(id)?;
     Ok((rpc, resuming))
 }
@@ -1583,7 +1761,10 @@ pub fn run(
                 changed = true;
                 let read_only = matches!(
                     command_request.control,
-                    Control::RefreshShells | Control::ReadUsage | Control::Mcp { .. }
+                    Control::RefreshShells
+                        | Control::ReadUsage
+                        | Control::Mcp { .. }
+                        | Control::Permissions { .. }
                 );
                 let result = command(&mut rpc, store, id, command_request.control, cancel);
                 if let Err(error) = &result
@@ -2223,6 +2404,56 @@ mod tests {
     }
 
     #[test]
+    fn proposed_plan_streams_text_and_completed_item_is_authoritative() {
+        let mut session = Session::new(
+            "test".into(),
+            Job::Coding(super::super::Launch {
+                repository: ".".into(),
+                isolated: true,
+                base: "HEAD".into(),
+                prompt: "Plan only".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        apply_event(
+            &mut session,
+            &json!({"method":"item/started","params":{"item":{"id":"p","type":"plan","text":""}}}),
+        );
+        apply_event(
+            &mut session,
+            &json!({"method":"item/plan/delta","params":{"itemId":"p","delta":"# Draft\n\n"}}),
+        );
+        apply_event(
+            &mut session,
+            &json!({"method":"item/plan/delta","params":{"itemId":"p","delta":"- Explore"}}),
+        );
+        let entry = session.entries.first();
+        assert_eq!(entry.map(|e| e.text.as_str()), Some("# Draft\n\n- Explore"));
+        assert_eq!(
+            entry
+                .and_then(|e| e.data.get("text"))
+                .and_then(Value::as_str),
+            Some("# Draft\n\n- Explore")
+        );
+        apply_event(
+            &mut session,
+            &json!({"method":"item/completed","params":{"item":{"id":"p","type":"plan","text":"# Final\n\n- Verify first"}}}),
+        );
+        assert_eq!(session.entries.len(), 1);
+        assert_eq!(
+            session.entries.first().map(|e| e.text.as_str()),
+            Some("# Final\n\n- Verify first")
+        );
+        assert!(
+            session
+                .entries
+                .first()
+                .is_some_and(|e| e.finished_at.is_some())
+        );
+    }
+
+    #[test]
     fn approval_and_streaming_lifecycle() {
         let mut session = Session::new(
             "test".into(),
@@ -2275,5 +2506,42 @@ mod tests {
                 .iter()
                 .any(|e| e.kind == "unsent" && e.text == "queued task")
         );
+    }
+    #[test]
+    fn settings_notifications_match_thread_and_do_not_clear_a_newer_mode_target() -> Result<()> {
+        let mut session = Session::new(
+            "settings".into(),
+            Job::Coding(super::super::Launch {
+                repository: "/repo".into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.thread_id = Some("current".into());
+        session.permission_state.mode = Some("default".into());
+        session.permission_state.pending_mode = Some("default".into());
+        apply_event(
+            &mut session,
+            &json!({"method":"thread/settings/updated","params":{"threadId":"current","threadSettings":{"collaborationMode":{"mode":"plan"}}}}),
+        );
+        assert_eq!(session.permission_state.mode.as_deref(), Some("default"));
+        assert_eq!(
+            session.permission_state.pending_mode.as_deref(),
+            Some("default")
+        );
+        apply_event(
+            &mut session,
+            &json!({"method":"thread/settings/updated","params":{"threadId":"other","threadSettings":{"collaborationMode":{"mode":"default"}}}}),
+        );
+        assert!(session.permission_state.pending_mode.is_some());
+        apply_event(
+            &mut session,
+            &json!({"method":"thread/settings/updated","params":{"threadId":"current","threadSettings":{"collaborationMode":{"mode":"default"}}}}),
+        );
+        assert!(session.permission_state.pending_mode.is_none());
+        Ok(())
     }
 }
