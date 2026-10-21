@@ -1,4 +1,6 @@
 //! PR image discovery and bounded downloads. No repository code is executed.
+mod tables;
+
 use crate::{
     model::{PrDetail, PrKey},
     process::{self, Cancel},
@@ -110,7 +112,7 @@ impl Request {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Reference {
     pub range: Range<usize>,
     pub source: String,
@@ -445,6 +447,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph},
 };
 use ratatui_image::{
+    Resize,
     picker::{Picker, ProtocolType},
     sliced::{SignedPosition, SlicedImage, SlicedProtocol},
 };
@@ -462,7 +465,8 @@ pub struct PreviewRow {
 pub struct RenderKey {
     id: String,
     width: u16,
-    height: u16,
+    // Inline previews fill the width; modals fit within both dimensions.
+    height: Option<u16>,
 }
 #[derive(Default)]
 pub struct State {
@@ -470,6 +474,8 @@ pub struct State {
     entries: HashMap<RenderKey, Result<SlicedProtocol, String>>,
     order: VecDeque<RenderKey>,
     pending: HashSet<RenderKey>,
+    // Retain layout measurements when encoded images leave the small LRU cache.
+    heights: HashMap<RenderKey, u16>,
 }
 impl State {
     pub fn detect(&mut self) {
@@ -482,6 +488,11 @@ impl State {
     }
     pub fn receive(&mut self, key: RenderKey, output: Result<SlicedProtocol, String>) {
         self.pending.remove(&key);
+        if key.height.is_none()
+            && let Ok(image) = &output
+        {
+            self.heights.insert(key.clone(), image.size().height);
+        }
         self.entries.insert(key.clone(), output);
         self.order.retain(|k| k != &key);
         self.order.push_back(key);
@@ -491,12 +502,81 @@ impl State {
             }
         }
     }
+    fn preview_height(&self, request: &Request, width: u16) -> u16 {
+        self.heights
+            .get(&RenderKey {
+                id: request.id(),
+                width,
+                height: None,
+            })
+            .copied()
+            .unwrap_or(24)
+    }
 }
 
-pub(crate) fn rows(source: &str, width: usize, pr: &PrDetail, supported: bool) -> Vec<TextRow> {
+pub(crate) fn rows(source: &str, width: usize, pr: &PrDetail, images: &State) -> Vec<TextRow> {
+    let references = references(source);
+    let mut output = Vec::new();
+    let mut end = 0;
+    for table in tables::find(source, &references) {
+        output.extend(fragment_rows(
+            source,
+            end..table.range.start,
+            &references,
+            width,
+            pr,
+            images,
+        ));
+        output.extend(table.rows(width, pr, images));
+        end = table.range.end;
+    }
+    output.extend(fragment_rows(
+        source,
+        end..source.len(),
+        &references,
+        width,
+        pr,
+        images,
+    ));
+    output
+}
+
+fn fragment_rows(
+    source: &str,
+    range: Range<usize>,
+    references: &[Reference],
+    width: usize,
+    pr: &PrDetail,
+    images: &State,
+) -> Vec<TextRow> {
+    let Some(fragment) = source.get(range.clone()) else {
+        return Vec::new();
+    };
+    let references = references
+        .iter()
+        .filter(|reference| {
+            reference.range.start >= range.start && reference.range.end <= range.end
+        })
+        .cloned()
+        .map(|mut reference| {
+            reference.range =
+                (reference.range.start - range.start)..(reference.range.end - range.start);
+            reference
+        })
+        .collect::<Vec<_>>();
+    rows_with_references(fragment, width, pr, images, &references)
+}
+
+fn rows_with_references(
+    source: &str,
+    width: usize,
+    pr: &PrDetail,
+    images: &State,
+    references: &[Reference],
+) -> Vec<TextRow> {
     let mut rows = Vec::new();
     let mut end = 0;
-    for reference in references(source) {
+    for reference in references {
         if reference.range.start < end {
             continue;
         }
@@ -509,7 +589,7 @@ pub(crate) fn rows(source: &str, width: usize, pr: &PrDetail, supported: bool) -
         } else {
             crate::model::clean(&reference.label)
         };
-        let request = Request::new(reference.source, label.clone(), pr);
+        let request = Request::new(reference.source.clone(), label.clone(), pr);
         if let Ok(url) = request.browser_url()
             && matches!(
                 std::path::Path::new(url.path())
@@ -530,16 +610,18 @@ pub(crate) fn rows(source: &str, width: usize, pr: &PrDetail, supported: bool) -
             row.action = Some(Action::Image(request.clone()));
             rows.push(row);
         }
-        if supported {
-            for offset in 0..24 {
+        if images.supported() {
+            let width = u16::try_from(width).unwrap_or(u16::MAX);
+            let height = images.preview_height(&request, width);
+            for offset in 0..height {
                 rows.push(TextRow {
-                    image: Some(PreviewRow {
+                    images: vec![PreviewRow {
                         request: request.clone(),
                         offset,
-                        height: 24,
-                        width: u16::try_from(width).unwrap_or(u16::MAX),
+                        height,
+                        width,
                         inset: 0,
-                    }),
+                    }],
                     action: Some(Action::Image(request.clone())),
                     ..Default::default()
                 });
@@ -562,7 +644,25 @@ pub(crate) fn rows(source: &str, width: usize, pr: &PrDetail, supported: bool) -
     rows
 }
 
-fn request_render(app: &mut App, request: &Request, width: u16, height: u16) -> RenderKey {
+fn inline_size(image: &DynamicImage, picker: &Picker, width: u16) -> Result<Size> {
+    let font = picker.font_size();
+    let pixel_width = u64::from(width) * u64::from(font.width);
+    let pixel_height =
+        (pixel_width * u64::from(image.height())).div_ceil(u64::from(image.width()).max(1));
+    let height = pixel_height.div_ceil(u64::from(font.height).max(1)).max(1);
+    // Keep the encoded image within the existing preview allocation limit and
+    // the pixel/cell dimensions supported by the terminal graphics library.
+    ensure!(
+        pixel_width <= u64::from(u16::MAX)
+            && height * u64::from(font.height) <= u64::from(u16::MAX)
+            && height <= i16::MAX as u64
+            && pixel_width * height * u64::from(font.height) * 4 <= 64 * 1024 * 1024,
+        "Image exceeds the preview rendering limit"
+    );
+    Ok(Size::new(width, height as u16))
+}
+
+fn request_render(app: &mut App, request: &Request, width: u16, height: Option<u16>) -> RenderKey {
     let key = RenderKey {
         id: request.id(),
         width,
@@ -588,8 +688,14 @@ fn request_render(app: &mut App, request: &Request, width: u16, height: u16) -> 
         let output = (|| -> Result<SlicedProtocol> {
             let image = load(&storage, &request, &cancel)?;
             cancel.check()?;
-            SlicedProtocol::new(&picker, image, Some(Size::new(width, height)))
-                .context("Could not render image")
+            match height {
+                Some(height) => SlicedProtocol::new(&picker, image, Some(Size::new(width, height))),
+                None => {
+                    let size = inline_size(&image, &picker, width)?;
+                    SlicedProtocol::new_with_resize(&picker, image, size, Resize::Scale(None))
+                }
+            }
+            .context("Could not render image")
         })()
         .map_err(|error| format!("{error:#}"));
         let _ = tx.send(Message::Image(job_key, output));
@@ -605,13 +711,13 @@ fn paint_image(
     app: &mut App,
     request: &Request,
     rect: Rect,
-    size: Size,
+    height: Option<u16>,
     offset: u16,
 ) {
     if rect.is_empty() {
         return;
     }
-    let key = request_render(app, request, size.width, size.height);
+    let key = request_render(app, request, rect.width, height);
     match app.images.entries.get(&key) {
         Some(Ok(image)) => frame.render_widget(
             SlicedImage::new(image, SignedPosition::from((0, -(offset as i16)))),
@@ -649,37 +755,28 @@ pub(crate) fn draw_inline(
     if app.modal.is_some() {
         return;
     }
-    let mut y = 0;
-    while y < area.height {
-        let Some(preview) = document
-            .rows
-            .get(app.scroll + usize::from(y))
-            .and_then(|r| r.right.image.as_ref())
-        else {
-            y += 1;
+    for y in 0..area.height {
+        let Some(row) = document.rows.get(app.scroll + usize::from(y)) else {
             continue;
         };
-        let height = preview
-            .height
-            .saturating_sub(preview.offset)
-            .min(area.height - y);
-        let rect = Rect::new(
-            area.x.saturating_add(preview.inset),
-            area.y + y,
-            preview.width.min(area.width.saturating_sub(preview.inset)),
-            height,
-        );
-        paint_image(
-            frame,
-            app,
-            &preview.request,
-            rect,
-            Size::new(preview.width, preview.height),
-            preview.offset,
-        );
-        app.hits
-            .push((rect, Action::Image(preview.request.clone())));
-        y = y.saturating_add(height.max(1));
+        for preview in &row.right.images {
+            if y > 0 && preview.offset > 0 {
+                continue;
+            }
+            let height = preview
+                .height
+                .saturating_sub(preview.offset)
+                .min(area.height - y);
+            let rect = Rect::new(
+                area.x.saturating_add(preview.inset),
+                area.y + y,
+                preview.width.min(area.width.saturating_sub(preview.inset)),
+                height,
+            );
+            paint_image(frame, app, &preview.request, rect, None, preview.offset);
+            app.hits
+                .push((rect, Action::Image(preview.request.clone())));
+        }
     }
 }
 pub(crate) fn draw_modal(frame: &mut Frame, app: &mut App) {
@@ -710,14 +807,7 @@ pub(crate) fn draw_modal(frame: &mut Frame, app: &mut App) {
         rect.width.saturating_sub(4),
         rect.height.saturating_sub(4),
     );
-    paint_image(
-        frame,
-        app,
-        &request,
-        inner,
-        Size::new(inner.width, inner.height),
-        0,
-    );
+    paint_image(frame, app, &request, inner, Some(inner.height), 0);
     let footer = Rect::new(inner.x, rect.bottom().saturating_sub(2), inner.width, 1);
     let row = request
         .browser_url()
@@ -802,8 +892,16 @@ mod tests {
 Useful summary text.
 
 </details>"#;
-        let output = rows(source, 80, &pr(), true);
-        assert!(output.iter().all(|row| row.image.is_none()));
+        let output = rows(
+            source,
+            80,
+            &pr(),
+            &State {
+                picker: Some(Picker::halfblocks()),
+                ..Default::default()
+            },
+        );
+        assert!(output.iter().all(|row| row.images.is_empty()));
         assert!(output.iter().any(|row| matches!(&row.action, Some(Action::Link(url)) if url == "https://example.com/badge.svg")));
         let rendered = output
             .iter()
@@ -955,8 +1053,8 @@ Useful summary text.
             Default::default(),
         );
         let pr = pr();
-        let fallback = rows(&pr.body, 80, &pr, false);
-        assert!(!fallback.iter().any(|r| r.image.is_some()));
+        let fallback = rows(&pr.body, 80, &pr, &State::default());
+        assert!(!fallback.iter().any(|r| !r.images.is_empty()));
         assert!(
             fallback.iter().any(
                 |r| matches!(&r.action,Some(Action::Link(url)) if url.contains("/blob/abc123/"))
@@ -989,6 +1087,241 @@ Useful summary text.
         Ok(())
     }
     #[test]
+    fn markdown_and_html_tables_keep_images_and_browser_links_in_their_cells() -> Result<()> {
+        let pr = pr();
+        for source in [
+            "Intro\n\n| Before | After |\n| :--- | ---: |\n| ![Before][before] | <img src='after.png' alt='After'> |\n\nTail\n\n[before]: before.png",
+            "Intro\n\n<table><tr><th>Before</th><th>After</th></tr><tr><td><img src='before.png' alt='Before'></td><td align='right'><img src='after.png' alt='After'></td></tr></table>\n\nTail",
+            "Intro\n\n<table>\n<tr><th>Before</th><th>After</th></tr>\n<tr>\n<td>![Before](before.png)</td>\n<td>![After](after.png)</td>\n</tr>\n</table>\n\nTail",
+        ] {
+            let images = State {
+                picker: Some(Picker::halfblocks()),
+                ..Default::default()
+            };
+            for width in [24, 79] {
+                let output = rows(source, width, &pr, &images);
+                let pair = output
+                    .iter()
+                    .find(|row| row.images.len() == 2)
+                    .context("side-by-side images")?;
+                let [before, after] = pair.images.as_slice() else {
+                    bail!("expected two image cells")
+                };
+                assert_eq!(before.request.source, "before.png");
+                assert_eq!(after.request.source, "after.png");
+                assert_eq!(before.inset, 2);
+                assert_eq!(after.inset, before.inset + before.width + 3);
+                assert_eq!(usize::from(after.inset + after.width) + 2, width);
+                assert!(output.iter().all(|row| {
+                    row.spans
+                        .iter()
+                        .map(ratatui::text::Span::width)
+                        .sum::<usize>()
+                        <= width
+                }));
+                assert!(output.iter().all(|row| {
+                    row.code_links
+                        .iter()
+                        .all(|link| link.column + link.width <= width)
+                }));
+                let rendered = output
+                    .iter()
+                    .flat_map(|row| &row.spans)
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                assert!(rendered.contains("Intro") && rendered.contains("Tail"));
+                assert!(
+                    !rendered.contains("<td")
+                        && !rendered.contains("![")
+                        && !rendered.contains("| :---")
+                );
+                for source in ["before.png", "after.png"] {
+                    assert!(output.iter().flat_map(|row| &row.code_links).any(
+                        |link| matches!(&link.action, Action::Link(url) if url.ends_with(source))
+                    ));
+                }
+                let fallback = rows(source, width, &pr, &State::default());
+                assert!(fallback.iter().all(|row| row.images.is_empty()));
+                for source in ["before.png", "after.png"] {
+                    assert!(fallback.iter().flat_map(|row| &row.code_links).any(
+                        |link| matches!(&link.action, Action::Link(url) if url.ends_with(source))
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn table_images_with_different_heights_clip_and_keep_card_hit_targets() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = App::new(
+            Storage {
+                config: dir.path().join("config"),
+                cache: dir.path().join("cache"),
+            },
+            Default::default(),
+        );
+        app.images.picker = Some(Picker::halfblocks());
+        let mut pr = pr();
+        pr.body =
+            "| Before | After |\n|---|---|\n| ![Before](before.png) | ![After](after.png) |".into();
+        let review = Review {
+            detail: Some(Arc::new(pr.clone())),
+            timeline: vec![crate::model::TimelineItem {
+                date: String::new(),
+                author: "reviewer".into(),
+                kind: "commented".into(),
+                body: pr.body.clone(),
+                url: String::new(),
+            }],
+            ..Default::default()
+        };
+        let initial = crate::overview::rows_with_images(&review, 84, &app.images);
+        for preview in initial
+            .iter()
+            .flat_map(|row| &row.images)
+            .filter(|preview| preview.offset == 0)
+        {
+            let picker = app.images.picker.as_ref().context("image picker")?;
+            let image = if preview.request.source == "before.png" {
+                DynamicImage::new_rgb8(200, 100)
+            } else {
+                DynamicImage::new_rgb8(100, 200)
+            };
+            let size = inline_size(&image, picker, preview.width)?;
+            let protocol =
+                SlicedProtocol::new_with_resize(picker, image, size, Resize::Scale(None))?;
+            app.images.receive(
+                RenderKey {
+                    id: preview.request.id(),
+                    width: preview.width,
+                    height: None,
+                },
+                Ok(protocol),
+            );
+        }
+        let rows = crate::overview::rows_with_images(&review, 84, &app.images);
+        let index = rows
+            .iter()
+            .position(|row| row.images.len() == 2)
+            .context("first image row")?;
+        let pair = rows.get(index).context("image row")?;
+        let [before, after] = pair.images.as_slice() else {
+            bail!("expected two image cells")
+        };
+        assert_eq!((before.inset, before.width), (4, 37));
+        assert_eq!((after.inset, after.width), (44, 36));
+        assert_eq!((before.height, after.height), (10, 36));
+        let first_end = index + usize::from(before.height);
+        let browser_row = rows.get(first_end).context("short image browser link")?;
+        assert_eq!(browser_row.images.len(), 1);
+        assert!(browser_row.code_links.iter().any(|link| link.column == 4
+            && matches!(&link.action, Action::Link(url) if url.ends_with("before.png"))));
+        assert!(
+            rows.iter()
+                .flat_map(|row| &row.images)
+                .any(|image| image.inset == 6)
+        );
+        assert!(
+            rows.iter()
+                .flat_map(|row| &row.code_links)
+                .any(|link| link.column == 6
+                    && matches!(&link.action, Action::Link(url) if url.ends_with("before.png")))
+        );
+        app.scroll = index + 8;
+        let document = crate::ui::Document {
+            navigation: vec![],
+            epoch: 0,
+            width: 84,
+            horizontal: 0,
+            rows: rows
+                .into_iter()
+                .map(|right| crate::ui::Row {
+                    right,
+                    ..Default::default()
+                })
+                .collect(),
+            sections: vec![],
+            files: vec![],
+            guide_columns: false,
+            left_width: 0,
+        };
+        let mut terminal = Terminal::new(TestBackend::new(90, 10))?;
+        terminal.draw(|frame| {
+            for y in 0..5 {
+                if let Some(row) = document.rows.get(app.scroll + usize::from(y)) {
+                    crate::ui::paint(frame, Rect::new(1, 1 + y, 84, 1), &row.right, &mut app);
+                }
+            }
+            draw_inline(frame, &mut app, &document, Rect::new(1, 1, 84, 5));
+        })?;
+        let hits = app
+            .hits
+            .iter()
+            .filter_map(|(rect, action)| {
+                if let Action::Image(request) = action
+                    && rect.height > 1
+                {
+                    Some((*rect, request.source.as_str()))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            hits,
+            vec![
+                (Rect::new(5, 1, 37, 2), "before.png"),
+                (Rect::new(45, 1, 36, 5), "after.png")
+            ]
+        );
+        for x in [3, 43, 82, 84] {
+            assert_eq!(
+                terminal
+                    .backend()
+                    .buffer()
+                    .cell((x, 1))
+                    .map(|cell| cell.symbol()),
+                Some("│")
+            );
+        }
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((5, 3))
+                .map(|cell| cell.symbol()),
+            Some("↗")
+        );
+        assert!(app.images.pending.is_empty());
+        app.shutdown();
+        Ok(())
+    }
+
+    #[test]
+    fn inline_previews_fill_width_for_landscape_portrait_and_small_images() -> Result<()> {
+        for protocol in [
+            ProtocolType::Halfblocks,
+            ProtocolType::Kitty,
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+        ] {
+            let mut picker = Picker::halfblocks();
+            picker.set_protocol_type(protocol);
+            for (width, height, expected_height) in [(1600, 900, 15), (20, 60, 80), (100, 100, 27)]
+            {
+                let image = DynamicImage::new_rgb8(width, height);
+                let size = inline_size(&image, &picker, 53)?;
+                assert_eq!(size, Size::new(53, expected_height));
+                let encoded =
+                    SlicedProtocol::new_with_resize(&picker, image, size, Resize::Scale(None))?;
+                assert_eq!(encoded.size(), size);
+            }
+        }
+        Ok(())
+    }
+    #[test]
     fn background_cache_loading_and_clipped_preview_keep_card_geometry() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut app = App::new(
@@ -1004,9 +1337,9 @@ Useful summary text.
         let pr = pr();
         let request = Request::new("docs/image.png".into(), "Screenshot".into(), &pr);
         cached_image(&app.storage, &request, &Cancel::default(), png)?;
-        let key = request_render(&mut app, &request, 80, 12);
+        let key = request_render(&mut app, &request, 80, None);
         assert_eq!(app.images.pending.len(), 1);
-        request_render(&mut app, &request, 80, 12);
+        request_render(&mut app, &request, 80, None);
         assert_eq!(app.images.pending.len(), 1);
         let deadline = Instant::now() + Duration::from_secs(5);
         while !app.images.entries.contains_key(&key) && Instant::now() < deadline {
@@ -1014,6 +1347,14 @@ Useful summary text.
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(matches!(app.images.entries.get(&key), Some(Ok(_))));
+        assert_eq!(
+            app.images
+                .entries
+                .get(&key)
+                .and_then(|entry| entry.as_ref().ok())
+                .map(SlicedProtocol::size),
+            Some(Size::new(80, 40))
+        );
         let review = Review {
             detail: Some(Arc::new(pr.clone())),
             timeline: vec![crate::model::TimelineItem {
@@ -1025,19 +1366,19 @@ Useful summary text.
             }],
             ..Default::default()
         };
-        let rows = crate::overview::rows_with_images(&review, 84, true);
-        let previews: Vec<_> = rows.iter().filter_map(|r| r.image.as_ref()).collect();
-        assert_eq!(previews.len(), 48);
+        let rows = crate::overview::rows_with_images(&review, 84, &app.images);
+        let previews: Vec<_> = rows.iter().flat_map(|r| &r.images).collect();
+        assert_eq!(previews.len(), 64);
         assert!(
             previews
                 .iter()
-                .take(24)
-                .all(|p| p.inset == 2 && p.width == 80)
+                .take(40)
+                .all(|p| p.inset == 2 && p.width == 80 && p.height == 40)
         );
         assert!(
             previews
                 .iter()
-                .skip(24)
+                .skip(40)
                 .all(|p| p.inset == 4 && p.width == 78)
         );
         app.inbox.push(PrSummary {
@@ -1054,7 +1395,7 @@ Useful summary text.
         app.reviews.insert(pr.key.id(), review);
         app.scroll = rows
             .iter()
-            .position(|r| r.image.is_some())
+            .position(|r| !r.images.is_empty())
             .context("image row")?
             + 3;
         let document = crate::ui::Document {

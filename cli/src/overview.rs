@@ -26,7 +26,9 @@ pub(crate) fn column(area: Rect) -> Rect {
 /// Preserve span styling and link actions when an unbroken URL or branch name
 /// needs more rows. All widths are terminal cells, not UTF-8 bytes.
 fn flow(row: TextRow, width: usize) -> Vec<TextRow> {
-    if row.image.is_some() {
+    if !row.images.is_empty()
+        || (!row.code_links.is_empty() && row.spans.iter().map(Span::width).sum::<usize>() <= width)
+    {
         return vec![row];
     }
     let width = width.max(1);
@@ -46,7 +48,7 @@ fn flow(row: TextRow, width: usize) -> Vec<TextRow> {
                     action: row.action.clone(),
                     target: None,
                     code_links: Vec::new(),
-                    image: None,
+                    images: Vec::new(),
                     hunk: None,
                     style: row.style,
                 });
@@ -72,7 +74,7 @@ fn flow(row: TextRow, width: usize) -> Vec<TextRow> {
         action: row.action,
         target: None,
         code_links: Vec::new(),
-        image: None,
+        images: Vec::new(),
         hunk: None,
         style: row.style,
     });
@@ -86,8 +88,11 @@ fn rule(width: usize, left: &str, right: &str) -> TextRow {
     )
 }
 fn padded(mut row: TextRow, width: usize, background: Color) -> TextRow {
-    if let Some(image) = &mut row.image {
+    for image in &mut row.images {
         image.inset += 2;
+    }
+    for link in &mut row.code_links {
+        link.column += 2;
     }
     let used: usize = row.spans.iter().map(Span::width).sum();
     let mut spans = vec![
@@ -107,8 +112,8 @@ fn padded(mut row: TextRow, width: usize, background: Color) -> TextRow {
         spans,
         action: row.action,
         target: None,
-        code_links: Vec::new(),
-        image: row.image,
+        code_links: row.code_links,
+        images: row.images,
         hunk: row.hunk,
         style: row.style,
     }
@@ -148,9 +153,13 @@ fn state_color(state: &str) -> Color {
 
 #[cfg(test)]
 pub(crate) fn rows(review: &Review, width: u16) -> Vec<TextRow> {
-    rows_with_images(review, width, false)
+    rows_with_images(review, width, &crate::images::State::default())
 }
-pub(crate) fn rows_with_images(review: &Review, width: u16, images: bool) -> Vec<TextRow> {
+pub(crate) fn rows_with_images(
+    review: &Review,
+    width: u16,
+    images: &crate::images::State,
+) -> Vec<TextRow> {
     let width = width as usize;
     let inner = width.saturating_sub(4).max(1);
     let Some(pr) = review.detail.as_ref() else {
@@ -303,8 +312,11 @@ pub(crate) fn rows_with_images(review: &Review, width: u16, images: bool) -> Vec
         }
         for mut row in card(activity_width, header, body) {
             row.spans.insert(0, Span::raw(" ".repeat(inset)));
-            if let Some(image) = &mut row.image {
+            for image in &mut row.images {
                 image.inset += inset as u16;
+            }
+            for link in &mut row.code_links {
+                link.column += inset;
             }
             rows.push(row);
         }

@@ -655,6 +655,8 @@ the selected repository.
 Descriptions and activity comments show inline PNG, JPEG, WebP, and GIF previews
 (the first GIF frame). Click an image to enlarge it; **Esc** returns to the same
 review position. The image modal also offers **o** to open it in your browser.
+Previews fill their container width while preserving proportions. Images in
+Markdown and HTML tables stay inside their cells and fill the cell width.
 
 Images load in the background and are cached locally. Terminals without a
 supported graphics protocol, inaccessible attachments, and unsupported formats

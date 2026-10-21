@@ -121,6 +121,36 @@ fn table(cells: Vec<Vec<Vec<Inline>>>, align: &[Alignment], width: usize) -> Vec
             *value -= 1;
         }
     }
+    let cells = cells
+        .into_iter()
+        .enumerate()
+        .map(|(index, cells)| {
+            sizes
+                .iter()
+                .enumerate()
+                .map(|(i, size)| {
+                    let mut spans = cells.get(i).cloned().unwrap_or_default();
+                    if index == 0 {
+                        for span in &mut spans {
+                            span.span.style = span.span.style.add_modifier(Modifier::BOLD);
+                        }
+                    }
+                    wrap_inline(spans, *size)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    table_rows(cells, &sizes, align, width, true)
+}
+
+/// Compose already-wrapped cells, retaining image placements and cell-local actions.
+pub(crate) fn table_rows(
+    cells: Vec<Vec<Vec<TextRow>>>,
+    sizes: &[usize],
+    align: &[Alignment],
+    width: usize,
+    header: bool,
+) -> Vec<TextRow> {
     let rule = |left: &str, mid: &str, right: &str| {
         text(
             format!(
@@ -135,24 +165,12 @@ fn table(cells: Vec<Vec<Vec<Inline>>>, align: &[Alignment], width: usize) -> Vec
         )
     };
     let mut rows = vec![rule("╭", "┬", "╮")];
-    for (index, cells) in cells.into_iter().enumerate() {
-        let columns = sizes
-            .iter()
-            .enumerate()
-            .map(|(i, size)| {
-                let mut spans = cells.get(i).cloned().unwrap_or_default();
-                if index == 0 {
-                    for span in &mut spans {
-                        span.span.style = span.span.style.add_modifier(Modifier::BOLD);
-                    }
-                }
-                wrap_inline(spans, *size)
-            })
-            .collect::<Vec<_>>();
+    for (index, columns) in cells.into_iter().enumerate() {
         let height = columns.iter().map(Vec::len).max().unwrap_or(1).max(1);
         for line in 0..height {
             let mut spans = vec![Span::styled("│", Style::default().fg(BORDER))];
             let mut links = Vec::new();
+            let mut images = Vec::new();
             for (col, size) in sizes.iter().enumerate() {
                 let content = columns.get(col).and_then(|r| r.get(line));
                 let used = content
@@ -160,6 +178,7 @@ fn table(cells: Vec<Vec<Vec<Inline>>>, align: &[Alignment], width: usize) -> Vec
                     .unwrap_or(0);
                 let padding = size.saturating_sub(used);
                 let left = match align.get(col) {
+                    _ if content.is_some_and(|row| !row.images.is_empty()) => 0,
                     Some(Alignment::Right) => padding,
                     Some(Alignment::Center) => padding / 2,
                     _ => 0,
@@ -171,10 +190,30 @@ fn table(cells: Vec<Vec<Vec<Inline>>>, align: &[Alignment], width: usize) -> Vec
                         link.column += offset;
                         link
                     }));
+                    if let Some(action) = &content.action {
+                        links.push(crate::ui::CodeLink {
+                            column: offset,
+                            width: size.saturating_sub(left),
+                            action: action.clone(),
+                        });
+                    }
+                    images.extend(content.images.iter().cloned().map(|mut image| {
+                        image.inset = image.inset.saturating_add(offset as u16);
+                        image
+                    }));
                     spans.extend(content.spans.clone());
                 }
                 spans.push(Span::raw(" ".repeat(padding - left + 1)));
                 spans.push(Span::styled("│", Style::default().fg(BORDER)));
+            }
+            if spans.iter().map(Span::width).sum::<usize>() <= width || !images.is_empty() {
+                rows.push(TextRow {
+                    spans,
+                    code_links: links,
+                    images,
+                    ..Default::default()
+                });
+                continue;
             }
             let mut column = 0;
             let mut linked = Vec::new();
@@ -199,7 +238,7 @@ fn table(cells: Vec<Vec<Vec<Inline>>>, align: &[Alignment], width: usize) -> Vec
             }
             rows.extend(wrap_inline(linked, width));
         }
-        if index == 0 {
+        if index == 0 && header {
             rows.push(rule("├", "┼", "┤"));
         }
     }
