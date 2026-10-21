@@ -32,6 +32,7 @@ pub(crate) struct Panel {
     pub export_path: Option<PathBuf>,
     pub replay: Instant,
     preview: crate::agents::ui::settings_preview::SettingsPreview,
+    visual_config: Option<Config>,
     pub(super) details_expanded: bool,
     pub(super) details_scroll: u16,
     search_focused: bool,
@@ -58,6 +59,7 @@ impl Panel {
             replay: Instant::now(),
             search_focused: true,
             preview: crate::agents::ui::settings_preview::SettingsPreview::new(Instant::now()),
+            visual_config: None,
             edit: None,
             extra_specs: Vec::new(),
             dynamic_choices: Default::default(),
@@ -207,13 +209,39 @@ impl Panel {
 }
 
 impl Panel {
+    /// Overlay only locally edited visual fields; keep the save/conflict baseline untouched.
+    pub fn refresh_preview(&mut self, committed: &Config) {
+        let mut visual = committed.clone();
+        for id in self.draft.edited() {
+            if spec(id).is_some_and(|spec| {
+                matches!(
+                    spec.preview,
+                    Preview::Appearance
+                        | Preview::Animation
+                        | Preview::Conversation
+                        | Preview::Layout
+                        | Preview::Diff
+                        | Preview::Input
+                )
+            }) && let Err(error) = set(&mut visual, id, self.draft.value(id))
+            {
+                self.error = Some(format!("Could not preview Settings: {error:#}"));
+            }
+        }
+        self.visual_config = Some(visual);
+    }
+    pub fn preview_config(&self) -> &Config {
+        self.visual_config.as_ref().unwrap_or(self.draft.config())
+    }
     pub fn animating(&self) -> bool {
         self.rows()
             .get(self.selected)
             .is_some_and(|spec| spec.preview == Preview::Animation)
-            && self.draft.config().preferences.motion.level != Motion::Off
-            && self.draft.config().tweaks.agent_reply_cps > 0
-            && self.draft.config().preferences.motion.reply_tool
+            && self.preview_config().preferences.motion.level == Motion::Full
+            && ((self.preview_config().tweaks.agent_reply_cps > 0
+                && self.preview_config().preferences.motion.reply_tool)
+                || (self.preview_config().tweaks.sent_message_ms > 0
+                    && self.preview_config().preferences.motion.sent_message))
             && self.preview.animating()
     }
 }

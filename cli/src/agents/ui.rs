@@ -326,6 +326,7 @@ enum Task {
 }
 
 pub struct Ui {
+    pub(crate) preferences: crate::settings::Preferences,
     pub(crate) settings_requested: Option<crate::settings::Category>,
     panels: panels::Panels,
     prs: prs::State,
@@ -412,6 +413,7 @@ impl Ui {
     pub fn new(storage: Storage, config: &Config) -> Self {
         let (sender, receiver) = mpsc::channel();
         Self {
+            preferences: config.preferences.clone(),
             panels: panels::Panels::new(config.agent_panel_right),
             prs: prs::State::load(&storage),
             defaults: config.agent_defaults.clone(),
@@ -503,18 +505,19 @@ impl Ui {
         });
     }
     pub fn redraw_interval(&self) -> Option<Duration> {
-        if self.voice_active()
-            || self.question_flip.animating(Instant::now())
-            || !self.sidebar_highlights.is_empty()
-            || self
-                .sidebar_boards
-                .values()
-                .any(|board| board.animating(Instant::now()))
-            || self
-                .selected
-                .as_ref()
-                .and_then(|id| self.positions.get(id))
-                .is_some_and(Position::animating)
+        if self.preferences.motion.level == crate::settings::Motion::Full
+            && (self.voice_active()
+                || self.question_flip.animating(Instant::now())
+                || !self.sidebar_highlights.is_empty()
+                || self
+                    .sidebar_boards
+                    .values()
+                    .any(|board| board.animating(Instant::now()))
+                || self
+                    .selected
+                    .as_ref()
+                    .and_then(|id| self.positions.get(id))
+                    .is_some_and(Position::animating))
         {
             return Some(crate::repaint::FRAME_INTERVAL);
         }
@@ -527,7 +530,13 @@ impl Ui {
                         || self.list_visible && self.prs.visible.contains(&s.id))
             })
         {
-            return Some(crate::repaint::FRAME_INTERVAL);
+            return Some(
+                if self.preferences.motion.level == crate::settings::Motion::Full {
+                    crate::repaint::FRAME_INTERVAL
+                } else {
+                    Duration::from_secs(1)
+                },
+            );
         }
         if let Some(panels::View::PullRequest { app }) = &self.panels.view {
             return app.redraw_interval();
@@ -2674,6 +2683,9 @@ impl Ui {
     /// Flips the whole drawn screen in after a tab switch at `started`;
     /// returns whether the flip is still playing.
     pub fn flip_screen(&self, buffer: &mut ratatui::buffer::Buffer, started: Instant) -> bool {
+        if !self.preferences.motion.screen() {
+            return false;
+        }
         let duration = Duration::from_millis(u64::from(self.tweaks.capped(flap::SCREEN_MS)));
         self.tweaks.agent_reply_cps > 0 && flap::screen(buffer, started, duration, Instant::now())
     }
@@ -3173,7 +3185,12 @@ impl Ui {
         let mut offset = 0;
         let now = Instant::now();
         // Cards flip as their text changes; those listed first show at once.
-        let settled = !self.sidebar_seen || self.tweaks.agent_reply_cps == 0;
+        let settled = !self.sidebar_seen
+            || self.tweaks.agent_reply_cps == 0
+            || !self.preferences.motion.sidebar();
+        if settled {
+            self.sidebar_highlights.clear();
+        }
         let order: Vec<String> = list.iter().map(|session| session.id.clone()).collect();
         if !settled && order != self.sidebar_order {
             // A card moving into a slot flips from the text that was there.
@@ -3450,12 +3467,16 @@ impl Ui {
         activity_rows.extend(waiting);
         if let Some(position) = self.positions.get_mut(&id) {
             let now = Instant::now();
-            let tweaks = self.tweaks;
+            let tweaks = self.preferences.motion.tweaks(self.tweaks);
             let (working, waiting) = activity_rows.split_at_mut(working);
             if working.is_empty() {
                 position.activity = flap::Board::default();
             } else {
-                position.activity.show(working, now, ACCENT, area.width);
+                if self.preferences.motion.level == crate::settings::Motion::Full {
+                    position.activity.show(working, now, ACCENT, area.width);
+                } else {
+                    position.activity.settle(working, now);
+                }
             }
             // Queued messages flip in over the sent-message time.
             let sent = Duration::from_millis(u64::from(tweaks.capped(tweaks.sent_message_ms)));
@@ -3507,7 +3528,9 @@ impl Ui {
         }
         position.transcript_viewport = Some((body.width, body.height, session.version));
         let before_measure = position.conversation;
-        let tweaks = self.tweaks;
+        let tweaks = self.preferences.motion.tweaks(self.tweaks);
+        let appearance_changed = self.transcript_window.appearance != self.preferences.appearance;
+        self.transcript_window.appearance = self.preferences.appearance.clone();
         let view = self.transcript_window.render(
             session,
             position,
@@ -3515,8 +3538,10 @@ impl Ui {
             body.height,
             self.focus == Focus::Conversation,
         );
-        self.text_selection
-            .rebase(1, position.conversation as isize - before_measure as isize);
+        if !appearance_changed {
+            self.text_selection
+                .rebase(1, position.conversation as isize - before_measure as isize);
+        }
         let transcript_window::View {
             mut lines,
             mut links,
@@ -3531,9 +3556,13 @@ impl Ui {
         reveal::apply(
             position, session, &sections, start, total, &mut lines, tweaks, body.width, now, turn,
         );
-        flap::apply(
-            position, session, &sections, start, total, &mut lines, body.width, now,
-        );
+        if self.preferences.motion.reply() {
+            flap::apply(
+                position, session, &sections, start, total, &mut lines, body.width, now,
+            );
+        } else {
+            position.voice_flaps.clear();
+        }
         // Rows still waiting for their first character take no space yet.
         let dropped = flap::grow(
             &mut sections,
@@ -3601,6 +3630,10 @@ impl Ui {
         }
         self.hits
             .extend(transcript::link_hits(&links, body, position.conversation));
+        if appearance_changed {
+            self.text_selection
+                .reflow(1, &self.conversation_sections, &sections);
+        }
         self.conversation_sections = sections;
         self.text_selection
             .register_window(1, body, position.conversation, start, &lines);

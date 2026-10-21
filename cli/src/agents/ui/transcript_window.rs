@@ -4,6 +4,7 @@ use super::*;
 
 #[derive(Default)]
 pub(super) struct Window {
+    pub appearance: crate::settings::Appearance,
     session: String,
     width: u16,
     last_position: usize,
@@ -16,6 +17,7 @@ pub(super) struct Window {
 }
 #[derive(PartialEq)]
 struct Source {
+    appearance: crate::settings::Appearance,
     entry: Entry,
     expanded: bool,
     focused: bool,
@@ -29,8 +31,10 @@ impl Source {
         position: &Position,
         focused: bool,
         timer: Option<(Status, i64)>,
+        appearance: &crate::settings::Appearance,
     ) -> bool {
-        self.entry == *entry
+        self.appearance == *appearance
+            && self.entry == *entry
             && self.expanded == position.expanded.contains(&entry.id)
             && self.focused == (focused && position.focused_entry.as_ref() == Some(&entry.id))
             && self.timer == timer
@@ -187,21 +191,21 @@ impl Window {
                             },
                         )
                     });
-                if !self
-                    .sources
-                    .get(&section.id)
-                    .is_some_and(|source| source.matches(entry, position, focused, timer))
-                {
-                    let (rows, _, links) = transcript::render_entries(
+                if !self.sources.get(&section.id).is_some_and(|source| {
+                    source.matches(entry, position, focused, timer, &self.appearance)
+                }) {
+                    let (rows, _, links) = transcript::render_entries_with_appearance(
                         session,
                         std::slice::from_ref(entry),
                         position,
                         width,
                         focused,
+                        &self.appearance,
                     );
                     self.sources.insert(
                         section.id.clone(),
                         Source {
+                            appearance: self.appearance.clone(),
                             entry: entry.clone(),
                             expanded: position.expanded.contains(&entry.id),
                             focused: focused && position.focused_entry.as_ref() == Some(&entry.id),

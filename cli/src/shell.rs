@@ -20,6 +20,7 @@ use unicode_width::UnicodeWidthStr;
 const TAB_LABELS: [&str; 2] = [" Agents (⌥+1) ", " Reviews (⌥+2) "];
 const TAB_MARGIN: u16 = 1;
 mod palette;
+mod preferences;
 pub(crate) mod settings_panel;
 
 pub struct Shell {
@@ -30,6 +31,9 @@ pub struct Shell {
     palette: Option<palette::Palette>,
     pub(crate) settings: Option<settings_panel::Panel>,
     settings_action_open: bool,
+    settings_refreshed: Option<std::time::Instant>,
+    settings_fingerprint: Option<String>,
+    settings_refresh_error: Option<String>,
     pub(crate) settings_pending_action: Option<crate::settings::SettingId>,
     pub(crate) settings_preview_requested: Option<crate::settings::Preview>,
     /// When the last tab switch started flipping the screen in.
@@ -50,6 +54,9 @@ impl Shell {
             palette: None,
             settings: None,
             settings_action_open: false,
+            settings_refreshed: None,
+            settings_fingerprint: serde_json::to_string(&config).ok(),
+            settings_refresh_error: None,
             settings_pending_action: None,
             settings_preview_requested: None,
             switched: None,
@@ -73,7 +80,10 @@ impl Shell {
         self.settings_preview_requested = None;
         self.switched = None;
         match settings_panel::Panel::new(&self.reviews.storage, category) {
-            Ok(panel) => self.settings = Some(panel),
+            Ok(mut panel) => {
+                panel.refresh_preview(&self.reviews.config);
+                self.settings = Some(panel);
+            }
             Err(error) => {
                 let message = format!("Could not open Settings: {error:#}");
                 self.reviews.notice = crate::app::Notice::error(message.clone());
@@ -89,7 +99,7 @@ impl Shell {
     fn switch(&mut self, agents: bool) {
         self.agents.cancel_voice();
         if self.agents_active != agents {
-            self.switched = Some(std::time::Instant::now());
+            self.switched = self.screen_motion().then(std::time::Instant::now);
         }
         self.agents_active = agents;
         self.reviews.config.last_tab_agents = agents;
@@ -111,7 +121,7 @@ impl Shell {
             .settings
             .as_ref()
             .is_some_and(|panel| panel.animating())
-            || self.switched.is_some()
+            || (self.screen_motion() && self.switched.is_some())
         {
             return Some(crate::repaint::FRAME_INTERVAL);
         }
@@ -128,6 +138,7 @@ impl Shell {
         self.tick_focused(true);
     }
     pub fn tick_focused(&mut self, focused: bool) {
+        self.refresh_settings();
         let selected = self.palette_selection();
         self.agents
             .tick(focused && (self.agents_active || self.palette.is_some()));
@@ -174,8 +185,7 @@ impl Shell {
                 .map(|panel| panel.key(key, &self.reviews.storage))
                 .unwrap_or_default();
             if let Some(config) = outcome.saved {
-                self.agents.apply_settings(&config);
-                self.reviews.config = config;
+                self.apply_committed_settings(config);
             }
             if let Some(preview) = outcome.preview_test {
                 self.settings_preview_requested = Some(preview);
@@ -183,9 +193,12 @@ impl Shell {
             if let Some(action) = outcome.action {
                 self.settings_action(action);
             }
+            if let Some(panel) = &mut self.settings {
+                panel.refresh_preview(&self.reviews.config);
+            }
             if outcome.close {
                 self.settings = None;
-                crate::theme::select(crate::theme::index(self.reviews.config.theme.as_deref()));
+                self.agents.preview_visual_settings(&self.reviews.config);
             }
             return;
         }
@@ -298,6 +311,15 @@ impl Shell {
         }
     }
     pub fn draw(&mut self, frame: &mut Frame) {
+        if let Some(panel) = &mut self.settings {
+            panel.refresh_preview(&self.reviews.config);
+        }
+        let visual = self
+            .settings
+            .as_ref()
+            .map(|panel| panel.preview_config())
+            .unwrap_or(&self.reviews.config);
+        self.agents.preview_visual_settings(visual);
         self.agents.configure_pr_images(&self.reviews.images);
         if self.agents_active {
             self.agents.draw(frame);
@@ -320,7 +342,8 @@ impl Shell {
         }
         self.draw_palette(frame);
         if let Some(panel) = &mut self.settings {
-            crate::theme::select(crate::theme::index(panel.draft.config().theme.as_deref()));
+            crate::theme::select(crate::theme::index(panel.preview_config().theme.as_deref()));
+            crate::theme::set_contrast(panel.preview_config().preferences.appearance.contrast);
             panel.draw(frame);
         }
         if self.settings_action_open {
@@ -417,6 +440,212 @@ mod settings_integration_tests {
         shell.reviews_started = true;
         Ok((dir, shell))
     }
+    #[test]
+    fn committed_refresh_preserves_dirty_settings_and_unsent_session_state() -> Result<()> {
+        let (_dir, mut shell) = fixture()?;
+        shell.open_settings(None);
+        shell
+            .settings
+            .as_mut()
+            .context("panel")?
+            .draft
+            .set(SettingId::Theme, SettingValue::Choice("amber".into()))?;
+        shell.agents.selected = Some("session".into());
+        let position = shell.agents.positions.entry("session".into()).or_default();
+        position.draft = crate::editor::Editor::from("Keep this draft");
+        position.conversation = 42;
+        position.selection = Some(9);
+        shell.reviews.storage.update_config(|config| {
+            config.preferences.motion.level = crate::settings::Motion::Off;
+            config.theme = Some("dracula".into());
+            config.agent_list_visible = false;
+        })?;
+        shell.refresh_settings();
+        assert_eq!(shell.reviews.config.theme.as_deref(), Some("dracula"));
+        assert_eq!(
+            shell.agents.preferences.motion.level,
+            crate::settings::Motion::Off
+        );
+        assert!(!shell.agents.list_visible);
+        assert_eq!(
+            shell
+                .settings
+                .as_ref()
+                .context("panel")?
+                .draft
+                .config()
+                .theme
+                .as_deref(),
+            Some("amber")
+        );
+        let position = shell.agents.positions.get("session").context("position")?;
+        assert_eq!(position.draft.text(), "Keep this draft");
+        assert_eq!(position.conversation, 42);
+        assert_eq!(position.selection, Some(9));
+        std::fs::write(&shell.reviews.storage.config, "{ malformed")?;
+        shell.settings_refreshed = None;
+        shell.refresh_settings();
+        assert_eq!(shell.reviews.config.theme.as_deref(), Some("dracula"));
+        assert!(
+            shell
+                .agents
+                .notice
+                .as_ref()
+                .is_some_and(|(message, error)| *error && message.contains("refresh"))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&shell.reviews.storage.config)?,
+            "{ malformed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn two_clients_preview_only_edited_fields_and_keep_same_field_conflicts() -> Result<()> {
+        let (_dir, mut first) = fixture()?;
+        let mut second = Shell::new(first.reviews.storage.clone(), Config::default(), None);
+        first.open_settings(None);
+        second.open_settings(None);
+        first
+            .settings
+            .as_mut()
+            .context("first")?
+            .draft
+            .set(SettingId::Theme, SettingValue::Choice("amber".into()))?;
+        let draft = &mut second.settings.as_mut().context("second")?.draft;
+        draft.set(SettingId::Theme, SettingValue::Choice("dracula".into()))?;
+        draft.set(SettingId::Motion, SettingValue::Choice("off".into()))?;
+        draft.set(SettingId::Contrast, SettingValue::Choice("high".into()))?;
+        second.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        first.refresh_settings();
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30))?;
+        terminal.draw(|frame| first.draw(frame))?;
+        assert_eq!(crate::theme::active().id, "amber");
+        assert_eq!(
+            first.agents.preferences.motion.level,
+            crate::settings::Motion::Off,
+            "unedited external motion stays current while theme is previewed"
+        );
+        assert_eq!(
+            first.agents.preferences.appearance.contrast,
+            crate::settings::Contrast::High
+        );
+        assert_eq!(
+            first
+                .settings
+                .as_ref()
+                .context("first")?
+                .draft
+                .config()
+                .preferences
+                .motion
+                .level,
+            crate::settings::Motion::Full,
+            "the original draft baseline stays intact"
+        );
+        first.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert!(
+            first
+                .settings
+                .as_ref()
+                .context("first")?
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("changed"))
+        );
+        assert_eq!(
+            first.reviews.storage.load_config()?.theme.as_deref(),
+            Some("dracula")
+        );
+        first.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| first.draw(frame))?;
+        assert_eq!(crate::theme::active().id, "dracula");
+        assert_eq!(
+            first.agents.preferences.motion.level,
+            crate::settings::Motion::Off
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_zero_speed_never_schedules_a_tab_transition() -> Result<()> {
+        let (_dir, mut shell) = fixture()?;
+        shell.reviews.config.tweaks.agent_reply_cps = 0;
+        shell.agents.tweaks.agent_reply_cps = 0;
+        shell.switch(false);
+        assert_eq!(shell.redraw_interval(), None);
+        assert!(shell.switched.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn all_theme_previews_stay_local_and_save_discard_apply_visual_settings() -> Result<()> {
+        let (_dir, mut shell) = fixture()?;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 35))?;
+        shell.open_settings(None);
+        for theme in crate::theme::themes() {
+            let draft = &mut shell.settings.as_mut().context("panel")?.draft;
+            draft.set(SettingId::Theme, SettingValue::Choice(theme.id.into()))?;
+            draft.set(SettingId::Contrast, SettingValue::Choice("high".into()))?;
+            draft.set(SettingId::Density, SettingValue::Choice("compact".into()))?;
+            draft.set(SettingId::MessageSeparators, SettingValue::Bool(true))?;
+            draft.set(SettingId::VoiceEnabled, SettingValue::Bool(true))?;
+            draft.set(SettingId::Motion, SettingValue::Choice("off".into()))?;
+            terminal.draw(|frame| {
+                shell.draw(frame);
+                crate::theme::present(frame.buffer_mut());
+            })?;
+            assert_eq!(crate::theme::active().id, theme.id);
+            assert_eq!(
+                crate::theme::resolve(crate::theme::slot(crate::theme::Role::Dim)),
+                theme.color(crate::theme::Role::Text)
+            );
+            assert_eq!(
+                shell.agents.preferences.appearance.density,
+                crate::settings::Density::Compact
+            );
+            assert!(
+                !shell.agents.voice_enabled(),
+                "preview must not apply nonvisual settings"
+            );
+            assert!(
+                !shell.reviews.storage.config.exists(),
+                "preview must not persist"
+            );
+        }
+        shell.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        terminal.draw(|frame| shell.draw(frame))?;
+        assert_eq!(crate::theme::active().id, "default");
+        assert_eq!(
+            shell.agents.preferences.appearance,
+            crate::settings::Appearance::default()
+        );
+        assert_eq!(
+            shell.agents.preferences.motion.level,
+            crate::settings::Motion::Full
+        );
+        assert_eq!(
+            crate::theme::resolve(crate::theme::slot(crate::theme::Role::Dim)),
+            crate::theme::active().color(crate::theme::Role::Dim)
+        );
+        let draft = &mut shell.settings.as_mut().context("panel")?.draft;
+        draft.set(SettingId::Theme, SettingValue::Choice("amber".into()))?;
+        draft.set(SettingId::Motion, SettingValue::Choice("reduced".into()))?;
+        shell.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        shell.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        terminal.draw(|frame| shell.draw(frame))?;
+        assert_eq!(crate::theme::active().id, "amber");
+        assert_eq!(
+            shell.reviews.storage.load_config()?.theme.as_deref(),
+            Some("amber")
+        );
+        assert_eq!(
+            shell.agents.preferences.motion.level,
+            crate::settings::Motion::Reduced
+        );
+        Ok(())
+    }
+
     #[test]
     fn settings_preserves_agent_draft_selection_and_scroll_from_both_tabs() -> Result<()> {
         let (_dir, mut shell) = fixture()?;

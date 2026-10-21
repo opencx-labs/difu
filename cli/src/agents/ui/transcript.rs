@@ -459,6 +459,39 @@ pub(super) fn render_entries(
     width: u16,
     focused: bool,
 ) -> (Vec<Line<'static>>, Vec<Section>, Vec<Link>) {
+    render_entries_with_appearance(
+        session,
+        entries,
+        position,
+        width,
+        focused,
+        &Default::default(),
+    )
+}
+
+fn entry_spacing(
+    lines: &mut Vec<Line<'static>>,
+    width: u16,
+    appearance: &crate::settings::Appearance,
+) {
+    if appearance.message_separators {
+        lines.push(Line::from(Span::styled(
+            "─".repeat(usize::from(width)),
+            Style::default().fg(DIM),
+        )));
+    } else if appearance.density == crate::settings::Density::Comfortable {
+        lines.push(Line::default());
+    }
+}
+
+pub(super) fn render_entries_with_appearance(
+    session: &Session,
+    entries: &[Entry],
+    position: &Position,
+    width: u16,
+    focused: bool,
+    appearance: &crate::settings::Appearance,
+) -> (Vec<Line<'static>>, Vec<Section>, Vec<Link>) {
     let mut links = Vec::new();
     let mut lines = Vec::new();
     let mut sections = Vec::new();
@@ -473,12 +506,14 @@ pub(super) fn render_entries(
             tool: is_tool,
         });
         if is_tool && !position.expanded.contains(&entry.id) {
-            let (rows, targets) = preview(
+            let (mut rows, targets) = preview(
                 session,
                 entry,
                 width,
                 focused && position.focused_entry.as_ref() == Some(&entry.id),
             );
+            rows.pop(); // The shared entry spacer controls the preview's trailing gap.
+            entry_spacing(&mut rows, width, appearance);
             links.extend(targets.into_iter().map(|mut link| {
                 link.row += lines.len();
                 link
@@ -493,6 +528,9 @@ pub(super) fn render_entries(
                     .map(|text| Line::from(Span::styled(text, board)))
                     .collect()
             }));
+            if appearance.message_separators {
+                entry_spacing(&mut lines, width, appearance);
+            }
             continue;
         }
         if entry.data.get("difuVoiceHandoff").is_some() {
@@ -501,6 +539,9 @@ pub(super) fn render_entries(
                     .into_iter()
                     .map(|text| Line::from(Span::styled(text, Style::default().fg(DIM)))),
             );
+            if appearance.message_separators {
+                entry_spacing(&mut lines, width, appearance);
+            }
             continue;
         }
         match entry.kind.as_str() {
@@ -837,7 +878,7 @@ pub(super) fn render_entries(
                 ));
             }
         }
-        lines.push(Line::default());
+        entry_spacing(&mut lines, width, appearance);
     }
     (lines, sections, links)
 }

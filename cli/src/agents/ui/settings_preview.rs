@@ -5,6 +5,7 @@ pub(crate) struct SettingsPreview {
     session: Session,
     position: Position,
     replay: Instant,
+    playing: bool,
 }
 impl SettingsPreview {
     pub fn new(replay: Instant) -> Self {
@@ -28,6 +29,7 @@ impl SettingsPreview {
             session,
             position: Position::default(),
             replay,
+            playing: false,
         }
     }
     pub fn animating(&self) -> bool {
@@ -41,27 +43,59 @@ impl SettingsPreview {
         replay: Instant,
         animate: bool,
     ) -> Vec<Line<'static>> {
-        if self.replay != replay {
+        if self.replay != replay || !animate || !self.playing {
             self.position = Position::default();
             self.replay = replay;
+            if animate {
+                self.position.replies_seen = true;
+                self.position.known = Some(HashSet::new());
+                if let Some(entry) = self.session.entries.first() {
+                    let tweaks = config.preferences.motion.tweaks(config.tweaks);
+                    self.position.sent = reveal::Typing::start(
+                        &entry.text,
+                        tweaks.capped(tweaks.sent_message_ms),
+                        replay,
+                    );
+                }
+            }
+        }
+        self.playing = animate;
+        if config
+            .preferences
+            .motion
+            .tweaks(config.tweaks)
+            .sent_message_ms
+            == 0
+        {
+            self.position.sent = None;
         }
         self.position.expanded.clear();
         if config.preferences.conversation.tool_display == crate::settings::ToolDisplay::Expanded {
             self.position.expanded.insert("sample-tool".into());
         }
-        let (mut lines, sections, _) = transcript::render_entries(
+        let (mut lines, sections, _) = transcript::render_entries_with_appearance(
             &self.session,
             &self.session.entries,
             &self.position,
             width.max(1),
             false,
+            &config.preferences.appearance,
         );
-        if animate
-            && config.preferences.motion.level != crate::settings::Motion::Off
-            && config.preferences.motion.reply_tool
-        {
-            self.position.replies_seen = true;
+        if animate {
+            let tweaks = config.preferences.motion.tweaks(config.tweaks);
+            let now = Instant::now();
             let total = lines.len();
+            let turn = flap::chat(
+                &mut self.position,
+                &self.session,
+                &sections,
+                0,
+                total,
+                &mut lines,
+                tweaks,
+                width.max(1),
+                now,
+            );
             reveal::apply(
                 &mut self.position,
                 &self.session,
@@ -69,10 +103,10 @@ impl SettingsPreview {
                 0,
                 total,
                 &mut lines,
-                config.tweaks,
+                tweaks,
                 width.max(1),
-                Instant::now(),
-                replay,
+                now,
+                turn,
             );
         }
         lines

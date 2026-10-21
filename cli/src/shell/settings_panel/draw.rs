@@ -284,11 +284,12 @@ impl Panel {
             Line::default(),
             Line::styled("Sample · Ctrl+P Replay", Style::default().fg(DIM)),
         ];
+        let visual = self.preview_config().clone();
         let lines = match spec.preview {
-            Preview::Diff => diff_preview(self.draft.config(), inner.width),
+            Preview::Diff => diff_preview(&visual, inner.width),
             Preview::Conversation | Preview::Animation | Preview::Appearance | Preview::Layout => {
                 self.preview.render(
-                    self.draft.config(),
+                    &visual,
                     inner.width,
                     self.replay,
                     spec.preview == Preview::Animation,

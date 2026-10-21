@@ -15,7 +15,7 @@ impl Ui {
         if !self.sessions.contains_key(&id) {
             return;
         }
-        let tweaks = self.tweaks;
+        let tweaks = self.preferences.motion.tweaks(self.tweaks);
         let position = self.positions.entry(id.clone()).or_default();
         let text = position.draft.text();
         if text.trim().is_empty() {

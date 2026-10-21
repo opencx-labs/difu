@@ -220,3 +220,29 @@ impl Default for Notifications {
         }
     }
 }
+
+impl MotionPreferences {
+    pub(crate) fn reply(&self) -> bool {
+        self.level == Motion::Full && self.reply_tool
+    }
+    pub(crate) fn sent(&self) -> bool {
+        self.level == Motion::Full && self.sent_message
+    }
+    pub(crate) fn sidebar(&self) -> bool {
+        self.level == Motion::Full && self.sidebar
+    }
+    pub(crate) fn screen(&self) -> bool {
+        self.level == Motion::Full && self.screen_transition
+    }
+    /// Derive effective timings without changing the user's saved timings, including zero = uncapped.
+    pub(crate) fn tweaks(&self, mut stored: crate::storage::Tweaks) -> crate::storage::Tweaks {
+        if !self.reply() {
+            stored.agent_reply_cps = 0;
+        }
+        if !self.sent() {
+            stored.sent_message_ms = 0;
+            stored.input_clear_ms = 0;
+        }
+        stored
+    }
+}

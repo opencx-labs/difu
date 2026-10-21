@@ -417,6 +417,16 @@ impl Ui {
         }
     }
     /// Rows the voice strip (and live dictation) need above the composer.
+    fn voice_preview(&self, hold: &Hold, width: u16, now: Instant) -> Vec<Line<'static>> {
+        if self.preferences.motion.reply() {
+            hold.flap.lines(width, now, flap::preview_board())
+        } else {
+            wrapped(&crate::model::clean(&hold.transcript()), width)
+                .into_iter()
+                .map(|text| Line::from(Span::styled(text, flap::preview_board())))
+                .collect()
+        }
+    }
     pub(super) fn voice_rows(&self, width: u16) -> u16 {
         let Some(hold) = self.voice.hold.as_ref().filter(|h| h.voice.is_some()) else {
             return 0;
@@ -424,13 +434,8 @@ impl Ui {
         if hold.mode == Mode::Converse {
             return 2;
         }
-        let preview = hold
-            .flap
-            .lines(
-                width.saturating_sub(2),
-                Instant::now(),
-                flap::preview_board(),
-            )
+        let preview = self
+            .voice_preview(hold, width.saturating_sub(2), Instant::now())
             .len()
             .min(PREVIEW_ROWS);
         2 + u16::try_from(preview).unwrap_or(0)
@@ -452,6 +457,9 @@ impl Ui {
         }
         let now = Instant::now();
         let spinner = || {
+            if self.preferences.motion.level != crate::settings::Motion::Full {
+                return "●";
+            }
             let frame = now
                 .saturating_duration_since(hold.phase_started)
                 .as_millis()
@@ -559,7 +567,7 @@ impl Ui {
         if hold.mode == Mode::Converse {
             return;
         }
-        let lines = hold.flap.lines(area.width, now, flap::preview_board());
+        let lines = self.voice_preview(hold, area.width, now);
         let shown = lines.len().min(usize::from(area.height.saturating_sub(2)));
         let tail: Vec<_> = lines.into_iter().rev().take(shown).rev().collect();
         frame.render_widget(
@@ -778,6 +786,34 @@ mod tests {
         assert_eq!(ui.voice_mode("voice-test"), Mode::Dictate);
         Ok(())
     }
+    #[test]
+    fn reduced_and_off_voice_show_received_words_without_flapping() -> Result<()> {
+        for motion in [
+            crate::settings::Motion::Reduced,
+            crate::settings::Motion::Off,
+        ] {
+            let (mut ui, _tmp) = fixture()?;
+            ui.preferences.motion.level = motion;
+            ui.list_visible = false;
+            let mut session = coding();
+            session.status = Status::Idle;
+            ui.sessions.insert(session.id.clone(), session);
+            let tx = talking(&mut ui, Mode::Dictate)?;
+            tx.send(Event::Delta(Role::User, "complete spoken words".into()))?;
+            ui.tick_voice(true);
+            let first = screen(&mut ui, 100)?;
+            assert!(first.contains("complete spoken words"), "{first}");
+            ui.voice.hold.as_mut().context("hold")?.phase_started -= Duration::from_millis(350);
+            assert_eq!(
+                screen(&mut ui, 100)?,
+                first,
+                "decorative spinner must remain static"
+            );
+            assert_eq!(draft(&ui)?, "keep this draft");
+        }
+        Ok(())
+    }
+
     #[test]
     fn dictation_strip_shows_codex_states_meter_and_transcript() -> Result<()> {
         for width in [48, 100] {

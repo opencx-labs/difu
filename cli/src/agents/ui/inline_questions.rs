@@ -468,7 +468,8 @@ impl Ui {
         let question_id = question_id.to_owned();
         let index = self.question_index().unwrap_or(0);
         self.remember_answers();
-        let clear = self.tweaks.capped(self.tweaks.input_clear_ms);
+        let tweaks = self.preferences.motion.tweaks(self.tweaks);
+        let clear = tweaks.capped(tweaks.input_clear_ms);
         if clear > 0 && !self.question_flip.drawn.is_empty() {
             self.question_flip.leaving = Some(Leaving {
                 session: id.clone(),
@@ -785,7 +786,7 @@ impl Ui {
             _ => None,
         };
         let sending = self.question_send.is_some();
-        let tweaks = self.tweaks;
+        let tweaks = self.preferences.motion.tweaks(self.tweaks);
         let flip = &mut self.question_flip;
         if let Some((rows, ..)) = &shown {
             flip.drawn.clone_from(rows);
