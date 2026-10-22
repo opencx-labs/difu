@@ -133,6 +133,7 @@ pub fn switch(
     session.usage = Value::Null;
     session.token_usage = Value::Null;
     session.completed_turn = None;
+    session.completed_turn_successful = false;
     super::plan::invalidate(session);
     session.suggestion = None;
     session.suggestion_attempted = None;

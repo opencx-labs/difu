@@ -18,6 +18,7 @@ use std::io::Write;
 use unicode_width::UnicodeWidthStr;
 
 const TAB_MARGIN: u16 = 1;
+mod notifications;
 mod palette;
 mod preferences;
 pub(crate) mod settings_panel;
@@ -29,6 +30,7 @@ pub struct Shell {
     pub agents: Ui,
     pub agents_active: bool,
     reviews_started: bool,
+    notification_client: crate::agents::notifications::client::Client,
     palette: Option<palette::Palette>,
     pub(crate) settings: Option<settings_panel::Panel>,
     settings_action_open: bool,
@@ -57,6 +59,7 @@ impl Shell {
         }
         Self {
             reviews,
+            notification_client: crate::agents::notifications::client::Client::new(storage.clone()),
             agents: Ui::new(storage, &config),
             agents_active: !reviews_started,
             reviews_started,
@@ -93,6 +96,7 @@ impl Shell {
             Ok(mut panel) => {
                 panel.refresh_preview(&self.reviews.config);
                 self.settings = Some(panel);
+                self.notification_action(crate::agents::notifications::Command::Status);
             }
             Err(error) => {
                 let message = format!("Could not open Settings: {error:#}");
@@ -214,8 +218,14 @@ impl Shell {
             if let Some(config) = outcome.saved {
                 self.apply_committed_settings(config);
             }
+            if outcome.native_enable {
+                self.notification_action(crate::agents::notifications::Command::Enable);
+            }
             if let Some(preview) = outcome.preview_test {
                 self.settings_preview_requested = Some(preview);
+                if preview == crate::settings::Preview::Notification {
+                    self.test_notification();
+                }
             }
             if let Some(action) = outcome.action {
                 self.settings_action(action);

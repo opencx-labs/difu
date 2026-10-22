@@ -176,6 +176,7 @@ fn main() -> Result<()> {
                     break;
                 }
             }
+            app.notification_tick(focused);
             let sent = app.agents.take_send_repaint();
             if !input && !sent {
                 app.tick_focused(focused);

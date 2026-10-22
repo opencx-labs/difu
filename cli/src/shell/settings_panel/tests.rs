@@ -1117,3 +1117,44 @@ fn capture_rejects_embedded_coactive_actions_but_accepts_disjoint_filter() -> Re
     );
     Ok(())
 }
+#[test]
+fn notification_preview_reflects_selected_event_disable_and_quiet_without_actions() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut panel = Panel::new(&storage(&dir), Some(Category::Notifications))?;
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(130, 50))?;
+    panel.selected = panel
+        .rows()
+        .iter()
+        .position(|row| row.id == SettingId::QuestionNotification)
+        .context("question row")?;
+    panel
+        .draft
+        .set(SettingId::QuestionNotification, SettingValue::Bool(false))?;
+    terminal.draw(|frame| panel.draw(frame))?;
+    let content = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(content.contains("Example · Question or approval needed"));
+    assert!(content.contains("Disabled in draft"));
+    panel
+        .draft
+        .set(SettingId::QuestionNotification, SettingValue::Bool(true))?;
+    panel
+        .draft
+        .set(SettingId::NotificationQuiet, SettingValue::Bool(true))?;
+    terminal.draw(|frame| panel.draw(frame))?;
+    let content = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(content.contains("Quiet is on"));
+    assert!(!storage(&dir).config.exists());
+    Ok(())
+}

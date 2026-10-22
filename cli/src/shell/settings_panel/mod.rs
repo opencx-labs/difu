@@ -19,6 +19,7 @@ mod tests;
 pub(crate) struct Outcome {
     pub close: bool,
     pub saved: Option<Config>,
+    pub native_enable: bool,
     /// Explicit user action; Shell or later integrations decide how to apply it.
     pub action: Option<SettingId>,
     pub preview_test: Option<Preview>,
@@ -36,6 +37,7 @@ pub(crate) struct Panel {
     pub selected: usize,
     pub error: Option<String>,
     pub notice: Option<String>,
+    pub notification_status: Option<crate::agents::notifications::Capabilities>,
     pub confirm_discard: bool,
     pub export_path: Option<PathBuf>,
     pub replay: Instant,
@@ -65,6 +67,7 @@ impl Panel {
             selected: 0,
             error: None,
             notice: None,
+            notification_status: None,
             confirm_discard: false,
             details_expanded: false,
             details_scroll: 0,

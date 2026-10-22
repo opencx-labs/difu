@@ -43,6 +43,12 @@ url = "2"
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = { version = "4.18", default-features = false, features = ["z"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zbus = "5.19"
+
 [profile.release]
 lto = "thin"
 strip = true

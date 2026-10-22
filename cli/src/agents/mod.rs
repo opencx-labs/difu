@@ -8,6 +8,7 @@ mod guidance;
 mod management;
 pub mod mcp;
 pub mod media;
+pub mod notifications;
 mod orchestrator;
 mod peers;
 pub mod permissions;
@@ -334,6 +335,9 @@ pub struct Session {
     pub usage: Value,
     #[serde(default)]
     pub completed_turn: Option<String>,
+    /// Outcome evidence for notifications; Idle may also mean a cancelled turn.
+    #[serde(default)]
+    pub completed_turn_successful: bool,
     #[serde(default)]
     pub plan_prompt: Option<plan::Proposal>,
     #[serde(default)]
@@ -427,6 +431,7 @@ impl Session {
             token_usage: Value::Null,
             usage: Value::Null,
             completed_turn: None,
+            completed_turn_successful: false,
             plan_prompt: None,
             plan_handled: None,
             model,
@@ -786,6 +791,7 @@ pub enum Control {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
+    Notifications(notifications::Command),
     Permissions {
         id: String,
         action: permissions::Action,
@@ -897,6 +903,7 @@ pub enum Request {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
+    Notifications(notifications::Snapshot),
     Permissions {
         snapshot: permissions::Snapshot,
     },

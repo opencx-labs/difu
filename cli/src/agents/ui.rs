@@ -429,6 +429,17 @@ pub struct Ui {
     media_pending: Option<(String, mpsc::Receiver<Result<super::media::Paste, String>>)>,
 }
 impl Ui {
+    pub(crate) fn notification_viewed_session(&self) -> Option<String> {
+        if self.modal.is_some()
+            || self.changes_visible
+            || (self.panels.visible() && !self.panels.right)
+        {
+            None
+        } else {
+            self.selected.clone()
+        }
+    }
+
     pub fn new(storage: Storage, config: &Config) -> Self {
         let (sender, receiver) = mpsc::channel();
         Self {
@@ -4757,6 +4768,45 @@ mod tests {
         ui.sessions.insert(session.id.clone(), session);
         ui.select("one".into());
         ui
+    }
+    #[test]
+    fn notification_presence_follows_conversation_visibility_with_helper_placements() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let storage = Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        };
+        let mut ui = Ui::new(storage, &Config::default());
+        ui.selected = Some("selected".into());
+        ui.drilled = true;
+        ui.panels.session = Some("remembered-helper-session".into());
+        ui.panels.view = Some(panels::View::Shell {
+            id: "shell".into(),
+            command: "example".into(),
+        });
+        for placement in [
+            crate::settings::HelperPlacement::Right,
+            crate::settings::HelperPlacement::Bottom,
+        ] {
+            ui.preferences.layout.helper_placement = Some(placement);
+            ui.panels.right = true;
+            assert_eq!(
+                ui.notification_viewed_session().as_deref(),
+                Some("selected")
+            );
+        }
+        ui.preferences.layout.helper_placement = Some(crate::settings::HelperPlacement::Main);
+        ui.panels.right = false;
+        assert_eq!(ui.notification_viewed_session(), None);
+        ui.panels.hidden = true;
+        assert_eq!(
+            ui.notification_viewed_session().as_deref(),
+            Some("selected")
+        );
+        ui.changes_visible = true;
+        assert_eq!(ui.notification_viewed_session(), None);
+        Ok(())
     }
     #[test]
     fn permissions_command_and_actions_open_for_both_providers() -> Result<()> {

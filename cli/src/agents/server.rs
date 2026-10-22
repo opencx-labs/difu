@@ -25,6 +25,7 @@ pub struct Store {
     sessions: Mutex<BTreeMap<String, Session>>,
     changed: Condvar,
     save_lock: Mutex<()>,
+    pub(super) notifications: Option<notifications::Dispatcher>,
 }
 impl Store {
     #[cfg(test)]
@@ -38,6 +39,7 @@ impl Store {
             sessions: Mutex::new(sessions.into_iter().map(|s| (s.id.clone(), s)).collect()),
             changed: Condvar::new(),
             save_lock: Mutex::new(()),
+            notifications: None,
         }
     }
     pub fn get(&self, id: &str) -> Result<Session> {
@@ -57,9 +59,15 @@ impl Store {
             .lock()
             .map_err(|_| anyhow::anyhow!("Session store lock failed"))?;
         let session = sessions.get_mut(id).context("Session not found")?;
+        let transition = notifications::Transition::capture(session);
         f(session);
         session.touch();
+        let events = transition.events(session);
         self.changed.notify_all();
+        drop(sessions);
+        if let Some(notifications) = &self.notifications {
+            notifications.emit(events);
+        }
         Ok(())
     }
     /// Serialize durable manager-record changes with saves, without touching chat history.
@@ -434,6 +442,13 @@ impl Service {
                 Ok(Reply::Launched(id))
             }
             Request::SlackControl { .. } => anyhow::bail!("Unexpected nested Slack control"),
+            Request::Notifications(command) => Ok(Reply::Notifications(
+                self.store
+                    .notifications
+                    .as_ref()
+                    .context("Notification service unavailable")?
+                    .request(command)?,
+            )),
             Request::Ping => Ok(Reply::Ok),
             Request::ServiceVersion => Ok(Reply::ServiceVersion {
                 version: env!("CARGO_PKG_VERSION").into(),
@@ -1264,6 +1279,7 @@ fn clear_conversation(s: &mut Session) {
     s.provider_threads.clear();
     s.provider_context = None;
     s.completed_turn = None;
+    s.completed_turn_successful = false;
     s.token_usage = Value::Null;
     s.usage = Value::Null;
     s.answered_questions.clear();
@@ -1414,6 +1430,7 @@ pub fn run(storage: Storage) -> Result<()> {
         sessions.insert(session.id.clone(), session);
     }
     let remote = super::remote::Remote::start(storage.clone());
+    let notifications = notifications::Dispatcher::start(storage.clone(), notifications::Native)?;
     let service = Arc::new(Service {
         remote,
         store: Arc::new(Store {
@@ -1422,6 +1439,7 @@ pub fn run(storage: Storage) -> Result<()> {
             sessions: Mutex::new(sessions),
             changed: Condvar::new(),
             save_lock: Mutex::new(()),
+            notifications: Some(notifications),
         }),
         workers: Mutex::new(BTreeMap::new()),
         action_locks: Mutex::new(BTreeMap::new()),
@@ -1580,6 +1598,7 @@ mod watch_tests {
             sessions: Mutex::new(BTreeMap::from([("one".into(), session)])),
             changed: Condvar::new(),
             save_lock: Mutex::new(()),
+            notifications: None,
         });
         let (client, mut server) = UnixStream::pair()?;
         client.set_read_timeout(Some(Duration::from_secs(2)))?;

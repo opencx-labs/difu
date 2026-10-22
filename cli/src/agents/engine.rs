@@ -407,6 +407,8 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
         }
         "turn/completed" => {
             super::plan::completed(session, params);
+            session.completed_turn_successful =
+                params.pointer("/turn/status").and_then(Value::as_str) == Some("completed");
             session.completed_turn = params
                 .pointer("/turn/id")
                 .and_then(Value::as_str)

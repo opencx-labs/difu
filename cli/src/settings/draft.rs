@@ -12,6 +12,13 @@ pub struct SettingsDraft {
     guarded: BTreeSet<SettingId>,
 }
 impl SettingsDraft {
+    pub(crate) fn enables_native(&self) -> bool {
+        self.edited.contains(&SettingId::NotificationDelivery)
+            && self.baseline.preferences.notifications.delivery
+                == super::NotificationDelivery::InApp
+            && self.config.preferences.notifications.delivery != super::NotificationDelivery::InApp
+    }
+
     pub fn new(config: Config) -> Self {
         Self {
             baseline: config.clone(),

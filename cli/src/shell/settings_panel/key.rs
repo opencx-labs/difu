@@ -130,7 +130,11 @@ impl Panel {
             return outcome;
         }
         match action {
-            Some(ids::SETTINGS_SAVE) => outcome.saved = self.save(storage),
+            Some(ids::SETTINGS_SAVE) => {
+                let enable = self.draft.enables_native();
+                outcome.saved = self.save(storage);
+                outcome.native_enable = enable && outcome.saved.is_some();
+            }
             Some(ids::SETTINGS_DISCARD) => outcome.saved = self.discard(storage),
             Some(ids::SETTINGS_RESET_SECTION) => self.reset_section(),
             Some(ids::SETTINGS_EXPORT) => {

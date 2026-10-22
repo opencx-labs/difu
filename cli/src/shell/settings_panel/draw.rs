@@ -337,13 +337,44 @@ impl Panel {
                 }
                 lines
             }
-            Preview::Notification => vec![
-                Line::from(Span::styled(
-                    "✓ Example session finished",
-                    Style::default().fg(ACCENT),
-                )),
-                Line::from("Synthetic status; no notification is sent."),
-            ],
+            Preview::Notification => {
+                let preferences = &self.draft.config().preferences.notifications;
+                let (label, enabled) = match spec.id {
+                    SettingId::NotificationSound => ("Notification sound", preferences.sound),
+                    SettingId::QuestionNotification => {
+                        ("Question or approval needed", preferences.question_approval)
+                    }
+                    SettingId::ErrorNotification => ("Session failed", preferences.error),
+                    _ => ("Turn completed", preferences.completion),
+                };
+                let mut lines = vec![
+                    Line::from(Span::styled(
+                        format!("Example · {label}"),
+                        Style::default().fg(ACCENT),
+                    )),
+                    Line::from(
+                        "Only explicit Test sends this synthetic example. Sound test plays standalone audio; Quiet keeps it silent.",
+                    ),
+                ];
+                if !enabled {
+                    lines.push(Line::from("Disabled in draft: Test remains silent."));
+                }
+                if preferences.quiet {
+                    lines.push(Line::from(
+                        "Quiet is on: desktop and sound previews are silent.",
+                    ));
+                } else if !preferences.sound {
+                    lines.push(Line::from("Sound is off: Test will not play audio."));
+                }
+                if let Some(status) = &self.notification_status {
+                    lines.push(Line::from(format!("Desktop: {}", status.desktop)));
+                    lines.push(Line::from(format!("Sound: {}", status.sound)));
+                    if let Some(error) = &status.error {
+                        lines.push(Line::from(error.clone()));
+                    }
+                }
+                lines
+            }
             Preview::None => vec![
                 Line::from(format!(
                     "{} edits or opens the selected control.",
