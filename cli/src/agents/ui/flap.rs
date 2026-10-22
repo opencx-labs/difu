@@ -296,22 +296,29 @@ pub(super) fn screen(
 const HIGHLIGHT: Duration = Duration::from_millis(240);
 const FLAP: Duration = Duration::from_millis(90);
 
-/// A sidebar card's highlight flipping on or off, cell by cell in reading
-/// order: each cell's flap falls with its top half in the new colour.
+/// A sidebar card's highlight flipping on or off, row by row, mirrored
+/// horizontally when moving down: each flap's top half has the new colour.
 #[derive(Clone, Copy)]
 pub(super) struct Highlight {
     on: bool,
+    right_to_left: bool,
     started: Instant,
     duration: Duration,
 }
 impl Highlight {
-    pub(super) fn start(on: bool, now: Instant, tweaks: crate::storage::Tweaks) -> Option<Self> {
+    pub(super) fn start(
+        on: bool,
+        right_to_left: bool,
+        now: Instant,
+        tweaks: crate::storage::Tweaks,
+    ) -> Option<Self> {
         let ms = u64::try_from(HIGHLIGHT.as_millis()).unwrap_or(u64::MAX);
         let duration = Duration::from_millis(u64::from(
             tweaks.capped(u32::try_from(ms).unwrap_or(u32::MAX)),
         ));
         (tweaks.agent_reply_cps > 0 && !duration.is_zero()).then_some(Self {
             on,
+            right_to_left,
             started: now,
             duration,
         })
@@ -335,10 +342,18 @@ impl Highlight {
             (highlight, plain)
         };
         let total = usize::from(area.width) * usize::from(area.height);
-        for (index, position) in area.positions().enumerate() {
+        for position in area.positions() {
             let Some(cell) = buffer.cell_mut(position) else {
                 continue;
             };
+            let column = position.x - area.x;
+            let column = if self.right_to_left {
+                area.width - 1 - column
+            } else {
+                column
+            };
+            let index =
+                usize::from(position.y - area.y) * usize::from(area.width) + usize::from(column);
             let at = self.started + self.duration.mul_f64(index as f64 / total.max(1) as f64);
             if now < at {
                 cell.bg = from;
