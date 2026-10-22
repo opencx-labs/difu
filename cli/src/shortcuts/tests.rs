@@ -329,3 +329,61 @@ fn legacy_question_aliases_stay_contextual_and_opaque_modifiers_are_not_capturab
     }
     Ok(())
 }
+
+#[test]
+fn permission_control_aliases_are_authoritative_contextual_and_replaceable() -> Result<()> {
+    for (action, binding_key, code) in [
+        (ids::PERMISSIONS_SUBMIT, BindingKey::Enter, KeyCode::Enter),
+        (
+            ids::PERMISSIONS_REFRESH_FORM,
+            BindingKey::Character('r'),
+            KeyCode::Char('r'),
+        ),
+    ] {
+        let mut config = Config::default();
+        let bindings = Bindings::new(&config);
+        let effective = bindings.effective(action, contexts::AGENT_PERMISSION_FORM);
+        assert_eq!(effective.len(), 8);
+        for modifiers in [1, 3, 5, 7, 9, 11, 13, 15] {
+            assert!(effective.contains(&key(binding_key.clone(), modifiers)));
+        }
+        let combined = KeyEvent::new(
+            code,
+            M::CONTROL | M::SHIFT | M::ALT | M::SUPER | M::HYPER | M::META,
+        );
+        assert!(bindings.matches(action, contexts::AGENT_PERMISSION_MULTILINE, combined));
+        assert!(!bindings.matches(action, contexts::AGENT_MCP, combined));
+        assert!(!bindings.matches(action, contexts::AGENT_COMPOSER, combined));
+        assert!(!bindings.matches(
+            action,
+            contexts::AGENT_PERMISSION_FORM,
+            KeyEvent::new(code, M::HYPER | M::META)
+        ));
+        assert!(!bindings.matches(
+            action,
+            contexts::AGENT_PERMISSION_FORM,
+            KeyEvent::new_with_kind(code, combined.modifiers, KeyEventKind::Release)
+        ));
+        config
+            .preferences
+            .keyboard
+            .bindings
+            .insert(action.0.into(), key(BindingKey::Function(12), 0));
+        let rebound = Bindings::new(&config);
+        assert!(!rebound.matches(action, contexts::AGENT_PERMISSION_FORM, combined));
+        assert_eq!(rebound.hint(action), "F12");
+    }
+    let mut config = Config::default();
+    config.preferences.keyboard.bindings.insert(
+        ids::NAVIGATION_NEXT_FOCUS.0.into(),
+        key(BindingKey::Enter, 15),
+    );
+    assert!(
+        Bindings::new(&config)
+            .conflicts()
+            .iter()
+            .any(|error| error.contains("Save permission form")
+                && error.contains("Ctrl+Alt+Shift+Super+Enter"))
+    );
+    Ok(())
+}

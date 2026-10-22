@@ -107,6 +107,24 @@ impl<'a> Bindings<'a> {
         {
             return true;
         }
+        // Native permission form controls explicitly accepted CONTROL with extra
+        // modifiers. Capturable combinations live in the catalog; only opaque
+        // Hyper/Meta variants need this narrow, default-only compatibility path.
+        if [ids::PERMISSIONS_SUBMIT, ids::PERMISSIONS_REFRESH_FORM].contains(&action)
+            && spec(action).is_some_and(|spec| spec.contexts.contains(&context))
+            && !self
+                .config
+                .preferences
+                .keyboard
+                .bindings
+                .contains_key(action.0)
+            && event.modifiers.contains(M::CONTROL)
+            && event.modifiers.intersects(M::HYPER | M::META)
+            && ((action == ids::PERMISSIONS_SUBMIT && event.code == KeyCode::Enter)
+                || (action == ids::PERMISSIONS_REFRESH_FORM && event.code == KeyCode::Char('r')))
+        {
+            return true;
+        }
         let Some(chord) = capture(event) else {
             return false;
         };

@@ -82,6 +82,12 @@ pub(super) fn binding_fixture(
 
 /// Observe the existing IPC boundary without a daemon or provider process.
 pub(super) fn request_at_boundary(ui: &mut Ui, key: KeyEvent) -> Result<Request> {
+    request_at_boundary_with(ui, |ui| ui.key(key))
+}
+pub(super) fn request_at_boundary_with(
+    ui: &mut Ui,
+    dispatch: impl FnOnce(&mut Ui),
+) -> Result<Request> {
     use std::{
         io::{BufRead, BufReader, Write},
         os::unix::net::UnixListener,
@@ -112,7 +118,7 @@ pub(super) fn request_at_boundary(ui: &mut Ui, key: KeyEvent) -> Result<Request>
             }
         }
     });
-    ui.key(key);
+    dispatch(ui);
     reader
         .join()
         .map_err(|_| anyhow::anyhow!("IPC fixture reader"))?

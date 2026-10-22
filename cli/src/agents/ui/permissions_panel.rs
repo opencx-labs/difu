@@ -1325,34 +1325,61 @@ impl Ui {
                 lines.extend(entry.into_iter().take(remaining));
             }
         }
-        let footer = if state.form.is_some() {
-            self.hits.push((
-                Rect::new(
-                    area.x,
-                    area.bottom().saturating_sub(1),
-                    area.width.min(12),
-                    1,
-                ),
-                Action::PermissionSave,
-            ));
-            format!(
-                "{} Delete · {} refresh · Esc Cancel",
+        let footer_area = Rect::new(
+            area.x,
+            area.bottom().saturating_sub(3),
+            area.width,
+            area.height.min(3),
+        );
+        let (footer, hint_area) = if state.form.is_some() {
+            let label = format!(
+                "{} Delete",
                 bindings.primary_hint_in(
                     NAVIGATION_ACTIVATE,
                     crate::shortcuts::contexts::AGENT_PERMISSION_DELETE
-                ),
-                bindings.primary_hint_in(
-                    PERMISSIONS_REFRESH_FORM,
-                    crate::shortcuts::contexts::AGENT_PERMISSION_DELETE
                 )
+            );
+            // The destructive control is rendered and hit-tested as one widget.
+            // Remaining help occupies separate rows and never inherits its hitbox.
+            let delete_area = Rect::new(
+                footer_area.x,
+                footer_area.y,
+                footer_area.width.min(
+                    u16::try_from(unicode_width::UnicodeWidthStr::width(label.as_str()))
+                        .unwrap_or(u16::MAX),
+                ),
+                footer_area.height.min(1),
+            );
+            self.hits.push((delete_area, Action::PermissionSave));
+            frame.render_widget(
+                Paragraph::new(label).style(Style::default().fg(DIM)),
+                delete_area,
+            );
+            (
+                format!(
+                    "{} refresh · Esc Cancel",
+                    bindings.primary_hint_in(
+                        PERMISSIONS_REFRESH_FORM,
+                        crate::shortcuts::contexts::AGENT_PERMISSION_DELETE
+                    )
+                ),
+                Rect::new(
+                    footer_area.x,
+                    footer_area.y + footer_area.height.min(1),
+                    footer_area.width,
+                    footer_area.height.saturating_sub(1),
+                ),
             )
         } else if state.searching {
-            format!(
-                "Type to filter · {} finish · Esc cancel",
-                bindings.primary_hint_in(
-                    PERMISSIONS_FINISH_SEARCH,
-                    crate::shortcuts::contexts::AGENT_PERMISSION_SEARCH
-                )
+            (
+                format!(
+                    "Type to filter · {} finish · Esc cancel",
+                    bindings.primary_hint_in(
+                        PERMISSIONS_FINISH_SEARCH,
+                        crate::shortcuts::contexts::AGENT_PERMISSION_SEARCH
+                    )
+                ),
+                footer_area,
             )
         } else {
             let edits = if state.tab.kinds().is_empty() {
@@ -1365,16 +1392,19 @@ impl Ui {
                     hint(PERMISSIONS_DELETE)
                 )
             };
-            format!(
-                "{}/{} tabs · {}/{} select · {} apply{} · {} search · {} refresh · Esc close",
-                hint(PERMISSIONS_PREVIOUS_TAB),
-                hint(PERMISSIONS_NEXT_TAB),
-                hint(NAVIGATION_UP),
-                hint(NAVIGATION_DOWN),
-                hint(NAVIGATION_ACTIVATE),
-                edits,
-                hint(PERMISSIONS_SEARCH),
-                hint(PERMISSIONS_REFRESH)
+            (
+                format!(
+                    "{}/{} tabs · {}/{} select · {} apply{} · {} search · {} refresh · Esc close",
+                    hint(PERMISSIONS_PREVIOUS_TAB),
+                    hint(PERMISSIONS_NEXT_TAB),
+                    hint(NAVIGATION_UP),
+                    hint(NAVIGATION_DOWN),
+                    hint(NAVIGATION_ACTIVATE),
+                    edits,
+                    hint(PERMISSIONS_SEARCH),
+                    hint(PERMISSIONS_REFRESH)
+                ),
+                footer_area,
             )
         };
         frame.render_widget(
@@ -1385,12 +1415,7 @@ impl Ui {
             Paragraph::new(footer)
                 .wrap(ratatui::widgets::Wrap { trim: true })
                 .style(Style::default().fg(DIM)),
-            Rect::new(
-                area.x,
-                area.bottom().saturating_sub(3),
-                area.width,
-                area.height.min(3),
-            ),
+            hint_area,
         );
     }
 }
@@ -1415,6 +1440,222 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n"))
     }
+    fn delete_clicks_from_native_render(
+        ui: &mut Ui,
+        width: u16,
+        custom: bool,
+    ) -> Result<(MouseEvent, MouseEvent)> {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 40))?;
+        terminal.draw(|frame| ui.draw(frame))?;
+        let buffer = terminal.backend().buffer();
+        let label = if custom { "F12 Delete" } else { "Enter Delete" };
+        for row in 0..40 {
+            let line = (0..width)
+                .filter_map(|column| buffer.cell((column, row)))
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            if let Some(byte) = line.find(label) {
+                let prefix = line.get(..byte).context("label prefix")?;
+                let column = u16::try_from(prefix.chars().count())? + if custom { 4 } else { 6 };
+                assert_eq!(
+                    buffer
+                        .cell((column, row))
+                        .context("visible Delete")?
+                        .symbol(),
+                    "D"
+                );
+                assert_eq!(
+                    buffer
+                        .cell((column, row + 2))
+                        .context("obsolete blank target")?
+                        .symbol(),
+                    " "
+                );
+                let click = |row| MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                };
+                return Ok((click(row), click(row + 2)));
+            }
+        }
+        anyhow::bail!("visible {label} missing from native render")
+    }
+    fn delete_fixture(custom: bool) -> Result<(Ui, tempfile::TempDir)> {
+        let (mut ui, dir, _) = shortcut_tests::fixture(custom.then_some(NAVIGATION_ACTIVATE))?;
+        let mut state = list_state();
+        state.selected = 2;
+        state.begin_edit(false);
+        state.form.as_mut().context("delete form")?.delete = true;
+        ui.modal = Some(Modal::Permissions(Box::new(state)));
+        Ok((ui, dir))
+    }
+    #[test]
+    fn visible_permission_delete_click_uses_native_geometry_and_exact_ipc() -> Result<()> {
+        for width in [40, 80, 160] {
+            for custom in [false, true] {
+                let (mut ui, _dir) = delete_fixture(custom)?;
+                let (visible, _) = delete_clicks_from_native_render(&mut ui, width, custom)?;
+                let request =
+                    shortcut_tests::request_at_boundary_with(&mut ui, |ui| ui.mouse(visible))?;
+                let Request::Permissions {
+                    id,
+                    action: permissions::Action::Edit { edit },
+                } = request
+                else {
+                    anyhow::bail!("delete request")
+                };
+                assert_eq!(id, "one");
+                assert_eq!(edit.kind, SettingKind::Allow);
+                assert_eq!(edit.scope, Scope::Project);
+                assert_eq!(edit.before.as_deref(), Some("Read(2)"));
+                assert!(edit.after.is_none());
+                assert_eq!(edit.revision, "r1");
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn obsolete_permission_delete_blank_row_never_submits() -> Result<()> {
+        for width in [40, 80, 160] {
+            for custom in [false, true] {
+                let (mut ui, _dir) = delete_fixture(custom)?;
+                let (_, blank) = delete_clicks_from_native_render(&mut ui, width, custom)?;
+                ui.mouse(blank);
+                assert!(
+                    matches!(&ui.modal, Some(Modal::Permissions(state)) if !state.loading && state.form.as_ref().is_some_and(|form| form.delete && form.before.as_deref() == Some("Read(2)")))
+                );
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn permission_control_predicates_keep_combined_modifiers_and_override_removal() -> Result<()> {
+        for (action, code) in [
+            (PERMISSIONS_SUBMIT, KeyCode::Enter),
+            (PERMISSIONS_REFRESH_FORM, KeyCode::Char('r')),
+        ] {
+            for field in 0..6 {
+                if field == 5 && action == PERMISSIONS_SUBMIT {
+                    continue;
+                }
+                for mask in 0..32 {
+                    let modifiers = [
+                        KeyModifiers::SHIFT,
+                        KeyModifiers::ALT,
+                        KeyModifiers::SUPER,
+                        KeyModifiers::HYPER,
+                        KeyModifiers::META,
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    .fold(KeyModifiers::CONTROL, |modifiers, (index, flag)| {
+                        if mask & (1 << index) != 0 {
+                            modifiers | flag
+                        } else {
+                            modifiers
+                        }
+                    });
+                    for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                        let (mut ui, _dir, _) = shortcut_tests::binding_fixture(action, phase)?;
+                        let mut state = field_state(
+                            Some(if field == 5 { 2 } else { field }),
+                            false,
+                            field == 5,
+                        );
+                        let form = state.form.as_mut().context("form")?;
+                        form.value = Editor::from("retained value");
+                        if field == 4 {
+                            form.scope = Scope::User;
+                        }
+                        state.data.revisions.insert(
+                            if field == 4 {
+                                Scope::User
+                            } else {
+                                Scope::Session
+                            },
+                            "combined-revision".into(),
+                        );
+                        ui.modal = Some(Modal::Permissions(Box::new(state)));
+                        ui.key(KeyEvent::new_with_kind(
+                            code,
+                            modifiers,
+                            crossterm::event::KeyEventKind::Release,
+                        ));
+                        assert!(
+                            matches!(&ui.modal, Some(Modal::Permissions(state)) if !state.loading)
+                        );
+                        if custom {
+                            ui.key(KeyEvent::new(code, modifiers));
+                            let Some(Modal::Permissions(state)) = &mut ui.modal else {
+                                anyhow::bail!("form")
+                            };
+                            assert!(
+                                !state.loading,
+                                "removed {action:?}: {modifiers:?}, field{field}, {phase}"
+                            );
+                            state.form.as_mut().context("form")?.value =
+                                Editor::from("retained value");
+                        }
+                        let request = shortcut_tests::request_at_boundary(
+                            &mut ui,
+                            KeyEvent::new(
+                                if custom { KeyCode::F(12) } else { code },
+                                if custom {
+                                    KeyModifiers::NONE
+                                } else {
+                                    modifiers
+                                },
+                            ),
+                        )
+                        .with_context(|| {
+                            format!("{action:?}: {modifiers:?}, field{field}, {phase}")
+                        })?;
+                        let Request::Permissions {
+                            id,
+                            action: requested,
+                        } = request
+                        else {
+                            anyhow::bail!("permissions request")
+                        };
+                        assert_eq!(id, "one");
+                        if action == PERMISSIONS_REFRESH_FORM {
+                            assert!(matches!(requested, permissions::Action::Refresh));
+                        } else {
+                            let permissions::Action::Edit { edit } = requested else {
+                                anyhow::bail!("submit")
+                            };
+                            assert_eq!(
+                                edit.kind,
+                                if field == 4 {
+                                    SettingKind::AutoEnvironment
+                                } else {
+                                    SettingKind::Allow
+                                }
+                            );
+                            assert_eq!(
+                                edit.scope,
+                                if field == 4 {
+                                    Scope::User
+                                } else {
+                                    Scope::Session
+                                }
+                            );
+                            assert!(edit.before.is_none());
+                            assert_eq!(edit.after.as_deref(), Some("retained value"));
+                            assert_eq!(edit.revision, "combined-revision");
+                        }
+                        assert!(
+                            matches!(&ui.modal, Some(Modal::Permissions(state)) if state.loading && state.preserve_form == (action == PERMISSIONS_REFRESH_FORM) && state.form.as_ref().is_some_and(|form| form.value.text() == "retained value"))
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn permission_kind_selectors_and_save_errors_retain_the_real_form_guards() -> Result<()> {
         for (action, code, want) in [
