@@ -149,13 +149,40 @@ pub(super) fn build() -> Vec<ActionSpec> {
             }
         }
     }
+    // These main actions precede generic modal dispatch, using the actual modal
+    // context so invalid overrides still obey that editor's reservations.
+    for entry in &mut entries {
+        if [
+            ids::AGENTS_SIDEBAR,
+            ids::AGENTS_CHANGES,
+            ids::AGENTS_MODELS,
+            ids::QUESTION_OPEN,
+        ]
+        .contains(&entry.id)
+        {
+            for context in contexts::AGENT_GENERIC_MODALS {
+                if !entry.contexts.contains(context) {
+                    entry.contexts.push(*context);
+                }
+                for binding in &mut entry.defaults {
+                    if !binding.contexts.contains(context) {
+                        binding.contexts.push(*context);
+                    }
+                }
+            }
+        }
+    }
     // Queue buttons have no Editor; globals must use that exact context rather
     // than suppressing valid list/button bindings as though text were focused.
     for entry in &mut entries {
         if entry.contexts.contains(&contexts::AGENT_QUEUE_EDITOR) {
-            entry.contexts.push(contexts::AGENT_QUEUE_BUTTON);
+            if !entry.contexts.contains(&contexts::AGENT_QUEUE_BUTTON) {
+                entry.contexts.push(contexts::AGENT_QUEUE_BUTTON);
+            }
             for binding in &mut entry.defaults {
-                if binding.contexts.contains(&contexts::AGENT_QUEUE_EDITOR) {
+                if binding.contexts.contains(&contexts::AGENT_QUEUE_EDITOR)
+                    && !binding.contexts.contains(&contexts::AGENT_QUEUE_BUTTON)
+                {
                     binding.contexts.push(contexts::AGENT_QUEUE_BUTTON);
                 }
             }

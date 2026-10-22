@@ -1023,3 +1023,217 @@ fn inline_question_navigation_uses_custom_keys_and_preserves_answers() -> Result
     }
     Ok(())
 }
+
+#[test]
+fn inline_question_preserves_non_shift_enter_aliases_and_rebind_removes_them() -> Result<()> {
+    for modifiers in [
+        KeyModifiers::NONE,
+        KeyModifiers::CONTROL,
+        KeyModifiers::ALT,
+        KeyModifiers::SUPER,
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+        KeyModifiers::CONTROL | KeyModifiers::SUPER,
+        KeyModifiers::ALT | KeyModifiers::SUPER,
+        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+    ]
+    .into_iter()
+    .flat_map(|base| {
+        [
+            KeyModifiers::NONE,
+            KeyModifiers::HYPER,
+            KeyModifiers::META,
+            KeyModifiers::HYPER | KeyModifiers::META,
+        ]
+        .map(|extra| base | extra)
+    }) {
+        for note in [false, true] {
+            for custom in [false, true] {
+                let (mut ui, _dir, _) = fixture(custom.then_some(ids::QUESTION_SUBMIT))?;
+                ui.sessions.get_mut("one").context("session")?.pending.push(Pending {
+                    id: serde_json::json!("request"), method: "item/tool/requestUserInput".into(), responded: false,
+                    params: serde_json::json!({"questions":[{"id":"a","question":"Scope?","options":[{"label":"Small"},{"label":"Large"}]}]}),
+                });
+                ui.open_question(0);
+                if note {
+                    ui.open_question_note();
+                }
+                ui.key(KeyEvent::new_with_kind(
+                    KeyCode::Enter,
+                    modifiers,
+                    crossterm::event::KeyEventKind::Release,
+                ));
+                assert!(ui.question_send.is_none(), "Release must never submit");
+                press(&mut ui, KeyCode::Enter, modifiers | KeyModifiers::SHIFT);
+                assert!(ui.question_send.is_none(), "Shift must keep editing");
+                if let Some(Modal::Approval { selected, .. }) = &mut ui.modal {
+                    *selected = 0;
+                }
+                press(&mut ui, KeyCode::Enter, modifiers);
+                if custom {
+                    assert!(
+                        ui.question_send.is_none(),
+                        "removed alias {modifiers:?}, note={note}"
+                    );
+                    if let Some(Modal::Approval { selected, .. }) = &mut ui.modal {
+                        *selected = 0;
+                    }
+                    press(&mut ui, KeyCode::F(12), KeyModifiers::NONE);
+                }
+                assert!(
+                    ui.question_send
+                        .as_ref()
+                        .is_some_and(|(_, _, id, _)| id == "a"),
+                    "submission {modifiers:?}, note={note}, custom={custom}"
+                );
+                assert_eq!(text(&ui)?, "unsent draft");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn early_main_actions_remain_reachable_from_real_modal_contexts() -> Result<()> {
+    for (action, code) in [
+        (ids::AGENTS_SIDEBAR, KeyCode::Char('[')),
+        (ids::AGENTS_CHANGES, KeyCode::Char('d')),
+        (ids::AGENTS_MODELS, KeyCode::Char('m')),
+        (ids::QUESTION_OPEN, KeyCode::Up),
+    ] {
+        for modal in ["rename", "help", "queue", "delete"] {
+            for custom in [false, true] {
+                let (mut ui, _dir, _) = fixture(custom.then_some(action))?;
+                ui.model_completion.options = vec![crate::model::ModelInfo {
+                    id: "sample-model".into(),
+                    name: "Sample model".into(),
+                    efforts: vec!["medium".into()],
+                }];
+                ui.modal = Some(match modal {
+                    "rename" => Modal::Rename(Editor::from("kept name")),
+                    "help" => Modal::Help(Default::default()),
+                    "queue" => Modal::Queue { selected: 0 },
+                    _ => Modal::Delete,
+                });
+                let context = ui.shortcut_context();
+                if custom {
+                    press(&mut ui, code, KeyModifiers::ALT);
+                    assert_eq!(
+                        ui.shortcut_context(),
+                        context,
+                        "removed {action:?} in {modal}"
+                    );
+                    assert!(ui.list_visible && !ui.changes_visible);
+                }
+                press(
+                    &mut ui,
+                    if custom { KeyCode::F(12) } else { code },
+                    if custom {
+                        KeyModifiers::NONE
+                    } else {
+                        KeyModifiers::ALT
+                    },
+                );
+                match action {
+                    ids::AGENTS_SIDEBAR => assert!(!ui.list_visible, "sidebar in {modal}"),
+                    ids::AGENTS_CHANGES => assert!(ui.changes_visible, "changes in {modal}"),
+                    ids::AGENTS_MODELS => assert!(
+                        matches!(ui.modal, Some(Modal::ModelPicker(_))),
+                        "models in {modal}"
+                    ),
+                    ids::QUESTION_OPEN => assert!(
+                        matches!(ui.modal, Some(Modal::Pending { .. })),
+                        "questions in {modal}"
+                    ),
+                    _ => anyhow::bail!("action"),
+                }
+                assert_eq!(text(&ui)?, "unsent draft");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn early_modal_actions_cannot_steal_rename_typing_or_question_selection() -> Result<()> {
+    for action in [
+        ids::AGENTS_SIDEBAR,
+        ids::AGENTS_CHANGES,
+        ids::AGENTS_MODELS,
+        ids::QUESTION_OPEN,
+    ] {
+        let (mut ui, _dir, mut config) = fixture(None)?;
+        config
+            .preferences
+            .keyboard
+            .bindings
+            .insert(action.0.into(), chord(BindingKey::Character('z'), 0));
+        assert!(crate::shortcuts::Bindings::new(&config).validate().is_err());
+        ui.apply_settings(&config);
+        ui.modal = Some(Modal::Rename(Editor::from("name")));
+        press(&mut ui, KeyCode::Char('z'), KeyModifiers::NONE);
+        let Some(Modal::Rename(editor)) = &ui.modal else {
+            anyhow::bail!("typing opened action");
+        };
+        assert_eq!(editor.text(), "namez");
+        assert!(ui.list_visible && !ui.changes_visible);
+    }
+    let (mut ui, _dir, mut config) = fixture(None)?;
+    config
+        .preferences
+        .keyboard
+        .bindings
+        .insert(ids::QUESTION_OPEN.0.into(), chord(BindingKey::Left, 4));
+    config.preferences.keyboard.question_overrides_selection = true;
+    crate::shortcuts::Bindings::new(&config).validate()?;
+    ui.apply_settings(&config);
+    ui.modal = Some(Modal::Rename(Editor::from("name")));
+    press(&mut ui, KeyCode::Left, KeyModifiers::SHIFT);
+    let Some(Modal::Rename(editor)) = &ui.modal else {
+        anyhow::bail!("selection opened question");
+    };
+    assert_eq!(editor.selected_text().as_deref(), Some("e"));
+    Ok(())
+}
+
+#[test]
+fn plan_and_inline_questions_keep_priority_over_early_main_actions() -> Result<()> {
+    for (action, code) in [
+        (ids::AGENTS_SIDEBAR, KeyCode::Char('[')),
+        (ids::AGENTS_CHANGES, KeyCode::Char('d')),
+        (ids::AGENTS_MODELS, KeyCode::Char('m')),
+        (ids::QUESTION_OPEN, KeyCode::Up),
+    ] {
+        for custom in [false, true] {
+            let (mut ui, _dir, _) = fixture(custom.then_some(action))?;
+            ui.sessions.get_mut("one").context("session")?.plan_prompt =
+                Some(crate::agents::plan::Proposal {
+                    id: "sample-plan".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    text: "Sample plan".into(),
+                });
+            ui.open_plan_prompt();
+            assert!(matches!(ui.modal, Some(Modal::Plan(_))));
+            let event = KeyEvent::new(
+                if custom { KeyCode::F(12) } else { code },
+                if custom {
+                    KeyModifiers::NONE
+                } else {
+                    KeyModifiers::ALT
+                },
+            );
+            ui.key(event);
+            assert!(matches!(ui.modal, Some(Modal::Plan(_))));
+            assert!(ui.list_visible && !ui.changes_visible);
+            ui.sessions.get_mut("one").context("session")?.pending.push(Pending {
+                id: serde_json::json!("question"), method: "item/tool/requestUserInput".into(), responded: false,
+                params: serde_json::json!({"questions":[{"id":"a","question":"Scope?","options":[{"label":"Small"}]}]}),
+            });
+            ui.open_question(0);
+            ui.key(event);
+            assert!(ui.inline_question());
+            assert!(ui.list_visible && !ui.changes_visible);
+        }
+    }
+    Ok(())
+}

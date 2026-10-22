@@ -86,11 +86,31 @@ impl<'a> Bindings<'a> {
             .collect()
     }
     pub fn matches(&self, action: ActionId, context: Context, event: KeyEvent) -> bool {
+        // Release is owned only by the voice hold lifecycle, never by action dispatch.
+        if event.kind == KeyEventKind::Release {
+            return false;
+        }
+        // The original question handler accepted every non-Shift Enter. Preserve
+        // opaque terminal modifiers only for this default semantic action; they
+        // remain unsupported by shortcut capture and persisted custom chords.
+        if action == ids::QUESTION_SUBMIT
+            && [contexts::AGENT_QUESTION, contexts::AGENT_QUESTION_NOTE].contains(&context)
+            && !self
+                .config
+                .preferences
+                .keyboard
+                .bindings
+                .contains_key(action.0)
+            && event.code == KeyCode::Enter
+            && !event.modifiers.contains(M::SHIFT)
+            && event.modifiers.intersects(M::HYPER | M::META)
+        {
+            return true;
+        }
         let Some(chord) = capture(event) else {
             return false;
         };
-        // Release is owned only by the voice hold lifecycle, never by action dispatch.
-        event.kind != KeyEventKind::Release && self.effective(action, context).contains(&chord)
+        self.effective(action, context).contains(&chord)
     }
     pub fn resolve(&self, context: Context, event: KeyEvent) -> Option<ActionId> {
         all()
@@ -147,7 +167,10 @@ impl<'a> Bindings<'a> {
                 );
                 for context in &action.contexts {
                     anyhow::ensure!(
-                        editing::allows(action, *context, &chord, self.config),
+                        editing::allows(action, *context, &chord, self.config)
+                            // Consent authorizes this assignment only in composers.
+                            // Effective bindings still suppress it in other editors.
+                            || editing::question_selection_override(action, &chord, self.config),
                         "{} is reserved for text editing in {}.{}",
                         label(&chord),
                         context.0,

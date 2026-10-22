@@ -323,7 +323,16 @@ pub(super) fn entries() -> Vec<ActionSpec> {
             ids::QUESTION_SUBMIT,
             "Submit question answer",
             &[contexts::AGENT_QUESTION, contexts::AGENT_QUESTION_NOTE],
-            &[key(BindingKey::Enter, 0)],
+            &[
+                key(BindingKey::Enter, 0),
+                key(BindingKey::Enter, 1),
+                key(BindingKey::Enter, 2),
+                key(BindingKey::Enter, 3),
+                key(BindingKey::Enter, 8),
+                key(BindingKey::Enter, 9),
+                key(BindingKey::Enter, 10),
+                key(BindingKey::Enter, 11),
+            ],
         ),
         entry(
             ids::QUESTION_SKIP,

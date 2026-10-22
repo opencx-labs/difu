@@ -270,3 +270,62 @@ fn editing_reservations_are_contextual_and_hints_exclude_suppressed_keys() -> Re
     }
     Ok(())
 }
+
+#[test]
+fn legacy_question_aliases_stay_contextual_and_opaque_modifiers_are_not_capturable() -> Result<()> {
+    for modifiers in [
+        M::HYPER,
+        M::META,
+        M::HYPER | M::META | M::CONTROL | M::ALT | M::SUPER,
+    ] {
+        let event = KeyEvent::new(KeyCode::Enter, modifiers);
+        assert!(capture(event).is_none());
+        let mut config = Config::default();
+        for context in [contexts::AGENT_QUESTION, contexts::AGENT_QUESTION_NOTE] {
+            assert_eq!(
+                Bindings::new(&config).resolve(context, event),
+                Some(ids::QUESTION_SUBMIT)
+            );
+        }
+        for context in [
+            contexts::AGENT_COMPOSER,
+            contexts::AGENT_RENAME,
+            contexts::AGENT_PLAN,
+            contexts::AGENT_APPROVAL_TEXT,
+        ] {
+            assert!(!Bindings::new(&config).matches(ids::QUESTION_SUBMIT, context, event));
+        }
+        config.preferences.keyboard.bindings.insert(
+            ids::QUESTION_SUBMIT.0.into(),
+            key(BindingKey::Function(12), 0),
+        );
+        assert!(!Bindings::new(&config).matches(
+            ids::QUESTION_SUBMIT,
+            contexts::AGENT_QUESTION,
+            event
+        ));
+    }
+    let mut config = Config::default();
+    config
+        .preferences
+        .keyboard
+        .bindings
+        .insert(ids::QUESTION_OPEN.0.into(), key(BindingKey::Left, 4));
+    config.preferences.keyboard.question_overrides_selection = true;
+    Bindings::new(&config).validate()?;
+    let selection = KeyEvent::new(KeyCode::Left, M::SHIFT);
+    assert!(Bindings::new(&config).matches(
+        ids::QUESTION_OPEN,
+        contexts::AGENT_COMPOSER,
+        selection
+    ));
+    for context in [
+        contexts::AGENT_RENAME,
+        contexts::AGENT_HELP,
+        contexts::AGENT_QUEUE_EDITOR,
+        contexts::AGENT_PERMISSION_FORM,
+    ] {
+        assert!(!Bindings::new(&config).matches(ids::QUESTION_OPEN, context, selection));
+    }
+    Ok(())
+}

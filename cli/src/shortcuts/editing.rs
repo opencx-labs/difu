@@ -33,8 +33,16 @@ pub(super) fn allows(
     {
         return true;
     }
+    [AGENT_COMPOSER, AGENT_COMPOSER_PANES].contains(&context)
+        && question_selection_override(action, chord, config)
+}
+
+pub(super) fn question_selection_override(
+    action: &ActionSpec,
+    chord: &KeyChord,
+    config: &Config,
+) -> bool {
     action.id == ids::QUESTION_OPEN
-        && [AGENT_COMPOSER, AGENT_COMPOSER_PANES].contains(&context)
         && *chord == key(BindingKey::Left, 4)
         && config.preferences.keyboard.question_overrides_selection
 }
