@@ -3320,12 +3320,17 @@ impl Ui {
         self.sidebar_order = order;
         if self.selected != self.sidebar_selected {
             if !settled {
+                let right_to_left = list
+                    .iter()
+                    .position(|session| Some(&session.id) == self.sidebar_selected.as_ref())
+                    .is_some_and(|previous| selected > previous);
                 for (id, on) in [
                     (self.sidebar_selected.clone(), false),
                     (self.selected.clone(), true),
                 ] {
                     if let Some(id) = id
-                        && let Some(highlight) = flap::Highlight::start(on, now, self.tweaks)
+                        && let Some(highlight) =
+                            flap::Highlight::start(on, right_to_left, now, self.tweaks)
                     {
                         self.sidebar_highlights.insert(id, highlight);
                     }
