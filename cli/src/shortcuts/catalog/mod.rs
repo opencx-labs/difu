@@ -734,7 +734,13 @@ pub(super) fn build() -> Vec<ActionSpec> {
     }
     for entry in &mut entries {
         if [ids::NAVIGATION_UP, ids::NAVIGATION_DOWN].contains(&entry.id) {
-            for flags in [1, 2, 3] {
+            // Models and Controls accepted every non-Shift arrow; Help also
+            // excluded Super because that was its fast-scroll predicate.
+            for flags in [1, 2, 3, 8, 9, 10, 11] {
+                let mut contexts = vec![contexts::REVIEW_MODELS, contexts::WORKFLOW_CONTROLS];
+                if flags & 8 == 0 {
+                    contexts.push(contexts::REVIEW_HELP);
+                }
                 entry.defaults.push(DefaultBinding {
                     chord: key(
                         if entry.id == ids::NAVIGATION_UP {
@@ -744,7 +750,7 @@ pub(super) fn build() -> Vec<ActionSpec> {
                         },
                         flags,
                     ),
-                    contexts: vec![contexts::REVIEW_HELP],
+                    contexts,
                 });
             }
         }

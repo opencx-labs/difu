@@ -977,11 +977,15 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
             append(
                 &mut doc.rows,
                 link(
-                    if app.config.pinned_repositories.contains(name) {
-                        "* · Unpin repository"
-                    } else {
-                        "* · Pin repository"
-                    },
+                    format!(
+                        "{} · {} repository",
+                        app.hint(REVIEW_PIN_REPOSITORY),
+                        if app.config.pinned_repositories.contains(name) {
+                            "Unpin"
+                        } else {
+                            "Pin"
+                        }
+                    ),
                     Action::PinRepository(name.clone()),
                 ),
             );

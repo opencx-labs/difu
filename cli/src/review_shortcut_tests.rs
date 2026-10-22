@@ -2262,3 +2262,173 @@ fn review_help_non_shift_arrow_predicate_preserves_scroll_and_editor_selection()
     }
     Ok(())
 }
+
+#[test]
+fn model_and_controls_non_shift_arrows_keep_aliases_and_native_selection() -> Result<()> {
+    for (phase, custom) in PHASES {
+        for controls in [false, true] {
+            for (id, code, initial, wanted) in [
+                (NAVIGATION_UP, KeyCode::Up, 2, 1),
+                (NAVIGATION_DOWN, KeyCode::Down, 1, 2),
+            ] {
+                for modifiers in [
+                    KeyModifiers::NONE,
+                    KeyModifiers::CONTROL,
+                    KeyModifiers::ALT,
+                    KeyModifiers::CONTROL | KeyModifiers::ALT,
+                    KeyModifiers::SUPER,
+                    KeyModifiers::SUPER | KeyModifiers::CONTROL,
+                    KeyModifiers::SUPER | KeyModifiers::ALT,
+                    KeyModifiers::SUPER | KeyModifiers::CONTROL | KeyModifiers::ALT,
+                    KeyModifiers::HYPER,
+                    KeyModifiers::META | KeyModifiers::SUPER | KeyModifiers::CONTROL,
+                ] {
+                    let (mut app, _dir) = fixture(id, phase)?;
+                    app.models = vec![ModelInfo {
+                        id: "fixture-model".into(),
+                        name: "Fixture".into(),
+                        efforts: vec!["low".into(), "medium".into(), "high".into()],
+                    }];
+                    let modal = || {
+                        if controls {
+                            Modal::Workflow(Box::new(crate::workflow::Wizard::Controls {
+                                key: pr_key(),
+                                head: "head".into(),
+                                draft: Some(false),
+                                selected: initial,
+                                query: "".into(),
+                            }))
+                        } else {
+                            Modal::Models {
+                                selected: initial,
+                                effort: 0,
+                                query: "".into(),
+                            }
+                        }
+                    };
+                    app.modal = Some(modal());
+                    let old = KeyEvent::new(code, modifiers);
+                    let selection = |app: &App| -> Result<usize> {
+                        match &app.modal {
+                            Some(Modal::Models { selected, .. }) => Ok(*selected),
+                            Some(Modal::Workflow(w)) => match w.as_ref() {
+                                crate::workflow::Wizard::Controls { selected, .. } => Ok(*selected),
+                                _ => anyhow::bail!("controls missing"),
+                            },
+                            _ => anyhow::bail!("picker missing"),
+                        }
+                    };
+                    for mut release in [old, active(custom, old)] {
+                        release.kind = crossterm::event::KeyEventKind::Release;
+                        app.key_event(release);
+                        assert_eq!(selection(&app)?, initial, "release must be inert");
+                    }
+                    if custom {
+                        app.key_event(old);
+                        assert_ne!(
+                            selection(&app)?,
+                            wanted,
+                            "removed {id:?} {modifiers:?} controls={controls}"
+                        );
+                        app.modal = Some(modal());
+                    }
+                    app.key_event(active(custom, old));
+                    assert_eq!(
+                        selection(&app)?,
+                        wanted,
+                        "{phase} {id:?} {modifiers:?} controls={controls}"
+                    );
+                }
+            }
+            let (mut app, _dir) = fixture(NAVIGATION_UP, phase)?;
+            let query: crate::editor::Editor = "one\ntwo".into();
+            app.modal = Some(if controls {
+                Modal::Workflow(Box::new(crate::workflow::Wizard::Controls {
+                    key: pr_key(),
+                    head: "head".into(),
+                    draft: Some(false),
+                    selected: 2,
+                    query,
+                }))
+            } else {
+                Modal::Models {
+                    selected: 2,
+                    effort: 0,
+                    query,
+                }
+            });
+            app.key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT));
+            let query = match &app.modal {
+                Some(Modal::Models { query, .. }) => query,
+                Some(Modal::Workflow(w)) => match w.as_ref() {
+                    crate::workflow::Wizard::Controls { query, .. } => query,
+                    _ => anyhow::bail!("controls missing"),
+                },
+                _ => anyhow::bail!("picker missing"),
+            };
+            assert!(
+                query.selected_text().is_some(),
+                "Shift+Up retains editor selection"
+            );
+            assert_eq!(query.text(), "one\ntwo");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn repository_detail_pin_hint_and_mouse_follow_saved_binding_in_both_states() -> Result<()> {
+    for (phase, custom) in PHASES {
+        for pinned in [false, true] {
+            let (mut app, _dir) = fixture(REVIEW_PIN_REPOSITORY, phase)?;
+            app.inbox_tab = InboxTab::Repositories;
+            app.repository_options = vec!["example/repo".into()];
+            app.repo_selected = Some("example/repo".into());
+            if pinned {
+                app.config.pinned_repositories.insert("example/repo".into());
+            }
+            app.storage
+                .update_config(|saved| *saved = app.config.clone())?;
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30))?;
+            terminal.draw(|frame| crate::ui::draw(frame, &mut app))?;
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            let verb = if pinned { "Unpin" } else { "Pin" };
+            let hint = if custom { "F12" } else { "Shift+8" };
+            assert!(
+                screen.contains(&format!("{hint} · {verb} repository")),
+                "{phase} pinned={pinned}: effective detail hint missing"
+            );
+            if custom {
+                assert!(!screen.contains(&format!("* · {verb} repository")));
+            }
+            let target = app
+                .hits
+                .iter()
+                .find_map(|(rect, action)| {
+                    matches!(action, Action::PinRepository(name) if name == "example/repo")
+                        .then_some(*rect)
+                })
+                .ok_or_else(|| anyhow::anyhow!("rendered pin target"))?;
+            app.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: target.x,
+                row: target.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(
+                app.storage
+                    .load_config()?
+                    .pinned_repositories
+                    .contains("example/repo"),
+                !pinned
+            );
+        }
+    }
+    Ok(())
+}

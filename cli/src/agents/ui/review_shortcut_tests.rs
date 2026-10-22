@@ -263,3 +263,92 @@ fn embedded_review_custom_host_and_review_actions_keep_default_escape_precedence
     }
     Ok(())
 }
+
+#[test]
+fn unfocused_embedded_filter_keeps_host_helper_controls_after_outside_click() -> Result<()> {
+    use crate::settings::HelperPlacement;
+    for (phase, custom) in super::shortcut_tests::BINDING_PHASES {
+        for placement in [
+            HelperPlacement::Right,
+            HelperPlacement::Bottom,
+            HelperPlacement::Main,
+        ] {
+            for (action, old) in [
+                (HELPER_PLACEMENT, KeyCode::Char('p')),
+                (HELPER_VISIBILITY, KeyCode::Char(']')),
+            ] {
+                let (mut ui, _dir, mut config) =
+                    super::shortcut_tests::binding_fixture(action, phase)?;
+                config.preferences.layout.helper_placement = Some(placement);
+                ui.apply_settings(&config);
+                install_review(&mut ui, true);
+                if let Some(panels::View::PullRequest { app }) = &mut ui.panels.view {
+                    app.filters
+                        .editor_mut(crate::filter::Kind::Files)
+                        .insert("retained filter");
+                }
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40))?;
+                terminal.draw(|frame| ui.draw(frame))?;
+                let target = ui
+                    .hits
+                    .iter()
+                    .find_map(|(rect, action)| {
+                        let wanted = if placement == HelperPlacement::Main {
+                            Focus::List
+                        } else {
+                            Focus::Composer
+                        };
+                        matches!(action, Action::Focus(focus) if *focus == wanted).then_some(*rect)
+                    })
+                    .ok_or_else(|| anyhow::anyhow!("rendered host target"))?;
+                ui.mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: target.x,
+                    row: target.y,
+                    modifiers: KeyModifiers::NONE,
+                });
+                assert!(!ui.panels.focused, "outside click must return to host");
+                let before = ui.panels.right;
+                if custom {
+                    ui.key(KeyEvent::new(old, KeyModifiers::ALT));
+                    assert_eq!(ui.panels.right, before);
+                    assert!(!ui.panels.hidden);
+                }
+                let event = if custom {
+                    KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE)
+                } else {
+                    KeyEvent::new(old, KeyModifiers::ALT)
+                };
+                ui.key(event);
+                if action == HELPER_PLACEMENT {
+                    assert_eq!(ui.panels.right, !before, "{phase} {placement:?}");
+                } else {
+                    assert!(ui.panels.hidden, "{phase} {placement:?}");
+                    ui.key(event);
+                    assert!(!ui.panels.hidden, "hidden App must not block host show");
+                }
+                assert_eq!(
+                    review(&ui)?.filters.focused,
+                    Some(crate::filter::Kind::Files)
+                );
+                assert_eq!(
+                    review(&ui)?
+                        .filters
+                        .editor(crate::filter::Kind::Files)
+                        .text(),
+                    "retained filter"
+                );
+                assert_eq!(
+                    ui.positions
+                        .get("one")
+                        .ok_or_else(|| anyhow::anyhow!("host draft"))?
+                        .draft
+                        .text(),
+                    "unsent draft"
+                );
+            }
+        }
+    }
+    Ok(())
+}

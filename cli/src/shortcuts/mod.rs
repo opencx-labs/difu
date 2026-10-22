@@ -207,7 +207,12 @@ impl<'a> Bindings<'a> {
             && (context.0.starts_with("Review") || context.0.starts_with("Workflow"))
             && ![contexts::REVIEW_LOCAL_ROOTS, contexts::REVIEW_LOCAL_SELECT].contains(&context))
             || ([ids::NAVIGATION_UP, ids::NAVIGATION_DOWN].contains(&action)
-                && context == contexts::REVIEW_HELP))
+                && [
+                    contexts::REVIEW_HELP,
+                    contexts::REVIEW_MODELS,
+                    contexts::WORKFLOW_CONTROLS,
+                ]
+                .contains(&context)))
             && !self
                 .config
                 .preferences

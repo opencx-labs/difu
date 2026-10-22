@@ -371,6 +371,7 @@ impl Ui {
             return false;
         }
         if self.panels.focused
+            && self.panels.visible()
             && let Some(View::PullRequest { app }) = &mut self.panels.view
             && !crate::shortcuts::embedded_content(app.shortcut_context())
         {
@@ -379,7 +380,10 @@ impl Ui {
         }
         use crate::shortcuts::ids::*;
         let shortcut = self.shortcut(key).filter(|action| {
-            if let Some(View::PullRequest { app }) = &self.panels.view {
+            if self.panels.focused
+                && self.panels.visible()
+                && let Some(View::PullRequest { app }) = &self.panels.view
+            {
                 crate::shortcuts::embedded_host_action(
                     *action,
                     app.shortcut_context(),
