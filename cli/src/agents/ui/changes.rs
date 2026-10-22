@@ -1,4 +1,9 @@
+#[path = "changes_reading.rs"]
+mod reading;
 use super::*;
+pub(super) fn copy_rows(rows: &[super::patch::SourceRow], position: &Position) -> Option<String> {
+    reading::copy(rows, position)
+}
 use ratatui::style::Modifier;
 use std::sync::Arc;
 
@@ -18,9 +23,23 @@ pub struct Document {
     pub files: Vec<File>,
     pub tree: Vec<crate::tree::Entry>,
     cache: Option<Rendered>,
+    context: HashMap<String, crate::context::FileState>,
+    original_patch: String,
+    context_request: Option<u64>,
+    context_error: Option<String>,
+    reading: Option<reading::Reading>,
+    last_rows: Arc<Vec<super::patch::SourceRow>>,
 }
 struct Rendered {
-    key: (usize, Option<String>, usize, u16, bool),
+    key: (
+        usize,
+        Option<String>,
+        usize,
+        u16,
+        bool,
+        bool,
+        crate::settings::Code,
+    ),
     rows: Arc<Vec<super::patch::SourceRow>>,
 }
 fn unquote(path: &str) -> String {
@@ -171,6 +190,12 @@ impl From<String> for Document {
             files,
             tree,
             cache: None,
+            context: HashMap::new(),
+            original_patch: source,
+            context_request: None,
+            context_error: None,
+            reading: None,
+            last_rows: Default::default(),
         }
     }
 }
@@ -181,11 +206,64 @@ impl From<&str> for Document {
 }
 
 impl Document {
+    pub(super) fn clear_reading(&mut self) {
+        self.reading = None;
+    }
+    pub(super) fn copied_source(&self, position: &Position) -> Option<String> {
+        self.reading
+            .as_ref()
+            .filter(|r| r.projected == (position.changes, position.selection))
+            .and_then(|r| r.copy.clone())
+            .or_else(|| reading::copy(&self.last_rows, position))
+    }
+    fn reflow(
+        &mut self,
+        position: &mut Position,
+        width: u16,
+        wrap: bool,
+        unified: bool,
+        code: &crate::settings::Code,
+    ) -> Arc<Vec<super::patch::SourceRow>> {
+        if self
+            .reading
+            .as_ref()
+            .is_some_and(|r| r.projected != (position.changes, position.selection))
+        {
+            self.reading = None;
+        }
+        if self.reading.is_none() && !self.last_rows.is_empty() {
+            self.reading = Some(reading::Reading::capture(&self.last_rows, position));
+        }
+        let rows = self.rows_with_preferences(position, width, wrap, unified, code);
+        if let Some(reading) = &mut self.reading {
+            reading.project(&rows, position);
+        }
+        position.changes = position.changes.min(rows.len().saturating_sub(1));
+        self.last_rows = Arc::clone(&rows);
+        rows
+    }
+    #[cfg(test)]
     fn rows(
         &mut self,
         position: &Position,
         width: u16,
         wrap: bool,
+    ) -> Arc<Vec<super::patch::SourceRow>> {
+        self.rows_with_preferences(
+            position,
+            width,
+            wrap,
+            true,
+            &crate::settings::Code::default(),
+        )
+    }
+    fn rows_with_preferences(
+        &mut self,
+        position: &Position,
+        width: u16,
+        wrap: bool,
+        unified: bool,
+        code: &crate::settings::Code,
     ) -> Arc<Vec<super::patch::SourceRow>> {
         let key = (
             position.change_file,
@@ -193,10 +271,12 @@ impl Document {
             position.horizontal,
             width,
             wrap,
+            unified,
+            code.clone(),
         );
         if self.cache.as_ref().is_none_or(|cache| cache.key != key) {
             let mut rows = Vec::new();
-            let mut source_index = 0;
+
             for (_, file) in self.files.iter().enumerate().filter(|(index, file)| {
                 position
                     .change_directory
@@ -212,6 +292,8 @@ impl Document {
                             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                         )),
                         source: None,
+                        paired_source: None,
+                        marked_line: None,
                     });
                 }
                 match &file.diff {
@@ -223,23 +305,80 @@ impl Document {
                                     Style::default().fg(DIM),
                                 )),
                                 source: None,
+                                paired_source: None,
+                                marked_line: None,
                             });
-                            for line in &hunk.lines {
-                                // Use the same source-coordinate and syntax renderer as PR diffs.
-                                for row in crate::ui::code_rows(
+                            let state = self.context.get(&file.path);
+                            if code.context_lines > 3
+                                && state.and_then(|s| s.data.as_ref()).is_none()
+                            {
+                                rows.push(super::patch::SourceRow {
+                                    line: Line::from(self.context_error.as_ref().map_or_else(
+                                        || "Loading extra context…".to_owned(),
+                                        |e| {
+                                            format!(
+                                                "Could not load context: {e}. Refresh to retry."
+                                            )
+                                        },
+                                    )),
+                                    source: None,
+                                    paired_source: None,
+                                    marked_line: None,
+                                });
+                            }
+                            for part in crate::context::project(
+                                hunk,
+                                state.and_then(|s| s.data.as_deref()),
+                                Default::default(),
+                                code.context_lines,
+                            ) {
+                                for row in crate::ui::code_rows_with_preferences(
                                     &file.path,
-                                    std::slice::from_ref(line),
+                                    part.lines,
                                     usize::from(width),
-                                    false,
+                                    !unified && width >= 80,
                                     (position.horizontal, wrap),
+                                    code,
                                 ) {
+                                    let (old, new) = match row.target {
+                                        Some(crate::workflow::Target::Code {
+                                            old, new, ..
+                                        }) => (old, new),
+                                        _ => (None, None),
+                                    };
+                                    let sources = |number: Option<u64>, old_side: bool| {
+                                        number
+                                            .and_then(|n| {
+                                                part.lines.iter().find(|line| {
+                                                    if old_side {
+                                                        line.old == Some(n)
+                                                    } else {
+                                                        line.new == Some(n)
+                                                    }
+                                                })
+                                            })
+                                            .map(|line| {
+                                                use std::hash::{Hash, Hasher};
+                                                let mut hash =
+                                                    std::collections::hash_map::DefaultHasher::new(
+                                                    );
+                                                file.path.hash(&mut hash);
+                                                line.old.hash(&mut hash);
+                                                line.new.hash(&mut hash);
+                                                let key = hash.finish() as usize;
+                                                (key, line.text.clone())
+                                            })
+                                    };
+                                    let source = sources(new, false).or_else(|| sources(old, true));
+                                    let paired_source = sources(old, true)
+                                        .filter(|old| source.as_ref() != Some(old));
                                     rows.push(super::patch::SourceRow {
                                         line: Line::from(row.spans),
-                                        source: (line.old.is_some() || line.new.is_some())
-                                            .then(|| (source_index, line.text.clone())),
+                                        marked_line: row.marked_spans.map(Line::from),
+                                        source,
+                                        paired_source,
                                     });
                                 }
-                                source_index += 1;
                             }
                         }
                     }
@@ -249,12 +388,16 @@ impl Document {
                             Style::default().fg(RED),
                         )),
                         source: None,
+                        paired_source: None,
+                        marked_line: None,
                     }),
                 }
                 if position.change_directory.is_some() {
                     rows.push(super::patch::SourceRow {
                         line: Line::default(),
                         source: None,
+                        paired_source: None,
+                        marked_line: None,
                     });
                 }
             }
@@ -271,6 +414,102 @@ impl Document {
 }
 
 impl Ui {
+    pub(super) fn request_change_context(&mut self) {
+        if self.preferences.code.context_lines <= 3 || !self.drilled || !self.changes_visible {
+            return;
+        }
+        let Some(id) = self.selected.clone() else {
+            return;
+        };
+        let source = self.change_source(&id);
+        let Some(document) = self
+            .changes
+            .get_mut(&id)
+            .filter(|d| d.context_request.is_none())
+        else {
+            return;
+        };
+        let files = document
+            .files
+            .iter()
+            .filter_map(|f| f.diff.as_ref().ok().cloned())
+            .collect::<Vec<_>>();
+        if files.is_empty() {
+            return;
+        }
+        document.context_request = Some(self.change_request);
+        document.cache = None;
+        let patch = document.original_patch.clone();
+        self.task(
+            Task::ChangesContext(source.clone(), self.change_request, patch.clone()),
+            Request::ChangesContext {
+                id,
+                pr: source.pr,
+                patch,
+                files,
+            },
+            false,
+        );
+    }
+    pub(super) fn receive_change_context(
+        &mut self,
+        source: &Source,
+        request: u64,
+        patch: &str,
+        result: Result<Reply, String>,
+    ) {
+        if self.selected.as_deref() != Some(source.id.as_str())
+            || self.change_source(&source.id) != *source
+        {
+            return;
+        }
+        let Some(document) = self
+            .changes
+            .get_mut(&source.id)
+            .filter(|d| d.original_patch == patch && d.context_request == Some(request))
+        else {
+            return;
+        };
+        match result {
+            Ok(Reply::ChangesContext(files)) => {
+                for (path, lines) in files {
+                    if let Some(file) = document
+                        .files
+                        .iter()
+                        .find(|f| f.path == path)
+                        .and_then(|f| f.diff.as_ref().ok())
+                    {
+                        match crate::context::FileContext::new(file, lines) {
+                            Ok(data) => {
+                                document.context.entry(path).or_default().data =
+                                    Some(Arc::new(data));
+                            }
+                            Err(error) => document.context_error = Some(error.to_string()),
+                        }
+                    }
+                }
+            }
+            Err(error) => document.context_error = Some(error),
+            _ => document.context_error = Some("Unexpected context response".into()),
+        }
+        if document.context_error.is_none()
+            && document
+                .files
+                .iter()
+                .filter_map(|f| f.diff.as_ref().ok())
+                .any(|f| {
+                    f.hunks.iter().any(|h| h.header.starts_with("@@ "))
+                        && document
+                            .context
+                            .get(&f.path)
+                            .is_none_or(|s| s.data.is_none())
+                })
+        {
+            document.context_error =
+                Some("Context response did not include the pinned file".into());
+        }
+        document.cache = None;
+    }
     pub(super) fn change_source(&self, id: &str) -> Source {
         let links = self.prs.all(id);
         let selected = self.positions.get(id).and_then(|p| p.change_pr.as_ref());
@@ -384,6 +623,12 @@ impl Ui {
                     .zip(&document.files)
                     .all(|(a, b)| a.patch == b.patch)
         }) {
+            if let Some(old) = self.changes.get_mut(&id)
+                && old.context_error.take().is_some()
+            {
+                old.context_request = None;
+                old.cache = None;
+            }
             return; // Keep navigation, scroll, and cached rows on unchanged background refreshes.
         }
         let position = self.positions.entry(id.clone()).or_default();
@@ -420,7 +665,7 @@ impl Ui {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        let Some(document) = self.changes.get(&id) else {
+        let Some(document) = self.changes.get_mut(&id) else {
             return;
         };
         let Some(entry) = document.tree.get(index) else {
@@ -430,6 +675,8 @@ impl Ui {
         p.change_tree = index;
         let directory = entry.file.is_none().then(|| entry.path.clone());
         if p.change_directory != directory || entry.file.is_some_and(|file| p.change_file != file) {
+            document.reading = None;
+            document.last_rows = Default::default();
             p.change_directory = directory;
             if let Some(file) = entry.file {
                 p.change_file = file;
@@ -474,11 +721,21 @@ impl Ui {
         let Some(file) = crate::tree::next_file(&document.tree, p.change_file, forward) else {
             return false;
         };
+        document.reading = None;
+        document.last_rows = Default::default();
         p.change_file = file;
         p.change_tree = crate::tree::selected(&document.tree, file, None);
         p.selection = None;
         p.horizontal = 0;
-        self.change_lines = document.rows(p, self.change_width, self.change_wrap).len();
+        self.change_lines = document
+            .rows_with_preferences(
+                p,
+                self.change_width,
+                self.change_wrap,
+                self.change_unified,
+                &self.preferences.code,
+            )
+            .len();
         p.changes = if forward {
             0
         } else {
@@ -687,7 +944,13 @@ impl Ui {
             Rect::new(content.x, content.y, content.width, 1),
         );
         self.change_width = content.width;
-        let rows = document.rows(p, content.width, self.change_wrap);
+        let rows = document.reflow(
+            p,
+            content.width,
+            self.change_wrap,
+            self.change_unified,
+            &self.preferences.code,
+        );
         let body = Rect::new(
             content.x,
             content.y + 1,
@@ -710,6 +973,9 @@ impl Ui {
                 if p.selection.is_some_and(|anchor| {
                     (anchor.min(p.changes)..=anchor.max(p.changes)).contains(&index)
                 }) {
+                    if let Some(marked) = &row.marked_line {
+                        line = marked.clone();
+                    }
                     line.style = line.style.bg(PANEL);
                     for span in &mut line.spans {
                         span.style = span.style.bg(PANEL);
@@ -735,6 +1001,352 @@ impl Ui {
 mod tests {
     use super::*;
     use anyhow::{Context, Result};
+    #[test]
+    fn changes_native_painter_applies_all_modes_without_modifying_copy() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut config = Config::default();
+        let mut ui = Ui::new(
+            Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().into(),
+            },
+            &config,
+        );
+        ui.selected = Some("one".into());
+        ui.focus = Focus::Changes;
+        let patch = "diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n@@ -13,6 +13,7 @@\n line 13\n line 14\n line 15\n+\tconst value = longFunctionName(argumentOne, argumentTwo);  \n line 17\n line 18\n line 19\n";
+        let mut document = Document::from(patch);
+        let canonical = document
+            .files
+            .first()
+            .and_then(|f| f.diff.as_ref().ok())
+            .context("file")?;
+        let mut full = Vec::new();
+        for n in 1..=31 {
+            full.push(crate::diff::DiffLine {
+                kind: if n == 16 {
+                    crate::diff::LineKind::Add
+                } else {
+                    crate::diff::LineKind::Context
+                },
+                old: if n == 16 {
+                    None
+                } else {
+                    Some(if n > 16 { n - 1 } else { n })
+                },
+                new: Some(n),
+                text: if n == 16 {
+                    "\tconst value = longFunctionName(argumentOne, argumentTwo);  ".into()
+                } else {
+                    format!("line {n}")
+                },
+            });
+        }
+        document.context.entry("file.ts".into()).or_default().data =
+            Some(Arc::new(crate::context::FileContext::new(canonical, full)?));
+        ui.changes.insert("one".into(), document);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 45))?;
+        let screen = |t: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+            t.backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+        for unified in [false, true] {
+            config.unified = unified;
+            for (context, count) in [(0, 1), (3, 7), (5, 11), (10, 21)] {
+                config.preferences.code.context_lines = context;
+                ui.apply_settings(&config);
+                terminal.draw(|f| ui.draw_changes(f, f.area()))?;
+                assert_eq!(
+                    ui.change_rows.iter().filter(|r| r.source.is_some()).count(),
+                    count
+                );
+                let code = ui
+                    .change_rows
+                    .iter()
+                    .find(|r| {
+                        r.source
+                            .as_ref()
+                            .is_some_and(|(_, s)| s.contains("longFunctionName"))
+                    })
+                    .context("code")?
+                    .line
+                    .to_string();
+                assert_eq!(code.contains('│'), !unified);
+            }
+        }
+        config.preferences.code.context_lines = 0;
+        config.preferences.code.line_numbers = false;
+        config.preferences.code.whitespace = crate::settings::Whitespace::SelectedLines;
+        ui.apply_settings(&config);
+        terminal.draw(|f| ui.draw_changes(f, f.area()))?;
+        assert!(!screen(&terminal).contains("→···const·value"));
+        let row = ui
+            .change_rows
+            .iter()
+            .position(|r| r.source.is_some())
+            .context("source")?;
+        let position = ui.positions.get_mut("one").context("position")?;
+        position.changes = row;
+        position.selection = Some(row);
+        terminal.draw(|f| ui.draw_changes(f, f.area()))?;
+        assert!(screen(&terminal).contains("→···const·value"));
+        assert!(
+            !ui.change_rows
+                .get(row)
+                .context("row")?
+                .line
+                .to_string()
+                .contains("   16")
+        );
+        ui.copy_change();
+        assert_eq!(
+            ui.clipboard.as_deref(),
+            Some("\tconst value = longFunctionName(argumentOne, argumentTwo);  ")
+        );
+        ui.positions.get_mut("one").context("position")?.selection = None;
+        config.preferences.code.whitespace = crate::settings::Whitespace::AllLines;
+        ui.apply_settings(&config);
+        terminal.draw(|f| ui.draw_changes(f, f.area()))?;
+        assert!(screen(&terminal).contains("→···const·value"));
+        config.preferences.code.whitespace = crate::settings::Whitespace::Off;
+        config.wrap_diff = false;
+        ui.apply_settings(&config);
+        let mut narrow = ratatui::Terminal::new(ratatui::backend::TestBackend::new(50, 20))?;
+        narrow.draw(|f| ui.draw_changes(f, f.area()))?;
+        let clipped = ui.change_rows.len();
+        config.wrap_diff = true;
+        ui.apply_settings(&config);
+        narrow.draw(|f| ui.draw_changes(f, f.area()))?;
+        assert!(ui.change_rows.len() > clipped);
+        assert!(!screen(&narrow).contains("→···const·value"));
+        Ok(())
+    }
+
+    #[test]
+    fn asynchronous_context_rejects_stale_results_and_preserves_preview_source_intent() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let mut ui = Ui::new(
+            Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().into(),
+            },
+            &Config::default(),
+        );
+        ui.selected = Some("one".into());
+        let patch = "diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n@@ -13,7 +13,7 @@\n line 13\n line 14\n line 15\n-old 16\n+new 16\n line 17\n line 18\n line 19\n";
+        let mut document = Document::from(patch);
+        let canonical = document
+            .files
+            .first()
+            .context("file")?
+            .diff
+            .as_ref()
+            .map_err(|e| anyhow::anyhow!(e.clone()))?
+            .hunks
+            .first()
+            .context("hunk")?
+            .id
+            .clone();
+        document.context_request = Some(7);
+        ui.changes.insert("one".into(), document);
+        let source = ui.change_source("one");
+        let mut code = crate::settings::Code {
+            context_lines: 10,
+            ..Default::default()
+        };
+        let mut position = Position::default();
+        let document = ui.changes.get_mut("one").context("document")?;
+        let pending = document.reflow(&mut position, 100, true, true, &code);
+        assert!(
+            pending
+                .iter()
+                .any(|r| r.line.to_string().contains("Loading extra context"))
+        );
+        position.changes = pending
+            .iter()
+            .position(|r| r.source.as_ref().is_some_and(|(_, s)| s == "line 13"))
+            .context("source")?;
+        position.selection = Some(position.changes);
+        document.reflow(&mut position, 100, true, true, &code);
+        code.context_lines = 0;
+        document.reflow(&mut position, 100, true, true, &code);
+        let mut full = Vec::new();
+        for n in 1..=31 {
+            if n == 16 {
+                full.push(crate::diff::DiffLine {
+                    kind: crate::diff::LineKind::Remove,
+                    old: Some(n),
+                    new: None,
+                    text: "old 16".into(),
+                });
+                full.push(crate::diff::DiffLine {
+                    kind: crate::diff::LineKind::Add,
+                    old: None,
+                    new: Some(n),
+                    text: "new 16".into(),
+                });
+            } else {
+                full.push(crate::diff::DiffLine {
+                    kind: crate::diff::LineKind::Context,
+                    old: Some(n),
+                    new: Some(n),
+                    text: format!("line {n}"),
+                });
+            }
+        }
+        ui.receive_change_context(
+            &source,
+            6,
+            patch,
+            Ok(Reply::ChangesContext(vec![(
+                "file.ts".into(),
+                full.clone(),
+            )])),
+        );
+        assert!(
+            ui.changes
+                .get("one")
+                .context("document")?
+                .context
+                .is_empty()
+        );
+        ui.receive_change_context(
+            &source,
+            7,
+            "stale patch",
+            Ok(Reply::ChangesContext(vec![(
+                "file.ts".into(),
+                full.clone(),
+            )])),
+        );
+        assert!(
+            ui.changes
+                .get("one")
+                .context("document")?
+                .context
+                .is_empty()
+        );
+        ui.change_request = 99; // An unchanged background refresh must not invalidate this result.
+        ui.receive_change_context(
+            &source,
+            7,
+            patch,
+            Ok(Reply::ChangesContext(vec![("file.ts".into(), full)])),
+        );
+        let document = ui.changes.get_mut("one").context("document")?;
+        code.context_lines = 10;
+        let rows = document.reflow(&mut position, 100, true, true, &code);
+        assert_eq!(
+            rows.get(position.changes)
+                .and_then(|r| r.source.as_ref())
+                .map(|(_, s)| s.as_str()),
+            Some("line 13")
+        );
+        assert_eq!(
+            document.copied_source(&position).as_deref(),
+            Some("line 13")
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.source.as_ref().is_some_and(|(_, s)| s == "line 6"))
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.source.as_ref().is_some_and(|(_, s)| s == "line 26"))
+        );
+        assert_eq!(
+            document
+                .files
+                .first()
+                .and_then(|f| f.diff.as_ref().ok())
+                .and_then(|f| f.hunks.first())
+                .map(|h| h.id.as_str()),
+            Some(canonical.as_str())
+        );
+        document.context.clear();
+        ui.receive_change_context(&source, 7, patch, Ok(Reply::ChangesContext(Vec::new())));
+        let document = ui.changes.get_mut("one").context("document")?;
+        let rows = document.reflow(&mut position, 100, true, true, &code);
+        assert!(
+            rows.iter()
+                .any(|r| r.line.to_string().contains("Could not load context"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn changes_reading_and_selection_survive_context_and_wrap_clamps() -> Result<()> {
+        let patch = format!(
+            "diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n@@ -1,3 +1,3 @@\n {}\n-old\n+new\n after\n",
+            "long context ".repeat(30)
+        );
+        let mut document = Document::from(patch);
+        let mut position = Position::default();
+        let mut code = crate::settings::Code::default();
+        let rows = document.reflow(&mut position, 50, true, true, &code);
+        let first = rows
+            .iter()
+            .position(|r| {
+                r.source
+                    .as_ref()
+                    .is_some_and(|(_, s)| s.starts_with("long context"))
+            })
+            .context("context")?;
+        position.changes = first + 4;
+        position.selection = Some(first);
+        let initial = position.changes;
+        document.reflow(&mut position, 50, true, true, &code);
+        code.context_lines = 0;
+        document.reflow(&mut position, 50, false, false, &code);
+        assert!(position.changes < initial);
+        assert_eq!(
+            document.copied_source(&position).as_deref(),
+            Some("long context ".repeat(30).as_str())
+        );
+        code.context_lines = 3;
+        document.reflow(&mut position, 50, true, true, &code);
+        assert_eq!(position.changes, initial);
+        assert_eq!(position.selection, Some(first));
+        Ok(())
+    }
+
+    #[test]
+    fn settings_changes_split_context_and_whitespace_preserve_copy_sources() -> Result<()> {
+        let mut document = Document::from(
+            "diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n@@ -1,3 +1,3 @@\n before\n- old value\n+ new value\n after\n",
+        );
+        let code = crate::settings::Code {
+            line_numbers: false,
+            context_lines: 0,
+            whitespace: crate::settings::Whitespace::AllLines,
+        };
+        let rows = document.rows_with_preferences(&Position::default(), 100, true, false, &code);
+        let text = rows
+            .iter()
+            .map(|r| r.line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("│"), "{text}");
+        assert!(
+            text.contains("- ·old·value") && text.contains("+ ·new·value"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("before") && !text.contains("after"),
+            "{text}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.source.as_ref().is_some_and(|(_, s)| s == " new value"))
+        );
+        Ok(())
+    }
+
     #[test]
     fn shared_code_rows_cache_wrap_source_coordinates_and_folder_boundaries() -> Result<()> {
         let mut document = Document::from(

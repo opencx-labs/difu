@@ -307,6 +307,7 @@ enum Task {
     List,
     Read(String),
     Changes(changes::Source, u64),
+    ChangesContext(changes::Source, u64, String),
     Statistics(String, u64),
     Shells(String),
     OpenArtifact,
@@ -394,6 +395,7 @@ pub struct Ui {
     change_lines: usize,
     change_width: u16,
     change_wrap: bool,
+    change_unified: bool,
     change_rows: std::sync::Arc<Vec<patch::SourceRow>>,
     skills: HashMap<String, (Vec<Skill>, Vec<String>)>,
     skills_loading: Option<String>,
@@ -479,6 +481,7 @@ impl Ui {
             change_lines: 0,
             change_width: 0,
             change_wrap: config.wrap_diff,
+            change_unified: config.unified,
             change_rows: Default::default(),
             skills: HashMap::new(),
             skills_loading: None,
@@ -594,6 +597,10 @@ impl Ui {
                 self.finish_send(id, *token, message.result);
                 continue;
             }
+            if let Task::ChangesContext(source, request, patch) = &message.kind {
+                self.receive_change_context(source, *request, patch, message.result);
+                continue;
+            }
             if let Task::Changes(source, request) = &message.kind {
                 self.receive_change_result(source, *request, message.result);
                 continue;
@@ -608,7 +615,7 @@ impl Ui {
                     self.refreshed = Some(Instant::now());
                 }
                 Task::Read(_) => {}
-                Task::Changes(..) => {}
+                Task::Changes(..) | Task::ChangesContext(..) => {}
                 Task::Launch
                 | Task::Repository(_)
                 | Task::Clear(_)
@@ -981,6 +988,9 @@ impl Ui {
                 };
                 self.task(Task::Changes(source, self.change_request), request, false);
             }
+        }
+        if visible {
+            self.request_change_context();
         }
         self.tick_plan_prompt(visible);
     }
@@ -1593,6 +1603,15 @@ impl Ui {
             self.voice_key(key);
             return;
         }
+        if self.focus == Focus::Changes
+            && matches!(key.code, KeyCode::Home | KeyCode::End)
+            && let Some(document) = self
+                .selected
+                .as_ref()
+                .and_then(|id| self.changes.get_mut(id))
+        {
+            document.clear_reading();
+        }
         self.question_flip.interrupt();
         if self.resource_key(key) || self.panel_key(key) {
             return;
@@ -2125,6 +2144,14 @@ impl Ui {
         }
     }
     fn scroll(&mut self, delta: i32, select: bool) {
+        if self.focus == Focus::Changes
+            && let Some(document) = self
+                .selected
+                .as_ref()
+                .and_then(|id| self.changes.get_mut(id))
+        {
+            document.clear_reading();
+        }
         if self.focus == Focus::ChangeTree {
             self.move_change_tree(delta);
             return;
@@ -2158,27 +2185,14 @@ impl Ui {
         }
     }
     fn copy_change(&mut self) {
-        if let Some(p) = self.selected.as_ref().and_then(|id| self.positions.get(id)) {
-            let start = p.selection.unwrap_or(p.changes).min(p.changes);
-            let end = p.selection.unwrap_or(p.changes).max(p.changes);
-            let mut previous = None;
-            let mut text = Vec::new();
-            for row in self
-                .change_rows
-                .iter()
-                .skip(start)
-                .take(end.saturating_sub(start) + 1)
-            {
-                if let Some((index, source)) = &row.source
-                    && previous != Some(*index)
-                {
-                    text.push(source.clone());
-                    previous = Some(*index);
-                }
-            }
-            if !text.is_empty() {
-                self.clipboard = Some(text.join("\n"));
-            }
+        if let Some(id) = &self.selected
+            && let Some(position) = self.positions.get(id)
+        {
+            self.clipboard = self
+                .changes
+                .get(id)
+                .and_then(|d| d.copied_source(position))
+                .or_else(|| changes::copy_rows(&self.change_rows, position));
         }
     }
     pub fn paste(&mut self, text: &str) {

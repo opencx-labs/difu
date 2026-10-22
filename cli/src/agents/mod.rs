@@ -864,6 +864,12 @@ pub enum Request {
     Changes {
         id: String,
     },
+    ChangesContext {
+        id: String,
+        pr: Option<PrKey>,
+        patch: String,
+        files: Vec<crate::diff::DiffFile>,
+    },
     PrChanges {
         id: String,
         pr: PrKey,
@@ -910,6 +916,7 @@ pub enum Reply {
     Launched(String),
     ChooseRepository,
     Changes(String),
+    ChangesContext(Vec<(String, Vec<crate::diff::DiffLine>)>),
     Statistics(DiffStatistics),
     WorkspacePaths(Vec<String>),
     Skills {

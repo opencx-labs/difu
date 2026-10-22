@@ -50,10 +50,15 @@ impl App {
         self.clipboard = None;
         let request = self.clipboard_id;
         let target = self
-            .document
+            .diff_reading
             .as_ref()
-            .and_then(|doc| doc.rows.get(self.workflow.cursor.unwrap_or(self.scroll)))
-            .and_then(|row| row.right.target.clone());
+            .and_then(crate::ui::DiffReading::target)
+            .or_else(|| {
+                self.document
+                    .as_ref()
+                    .and_then(|doc| doc.rows.get(self.workflow.cursor.unwrap_or(self.scroll)))
+                    .and_then(|row| row.right.target.clone())
+            });
         let anchor = match target {
             Some(Target::Header { path, .. }) => {
                 self.clipboard = Some(path);

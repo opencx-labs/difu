@@ -1162,6 +1162,19 @@ impl Service {
                 &self.store.storage,
                 &Cancel::default(),
             )?)),
+            Request::ChangesContext {
+                id,
+                pr,
+                patch,
+                files,
+            } => Ok(Reply::ChangesContext(super::workspace::changes_context(
+                &self.store.get(&id)?,
+                &self.store.storage,
+                pr.as_ref(),
+                &patch,
+                &files,
+                &Cancel::default(),
+            )?)),
             Request::PrChanges { id, pr } => {
                 ensure!(
                     matches!(self.store.get(&id)?.job, Job::Coding(_)),

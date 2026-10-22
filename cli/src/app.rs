@@ -249,6 +249,9 @@ pub enum Modal {
 pub struct App {
     pub hover: crate::hover::State,
     pub preserve_diff_position: bool,
+    pub(crate) diff_visual: Option<Config>,
+    pub(crate) diff_reading: Option<crate::ui::DiffReading>,
+    pub(crate) diff_style: Option<(bool, bool, crate::settings::Code)>,
     pub(crate) clipboard_id: u64,
     pub(crate) clipboard: Option<String>,
     pub filters: crate::filter::State,
@@ -340,6 +343,9 @@ impl App {
             repo_selected: None,
             hover: Default::default(),
             preserve_diff_position: false,
+            diff_visual: None,
+            diff_reading: None,
+            diff_style: None,
             clipboard_id: 0,
             clipboard: None,
             inbox_refreshed: None,
@@ -446,6 +452,54 @@ impl App {
     }
     pub fn review(&self) -> Option<&Review> {
         self.key().and_then(|key| self.reviews.get(&key))
+    }
+    pub(crate) fn diff_config(&self) -> &Config {
+        self.diff_visual.as_ref().unwrap_or(&self.config)
+    }
+    pub(crate) fn preview_diff_settings(&mut self, config: Option<&Config>) {
+        let before = self.diff_config();
+        let after = config.unwrap_or(&self.config);
+        let changed = before.unified != after.unified
+            || before.wrap_diff != after.wrap_diff
+            || before.preferences.code != after.preferences.code;
+        self.diff_visual = config.cloned();
+        if changed {
+            self.preserve_diff_position = true;
+            self.invalidate();
+        }
+    }
+    pub(crate) fn ensure_diff_context(&mut self) {
+        if self.home
+            || self.view == View::Overview
+            || self.diff_config().preferences.code.context_lines <= 3
+        {
+            return;
+        }
+        let hunks = self
+            .review()
+            .and_then(|r| r.snapshot.as_ref().map(|s| (r, s)))
+            .map(|(r, s)| {
+                s.files
+                    .iter()
+                    .filter(|f| {
+                        r.context.get(&f.path).is_none_or(|state| {
+                            state.data.is_none()
+                                && state.pending.is_empty()
+                                && state.error.is_none()
+                        })
+                    })
+                    .filter_map(|f| {
+                        f.hunks
+                            .iter()
+                            .find(|h| h.header.starts_with("@@ "))
+                            .map(|h| h.id.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for hunk in hunks {
+            self.expand_hunk_by(hunk, Direction::Above, 0);
+        }
     }
     pub fn invalidate(&mut self) {
         crate::repaint::request();
@@ -1926,6 +1980,12 @@ impl App {
         }));
     }
     pub fn action(&mut self, action: Action) {
+        if !matches!(
+            action,
+            Action::Copy | Action::ToggleWrap | Action::ToggleLayout | Action::ExpandHunk(..)
+        ) {
+            self.diff_reading = None;
+        }
         self.preserve_diff_position = false;
         if !matches!(action, Action::Filter) {
             self.filters.focused = None;
@@ -2147,13 +2207,13 @@ impl App {
                     return;
                 }
                 self.horizontal = 0;
-                self.workflow.cursor = None;
-                self.workflow.selection = None;
+                self.preserve_diff_position = true;
                 self.invalidate();
             }
             Action::ToggleLayout => {
                 let unified = !self.config.unified;
                 self.update_config("layout preference", |config| config.unified = unified);
+                self.preserve_diff_position = true;
                 self.invalidate();
             }
             Action::Scroll(delta) => self.move_scroll(delta),
@@ -2165,6 +2225,7 @@ impl App {
         }
     }
     fn move_scroll(&mut self, delta: i32) {
+        self.diff_reading = None;
         if self.focus == Focus::Navigation && self.home {
             if self.repository_directory() {
                 let names = self.visible_repositories();
@@ -2272,6 +2333,22 @@ impl App {
         if self.filters.focused.is_some() {
             self.filter_key(key);
             return;
+        }
+        if self.focus == Focus::Content
+            && matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Home
+                    | KeyCode::End
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Char(' ')
+            )
+        {
+            self.diff_reading = None;
         }
         let plain = !key.modifiers.intersects(
             KeyModifiers::CONTROL

@@ -543,6 +543,7 @@ impl App {
                 }
             }
             WAction::Nav(index) => {
+                self.diff_reading = None;
                 self.workflow.nav = index;
                 self.focus = Focus::Navigation;
                 self.workflow.selection = None;
@@ -552,6 +553,7 @@ impl App {
                 }
             }
             WAction::Cursor(row, side) => {
+                self.diff_reading = None;
                 self.focus = Focus::Content;
                 self.workflow.cursor = Some(row);
                 self.workflow.side = side;
@@ -1233,6 +1235,7 @@ impl App {
     }
 
     pub fn move_diff(&mut self, delta: i32, select: bool) {
+        self.diff_reading = None;
         let Some(doc) = &self.document else {
             return;
         };

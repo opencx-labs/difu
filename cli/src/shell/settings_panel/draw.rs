@@ -327,41 +327,86 @@ impl Panel {
 }
 /// Real review diff formatting on isolated synthetic data.
 pub(crate) fn diff_preview(config: &Config, width: u16) -> Vec<Line<'static>> {
-    use crate::diff::{DiffLine, LineKind};
-    let lines = vec![
-        DiffLine {
+    use crate::diff::{DiffFile, DiffLine, Hunk, LineKind};
+    let mut lines = (1..=11)
+        .map(|n| DiffLine {
             kind: LineKind::Context,
-            old: Some(1),
-            new: Some(1),
-            text: "fn greeting() {".into(),
+            old: Some(n),
+            new: Some(n),
+            text: if n == 11 {
+                "fn greeting() {".into()
+            } else {
+                format!("// Greeting context {n}")
+            },
+        })
+        .collect::<Vec<_>>();
+    lines.push(DiffLine {
+        kind: LineKind::Remove,
+        old: Some(12),
+        new: None,
+        text: "    println!(\"Hi\");".into(),
+    });
+    lines.push(DiffLine {
+        kind: LineKind::Add,
+        old: None,
+        new: Some(12),
+        text: "    println!(\"Hello, Difu!\");".into(),
+    });
+    lines.extend((13..=23).map(|n| DiffLine {
+        kind: LineKind::Context,
+        old: Some(n),
+        new: Some(n),
+        text: if n == 13 {
+            "}".into()
+        } else {
+            format!("// Greeting context {n}")
         },
-        DiffLine {
-            kind: LineKind::Remove,
-            old: Some(2),
-            new: None,
-            text: "    println!(\"Hi\");".into(),
-        },
-        DiffLine {
-            kind: LineKind::Add,
-            old: None,
-            new: Some(2),
-            text: "    println!(\"Hello, Difu!\");".into(),
-        },
-        DiffLine {
-            kind: LineKind::Context,
-            old: Some(3),
-            new: Some(3),
-            text: "}".into(),
-        },
-    ];
-    crate::ui::code_rows(
-        "src/greeting.rs",
-        &lines,
-        usize::from(width.max(1)),
-        !config.unified,
-        (0, config.wrap_diff),
+    }));
+    let file = DiffFile {
+        path: "src/greeting.ts".into(),
+        old_path: "src/greeting.ts".into(),
+        status: "M".into(),
+        additions: 1,
+        deletions: 1,
+        hunks: vec![Hunk {
+            id: "settings-example".into(),
+            header: "@@ -9,7 +9,7 @@".into(),
+            lines: lines.iter().skip(8).take(8).cloned().collect(),
+        }],
+    };
+    let Ok(context) = crate::context::FileContext::new(&file, lines) else {
+        return Vec::new();
+    };
+    let Some(hunk) = file.hunks.first() else {
+        return Vec::new();
+    };
+    crate::context::project(
+        hunk,
+        Some(&context),
+        Default::default(),
+        config.preferences.code.context_lines,
     )
-    .into_iter()
-    .map(|row| Line::from(row.spans))
+    .iter()
+    .flat_map(|part| {
+        crate::ui::code_rows_with_preferences(
+            &file.path,
+            part.lines,
+            usize::from(width.max(1)),
+            !config.unified,
+            (0, config.wrap_diff),
+            &config.preferences.code,
+        )
+    })
+    .map(|row| {
+        let selected = matches!(
+            row.target,
+            Some(crate::workflow::Target::Code { new: Some(12), .. })
+        );
+        Line::from(if selected {
+            row.marked_spans.unwrap_or(row.spans)
+        } else {
+            row.spans
+        })
+    })
     .collect()
 }

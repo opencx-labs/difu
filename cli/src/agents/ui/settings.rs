@@ -8,6 +8,7 @@ impl Ui {
         self.pinned_sessions = config.pinned_sessions.clone();
         self.session_order = config.session_order.clone();
         self.change_wrap = config.wrap_diff;
+        self.change_unified = config.unified;
         self.tweaks = config.tweaks;
         self.settle_disabled_motion();
         self.defaults = config.agent_defaults.clone();
@@ -86,6 +87,9 @@ impl Ui {
     pub(crate) fn preview_visual_settings(&mut self, config: &Config) {
         let changed =
             self.preferences.motion != config.preferences.motion || self.tweaks != config.tweaks;
+        self.preferences.code = config.preferences.code.clone();
+        self.change_wrap = config.wrap_diff;
+        self.change_unified = config.unified;
         self.preferences.appearance = config.preferences.appearance.clone();
         // Follow policy changes behavior as content arrives; only the synthetic
         // sample may preview it. Keep the live reading anchor until Save.

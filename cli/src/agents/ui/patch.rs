@@ -45,6 +45,8 @@ pub(super) fn counts(diff: &str) -> (usize, usize) {
 pub(super) struct SourceRow {
     pub line: Line<'static>,
     pub source: Option<(usize, String)>,
+    pub paired_source: Option<(usize, String)>,
+    pub marked_line: Option<Line<'static>>,
 }
 pub(super) fn render(diff: &str, width: u16) -> (Vec<Line<'static>>, usize, usize) {
     let (rows, added, removed) = render_full(diff, width);
@@ -159,7 +161,12 @@ pub(super) fn render_full(diff: &str, width: u16) -> (Vec<SourceRow>, usize, usi
     (
         rows.into_iter()
             .zip(sources)
-            .map(|(line, source)| SourceRow { line, source })
+            .map(|(line, source)| SourceRow {
+                line,
+                source,
+                paired_source: None,
+                marked_line: None,
+            })
             .collect(),
         added,
         removed,

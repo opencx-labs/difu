@@ -448,3 +448,35 @@ fn motion_controls_route_to_dedicated_synthetic_previews() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn diff_preview_uses_context_gutters_wrap_and_selected_whitespace() {
+    let mut config = Config {
+        unified: true,
+        ..Default::default()
+    };
+    config.preferences.code.context_lines = 0;
+    config.preferences.code.line_numbers = false;
+    config.preferences.code.whitespace = crate::settings::Whitespace::SelectedLines;
+    let text = draw::diff_preview(&config, 100)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("····println!"), "{text}");
+    assert!(
+        text.contains("    println!(\"Hi\")"),
+        "unselected old line: {text}"
+    );
+    assert!(!text.contains("fn greeting"), "{text}");
+    let mut counts = Vec::new();
+    for context in [0, 3, 5, 10] {
+        config.preferences.code.context_lines = context;
+        counts.push(draw::diff_preview(&config, 100).len());
+    }
+    assert_eq!(counts, vec![2, 8, 12, 22]);
+    config.wrap_diff = false;
+    let short = draw::diff_preview(&config, 18).len();
+    config.wrap_diff = true;
+    assert!(draw::diff_preview(&config, 18).len() > short);
+}

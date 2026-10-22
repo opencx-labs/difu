@@ -335,6 +335,11 @@ impl Shell {
         if self.settings.is_some() {
             self.agents.preview_visual_settings(visual);
         }
+        let diff_visual = self
+            .settings
+            .as_ref()
+            .map(|panel| panel.preview_config().clone());
+        self.reviews.preview_diff_settings(diff_visual.as_ref());
         self.agents.configure_pr_images(&self.reviews.images);
         if self.agents_active {
             self.agents.draw(frame);
@@ -1535,5 +1540,109 @@ mod settings_integration_tests {
     #[test]
     fn reading_intent_survives_reasoning_preview_discard_and_saved_navigation() -> Result<()> {
         check_reading_intent_across_detail_preview("reasoning")
+    }
+    #[test]
+    fn diff_settings_save_reset_discard_and_external_refresh_keep_committed_state_isolated()
+    -> Result<()> {
+        let (_dir, mut shell) = fixture()?;
+        shell.open_settings(Some(Category::Code));
+        let edited = [
+            (SettingId::UnifiedDiff, SettingValue::Bool(true)),
+            (SettingId::WrapDiff, SettingValue::Bool(true)),
+            (SettingId::LineNumbers, SettingValue::Bool(false)),
+            (SettingId::DiffContext, SettingValue::Number(10)),
+            (
+                SettingId::Whitespace,
+                SettingValue::Choice("selected_lines".into()),
+            ),
+        ];
+        for (id, value) in &edited {
+            shell
+                .settings
+                .as_mut()
+                .context("panel")?
+                .draft
+                .set(id.clone(), value.clone())?;
+        }
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))?;
+        terminal.draw(|f| shell.draw(f))?;
+        assert!(!shell.reviews.config.unified && !shell.reviews.config.wrap_diff);
+        assert!(shell.reviews.diff_config().unified && shell.reviews.diff_config().wrap_diff);
+        assert_eq!(
+            shell.reviews.config.preferences.code,
+            crate::settings::Code::default()
+        );
+        assert_eq!(shell.agents.preferences.code.context_lines, 10);
+        assert!(!shell.agents.preferences.code.line_numbers);
+        assert_eq!(
+            shell.agents.preferences.code.whitespace,
+            crate::settings::Whitespace::SelectedLines
+        );
+        assert_eq!(
+            shell.reviews.storage.load_config()?.preferences.code,
+            crate::settings::Code::default()
+        );
+        let external = shell
+            .reviews
+            .storage
+            .update_config(|c| c.preferences.appearance.message_separators = true)?;
+        shell.apply_committed_settings(external);
+        terminal.draw(|f| shell.draw(f))?;
+        assert!(
+            shell
+                .reviews
+                .diff_config()
+                .preferences
+                .appearance
+                .message_separators
+        );
+        assert_eq!(
+            shell
+                .settings
+                .as_ref()
+                .context("panel")?
+                .draft
+                .edited()
+                .len(),
+            5
+        );
+        shell.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        let saved = shell.reviews.storage.load_config()?;
+        for (id, value) in &edited {
+            assert_eq!(crate::settings::get(&saved, id), *value);
+        }
+        assert_eq!(shell.agents.preferences.code, saved.preferences.code);
+        shell.settings.as_mut().context("panel")?.reset_section();
+        terminal.draw(|f| shell.draw(f))?;
+        assert_eq!(
+            shell.reviews.diff_config().preferences.code,
+            crate::settings::Code::default()
+        );
+        assert_eq!(
+            shell.reviews.storage.load_config()?.preferences.code,
+            saved.preferences.code
+        );
+        shell.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+        terminal.draw(|f| shell.draw(f))?;
+        assert_eq!(
+            shell.reviews.diff_config().preferences.code,
+            saved.preferences.code
+        );
+        shell.settings.as_mut().context("panel")?.reset_section();
+        shell.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+        assert_eq!(
+            shell.reviews.config.preferences.code,
+            crate::settings::Code::default()
+        );
+        assert!(!shell.reviews.config.unified && !shell.reviews.config.wrap_diff);
+        assert!(
+            shell
+                .reviews
+                .config
+                .preferences
+                .appearance
+                .message_separators
+        );
+        Ok(())
     }
 }
