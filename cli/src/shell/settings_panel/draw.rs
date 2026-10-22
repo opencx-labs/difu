@@ -295,6 +295,11 @@ impl Panel {
                 Style::default().fg(DIM),
             ),
         ];
+        details.extend(
+            self.connection_details(&spec.id)
+                .into_iter()
+                .map(Line::from),
+        );
         let mut notification_sample = None;
         let visual = self.preview_config().clone();
         let lines = match spec.preview {

@@ -103,6 +103,7 @@ jobs:
       - name: Build release
         working-directory: cli
         env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
           DIFU_TARGET: ${{ matrix.target }}
         run: cargo build --locked --release --target "$DIFU_TARGET"
       - name: Package and smoke test
@@ -121,17 +122,14 @@ jobs:
           mkdir -p dist package smoke/empty-path
           cp "$binary" LICENSE cli/README.md package/
           cp -R cli/third_party package/third_party
+          case "$DIFU_TARGET" in
+            aarch64-apple-darwin) sh cli/scripts/build-notifications.sh arm64 "$PWD/package" ;;
+            x86_64-apple-darwin) sh cli/scripts/build-notifications.sh x86_64 "$PWD/package" ;;
+          esac
           archive="difu-$version-$DIFU_TARGET.tar.gz"
-          tar -czf "dist/$archive" -C package difu LICENSE README.md third_party
+          tar -czf "dist/$archive" -C package .
           tar -xzf "dist/$archive" -C smoke
-          # The downloaded executable must start without a compiler or helpers.
-          test "$(env PATH="$PWD/smoke/empty-path" "$PWD/smoke/difu" --version)" = "difu $version"
-          set +e
-          output="$(env PATH="$PWD/smoke/empty-path" "$PWD/smoke/difu" </dev/null 2>&1)"
-          status=$?
-          set -e
-          test "$status" -eq 1
-          [[ "$output" == *'difu needs an interactive terminal'* ]]
+          python3 cli/scripts/smoke-release.py "$PWD/smoke" "$DIFU_TARGET" "$version"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: difu-${{ matrix.target }}

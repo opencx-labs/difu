@@ -5,6 +5,7 @@ use crate::{
 };
 
 pub struct Settings {
+    draft: crate::settings::SettingsDraft,
     pub fields: Vec<Editor>,
     pub field: usize,
     pub error: Option<String>,
@@ -21,8 +22,12 @@ pub struct Settings {
 }
 impl Settings {
     fn new(defaults: AgentDefaults) -> Self {
-        let provider = super::super::provider::Provider::for_model(defaults.model.as_deref());
+        let provider = defaults.resolved_provider();
         Self {
+            draft: crate::settings::SettingsDraft::new(Config {
+                agent_defaults: defaults.clone(),
+                ..Config::default()
+            }),
             provider,
             fields: vec![
                 Editor::from(
@@ -48,7 +53,10 @@ impl Settings {
         }
     }
     pub(super) fn changed(&mut self) {
-        let provider = super::super::provider::Provider::for_model(self.value(1).as_deref());
+        let provider = self
+            .value(1)
+            .map(|model| super::super::provider::Provider::for_model(Some(&model)))
+            .unwrap_or(self.draft.config().agent_defaults.resolved_provider());
         if provider != self.provider {
             if let Some(effort) = self.fields.get_mut(2) {
                 *effort = Editor::default();
@@ -107,7 +115,10 @@ impl Settings {
                 Err(error) => self.directory_error = Some(error),
             }
         }
-        if self.field == 2 && self.value(1).is_none() {
+        if self.field == 2
+            && self.value(1).is_none()
+            && self.provider == super::super::provider::Provider::Codex
+        {
             let cwd = self
                 .value(0)
                 .map(std::path::PathBuf::from)
@@ -183,20 +194,34 @@ impl Ui {
         let Some(Modal::AgentDefaults(form)) = &mut self.modal else {
             return;
         };
-        let defaults = AgentDefaults {
-            provider: self.defaults.provider,
-            starting_mode: self.defaults.starting_mode.clone(),
-            repository: form.value(0).map(std::path::PathBuf::from),
-            model: form.value(1),
-            effort: form.value(2),
-            isolated: true,
-        };
-        let result = self
-            .storage
-            .update_config(|config| config.agent_defaults = defaults.clone());
+        let result = (|| -> anyhow::Result<Config> {
+            use crate::settings::{SettingId, SettingValue};
+            let model = form.value(1);
+            let effort = form.value(2);
+            if model != form.draft.config().agent_defaults.model {
+                form.draft.select_default_model(model, effort.clone())?;
+            } else if effort != form.draft.config().agent_defaults.effort {
+                form.draft
+                    .set(SettingId::DefaultEffort, SettingValue::Text(effort))?;
+            }
+            let repository = form.value(0);
+            if repository.as_deref()
+                != form
+                    .draft
+                    .config()
+                    .agent_defaults
+                    .repository
+                    .as_ref()
+                    .and_then(|p| p.to_str())
+            {
+                form.draft
+                    .set(SettingId::DefaultRepository, SettingValue::Text(repository))?;
+            }
+            Ok(self.storage.save_settings_draft(&mut form.draft)?)
+        })();
         match result {
-            Ok(_) => {
-                self.defaults = defaults;
+            Ok(config) => {
+                self.defaults = config.agent_defaults;
                 self.modal = None;
                 self.notice = Some(("Agent defaults saved for new sessions".into(), false));
             }
@@ -571,13 +596,14 @@ mod shortcut_regressions {
                 efforts: vec!["low".into(), "high".into()],
             },
         ];
-        let mut form = Settings::new(AgentDefaults {
-            model: Some("fixture-one".into()),
-            effort: Some("high".into()),
-            ..AgentDefaults::default()
-        });
-        if let Some(editor) = form.fields.first_mut() {
-            *editor = Editor::from("/temporary/repository");
+        // Match production opening: capture saved defaults before editing fields.
+        let mut form = Settings::new(AgentDefaults::default());
+        for (editor, value) in
+            form.fields
+                .iter_mut()
+                .zip(["/temporary/repository", "fixture-one", "high"])
+        {
+            *editor = Editor::from(value);
         }
         form.field = field;
         ui.modal = Some(Modal::AgentDefaults(Box::new(form)));
@@ -981,6 +1007,62 @@ mod shortcut_regressions {
                     .is_none()
             );
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dependent_defaults_tests {
+    use super::*;
+    use anyhow::{Context, Result};
+    #[test]
+    fn legacy_defaults_patch_fields_and_clear_mode_only_on_provider_change() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        storage.update_config(|c| {
+            c.agent_defaults.provider = Some(super::super::super::provider::Provider::Claude);
+            c.agent_defaults.starting_mode = Some("acceptEdits".into());
+            c.agent_defaults.model = Some("claude/sonnet".into());
+        })?;
+        let mut ui = Ui::new(storage.clone(), &storage.load_config()?);
+        ui.model_completion.options = vec![crate::model::ModelInfo {
+            id: "fixture-model".into(),
+            name: "Fixture".into(),
+            efforts: vec![],
+        }];
+        ui.open_defaults();
+        let Some(Modal::AgentDefaults(form)) = &mut ui.modal else {
+            anyhow::bail!("form")
+        };
+        *form.fields.get_mut(1).context("model")? = Editor::from("fixture-model");
+        storage.update_config(|c| c.agent_defaults.repository = Some("/concurrent-repo".into()))?;
+        ui.save_defaults();
+        let saved = storage.load_config()?;
+        assert_eq!(
+            saved.agent_defaults.provider,
+            Some(super::super::super::provider::Provider::Codex)
+        );
+        assert!(saved.agent_defaults.starting_mode.is_none());
+        assert_eq!(
+            saved.agent_defaults.repository,
+            Some("/concurrent-repo".into())
+        );
+        assert!(ui.modal.is_none());
+        ui.open_defaults();
+        let Some(Modal::AgentDefaults(form)) = &mut ui.modal else {
+            anyhow::bail!("form")
+        };
+        *form.fields.get_mut(1).context("model")? = Editor::from("another-model");
+        storage.update_config(|c| {
+            c.agent_defaults.provider = Some(super::super::super::provider::Provider::Claude)
+        })?;
+        let bytes = std::fs::read(&storage.config)?;
+        ui.save_defaults();
+        assert!(matches!(&ui.modal, Some(Modal::AgentDefaults(form)) if form.error.is_some()));
+        assert_eq!(std::fs::read(&storage.config)?, bytes);
         Ok(())
     }
 }

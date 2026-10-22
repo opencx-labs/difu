@@ -47,8 +47,41 @@ impl SettingsDraft {
                     .map(|(action, _)| SettingId::Shortcut(action.0.into())),
             );
         }
+        if matches!(
+            id,
+            SettingId::Provider
+                | SettingId::DefaultModel
+                | SettingId::DefaultEffort
+                | SettingId::StartingMode
+        ) {
+            self.guarded.extend([
+                SettingId::Provider,
+                SettingId::DefaultModel,
+                SettingId::DefaultEffort,
+                SettingId::StartingMode,
+            ]);
+        }
         self.recompute_edits();
         Ok(())
+    }
+    /// Legacy model managers deliberately select a provider with the model.
+    pub(crate) fn select_default_model(
+        &mut self,
+        model: Option<String>,
+        effort: Option<String>,
+    ) -> Result<()> {
+        if let Some(model) = model.as_deref() {
+            let provider = crate::agents::provider::Provider::for_model(Some(model));
+            if self.config.agent_defaults.resolved_provider() != provider {
+                self.set(SettingId::StartingMode, SettingValue::Text(None))?;
+            }
+            self.set(
+                SettingId::Provider,
+                SettingValue::Choice(provider.key().into()),
+            )?;
+        }
+        self.set(SettingId::DefaultModel, SettingValue::Text(model))?;
+        self.set(SettingId::DefaultEffort, SettingValue::Text(effort))
     }
     /// Reset only this draft, using the registry's default. Shortcut None removes its override.
     pub fn reset(&mut self, id: &SettingId) -> Result<()> {
@@ -164,8 +197,26 @@ impl Storage {
         draft: &mut SettingsDraft,
     ) -> std::result::Result<Config, SaveError> {
         let mut conflicts = Vec::new();
+        // Repository dependency follows final native-mode intent, not edit history.
+        let mut guarded = draft.guarded.clone();
+        if draft.config.agent_defaults.starting_mode.is_some()
+            && draft.edited.iter().any(|id| {
+                matches!(
+                    id,
+                    SettingId::Provider
+                        | SettingId::DefaultModel
+                        | SettingId::DefaultEffort
+                        | SettingId::StartingMode
+                )
+            })
+        {
+            guarded.insert(SettingId::DefaultRepository);
+        }
+        if draft.edited.contains(&SettingId::DefaultRepository) {
+            guarded.insert(SettingId::StartingMode);
+        }
         let result = self.try_patch_config(|fresh| {
-            for id in draft.edited.union(&draft.guarded) {
+            for id in draft.edited.union(&guarded) {
                 if super::registry::snapshot(fresh, id)
                     != super::registry::snapshot(&draft.baseline, id)
                 {
@@ -184,6 +235,17 @@ impl Storage {
                 } else {
                     set(fresh, id, get(&draft.config, id))?;
                 }
+            }
+            if draft.edited.iter().any(|id| {
+                matches!(
+                    id,
+                    SettingId::Provider
+                        | SettingId::DefaultModel
+                        | SettingId::DefaultEffort
+                        | SettingId::StartingMode
+                )
+            }) {
+                fresh.agent_defaults.validate()?;
             }
             crate::shortcuts::Bindings::new(fresh).validate()?;
             Ok(())

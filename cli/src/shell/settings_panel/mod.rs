@@ -1,10 +1,11 @@
-//! Native draft editor. No provider, service or session controls are dispatched here.
+//! Native draft editor with cancellable discovery and separately dispatched explicit actions.
 use crate::{
     settings::*,
     storage::{Config, Storage},
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::{path::PathBuf, time::Instant};
+mod connections;
 mod draw;
 mod integration;
 mod key;
@@ -12,6 +13,8 @@ mod shortcuts;
 pub(crate) use integration::command_category;
 #[cfg(test)]
 pub(crate) use integration::is_open_shortcut;
+#[cfg(test)]
+mod terminal_tests;
 #[cfg(test)]
 mod tests;
 
@@ -25,6 +28,7 @@ pub(crate) struct Outcome {
     pub preview_test: Option<Preview>,
 }
 pub(crate) struct Panel {
+    connections: connections::State,
     pub draft: SettingsDraft,
     committed: Config,
     capture: Option<crate::shortcuts::ActionId>,
@@ -69,6 +73,7 @@ impl Panel {
     }
     pub fn new(storage: &Storage, category: Option<Category>) -> anyhow::Result<Self> {
         let mut panel = Self {
+            connections: Default::default(),
             draft: storage.settings_draft()?,
             committed: storage.load_config()?,
             capture: None,
@@ -138,11 +143,24 @@ impl Panel {
         self.extra_specs = specs;
     }
     /// Integration hook: choices obtained without starting any login or connection flow.
-    #[allow(dead_code)] // Task 6 supplies provider capabilities without connecting.
     pub fn set_dynamic_choices(&mut self, id: SettingId, choices: Vec<String>) {
         self.dynamic_choices.insert(id, choices);
     }
     pub fn save(&mut self, storage: &Storage) -> Option<Config> {
+        if self.draft.edited().iter().any(|id| {
+            matches!(
+                id,
+                SettingId::Provider
+                    | SettingId::DefaultModel
+                    | SettingId::DefaultEffort
+                    | SettingId::StartingMode
+                    | SettingId::DefaultRepository
+            )
+        }) && let Some(error) = self.invalid_defaults()
+        {
+            self.error = Some(error);
+            return None;
+        }
         match storage.save_settings_draft(&mut self.draft) {
             Ok(config) => {
                 self.committed = config.clone();

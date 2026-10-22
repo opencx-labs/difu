@@ -2,6 +2,7 @@
 mod artifacts;
 mod claude;
 pub mod client;
+pub mod connections;
 mod elicitation;
 mod engine;
 mod guidance;

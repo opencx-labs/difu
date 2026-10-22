@@ -36,12 +36,16 @@ impl Ui {
     }
 }
 impl Ui {
+    pub(crate) fn open_settings_rules(&mut self, path: Option<std::path::PathBuf>) {
+        self.open_rules(path);
+    }
     pub(crate) fn open_settings_action(&mut self, id: &crate::settings::SettingId) {
         use crate::settings::SettingId;
         match id {
             SettingId::Rules => self.open_rules(None),
             SettingId::McpConnections => self.open_mcp(),
             SettingId::SlackConnection => self.open_slack(),
+            SettingId::RemoteConnection => self.open_remote_status(),
             _ => {}
         }
     }

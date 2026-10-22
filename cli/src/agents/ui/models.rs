@@ -360,6 +360,7 @@ const MODEL_CHOICES: [crate::shortcuts::ActionId; 9] = [
 /// Enter applies the pick to the current session and saves it as the default
 /// for new sessions; `s` changes the current session only.
 pub struct Picker {
+    defaults: crate::settings::SettingsDraft,
     selected: usize,
     effort: Option<String>,
     /// The model the selection snaps to once the catalog arrives.
@@ -432,7 +433,15 @@ impl Ui {
             Some(model) => (Some(model), session.and_then(|s| s.effort.clone())),
             None => (self.defaults.model.clone(), self.defaults.effort.clone()),
         };
+        let defaults = match self.storage.settings_draft() {
+            Ok(defaults) => defaults,
+            Err(error) => {
+                self.notice = Some((format!("Cannot read defaults: {error:#}"), true));
+                return;
+            }
+        };
         self.modal = Some(Modal::ModelPicker(Box::new(Picker {
+            defaults,
             selected: 0,
             effort,
             current,
@@ -488,7 +497,7 @@ impl Ui {
         }
     }
     fn picker_apply(&mut self, default: bool) {
-        let Some(Modal::ModelPicker(picker)) = &self.modal else {
+        let Some(Modal::ModelPicker(picker)) = &mut self.modal else {
             return;
         };
         let Some(model) = self.model_completion.options.get(picker.selected) else {
@@ -504,16 +513,18 @@ impl Ui {
             self.notice = Some(("Select a coding session to change its model".into(), true));
             return;
         }
-        self.modal = None;
         if default {
-            let result = self.storage.update_config(|config| {
-                config.agent_defaults.model = Some(id.clone());
-                config.agent_defaults.effort = effort.clone();
-            });
+            let result = picker
+                .defaults
+                .select_default_model(Some(id.clone()), effort.clone())
+                .and_then(|()| {
+                    self.storage
+                        .save_settings_draft(&mut picker.defaults)
+                        .map_err(Into::into)
+                });
             match result {
-                Ok(_) => {
-                    self.defaults.model = Some(id.clone());
-                    self.defaults.effort = effort.clone();
+                Ok(config) => {
+                    self.defaults = config.agent_defaults;
                     self.notice = Some((
                         format!(
                             "{} is now the default model for new sessions",
@@ -528,6 +539,7 @@ impl Ui {
                 }
             }
         }
+        self.modal = None;
         if applies {
             self.control(Control::Model {
                 model: Some(id),
@@ -695,6 +707,7 @@ mod shortcut_regressions {
     }
     fn picker(ui: &mut Ui, selected: usize) {
         ui.modal = Some(Modal::ModelPicker(Box::new(Picker {
+            defaults: crate::settings::SettingsDraft::new(Config::default()),
             selected,
             effort: None,
             current: None,
@@ -1095,6 +1108,47 @@ mod shortcut_regressions {
             );
             assert!(!ui.busy);
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dependent_picker_tests {
+    use super::*;
+    use anyhow::Result;
+    #[test]
+    fn legacy_picker_saves_compatible_provider_and_rejects_concurrent_bundle_change() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        storage.update_config(|c| {
+            c.agent_defaults.provider = Some(super::super::super::provider::Provider::Claude);
+            c.agent_defaults.starting_mode = Some("acceptEdits".into());
+        })?;
+        let mut ui = Ui::new(storage.clone(), &storage.load_config()?);
+        ui.model_completion.options = vec![ModelInfo {
+            id: "fixture-model".into(),
+            name: "Fixture".into(),
+            efforts: vec![],
+        }];
+        ui.open_model_picker();
+        ui.picker_apply(true);
+        let saved = storage.load_config()?;
+        assert_eq!(
+            saved.agent_defaults.provider,
+            Some(super::super::super::provider::Provider::Codex)
+        );
+        assert!(saved.agent_defaults.starting_mode.is_none());
+        ui.open_model_picker();
+        storage.update_config(|c| c.agent_defaults.starting_mode = Some("plan".into()))?;
+        let bytes = std::fs::read(&storage.config)?;
+        ui.picker_apply(true);
+        assert!(matches!(ui.modal, Some(Modal::ModelPicker(_))));
+        assert!(ui.notice.as_ref().is_some_and(|(_, error)| *error));
+        assert_eq!(std::fs::read(&storage.config)?, bytes);
         Ok(())
     }
 }

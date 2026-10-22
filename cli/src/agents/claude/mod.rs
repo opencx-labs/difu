@@ -749,6 +749,15 @@ fn connect_once(
     resume: Option<&str>,
     cancel: &Cancel,
 ) -> Result<Connection> {
+    if let Some(mode) = session.permission_state.pending_mode.as_deref() {
+        ensure!(
+            super::permissions::snapshot(session)
+                .modes
+                .iter()
+                .any(|choice| choice.id == mode && choice.available),
+            "Claude mode {mode} is unavailable"
+        );
+    }
     let instructions = instructions(session);
     let mut rpc = Connection::open(
         Options {
@@ -779,7 +788,8 @@ fn connect_once(
                 .pending_mode
                 .as_deref()
                 .or(session.permission_state.mode.as_deref()),
-            allow_bypass: session.permission_state.bypass_enabled,
+            allow_bypass: session.permission_state.bypass_enabled
+                || session.permission_state.pending_mode.as_deref() == Some("bypassPermissions"),
             settings: Some(&session.permission_state.claude_settings),
         },
         cancel,

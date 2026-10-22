@@ -36,6 +36,24 @@ impl Default for AgentDefaults {
 }
 
 impl AgentDefaults {
+    /// Structural checks only: discovery is asynchronous and never runs under the config lock.
+    pub fn validate(&self) -> Result<()> {
+        if let (Some(provider), Some(model)) = (self.provider, self.model.as_deref()) {
+            anyhow::ensure!(
+                provider == crate::agents::provider::Provider::for_model(Some(model)),
+                "Default model belongs to a different provider; select a compatible model or Automatic"
+            );
+        }
+        if let Some(mode) = self.starting_mode.as_deref() {
+            anyhow::ensure!(
+                crate::agents::permissions::mode_choices(self.resolved_provider())
+                    .iter()
+                    .any(|choice| choice.id == mode),
+                "Starting mode belongs to a different provider; select a supported mode or Automatic"
+            );
+        }
+        Ok(())
+    }
     pub fn resolved_provider(&self) -> crate::agents::provider::Provider {
         self.provider
             .unwrap_or_else(|| crate::agents::provider::Provider::for_model(self.model.as_deref()))

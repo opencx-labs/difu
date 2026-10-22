@@ -51,6 +51,7 @@ def main() -> None:
             "",
             "  def install",
             '    bin.install "difu"',
+            '    libexec.install "DifuNotifications.app" if OS.mac?',
             "  end",
             "",
             "  def caveats",

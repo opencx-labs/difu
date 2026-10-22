@@ -12,10 +12,19 @@ pub(super) struct State {
     receiver: Option<mpsc::Receiver<Outcome>>,
     checked: Option<Instant>,
     selected: usize,
+    pairing_requested: bool,
 }
 
 impl Ui {
+    pub(super) fn open_remote_status(&mut self) {
+        self.remote.pairing_requested = false;
+        self.modal = Some(Modal::Remote);
+        self.remote.error = None;
+        self.remote.selected = 0;
+        self.remote_command(Command::Status, false);
+    }
     pub(super) fn open_remote(&mut self) {
+        self.remote.pairing_requested = true;
         self.modal = Some(Modal::Remote);
         self.remote.error = None;
         self.remote.selected = 0;
@@ -79,9 +88,14 @@ impl Ui {
             .checked
             .is_some_and(|at| at.elapsed() >= Duration::from_secs(1))
         {
-            // A used or expired code is replaced while the modal stays open.
+            // Renew pairing only after an explicit request in this modal.
             let command = match &self.remote.status {
-                Some(status) if status.enabled && status.listening && status.pairing.is_none() => {
+                Some(status)
+                    if self.remote.pairing_requested
+                        && status.enabled
+                        && status.listening
+                        && status.pairing.is_none() =>
+                {
                     Command::Open
                 }
                 _ => Command::Status,
@@ -115,7 +129,10 @@ impl Ui {
                 }
             }
             Some(REMOTE_DISABLE) if enabled => self.remote_command(Command::Disable, false),
-            Some(REMOTE_ENABLE) => self.remote_command(Command::Open, false),
+            Some(REMOTE_ENABLE) => {
+                self.remote.pairing_requested = true;
+                self.remote_command(Command::Open, self.remote.status.is_none());
+            }
             Some(REMOTE_REMOVE) => {
                 if let Some(device) = devices.get(self.remote.selected) {
                     self.notice = Some((format!("Forgot {}", device.name), false));
@@ -139,7 +156,7 @@ impl Ui {
                 .remote
                 .error
                 .clone()
-                .unwrap_or_else(|| "Starting remote control…".into());
+                .unwrap_or_else(|| "Checking remote control…".into());
             let style = Style::default().fg(if self.remote.error.is_some() {
                 RED
             } else {
@@ -208,7 +225,7 @@ impl Ui {
         ];
         if !status.enabled {
             lines.push(Line::styled(
-                "Remote control is off. Press e to listen on this Wi-Fi network and show a pairing code.",
+                format!("Remote control is off. Press {} to listen on this Wi-Fi network and show a pairing code.", crate::shortcuts::Bindings::new(&self.shortcut_config).primary_hint_in(crate::shortcuts::ids::REMOTE_ENABLE, self.shortcut_context())),
                 Style::default().fg(TEXT),
             ));
         } else if !status.listening {
@@ -569,6 +586,72 @@ mod shortcut_effect_tests {
                 assert!(ui.clipboard.is_none());
             }
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod settings_browse_tests {
+    use super::*;
+    #[test]
+    fn settings_remote_browse_requests_only_status_and_keeps_explicit_enable() -> anyhow::Result<()>
+    {
+        let (mut ui, _dir, _) = super::super::shortcut_tests::fixture(None)?;
+        let request = super::super::shortcut_tests::request_at_boundary_with(&mut ui, |ui| {
+            ui.open_settings_action(&crate::settings::SettingId::RemoteConnection)
+        })?;
+        assert!(matches!(
+            request,
+            Request::Remote {
+                command: Command::Status
+            }
+        ));
+        assert!(matches!(ui.modal, Some(Modal::Remote)));
+        std::fs::remove_file(super::super::super::server::socket(&ui.storage)?)?;
+        ui.remote.receiver = None;
+        ui.remote.status = Some(Status {
+            enabled: true,
+            listening: true,
+            pairing: None,
+            ..Default::default()
+        });
+        ui.remote.checked = Some(Instant::now() - Duration::from_secs(2));
+        let request =
+            super::super::shortcut_tests::request_at_boundary_with(&mut ui, |ui| ui.tick_remote())?;
+        assert!(
+            matches!(
+                request,
+                Request::Remote {
+                    command: Command::Status
+                }
+            ),
+            "Browsing must never renew pairing implicitly"
+        );
+        std::fs::remove_file(super::super::super::server::socket(&ui.storage)?)?;
+        ui.remote.receiver = None;
+        let request = super::super::shortcut_tests::request_at_boundary_with(&mut ui, |ui| {
+            ui.remote_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+        })?;
+        assert!(matches!(
+            request,
+            Request::Remote {
+                command: Command::Open
+            }
+        ));
+        std::fs::remove_file(super::super::super::server::socket(&ui.storage)?)?;
+        ui.remote.receiver = None;
+        ui.remote.checked = Some(Instant::now() - Duration::from_secs(2));
+        let request =
+            super::super::shortcut_tests::request_at_boundary_with(&mut ui, |ui| ui.tick_remote())?;
+        assert!(
+            matches!(
+                request,
+                Request::Remote {
+                    command: Command::Open
+                }
+            ),
+            "Explicit pairing retains renewal"
+        );
         Ok(())
     }
 }

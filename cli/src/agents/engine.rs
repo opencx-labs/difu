@@ -741,6 +741,10 @@ fn send_turn(
         steer || session.permission_state.pending_preset.is_none(),
         "Codex has not confirmed the requested permission preset; no prompt was sent"
     );
+    ensure!(
+        steer || session.permission_state.pending_mode.is_none(),
+        "Provider has not confirmed the requested starting mode; no prompt was sent"
+    );
     let thread = session
         .thread_id
         .as_ref()
@@ -1645,7 +1649,6 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
         }
         if resuming && !session.permission_state.codex_thread_started {s.permission_state.codex_rollout=true;}
         s.permission_state.codex_thread_started=true;
-        s.permission_state.pending_mode=None;
         if !resuming {s.permission_state.mode=Some("default".into());}
         if response.pointer("/thread/turns").and_then(Value::as_array).is_some_and(|turns|!turns.is_empty()) {s.permission_state.codex_rollout=true;}
         s.thread_id = Some(thread_id); s.model = response.get("model").and_then(Value::as_str).map(String::from);
@@ -1665,14 +1668,24 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
     })?;
     permissions_control::record_policy(store, id, &response)?;
     permissions_control::capabilities(&mut rpc, store, id, cancel)?;
-    permissions_control::restore_mode(
+    let restored = permissions_control::restore_mode(
         &mut rpc,
         store,
         id,
-        session.permission_state.mode.as_deref(),
+        session
+            .permission_state
+            .pending_mode
+            .as_deref()
+            .or(session.permission_state.mode.as_deref()),
         &mut response,
         cancel,
-    )?;
+    );
+    if let Err(error) = restored {
+        if let Some(mode) = session.permission_state.pending_mode {
+            store.update(id, |s| s.permission_state.pending_mode = Some(mode))?;
+        }
+        return Err(error);
+    }
     store.update(id, super::plan::reconcile)?;
     store.save(id)?;
     Ok((rpc, resuming))

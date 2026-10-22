@@ -153,6 +153,9 @@ impl Shell {
     }
     pub fn tick_focused(&mut self, focused: bool) {
         self.refresh_settings();
+        if let Some(panel) = &mut self.settings {
+            panel.connection_tick();
+        }
         let selected = self.palette_selection();
         self.agents
             .tick(focused && (self.agents_active || self.palette.is_some()));

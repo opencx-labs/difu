@@ -23,9 +23,9 @@ impl Panel {
                 SettingValue::Choice(choices.get(next).map(|v| (**v).to_owned()).unwrap_or(value))
             }
             (SettingKind::DynamicChoice, SettingValue::Text(value))
-                if self.dynamic_choices.contains_key(&spec.id) =>
+                if self.available_choices(&spec.id).is_some() =>
             {
-                let choices = self.dynamic_choices.get(&spec.id)?;
+                let choices = self.available_choices(&spec.id)?;
                 let current = value
                     .as_ref()
                     .and_then(|v| choices.iter().position(|c| c == v))

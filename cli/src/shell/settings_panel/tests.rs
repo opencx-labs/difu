@@ -1246,3 +1246,277 @@ fn notification_samples_render_production_toast_borders_severity_and_wrapping() 
     assert!(!storage(&dir).config.exists());
     Ok(())
 }
+
+#[test]
+fn discovered_defaults_reject_invalid_selection_without_losing_offline_values() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, Some(Category::AgentDefaults))?;
+    panel.draft.set(
+        SettingId::DefaultModel,
+        SettingValue::Text(Some("fixture-model".into())),
+    )?;
+    panel.draft.set(
+        SettingId::DefaultEffort,
+        SettingValue::Text(Some("unsupported".into())),
+    )?;
+    panel.set_dynamic_choices(SettingId::DefaultModel, vec!["fixture-model".into()]);
+    panel.set_dynamic_choices(SettingId::DefaultEffort, vec!["high".into()]);
+    assert!(panel.save(&storage).is_none());
+    assert_eq!(
+        panel.draft.config().agent_defaults.effort.as_deref(),
+        Some("unsupported")
+    );
+    panel.draft.set(
+        SettingId::DefaultEffort,
+        SettingValue::Text(Some("high".into())),
+    )?;
+    assert!(panel.save(&storage).is_some());
+    panel.reset_section();
+    assert!(panel.draft.config().agent_defaults.model.is_none());
+    panel.discard(&storage);
+    assert_eq!(
+        panel.draft.config().agent_defaults.effort.as_deref(),
+        Some("high")
+    );
+    Ok(())
+}
+
+#[test]
+fn rules_manager_uses_settings_draft_repository_and_returns_to_same_draft() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    storage.update_config(|c| c.agent_defaults.repository = Some(dir.path().join("saved")))?;
+    let mut shell = crate::shell::Shell::new(storage.clone(), storage.load_config()?, None);
+    shell.settings = Some(Panel::new(&storage, Some(Category::AgentDefaults))?);
+    let path = dir.path().join("draft-target");
+    shell.settings.as_mut().context("panel")?.draft.set(
+        SettingId::DefaultRepository,
+        SettingValue::Text(Some(path.to_string_lossy().into_owned())),
+    )?;
+    shell.settings_action(SettingId::Rules);
+    let Some(crate::agents::ui::Modal::RepositoryRules(form)) = &shell.agents.modal else {
+        anyhow::bail!("rules")
+    };
+    assert_eq!(form.repository.text(), path.to_string_lossy());
+    shell.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(shell.settings.is_some());
+    assert!(
+        shell
+            .settings
+            .as_ref()
+            .context("panel")?
+            .draft
+            .edited()
+            .contains(&SettingId::DefaultRepository)
+    );
+    assert_ne!(storage.load_config()?.agent_defaults.repository, Some(path));
+    Ok(())
+}
+
+#[test]
+fn explicit_sign_in_handoff_keeps_unsaved_draft_and_separate_status_actions() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut shell = crate::shell::Shell::new(storage.clone(), Config::default(), None);
+    shell.settings = Some(Panel::new(&storage, Some(Category::Connections))?);
+    shell
+        .settings
+        .as_mut()
+        .context("panel")?
+        .draft
+        .set(SettingId::ReplySpeed, SettingValue::Number(17))?;
+    assert!(shell.take_sign_in().is_none());
+    shell.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    for (id, provider) in [
+        (
+            SettingId::CodexSignIn,
+            crate::agents::provider::Provider::Codex,
+        ),
+        (
+            SettingId::ClaudeSignIn,
+            crate::agents::provider::Provider::Claude,
+        ),
+    ] {
+        let panel = shell.settings.as_mut().context("panel")?;
+        panel.selected = panel
+            .rows()
+            .iter()
+            .position(|row| row.id == id)
+            .context("sign-in action")?;
+        shell.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(shell.take_sign_in(), Some(provider));
+        assert!(shell.take_sign_in().is_none());
+        shell.finish_sign_in(false, true);
+        assert_eq!(
+            shell
+                .settings
+                .as_ref()
+                .context("panel")?
+                .draft
+                .value(&SettingId::ReplySpeed),
+            SettingValue::Number(17)
+        );
+        assert_eq!(
+            storage.load_config()?.tweaks.agent_reply_cps,
+            Config::default().tweaks.agent_reply_cps
+        );
+    }
+    shell.settings_action(SettingId::ProviderConnections);
+    assert!(shell.take_sign_in().is_none());
+    assert!(shell.settings.is_some());
+    Ok(())
+}
+
+#[test]
+fn saving_agent_defaults_changes_only_future_sessions_and_preserves_running_session() -> Result<()>
+{
+    use crate::agents::{Job, Launch, Session, Status, provider::Provider};
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut shell = crate::shell::Shell::new(storage.clone(), Config::default(), None);
+    let mut session = Session::new(
+        "running".into(),
+        Job::Coding(Launch {
+            repository: dir.path().into(),
+            isolated: true,
+            base: "HEAD".into(),
+            prompt: "existing turn".into(),
+            model: Some("existing-codex".into()),
+            effort: Some("low".into()),
+        }),
+    );
+    session.status = Status::Running;
+    session.permission_state.mode = Some("default".into());
+    session.completed_turn = Some("previous-completed".into());
+    session.completed_turn_successful = true;
+    let before = serde_json::to_value(&session)?;
+    shell.agents.sessions.insert(session.id.clone(), session);
+    shell.agents.selected = Some("running".into());
+    shell.settings = Some(Panel::new(&storage, Some(Category::AgentDefaults))?);
+    let panel = shell.settings.as_mut().context("panel")?;
+    for (id, value) in [
+        (SettingId::Provider, SettingValue::Choice("claude".into())),
+        (
+            SettingId::DefaultModel,
+            SettingValue::Text(Some("claude/sonnet".into())),
+        ),
+        (
+            SettingId::DefaultEffort,
+            SettingValue::Text(Some("high".into())),
+        ),
+        (
+            SettingId::DefaultRepository,
+            SettingValue::Text(Some(dir.path().to_string_lossy().into_owned())),
+        ),
+        (
+            SettingId::StartingMode,
+            SettingValue::Text(Some("dontAsk".into())),
+        ),
+    ] {
+        panel.draft.set(id, value)?;
+    }
+    shell.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert!(
+        shell
+            .settings
+            .as_ref()
+            .context("panel")?
+            .draft
+            .edited()
+            .is_empty()
+    );
+    assert_eq!(
+        serde_json::to_value(shell.agents.sessions.get("running").context("session")?)?,
+        before
+    );
+    assert_eq!(shell.agents.defaults.resolved_provider(), Provider::Claude);
+    assert_eq!(
+        shell.agents.defaults.starting_mode.as_deref(),
+        Some("dontAsk")
+    );
+    assert_eq!(
+        storage.load_config()?.agent_defaults.model.as_deref(),
+        Some("claude/sonnet")
+    );
+    let saved = std::fs::read(&storage.config)?;
+    shell.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    let reset = &shell
+        .settings
+        .as_ref()
+        .context("panel")?
+        .draft
+        .config()
+        .agent_defaults;
+    assert_eq!(reset.resolved_provider(), Provider::Codex);
+    assert!(
+        reset.model.is_none()
+            && reset.effort.is_none()
+            && reset.repository.is_none()
+            && reset.starting_mode.is_none()
+    );
+    assert_eq!(std::fs::read(&storage.config)?, saved);
+    shell.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL));
+    assert_eq!(
+        shell
+            .settings
+            .as_ref()
+            .context("panel")?
+            .draft
+            .config()
+            .agent_defaults
+            .starting_mode
+            .as_deref(),
+        Some("dontAsk")
+    );
+    shell.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+    shell.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    let reset = storage.load_config()?.agent_defaults;
+    assert_eq!(reset.resolved_provider(), Provider::Codex);
+    assert!(
+        reset.model.is_none()
+            && reset.effort.is_none()
+            && reset.repository.is_none()
+            && reset.starting_mode.is_none()
+    );
+    assert_eq!(
+        serde_json::to_value(shell.agents.sessions.get("running").context("session")?)?,
+        before
+    );
+    Ok(())
+}
+
+#[test]
+fn repository_edit_cannot_save_a_known_unavailable_retained_starting_mode() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    storage.update_config(|config| {
+        config.agent_defaults.provider = Some(crate::agents::provider::Provider::Claude);
+        config.agent_defaults.starting_mode = Some("auto".into());
+    })?;
+    let original = std::fs::read(&storage.config)?;
+    let mut panel = Panel::new(&storage, Some(Category::AgentDefaults))?;
+    panel.draft.set(
+        SettingId::DefaultRepository,
+        SettingValue::Text(Some(
+            dir.path().join("restricted").to_string_lossy().into_owned(),
+        )),
+    )?;
+    panel.set_dynamic_choices(
+        SettingId::StartingMode,
+        vec!["default".into(), "dontAsk".into()],
+    );
+    assert!(panel.save(&storage).is_none());
+    assert!(
+        panel
+            .error
+            .as_ref()
+            .is_some_and(|message| message.contains("unavailable"))
+    );
+    assert_eq!(std::fs::read(&storage.config)?, original);
+    panel
+        .draft
+        .set(SettingId::StartingMode, SettingValue::Text(None))?;
+    assert!(panel.save(&storage).is_some());
+    Ok(())
+}

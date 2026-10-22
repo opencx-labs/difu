@@ -757,3 +757,131 @@ fn embedded_review_coactive_bindings_reject_cross_draft_and_normalized_collision
     );
     Ok(())
 }
+
+#[test]
+fn agent_defaults_dependent_edits_conflict_without_losing_drafts() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = store(&dir);
+    for dependent in [
+        SettingId::DefaultModel,
+        SettingId::DefaultEffort,
+        SettingId::StartingMode,
+    ] {
+        storage.update_config(|config| *config = Config::default())?;
+        let mut provider = storage.settings_draft()?;
+        let mut other = storage.settings_draft()?;
+        provider.set(SettingId::Provider, SettingValue::Choice("claude".into()))?;
+        other.set(
+            dependent.clone(),
+            SettingValue::Text(Some(
+                match dependent {
+                    SettingId::DefaultModel => "gpt-test",
+                    SettingId::DefaultEffort => "high",
+                    _ => "plan",
+                }
+                .into(),
+            )),
+        )?;
+        storage.save_settings_draft(&mut provider)?;
+        let bytes = fs::read(&storage.config)?;
+        assert!(
+            storage.save_settings_draft(&mut other).is_err(),
+            "{dependent:?}"
+        );
+        assert_eq!(fs::read(&storage.config)?, bytes);
+        assert!(other.edited().contains(&dependent));
+    }
+    Ok(())
+}
+
+#[test]
+fn incompatible_explicit_provider_model_is_retained_in_draft_but_not_saved() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = store(&dir);
+    let mut draft = storage.settings_draft()?;
+    draft.set(SettingId::Provider, SettingValue::Choice("claude".into()))?;
+    draft.set(
+        SettingId::DefaultModel,
+        SettingValue::Text(Some("gpt-test".into())),
+    )?;
+    assert!(storage.save_settings_draft(&mut draft).is_err());
+    assert_eq!(
+        draft.config().agent_defaults.model.as_deref(),
+        Some("gpt-test")
+    );
+    draft.set(SettingId::DefaultModel, SettingValue::Text(None))?;
+    let saved = storage.save_settings_draft(&mut draft)?;
+    assert_eq!(
+        saved.agent_defaults.resolved_provider(),
+        crate::agents::provider::Provider::Claude
+    );
+    Ok(())
+}
+
+#[test]
+fn starting_mode_and_repository_edits_guard_each_other_in_both_save_orders() -> Result<()> {
+    for repository_first in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let storage = store(&dir);
+        let mut repository = storage.settings_draft()?;
+        let mut mode = storage.settings_draft()?;
+        repository.set(
+            SettingId::DefaultRepository,
+            SettingValue::Text(Some("/different-repository".into())),
+        )?;
+        mode.set(
+            SettingId::StartingMode,
+            SettingValue::Text(Some("plan".into())),
+        )?;
+        let (first, second) = if repository_first {
+            (&mut repository, &mut mode)
+        } else {
+            (&mut mode, &mut repository)
+        };
+        storage.save_settings_draft(first)?;
+        let bytes = fs::read(&storage.config)?;
+        assert!(storage.save_settings_draft(second).is_err());
+        assert_eq!(fs::read(&storage.config)?, bytes);
+        assert!(!second.edited().is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn starting_mode_vocabulary_rejects_cross_provider_mode_while_offline() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = store(&dir);
+    let mut draft = storage.settings_draft()?;
+    draft.set(
+        SettingId::StartingMode,
+        SettingValue::Text(Some("dontAsk".into())),
+    )?;
+    assert!(storage.save_settings_draft(&mut draft).is_err());
+    assert_eq!(
+        draft.config().agent_defaults.starting_mode.as_deref(),
+        Some("dontAsk")
+    );
+    draft.set(SettingId::Provider, SettingValue::Choice("claude".into()))?;
+    assert!(storage.save_settings_draft(&mut draft).is_ok());
+    Ok(())
+}
+
+#[test]
+fn starting_mode_returned_to_automatic_merges_independent_repository_edit() -> Result<()> {
+    for initial in [None, Some("plan".to_string())] {
+        let dir = tempfile::tempdir()?;
+        let storage = store(&dir);
+        storage.update_config(|c| c.agent_defaults.starting_mode = initial.clone())?;
+        let mut draft = storage.settings_draft()?;
+        draft.set(
+            SettingId::StartingMode,
+            SettingValue::Text(Some("plan".into())),
+        )?;
+        draft.set(SettingId::StartingMode, SettingValue::Text(None))?;
+        storage.update_config(|c| c.agent_defaults.repository = Some("/concurrent".into()))?;
+        let saved = storage.save_settings_draft(&mut draft)?;
+        assert_eq!(saved.agent_defaults.repository, Some("/concurrent".into()));
+        assert!(saved.agent_defaults.starting_mode.is_none());
+    }
+    Ok(())
+}

@@ -353,7 +353,12 @@ impl Service {
         );
         Ok(())
     }
-    fn insert_session(&self, mut job: Job, empty: bool) -> Result<String> {
+    fn insert_session(
+        &self,
+        mut job: Job,
+        empty: bool,
+        defaults: Option<&crate::storage::AgentDefaults>,
+    ) -> Result<String> {
         let entropy = tempfile::Builder::new()
             .prefix("id-")
             .tempfile_in(&self.store.home)?;
@@ -369,6 +374,11 @@ impl Service {
             launch.isolated = true;
         }
         let mut session = Session::new(id.clone(), job);
+        if let Some(defaults) = defaults {
+            defaults.validate()?;
+            session.provider = defaults.resolved_provider();
+            session.permission_state.pending_mode = defaults.starting_mode.clone();
+        }
         super::rules::capture(&self.store.storage, &mut session)?;
         if empty {
             session.title = "New session".into();
@@ -467,6 +477,7 @@ impl Service {
                 cwd,
                 remember_repository,
             } => {
+                defaults.validate()?;
                 let root = match super::workspace::repository(
                     defaults.repository.as_deref().unwrap_or(&cwd),
                     &Cancel::default(),
@@ -490,10 +501,14 @@ impl Service {
                     }
                     .into(),
                     prompt: String::new(),
-                    model: defaults.model,
-                    effort: defaults.effort,
+                    model: defaults.model.clone(),
+                    effort: defaults.effort.clone(),
                 });
-                Ok(Reply::Launched(self.insert_session(job, true)?))
+                Ok(Reply::Launched(self.insert_session(
+                    job,
+                    true,
+                    Some(&defaults),
+                )?))
             }
             Request::Launch { job } => {
                 let _launch_guard = self
@@ -513,7 +528,7 @@ impl Service {
                         return Ok(Reply::Launched(existing.id.clone()));
                     }
                 }
-                let id = self.insert_session(*job, false)?;
+                let id = self.insert_session(*job, false, None)?;
                 Ok(Reply::Launched(id))
             }
             Request::Control { id, control } => {
