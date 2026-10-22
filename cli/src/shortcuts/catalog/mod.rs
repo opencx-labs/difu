@@ -188,5 +188,93 @@ pub(super) fn build() -> Vec<ActionSpec> {
             }
         }
     }
+    // A permission form has native text only in its value field. Selector and
+    // button contexts preserve early globals and field actions without pretending
+    // those controls are editors. Delete confirmation retains native refresh.
+    for entry in &mut entries {
+        if entry.contexts.contains(&contexts::AGENT_PERMISSION_FORM) {
+            for context in [
+                contexts::AGENT_PERMISSION_CHOICE,
+                contexts::AGENT_PERMISSION_BUTTON,
+            ] {
+                if entry.id == ids::PERMISSIONS_ACTIVATE
+                    && context == contexts::AGENT_PERMISSION_CHOICE
+                {
+                    continue;
+                }
+                if !entry.contexts.contains(&context) {
+                    entry.contexts.push(context);
+                }
+                for binding in &mut entry.defaults {
+                    if binding.contexts.contains(&contexts::AGENT_PERMISSION_FORM)
+                        && !binding.contexts.contains(&context)
+                    {
+                        binding.contexts.push(context);
+                    }
+                }
+            }
+        }
+        if entry.id == ids::PERMISSIONS_REFRESH_FORM {
+            entry.contexts.push(contexts::AGENT_PERMISSION_DELETE);
+            for binding in &mut entry.defaults {
+                binding.contexts.push(contexts::AGENT_PERMISSION_DELETE);
+            }
+        }
+    }
+    for entry in &mut entries {
+        if entry.contexts.contains(&contexts::AGENT_PERMISSION_FORM) {
+            if !entry
+                .contexts
+                .contains(&contexts::AGENT_PERMISSION_MULTILINE)
+            {
+                entry.contexts.push(contexts::AGENT_PERMISSION_MULTILINE);
+            }
+            for binding in &mut entry.defaults {
+                if binding.contexts.contains(&contexts::AGENT_PERMISSION_FORM)
+                    && !binding
+                        .contexts
+                        .contains(&contexts::AGENT_PERMISSION_MULTILINE)
+                {
+                    binding.contexts.push(contexts::AGENT_PERMISSION_MULTILINE);
+                }
+            }
+        }
+        if entry.id == ids::PERMISSIONS_ACTIVATE {
+            entry.defaults.push(DefaultBinding {
+                chord: key(BindingKey::Enter, 4),
+                contexts: vec![
+                    contexts::AGENT_PERMISSION_FORM,
+                    contexts::AGENT_PERMISSION_BUTTON,
+                ],
+            });
+        }
+    }
+    // MCP list, actions, tools, and source detail are different real pages.
+    // Numeric actions belong only to the server action list; source has no select.
+    for entry in &mut entries {
+        if entry.contexts.contains(&contexts::AGENT_MCP) {
+            for context in [
+                contexts::AGENT_MCP_SERVER,
+                contexts::AGENT_MCP_TOOLS,
+                contexts::AGENT_MCP_TOOL,
+            ] {
+                if context == contexts::AGENT_MCP_TOOL
+                    && [ids::MCP_SELECT, ids::NAVIGATION_ACTIVATE].contains(&entry.id)
+                {
+                    continue;
+                }
+                if !entry.contexts.contains(&context) {
+                    entry.contexts.push(context);
+                }
+                for binding in &mut entry.defaults {
+                    if binding.contexts.contains(&contexts::AGENT_MCP)
+                        && !binding.contexts.contains(&context)
+                    {
+                        binding.contexts.push(context);
+                    }
+                }
+            }
+        }
+    }
     entries
 }

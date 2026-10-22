@@ -21,7 +21,7 @@ impl Ui {
                         AGENT_PLAN
                     }
                 }
-                Modal::Mcp(_) => AGENT_MCP,
+                Modal::Mcp(state) => state.shortcut_context(),
                 Modal::Slack(_) => AGENT_SLACK,
                 Modal::Transcript { .. } => AGENT_TRANSCRIPT,
                 Modal::InstallBrowser { .. } => AGENT_RESOURCE_PICKER,

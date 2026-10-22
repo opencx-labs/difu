@@ -448,13 +448,13 @@ pub(super) fn entries() -> Vec<ActionSpec> {
         entry(
             ids::PERMISSIONS_PREVIOUS_VALUE,
             "Previous permission kind or scope",
-            &[contexts::AGENT_PERMISSION_FORM],
+            &[contexts::AGENT_PERMISSION_CHOICE],
             &[key(BindingKey::Left, 0)],
         ),
         entry(
             ids::PERMISSIONS_NEXT_VALUE,
             "Next permission kind or scope",
-            &[contexts::AGENT_PERMISSION_FORM],
+            &[contexts::AGENT_PERMISSION_CHOICE],
             &[key(BindingKey::Right, 0)],
         ),
         entry(
@@ -477,7 +477,7 @@ pub(super) fn entries() -> Vec<ActionSpec> {
         ),
         entry(
             ids::MCP_OPEN,
-            "Open MCP detail",
+            "Open MCP authentication link",
             &[contexts::AGENT_MCP],
             &[key(BindingKey::Character('o'), 0)],
         ),
@@ -581,7 +581,7 @@ pub(super) fn entries() -> Vec<ActionSpec> {
         entry(
             ids::MCP_CHOOSE_1,
             "Choose MCP option 1",
-            &[contexts::AGENT_MCP],
+            &[contexts::AGENT_MCP_SERVER],
             &[key(BindingKey::Character('1'), 0)],
         ),
         entry(
@@ -593,7 +593,7 @@ pub(super) fn entries() -> Vec<ActionSpec> {
         entry(
             ids::MCP_CHOOSE_2,
             "Choose MCP option 2",
-            &[contexts::AGENT_MCP],
+            &[contexts::AGENT_MCP_SERVER],
             &[key(BindingKey::Character('2'), 0)],
         ),
         entry(
@@ -605,7 +605,7 @@ pub(super) fn entries() -> Vec<ActionSpec> {
         entry(
             ids::MCP_CHOOSE_3,
             "Choose MCP option 3",
-            &[contexts::AGENT_MCP],
+            &[contexts::AGENT_MCP_SERVER],
             &[key(BindingKey::Character('3'), 0)],
         ),
         entry(
@@ -617,7 +617,7 @@ pub(super) fn entries() -> Vec<ActionSpec> {
         entry(
             ids::MCP_CHOOSE_4,
             "Choose MCP option 4",
-            &[contexts::AGENT_MCP],
+            &[contexts::AGENT_MCP_SERVER],
             &[key(BindingKey::Character('4'), 0)],
         ),
         entry(
@@ -627,21 +627,9 @@ pub(super) fn entries() -> Vec<ActionSpec> {
             &[key(BindingKey::Character('5'), 0)],
         ),
         entry(
-            ids::MCP_CHOOSE_5,
-            "Choose MCP option 5",
-            &[contexts::AGENT_MCP],
-            &[key(BindingKey::Character('5'), 0)],
-        ),
-        entry(
             ids::MODELS_CHOOSE_6,
             "Choose model 6",
             &[contexts::AGENT_MODEL_PICKER],
-            &[key(BindingKey::Character('6'), 0)],
-        ),
-        entry(
-            ids::MCP_CHOOSE_6,
-            "Choose MCP option 6",
-            &[contexts::AGENT_MCP],
             &[key(BindingKey::Character('6'), 0)],
         ),
         entry(
@@ -651,33 +639,15 @@ pub(super) fn entries() -> Vec<ActionSpec> {
             &[key(BindingKey::Character('7'), 0)],
         ),
         entry(
-            ids::MCP_CHOOSE_7,
-            "Choose MCP option 7",
-            &[contexts::AGENT_MCP],
-            &[key(BindingKey::Character('7'), 0)],
-        ),
-        entry(
             ids::MODELS_CHOOSE_8,
             "Choose model 8",
             &[contexts::AGENT_MODEL_PICKER],
             &[key(BindingKey::Character('8'), 0)],
         ),
         entry(
-            ids::MCP_CHOOSE_8,
-            "Choose MCP option 8",
-            &[contexts::AGENT_MCP],
-            &[key(BindingKey::Character('8'), 0)],
-        ),
-        entry(
             ids::MODELS_CHOOSE_9,
             "Choose model 9",
             &[contexts::AGENT_MODEL_PICKER],
-            &[key(BindingKey::Character('9'), 0)],
-        ),
-        entry(
-            ids::MCP_CHOOSE_9,
-            "Choose MCP option 9",
-            &[contexts::AGENT_MCP],
             &[key(BindingKey::Character('9'), 0)],
         ),
         entry(

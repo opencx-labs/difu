@@ -42,6 +42,82 @@ pub(super) fn fixture(action: Option<ActionId>) -> Result<(Ui, tempfile::TempDir
     ui.positions.entry("one".into()).or_default().draft = Editor::from("unsent draft");
     Ok((ui, dir, config))
 }
+pub(super) const BINDING_PHASES: [(&str, bool); 4] = [
+    ("default", false),
+    ("custom", true),
+    ("reset", false),
+    ("discard", true),
+];
+/// Each panel assertion exercises behavior after a real Settings reset/save or
+/// discard as well as fresh default/custom configuration.
+pub(super) fn binding_fixture(
+    action: ActionId,
+    phase: &str,
+) -> Result<(Ui, tempfile::TempDir, Config)> {
+    let (mut ui, dir, mut config) = fixture((phase != "default").then_some(action))?;
+    if phase == "reset" || phase == "discard" {
+        ui.storage.update_config(|saved| *saved = config.clone())?;
+        let mut draft = ui.storage.settings_draft()?;
+        draft.reset(&crate::settings::SettingId::Shortcut(action.0.into()))?;
+        assert!(
+            ui.shortcut_config
+                .preferences
+                .keyboard
+                .bindings
+                .contains_key(action.0),
+            "reset remains draft-only"
+        );
+        if phase == "reset" {
+            config = ui.storage.save_settings_draft(&mut draft)?;
+            assert!(!config.preferences.keyboard.bindings.contains_key(action.0));
+        } else {
+            draft.discard(ui.storage.load_config()?);
+            config = draft.config().clone();
+            assert!(config.preferences.keyboard.bindings.contains_key(action.0));
+        }
+        ui.apply_settings(&config);
+    }
+    Ok((ui, dir, config))
+}
+
+/// Observe the existing IPC boundary without a daemon or provider process.
+pub(super) fn request_at_boundary(ui: &mut Ui, key: KeyEvent) -> Result<Request> {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixListener,
+    };
+    let socket = super::super::server::socket(&ui.storage)?;
+    let listener = UnixListener::bind(socket)?;
+    listener.set_nonblocking(true)?;
+    let reader = thread::spawn(move || -> Result<Request> {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false)?;
+                    stream.set_read_timeout(Some(Duration::from_secs(1)))?;
+                    let mut line = String::new();
+                    BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+                    let request = serde_json::from_str(&line)?;
+                    stream.write_all(b"\"Ok\"\n")?;
+                    return Ok(request);
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(2))
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    });
+    ui.key(key);
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("IPC fixture reader"))?
+}
+
 fn press(ui: &mut Ui, code: KeyCode, modifiers: KeyModifiers) {
     ui.key(KeyEvent::new(code, modifiers));
 }

@@ -28,8 +28,14 @@ pub const AGENT_MODEL_PICKER: Context = Context("AgentModelPicker");
 pub const AGENT_DEFAULTS: Context = Context("AgentDefaults");
 pub const AGENT_PERMISSIONS: Context = Context("AgentPermissions");
 pub const AGENT_PERMISSION_SEARCH: Context = Context("AgentPermissionSearch");
+pub const AGENT_PERMISSION_CHOICE: Context = Context("AgentPermissionChoice");
+pub const AGENT_PERMISSION_BUTTON: Context = Context("AgentPermissionButton");
+pub const AGENT_PERMISSION_MULTILINE: Context = Context("AgentPermissionMultiline");
 pub const AGENT_PERMISSION_FORM: Context = Context("AgentPermissionForm");
 pub const AGENT_PERMISSION_DELETE: Context = Context("AgentPermissionDelete");
+pub const AGENT_MCP_SERVER: Context = Context("AgentMcpServer");
+pub const AGENT_MCP_TOOLS: Context = Context("AgentMcpTools");
+pub const AGENT_MCP_TOOL: Context = Context("AgentMcpTool");
 pub const AGENT_MCP: Context = Context("AgentMcp");
 pub const AGENT_REMOTE: Context = Context("AgentRemote");
 pub const AGENT_RULES: Context = Context("AgentRules");
@@ -111,8 +117,14 @@ pub const ALL: &[Context] = &[
     AGENT_PERMISSIONS,
     AGENT_PERMISSION_SEARCH,
     AGENT_PERMISSION_FORM,
+    AGENT_PERMISSION_MULTILINE,
+    AGENT_PERMISSION_CHOICE,
+    AGENT_PERMISSION_BUTTON,
     AGENT_PERMISSION_DELETE,
     AGENT_MCP,
+    AGENT_MCP_SERVER,
+    AGENT_MCP_TOOLS,
+    AGENT_MCP_TOOL,
     AGENT_REMOTE,
     AGENT_RULES,
     AGENT_SLACK,
@@ -168,9 +180,15 @@ pub const ALL: &[Context] = &[
 /// Main sidebar/Changes/model/question actions historically run before these.
 pub const AGENT_GENERIC_MODALS: &[Context] = &[
     AGENT_MCP,
+    AGENT_MCP_SERVER,
+    AGENT_MCP_TOOLS,
+    AGENT_MCP_TOOL,
     AGENT_PERMISSIONS,
     AGENT_PERMISSION_SEARCH,
     AGENT_PERMISSION_FORM,
+    AGENT_PERMISSION_MULTILINE,
+    AGENT_PERMISSION_CHOICE,
+    AGENT_PERMISSION_BUTTON,
     AGENT_PERMISSION_DELETE,
     AGENT_SLACK,
     AGENT_TRANSCRIPT,

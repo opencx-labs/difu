@@ -125,3 +125,51 @@ pub(crate) fn adapt(command: &mut Command) -> Result<()> {
         Ok(())
     })
 }
+
+// URL launches are asynchronous, so use unique namespace-scoped registrations
+// instead of the thread-local synchronous command fixture above.
+const URL_HOST: &str = "difu-shortcut-fixture.invalid";
+static URL_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+type UrlSenders = std::collections::BTreeMap<String, std::sync::mpsc::Sender<String>>;
+static URL_SENDERS: std::sync::OnceLock<std::sync::Mutex<UrlSenders>> = std::sync::OnceLock::new();
+pub(crate) struct UrlScope {
+    pub(crate) url: String,
+    pub(crate) receiver: std::sync::mpsc::Receiver<String>,
+}
+impl UrlScope {
+    pub(crate) fn new() -> Result<Self> {
+        let number = URL_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let url = format!("https://{URL_HOST}/{number}");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        URL_SENDERS
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| anyhow::anyhow!("URL fixture lock"))?
+            .insert(url.clone(), sender);
+        Ok(Self { url, receiver })
+    }
+}
+impl Drop for UrlScope {
+    fn drop(&mut self) {
+        if let Ok(mut senders) = URL_SENDERS.get_or_init(Default::default).lock() {
+            senders.remove(&self.url);
+        }
+    }
+}
+pub(crate) fn open_url(url: &url::Url) -> Option<Result<()>> {
+    if url.host_str() != Some(URL_HOST) {
+        return None;
+    }
+    // Fail closed after cleanup too: fixture URLs never reach the real launcher.
+    Some((|| {
+        let senders = URL_SENDERS
+            .get_or_init(Default::default)
+            .lock()
+            .map_err(|_| anyhow::anyhow!("URL fixture lock"))?;
+        let sender = senders
+            .get(url.as_str())
+            .context("Unregistered fixture URL")?;
+        sender.send(url.as_str().to_owned())?;
+        Ok(())
+    })())
+}

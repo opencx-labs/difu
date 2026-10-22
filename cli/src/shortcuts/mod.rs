@@ -131,6 +131,13 @@ impl<'a> Bindings<'a> {
         }
         chords.iter().map(label).collect::<Vec<_>>().join(" / ")
     }
+    /// Compact UI hints show the primary alias; binding details retain every alias.
+    pub fn primary_hint_in(&self, action: ActionId, context: Context) -> String {
+        self.effective(action, context)
+            .first()
+            .map(label)
+            .unwrap_or_default()
+    }
     pub fn conflicts(&self) -> Vec<String> {
         let mut errors = Vec::new();
         for (index, left) in all().iter().enumerate() {

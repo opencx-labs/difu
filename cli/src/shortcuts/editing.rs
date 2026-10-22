@@ -56,7 +56,8 @@ fn reserved(context: Context, chord: &KeyChord) -> bool {
     if context == AGENT_CONVERSATION_INPUT {
         return printable && !modifiers.alt;
     }
-    // AGENT_QUEUE_BUTTON deliberately has no Editor: its former text field is unfocused.
+    // AGENT_QUEUE_BUTTON, AGENT_PERMISSION_CHOICE and AGENT_PERMISSION_BUTTON
+    // deliberately have no Editor: their text fields are unfocused.
     // Settings uses simple strings, not Editor: reserve exactly its insertion and
     // Backspace paths. Its field editor also accepts Alt characters.
     if context == SETTINGS_SEARCH || context == SETTINGS_EDIT {
@@ -80,6 +81,7 @@ fn reserved(context: Context, chord: &KeyChord) -> bool {
         AGENT_DEFAULTS,
         AGENT_PERMISSION_SEARCH,
         AGENT_PERMISSION_FORM,
+        AGENT_PERMISSION_MULTILINE,
         AGENT_RULES,
         AGENT_SLACK,
         AGENT_TWEAKS,

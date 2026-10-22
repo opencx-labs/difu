@@ -1048,6 +1048,10 @@ pub fn open_url(url: &str, cancel: &Cancel) -> Result<()> {
         "xdg-open"
     };
     cancel.check()?;
+    #[cfg(test)]
+    if let Some(result) = crate::process::fixture::open_url(&parsed) {
+        return result;
+    }
     // Browser windows outlive this launcher and belong to the user.
     let mut child = Command::new(executable)
         .arg(url)

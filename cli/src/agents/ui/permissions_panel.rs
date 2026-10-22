@@ -1,6 +1,7 @@
 //! Provider-native permissions, fetched off the terminal thread.
 use super::*;
 use crate::agents::permissions::{self, CodexPreset, Scope, SettingKind, SettingsEdit, Snapshot};
+use crate::shortcuts::ids::*;
 use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -136,18 +137,18 @@ fn connection_failure(error: Option<&str>) -> bool {
             || error.contains("No conversation found")
     })
 }
-fn readable_error(error: &str) -> String {
+fn readable_error(error: &str, refresh: &str) -> String {
     if error.contains("channel is empty") || error.contains("sending half is closed") {
-        "Agent connection closed. Press r to reconnect.".into()
+        format!("Agent connection closed. Press {refresh} to reconnect.")
     } else if error.contains("No conversation found") {
-        "Agent session could not be resumed. Press r to reconnect.".into()
+        format!("Agent session could not be resumed. Press {refresh} to reconnect.")
     } else {
         let first = provider_error_text(error)
             .lines()
             .next()
             .unwrap_or("Turn failed")
             .trim();
-        format!("{first} · r retry")
+        format!("{first} · {refresh} retry")
     }
 }
 pub(super) fn composer_status(session: &Session, binding: &str) -> Line<'static> {
@@ -435,7 +436,12 @@ impl State {
             if form.delete {
                 AGENT_PERMISSION_DELETE
             } else {
-                AGENT_PERMISSION_FORM
+                match form.field {
+                    0 | 1 => AGENT_PERMISSION_CHOICE,
+                    2 if form.kind == SettingKind::AutoEnvironment => AGENT_PERMISSION_MULTILINE,
+                    2 => AGENT_PERMISSION_FORM,
+                    _ => AGENT_PERMISSION_BUTTON,
+                }
             }
         } else if self.searching {
             AGENT_PERMISSION_SEARCH
@@ -641,7 +647,63 @@ impl Ui {
             }
         }
     }
+    pub(super) fn permissions_scroll(&mut self, down: bool) {
+        let Some(Modal::Permissions(state)) = &mut self.modal else {
+            return;
+        };
+        let editor = if let Some(form) = &mut state.form {
+            if state.loading || form.delete || form.field != 2 {
+                return;
+            }
+            Some(&mut form.value)
+        } else if state.searching {
+            Some(&mut state.query)
+        } else {
+            None
+        };
+        if let Some(editor) = editor {
+            // Wheel motion inside native text fields remains Editor navigation.
+            for _ in 0..3 {
+                editor.key(KeyEvent::new(
+                    if down { KeyCode::Down } else { KeyCode::Up },
+                    KeyModifiers::NONE,
+                ));
+            }
+        } else {
+            state.selected = if down {
+                state
+                    .selected
+                    .saturating_add(3)
+                    .min(state.items().len().saturating_sub(1))
+            } else {
+                state.selected.saturating_sub(3)
+            };
+        }
+    }
+    pub(super) fn permissions_save(&mut self) {
+        let Some(Modal::Permissions(state)) = &mut self.modal else {
+            return;
+        };
+        if state.loading {
+            return;
+        }
+        let Some(form) = &state.form else {
+            return;
+        };
+        match form.edit(&state.data) {
+            Ok(edit) => self.request_permissions(permissions::Action::Edit { edit }),
+            Err(error) => state.error = Some(error.to_string()),
+        }
+    }
+    pub(super) fn permissions_search(&mut self) {
+        if let Some(Modal::Permissions(state)) = &mut self.modal
+            && state.form.is_none()
+        {
+            state.searching = true;
+        }
+    }
     pub(super) fn permissions_key(&mut self, key: KeyEvent) {
+        let shortcut = self.shortcut(key);
         let Some(Modal::Permissions(state)) = &mut self.modal else {
             return;
         };
@@ -656,59 +718,55 @@ impl Ui {
             if state.loading {
                 return;
             }
-            if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if shortcut == Some(PERMISSIONS_REFRESH_FORM) {
                 self.request_permissions(permissions::Action::Refresh);
                 return;
             }
             if form.delete {
-                if key.code == KeyCode::Enter {
-                    match form.edit(&state.data) {
-                        Ok(edit) => self.request_permissions(permissions::Action::Edit { edit }),
-                        Err(e) => state.error = Some(e.to_string()),
-                    }
+                if shortcut == Some(NAVIGATION_ACTIVATE) {
+                    self.permissions_save();
                 }
                 return;
             }
-            match key.code {
-                KeyCode::Tab | KeyCode::BackTab => {
-                    form.field = if key.code == KeyCode::BackTab {
-                        (form.field + 3) % 4
-                    } else {
-                        (form.field + 1) % 4
+            match shortcut {
+                Some(NAVIGATION_NEXT_FOCUS | NAVIGATION_PREVIOUS_FOCUS) => {
+                    form.field = (form.field
+                        + if shortcut == Some(NAVIGATION_PREVIOUS_FOCUS) {
+                            3
+                        } else {
+                            1
+                        })
+                        % 4;
+                }
+                Some(PERMISSIONS_PREVIOUS_VALUE | PERMISSIONS_NEXT_VALUE) => {
+                    if form.field == 0 {
+                        form.cycle_kind(shortcut == Some(PERMISSIONS_PREVIOUS_VALUE));
+                    } else if form.field == 1 {
+                        form.cycle_scope(shortcut == Some(PERMISSIONS_PREVIOUS_VALUE));
                     }
                 }
-                KeyCode::Left | KeyCode::Right if form.field == 0 => {
-                    form.cycle_kind(key.code == KeyCode::Left)
-                }
-                KeyCode::Left | KeyCode::Right if form.field == 1 => {
-                    form.cycle_scope(key.code == KeyCode::Left)
-                }
-                KeyCode::Enter
-                    if form.field == 3 || key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    match form.edit(&state.data) {
-                        Ok(edit) => self.request_permissions(permissions::Action::Edit { edit }),
-                        Err(e) => state.error = Some(e.to_string()),
-                    }
-                }
-                KeyCode::Enter
-                    if form.field == 2
-                        && form.kind == SettingKind::AutoEnvironment
-                        && key.modifiers.contains(KeyModifiers::SHIFT) =>
-                {
-                    form.value.insert("\n")
-                }
-                KeyCode::Enter if form.field == 2 => form.field = 3,
+                Some(PERMISSIONS_SUBMIT) => self.permissions_save(),
+                Some(PERMISSIONS_ACTIVATE) if form.field == 3 => self.permissions_save(),
+                Some(PERMISSIONS_ACTIVATE) if form.field == 2 => form.field = 3,
                 _ if form.field == 2 => {
-                    form.value.key(key);
+                    // This is native field editing, never an action shortcut.
+                    if form.kind == SettingKind::AutoEnvironment
+                        && key.code == KeyCode::Enter
+                        && key.modifiers == KeyModifiers::SHIFT
+                    {
+                        form.value.insert("\n");
+                    } else {
+                        form.value.key(key);
+                    }
                 }
                 _ => {}
             }
             return;
         }
         if state.searching {
-            match key.code {
-                KeyCode::Esc | KeyCode::Enter => state.searching = false,
+            match shortcut {
+                _ if key.code == KeyCode::Esc => state.searching = false,
+                Some(PERMISSIONS_FINISH_SEARCH) => state.searching = false,
                 _ => {
                     state.query.key(key);
                     state.selected = 0;
@@ -716,43 +774,43 @@ impl Ui {
             }
             return;
         }
-        match key.code {
-            KeyCode::Esc => self.modal = None,
-            KeyCode::Char('/') => state.searching = true,
-            KeyCode::Char('r') => self.request_permissions(permissions::Action::Refresh),
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Left | KeyCode::Right => {
+        match shortcut {
+            _ if key.code == KeyCode::Esc => self.modal = None,
+            Some(PERMISSIONS_SEARCH) => state.searching = true,
+            Some(PERMISSIONS_REFRESH) => self.request_permissions(permissions::Action::Refresh),
+            Some(PERMISSIONS_PREVIOUS_TAB | PERMISSIONS_NEXT_TAB) => {
                 let index = state
                     .tabs()
                     .iter()
                     .position(|tab| *tab == state.tab)
                     .unwrap_or(0);
                 let len = state.tabs().len();
-                let reverse = matches!(key.code, KeyCode::BackTab | KeyCode::Left);
+                let reverse = shortcut == Some(PERMISSIONS_PREVIOUS_TAB);
                 self.permissions_tab(if reverse {
                     (index + len - 1) % len
                 } else {
                     (index + 1) % len
                 });
             }
-            KeyCode::Up | KeyCode::Char('k') => state.selected = state.selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => {
+            Some(NAVIGATION_UP) => state.selected = state.selected.saturating_sub(1),
+            Some(NAVIGATION_DOWN) => {
                 state.selected = (state.selected + 1).min(state.items().len().saturating_sub(1))
             }
-            KeyCode::PageUp => state.selected = state.selected.saturating_sub(5),
-            KeyCode::PageDown => {
+            Some(NAVIGATION_PAGE_UP) => state.selected = state.selected.saturating_sub(5),
+            Some(NAVIGATION_PAGE_DOWN) => {
                 state.selected = (state.selected + 5).min(state.items().len().saturating_sub(1))
             }
-            KeyCode::Home => state.selected = 0,
-            KeyCode::End => state.selected = state.items().len().saturating_sub(1),
-            KeyCode::Char('a') => state.begin_edit(true),
-            KeyCode::Char('e') => state.begin_edit(false),
-            KeyCode::Char('d') | KeyCode::Delete if !state.loading => {
+            Some(NAVIGATION_FIRST) => state.selected = 0,
+            Some(NAVIGATION_LAST) => state.selected = state.items().len().saturating_sub(1),
+            Some(PERMISSIONS_ADD) => state.begin_edit(true),
+            Some(PERMISSIONS_EDIT) => state.begin_edit(false),
+            Some(PERMISSIONS_DELETE) if !state.loading => {
                 state.begin_edit(false);
                 if let Some(form) = &mut state.form {
                     form.delete = true;
                 }
             }
-            KeyCode::Enter => self.permissions_select(None),
+            Some(NAVIGATION_ACTIVATE) => self.permissions_select(None),
             _ => {}
         }
     }
@@ -762,7 +820,7 @@ impl Ui {
             Some(Modal::Permissions(state)) if state.form.is_some() => 23,
             Some(Modal::Permissions(state)) if state.tab == Tab::Mode => (state.items().len()
                 as u16
-                + 10
+                + 12
                 + u16::from(state.error.is_some()) * 3
                 + u16::from(state.data.message.is_some()) * 2)
                 .min(24),
@@ -797,6 +855,12 @@ impl Ui {
         );
     }
     pub(super) fn draw_permissions(&mut self, frame: &mut Frame, area: Rect) {
+        let bindings = crate::shortcuts::Bindings::new(&self.shortcut_config);
+        let hint = |id| bindings.primary_hint_in(id, crate::shortcuts::contexts::AGENT_PERMISSIONS);
+        let field_hint =
+            |id| bindings.primary_hint_in(id, crate::shortcuts::contexts::AGENT_PERMISSION_FORM);
+        let choice_hint =
+            |id| bindings.primary_hint_in(id, crate::shortcuts::contexts::AGENT_PERMISSION_CHOICE);
         let Some(Modal::Permissions(state)) = &mut self.modal else {
             return;
         };
@@ -862,7 +926,7 @@ impl Ui {
         lines.push(Line::styled(current, Style::default().fg(DIM)));
         if let Some(error) = state.error.as_deref().or(failure) {
             usage::text_lines(
-                &readable_error(error),
+                &readable_error(error, &hint(PERMISSIONS_REFRESH)),
                 area.width,
                 Style::default().fg(RED),
                 &mut lines,
@@ -932,9 +996,13 @@ impl Ui {
                         if form.field == 0 { ">" } else { " " },
                         form.kind.label(),
                         if is_auto(form.kind) && form.before.is_none() {
-                            " · ←/→ change"
+                            format!(
+                                " · {}/{} change",
+                                choice_hint(PERMISSIONS_PREVIOUS_VALUE),
+                                choice_hint(PERMISSIONS_NEXT_VALUE)
+                            )
                         } else {
-                            ""
+                            String::new()
                         }
                     ),
                     Style::default().fg(if form.field == 0 { ACCENT } else { TEXT }),
@@ -954,9 +1022,13 @@ impl Ui {
                         if form.field == 1 { ">" } else { " " },
                         form.scope.label(),
                         if form.before.is_none() && !is_auto(form.kind) {
-                            " · ←/→ change"
+                            format!(
+                                " · {}/{} change",
+                                choice_hint(PERMISSIONS_PREVIOUS_VALUE),
+                                choice_hint(PERMISSIONS_NEXT_VALUE)
+                            )
                         } else {
-                            " · source fixed"
+                            " · source fixed".into()
                         }
                     ),
                     Style::default().fg(if form.field == 1 { ACCENT } else { TEXT }),
@@ -994,7 +1066,7 @@ impl Ui {
                     area.y.saturating_add(head),
                     area.width,
                     area.height
-                        .saturating_sub(head + 3)
+                        .saturating_sub(head + 4)
                         .clamp(1, 8)
                         .min(area.height.saturating_sub(head)),
                 );
@@ -1018,8 +1090,13 @@ impl Ui {
                     ));
                     frame.render_widget(
                         Paragraph::new(format!(
-                            "{} Save · Ctrl+Enter save · Tab fields · Esc cancel\nCtrl+R refresh{}",
+                            "{} Save · {} save · Esc cancel\n{}/{} fields · {} accept\n{} refresh{}",
                             if form.field == 3 { ">" } else { " " },
+                            field_hint(PERMISSIONS_SUBMIT),
+                            field_hint(NAVIGATION_NEXT_FOCUS),
+                            field_hint(NAVIGATION_PREVIOUS_FOCUS),
+                            field_hint(PERMISSIONS_ACTIVATE),
+                            field_hint(PERMISSIONS_REFRESH_FORM),
                             if form.kind == SettingKind::AutoEnvironment {
                                 " · Shift+Enter newline"
                             } else {
@@ -1035,7 +1112,7 @@ impl Ui {
                             area.x,
                             foot_y,
                             area.width,
-                            area.bottom().saturating_sub(foot_y).min(2),
+                            area.bottom().saturating_sub(foot_y).min(3),
                         ),
                     );
                 }
@@ -1065,9 +1142,15 @@ impl Ui {
                 } else if state.tab == Tab::Denied {
                     "No denied tools observed in this Difu session."
                 } else if state.tab == Tab::Mode {
-                    "Provider permissions have not been reported yet. Press r to refresh."
+                    &format!(
+                        "Provider permissions have not been reported yet. Press {} to refresh.",
+                        hint(PERMISSIONS_REFRESH)
+                    )
                 } else {
-                    "No entries in this category. Press a to add one."
+                    &format!(
+                        "No entries in this category. Press {} to add one.",
+                        hint(PERMISSIONS_ADD)
+                    )
                 };
                 usage::text_lines(text, area.width, Style::default().fg(DIM), &mut lines);
                 if state.tab == Tab::Denied {
@@ -1077,7 +1160,7 @@ impl Ui {
                     ));
                 }
             }
-            let available = usize::from(area.height.saturating_sub(lines.len() as u16 + 1));
+            let available = usize::from(area.height.saturating_sub(lines.len() as u16 + 3));
             let mut entries = Vec::new();
             for (index, item) in items.iter().enumerate() {
                 let mut lines = Vec::new();
@@ -1230,7 +1313,7 @@ impl Ui {
             }
             for (index, entry) in entries.into_iter().enumerate().skip(start) {
                 let row_y = area.y.saturating_add(lines.len() as u16);
-                let remaining = usize::from(area.height.saturating_sub(lines.len() as u16 + 1));
+                let remaining = usize::from(area.height.saturating_sub(lines.len() as u16 + 3));
                 if remaining == 0 {
                     break;
                 }
@@ -1252,21 +1335,62 @@ impl Ui {
                 ),
                 Action::PermissionSave,
             ));
-            "Enter Delete · Ctrl+R refresh · Esc Cancel"
-        } else if state.tab == Tab::Denied {
-            "Tab / ←→ tabs · ↑↓ select · / search · r refresh · Esc close"
-        } else if state.tab.kinds().is_empty() {
-            "↑↓ choose · Enter apply · Tab sections · / search · r retry · Esc close"
+            format!(
+                "{} Delete · {} refresh · Esc Cancel",
+                bindings.primary_hint_in(
+                    NAVIGATION_ACTIVATE,
+                    crate::shortcuts::contexts::AGENT_PERMISSION_DELETE
+                ),
+                bindings.primary_hint_in(
+                    PERMISSIONS_REFRESH_FORM,
+                    crate::shortcuts::contexts::AGENT_PERMISSION_DELETE
+                )
+            )
+        } else if state.searching {
+            format!(
+                "Type to filter · {} finish · Esc cancel",
+                bindings.primary_hint_in(
+                    PERMISSIONS_FINISH_SEARCH,
+                    crate::shortcuts::contexts::AGENT_PERMISSION_SEARCH
+                )
+            )
         } else {
-            "Tab / ←→ tabs · ↑↓ select · a add · e edit · d delete · / search · r refresh · Esc close"
+            let edits = if state.tab.kinds().is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " · {} add · {} edit · {} delete",
+                    hint(PERMISSIONS_ADD),
+                    hint(PERMISSIONS_EDIT),
+                    hint(PERMISSIONS_DELETE)
+                )
+            };
+            format!(
+                "{}/{} tabs · {}/{} select · {} apply{} · {} search · {} refresh · Esc close",
+                hint(PERMISSIONS_PREVIOUS_TAB),
+                hint(PERMISSIONS_NEXT_TAB),
+                hint(NAVIGATION_UP),
+                hint(NAVIGATION_DOWN),
+                hint(NAVIGATION_ACTIVATE),
+                edits,
+                hint(PERMISSIONS_SEARCH),
+                hint(PERMISSIONS_REFRESH)
+            )
         };
         frame.render_widget(
             Paragraph::new(lines),
-            Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1)),
+            Rect::new(area.x, area.y, area.width, area.height.saturating_sub(3)),
         );
         frame.render_widget(
-            Paragraph::new(footer).style(Style::default().fg(DIM)),
-            Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
+            Paragraph::new(footer)
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .style(Style::default().fg(DIM)),
+            Rect::new(
+                area.x,
+                area.bottom().saturating_sub(3),
+                area.width,
+                area.height.min(3),
+            ),
         );
     }
 }
@@ -1291,6 +1415,937 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n"))
     }
+    #[test]
+    fn permission_kind_selectors_and_save_errors_retain_the_real_form_guards() -> Result<()> {
+        for (action, code, want) in [
+            (
+                PERMISSIONS_PREVIOUS_VALUE,
+                KeyCode::Left,
+                SettingKind::AutoEnvironment,
+            ),
+            (
+                PERMISSIONS_NEXT_VALUE,
+                KeyCode::Right,
+                SettingKind::AutoSoftDeny,
+            ),
+        ] {
+            for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                let (mut ui, _dir, _) = shortcut_tests::binding_fixture(action, phase)?;
+                let mut state = field_state(Some(0), false, false);
+                state.form.as_mut().context("form")?.kind = SettingKind::AutoAllow;
+                ui.modal = Some(Modal::Permissions(Box::new(state)));
+                if custom {
+                    ui.key(KeyEvent::new(code, KeyModifiers::NONE));
+                    assert!(
+                        matches!(&ui.modal, Some(Modal::Permissions(s)) if s.form.as_ref().is_some_and(|f| f.kind == SettingKind::AutoAllow))
+                    );
+                }
+                ui.key(KeyEvent::new(
+                    if custom { KeyCode::F(12) } else { code },
+                    KeyModifiers::NONE,
+                ));
+                assert!(
+                    matches!(&ui.modal, Some(Modal::Permissions(s)) if s.form.as_ref().is_some_and(|f| f.kind == want))
+                );
+            }
+        }
+        let (mut ui, _dir, _) = shortcut_tests::fixture(Some(PERMISSIONS_SUBMIT))?;
+        let mut state = field_state(Some(2), false, false);
+        state.form.as_mut().context("form")?.value.clear();
+        ui.modal = Some(Modal::Permissions(Box::new(state)));
+        ui.key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.modal, Some(Modal::Permissions(s)) if !s.loading && s.error.as_deref().is_some_and(|e| e.contains("before saving")))
+        );
+        if let Some(Modal::Permissions(state)) = &mut ui.modal {
+            state
+                .form
+                .as_mut()
+                .context("form")?
+                .value
+                .insert("kept draft");
+        }
+        ui.key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.modal, Some(Modal::Permissions(s)) if !s.loading && s.error.as_deref().is_some_and(|e| e.contains("source is unavailable")) && s.editor().is_some_and(|e| e.text() == "kept draft"))
+        );
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.modal, Some(Modal::Permissions(s)) if s.form.is_none() && s.error.is_none())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unregistered_modified_navigation_stays_in_the_native_editor() -> Result<()> {
+        let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
+        let mut state = list_state();
+        state.selected = 5;
+        ui.modal = Some(Modal::Permissions(Box::new(state)));
+        ui.key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
+        assert!(matches!(&ui.modal, Some(Modal::Permissions(s)) if s.selected == 5));
+        ui.modal = Some(Modal::Permissions(Box::new(field_state(
+            Some(2),
+            false,
+            false,
+        ))));
+        ui.key(KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL));
+        ui.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.modal, Some(Modal::Permissions(s)) if s.editor().is_some_and(|e| e.text() == "zvalue"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn permission_enter_and_shift_enter_keep_single_line_accept_and_multiline_editing() -> Result<()>
+    {
+        for (kind, code, modifiers, want_field, want_text) in [
+            (
+                SettingKind::Allow,
+                KeyCode::Enter,
+                KeyModifiers::SHIFT,
+                3,
+                "value",
+            ),
+            (
+                SettingKind::AutoEnvironment,
+                KeyCode::Enter,
+                KeyModifiers::SHIFT,
+                2,
+                "value\n",
+            ),
+            (
+                SettingKind::AutoEnvironment,
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                3,
+                "value",
+            ),
+        ] {
+            let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
+            let mut state = field_state(Some(2), false, false);
+            state.form.as_mut().context("form")?.kind = kind;
+            ui.modal = Some(Modal::Permissions(Box::new(state)));
+            ui.key(KeyEvent::new(code, modifiers));
+            let Some(Modal::Permissions(state)) = &ui.modal else {
+                anyhow::bail!("panel")
+            };
+            let form = state.form.as_ref().context("form")?;
+            assert_eq!(form.field, want_field);
+            assert_eq!(form.value.text(), want_text);
+        }
+        Ok(())
+    }
+
+    fn field_state(field: Option<usize>, searching: bool, delete: bool) -> State {
+        let mut state = list_state();
+        state.searching = searching;
+        if let Some(field) = field {
+            state.begin_edit(true);
+            if let Some(form) = &mut state.form {
+                form.field = if field == 4 { 2 } else { field };
+                if field == 4 {
+                    form.kind = SettingKind::AutoEnvironment;
+                }
+                form.value = Editor::from("value");
+                form.delete = delete;
+            }
+        }
+        state
+    }
+
+    #[test]
+    fn permission_contexts_keep_early_main_actions_and_reject_stored_typing_overrides() -> Result<()>
+    {
+        use crate::shortcuts::{contexts::*, ids::*};
+        for (field, searching, delete, context) in [
+            (None, false, false, AGENT_PERMISSIONS),
+            (None, true, false, AGENT_PERMISSION_SEARCH),
+            (Some(0), false, false, AGENT_PERMISSION_CHOICE),
+            (Some(1), false, false, AGENT_PERMISSION_CHOICE),
+            (Some(2), false, false, AGENT_PERMISSION_FORM),
+            (Some(4), false, false, AGENT_PERMISSION_MULTILINE),
+            (Some(3), false, false, AGENT_PERMISSION_BUTTON),
+            (Some(2), false, true, AGENT_PERMISSION_DELETE),
+        ] {
+            for (action, code) in [
+                (AGENTS_SIDEBAR, KeyCode::Char('[')),
+                (AGENTS_CHANGES, KeyCode::Char('d')),
+                (AGENTS_MODELS, KeyCode::Char('m')),
+                (QUESTION_OPEN, KeyCode::Up),
+            ] {
+                for custom in [false, true] {
+                    let (mut ui, _dir, _) = shortcut_tests::fixture(custom.then_some(action))?;
+                    ui.model_completion.options.push(crate::model::ModelInfo {
+                        id: "fixture-model".into(),
+                        name: "Fixture model".into(),
+                        efforts: vec!["medium".into()],
+                    });
+                    ui.modal = Some(Modal::Permissions(Box::new(field_state(
+                        field, searching, delete,
+                    ))));
+                    assert_eq!(ui.shortcut_context(), context);
+                    if custom {
+                        ui.key(KeyEvent::new(code, KeyModifiers::ALT));
+                        assert_eq!(ui.shortcut_context(), context);
+                        assert!(ui.list_visible && !ui.changes_visible);
+                    }
+                    ui.key(KeyEvent::new(
+                        if custom { KeyCode::F(12) } else { code },
+                        if custom {
+                            KeyModifiers::NONE
+                        } else {
+                            KeyModifiers::ALT
+                        },
+                    ));
+                    match action {
+                        AGENTS_SIDEBAR => assert!(!ui.list_visible),
+                        AGENTS_CHANGES => assert!(ui.changes_visible),
+                        AGENTS_MODELS => assert!(matches!(ui.modal, Some(Modal::ModelPicker(_)))),
+                        QUESTION_OPEN => assert!(matches!(ui.modal, Some(Modal::Pending { .. }))),
+                        _ => anyhow::bail!("action"),
+                    }
+                }
+            }
+            let (mut ui, _dir, mut config) = shortcut_tests::fixture(None)?;
+            config.preferences.keyboard.bindings.insert(
+                SETTINGS_OPEN.0.into(),
+                crate::shortcuts::key(crate::settings::BindingKey::Character('z'), 0),
+            );
+            ui.apply_settings(&config);
+            ui.modal = Some(Modal::Permissions(Box::new(field_state(
+                field, searching, delete,
+            ))));
+            let mut shell = crate::shell::Shell::new(ui.storage.clone(), config, None);
+            shell.agents = ui;
+            shell.agents_active = true;
+            shell.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+            let editing = searching || (matches!(field, Some(2 | 4)) && !delete);
+            assert_eq!(shell.settings.is_none(), editing, "{context:?}");
+            if editing {
+                let Some(Modal::Permissions(state)) = &shell.agents.modal else {
+                    anyhow::bail!("typing opened action")
+                };
+                assert!(state.editor().context("editor")?.text().ends_with('z'));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn permission_copy_uses_only_the_focused_field_and_preserves_selection() -> Result<()> {
+        for (field, searching, delete) in [
+            (None, false, false),
+            (None, true, false),
+            (Some(0), false, false),
+            (Some(1), false, false),
+            (Some(2), false, false),
+            (Some(4), false, false),
+            (Some(3), false, false),
+            (Some(2), false, true),
+        ] {
+            for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                let (mut ui, _dir, _) = shortcut_tests::binding_fixture(SELECTION_COPY, phase)?;
+                let mut state = field_state(field, searching, delete);
+                state.query = Editor::from("query");
+                if let Some(editor) = if searching {
+                    Some(&mut state.query)
+                } else {
+                    state
+                        .form
+                        .as_mut()
+                        .filter(|f| f.field == 2 && !f.delete)
+                        .map(|f| &mut f.value)
+                } {
+                    editor.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+                }
+                ui.positions
+                    .get_mut("one")
+                    .context("draft")?
+                    .draft
+                    .key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+                ui.modal = Some(Modal::Permissions(Box::new(state)));
+                if custom {
+                    ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
+                    assert!(ui.clipboard.is_none());
+                }
+                ui.key(KeyEvent::new(
+                    if custom {
+                        KeyCode::F(12)
+                    } else {
+                        KeyCode::Char('c')
+                    },
+                    if custom {
+                        KeyModifiers::NONE
+                    } else {
+                        KeyModifiers::SUPER
+                    },
+                ));
+                let want = if searching {
+                    Some("y")
+                } else if matches!(field, Some(2 | 4)) && !delete {
+                    Some("e")
+                } else {
+                    None
+                };
+                assert_eq!(ui.clipboard.as_deref(), want);
+                ui.clipboard = None;
+                ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+                assert_eq!(ui.clipboard.as_deref(), want);
+                assert_eq!(
+                    ui.positions.get("one").context("draft")?.draft.text(),
+                    "unsent draft"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn list_state() -> State {
+        let mut state = State::new("one".into(), provider::Provider::Claude);
+        state.tab = Tab::Allow;
+        state.data.rows = (0..20)
+            .map(|i| permissions::SettingRow {
+                kind: SettingKind::Allow,
+                scope: Some(Scope::Project),
+                value: format!("Read({i})"),
+                editable: true,
+                source: "fixture".into(),
+                revision: "r1".into(),
+            })
+            .collect();
+        state
+    }
+
+    #[test]
+    fn permission_shared_list_navigation_replaces_literal_arrows_and_aliases() -> Result<()> {
+        for (action, aliases, start, want) in [
+            (NAVIGATION_UP, vec![KeyCode::Up, KeyCode::Char('k')], 5, 4),
+            (
+                NAVIGATION_DOWN,
+                vec![KeyCode::Down, KeyCode::Char('j')],
+                5,
+                6,
+            ),
+            (NAVIGATION_PAGE_UP, vec![KeyCode::PageUp], 8, 3),
+            (NAVIGATION_PAGE_DOWN, vec![KeyCode::PageDown], 5, 10),
+            (NAVIGATION_FIRST, vec![KeyCode::Home], 5, 0),
+            (NAVIGATION_LAST, vec![KeyCode::End], 5, 19),
+        ] {
+            for alias in aliases {
+                for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                    let (mut ui, _dir, _) = shortcut_tests::binding_fixture(action, phase)?;
+                    let mut state = list_state();
+                    state.selected = start;
+                    ui.modal = Some(Modal::Permissions(Box::new(state)));
+                    if custom {
+                        ui.key(KeyEvent::new(alias, KeyModifiers::NONE));
+                        assert!(
+                            matches!(&ui.modal, Some(Modal::Permissions(s)) if s.selected == start)
+                        );
+                    }
+                    ui.key(KeyEvent::new(
+                        if custom { KeyCode::F(12) } else { alias },
+                        KeyModifiers::NONE,
+                    ));
+                    assert!(matches!(&ui.modal, Some(Modal::Permissions(s)) if s.selected == want));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn permission_mouse_wheels_and_clicks_survive_keyboard_rebinding() -> Result<()> {
+        let (mut ui, _dir, mut config) = shortcut_tests::fixture(Some(NAVIGATION_DOWN))?;
+        for id in [NAVIGATION_UP, PERMISSIONS_SEARCH, PERMISSIONS_SUBMIT] {
+            config.preferences.keyboard.bindings.insert(
+                id.0.into(),
+                crate::shortcuts::key(crate::settings::BindingKey::Function(11), 0),
+            );
+        }
+        ui.apply_settings(&config);
+        ui.modal = Some(Modal::Permissions(Box::new(list_state())));
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        ui.mouse(wheel(MouseEventKind::ScrollDown));
+        assert!(matches!(&ui.modal, Some(Modal::Permissions(s)) if s.selected == 3));
+        ui.mouse(wheel(MouseEventKind::ScrollUp));
+        assert!(matches!(&ui.modal, Some(Modal::Permissions(s)) if s.selected == 0));
+        ui.hits = vec![(Rect::new(1, 1, 2, 1), Action::PermissionSearch)];
+        ui.mouse(wheel(MouseEventKind::Down(MouseButton::Left)));
+        assert!(matches!(&ui.modal, Some(Modal::Permissions(s)) if s.searching));
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        ui.hits = vec![(Rect::new(1, 1, 2, 1), Action::PermissionItem(2))];
+        ui.mouse(wheel(MouseEventKind::Down(MouseButton::Left)));
+        assert!(
+            matches!(&ui.modal, Some(Modal::Permissions(s)) if s.form.as_ref().is_some_and(|f| f.before.as_deref() == Some("Read(2)")))
+        );
+        if let Some(Modal::Permissions(state)) = &mut ui.modal {
+            state.form.as_mut().context("form")?.value.clear();
+        }
+        ui.hits = vec![(Rect::new(1, 1, 2, 1), Action::PermissionSave)];
+        ui.mouse(wheel(MouseEventKind::Down(MouseButton::Left)));
+        assert!(
+            matches!(&ui.modal, Some(Modal::Permissions(s)) if s.error.as_deref().is_some_and(|e| e.contains("before saving")))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn permission_save_refresh_and_delete_reach_the_exact_ipc_boundary() -> Result<()> {
+        for (action, code, modifiers, mode) in [
+            (
+                PERMISSIONS_REFRESH,
+                KeyCode::Char('r'),
+                KeyModifiers::NONE,
+                "list",
+            ),
+            (
+                PERMISSIONS_REFRESH_FORM,
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+                "form",
+            ),
+            (
+                PERMISSIONS_REFRESH_FORM,
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+                "delete",
+            ),
+            (
+                PERMISSIONS_SUBMIT,
+                KeyCode::Enter,
+                KeyModifiers::CONTROL,
+                "form",
+            ),
+            (
+                PERMISSIONS_ACTIVATE,
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                "button",
+            ),
+            (
+                NAVIGATION_ACTIVATE,
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                "delete",
+            ),
+            (
+                NAVIGATION_ACTIVATE,
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                "mode",
+            ),
+            (
+                PERMISSIONS_REFRESH_FORM,
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+                "choice-kind",
+            ),
+            (
+                PERMISSIONS_REFRESH_FORM,
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+                "choice-scope",
+            ),
+            (
+                PERMISSIONS_REFRESH_FORM,
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+                "button",
+            ),
+            (
+                PERMISSIONS_REFRESH_FORM,
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+                "multiline",
+            ),
+            (
+                PERMISSIONS_SUBMIT,
+                KeyCode::Enter,
+                KeyModifiers::CONTROL,
+                "choice-kind",
+            ),
+            (
+                PERMISSIONS_SUBMIT,
+                KeyCode::Enter,
+                KeyModifiers::CONTROL,
+                "choice-scope",
+            ),
+            (
+                PERMISSIONS_SUBMIT,
+                KeyCode::Enter,
+                KeyModifiers::CONTROL,
+                "button",
+            ),
+            (
+                PERMISSIONS_SUBMIT,
+                KeyCode::Enter,
+                KeyModifiers::CONTROL,
+                "multiline",
+            ),
+        ] {
+            for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                let (mut ui, _dir, _) = shortcut_tests::binding_fixture(action, phase)?;
+                let mut state = State::new("one".into(), provider::Provider::Claude);
+                state.tab = Tab::Allow;
+                state
+                    .data
+                    .revisions
+                    .insert(Scope::Session, "revision-42".into());
+                if mode == "mode" {
+                    state.tab = Tab::Mode;
+                    state.data.modes.push(permissions::Choice {
+                        id: "plan".into(),
+                        label: "Plan".into(),
+                        description: "fixture".into(),
+                        available: true,
+                        reason: None,
+                    });
+                } else if mode != "list" {
+                    state.begin_edit(true);
+                    let form = state.form.as_mut().context("form")?;
+                    form.value = Editor::from("Read(fixture)");
+                    form.delete = mode == "delete";
+                    if form.delete {
+                        form.before = Some("Read(fixture)".into());
+                    }
+                    if mode == "button" {
+                        form.field = 3;
+                    }
+                    if mode == "choice-kind" {
+                        form.field = 0;
+                    }
+                    if mode == "choice-scope" {
+                        form.field = 1;
+                    }
+                    if mode == "multiline" {
+                        form.kind = SettingKind::AutoEnvironment;
+                        form.scope = Scope::User;
+                        state
+                            .data
+                            .revisions
+                            .insert(Scope::User, "revision-42".into());
+                    }
+                }
+                ui.modal = Some(Modal::Permissions(Box::new(state)));
+                if custom {
+                    ui.key(KeyEvent::new(code, modifiers));
+                    let Some(Modal::Permissions(state)) = &mut ui.modal else {
+                        anyhow::bail!("panel")
+                    };
+                    assert!(!state.loading, "removed {action:?}");
+                    if let Some(form) = &mut state.form {
+                        form.value = Editor::from("Read(fixture)");
+                    }
+                }
+                let request = shortcut_tests::request_at_boundary(
+                    &mut ui,
+                    KeyEvent::new(
+                        if custom { KeyCode::F(12) } else { code },
+                        if custom {
+                            KeyModifiers::NONE
+                        } else {
+                            modifiers
+                        },
+                    ),
+                )
+                .with_context(|| format!("{action:?} {mode} {phase}"))?;
+                let Request::Permissions {
+                    id,
+                    action: requested,
+                } = request
+                else {
+                    anyhow::bail!("wrong request")
+                };
+                assert_eq!(id, "one");
+                if [PERMISSIONS_REFRESH, PERMISSIONS_REFRESH_FORM].contains(&action) {
+                    assert!(matches!(requested, permissions::Action::Refresh));
+                } else if mode == "mode" {
+                    assert!(
+                        matches!(requested, permissions::Action::SetMode { mode } if mode == "plan")
+                    );
+                } else {
+                    let permissions::Action::Edit { edit } = requested else {
+                        anyhow::bail!("edit")
+                    };
+                    assert_eq!(
+                        edit.kind,
+                        if mode == "multiline" {
+                            SettingKind::AutoEnvironment
+                        } else {
+                            SettingKind::Allow
+                        }
+                    );
+                    assert_eq!(
+                        edit.scope,
+                        if mode == "multiline" {
+                            Scope::User
+                        } else {
+                            Scope::Session
+                        }
+                    );
+                    assert_eq!(edit.revision, "revision-42");
+                    assert_eq!(
+                        edit.before.as_deref(),
+                        (mode == "delete").then_some("Read(fixture)")
+                    );
+                    assert_eq!(
+                        edit.after.as_deref(),
+                        (mode != "delete").then_some("Read(fixture)")
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn permission_native_hints_follow_custom_bindings_in_each_field() -> Result<()> {
+        for (action, field, searching) in [
+            (PERMISSIONS_SEARCH, None, false),
+            (PERMISSIONS_REFRESH, None, false),
+            (PERMISSIONS_PREVIOUS_TAB, None, false),
+            (PERMISSIONS_NEXT_TAB, None, false),
+            (PERMISSIONS_ADD, None, false),
+            (PERMISSIONS_EDIT, None, false),
+            (PERMISSIONS_DELETE, None, false),
+            (NAVIGATION_UP, None, false),
+            (NAVIGATION_DOWN, None, false),
+            (PERMISSIONS_PREVIOUS_VALUE, Some(1), false),
+            (PERMISSIONS_NEXT_VALUE, Some(1), false),
+            (PERMISSIONS_SUBMIT, Some(2), false),
+            (NAVIGATION_NEXT_FOCUS, Some(2), false),
+            (NAVIGATION_PREVIOUS_FOCUS, Some(2), false),
+            (PERMISSIONS_REFRESH_FORM, Some(2), false),
+            (PERMISSIONS_ACTIVATE, Some(2), false),
+            (PERMISSIONS_FINISH_SEARCH, None, true),
+        ] {
+            let (mut ui, _dir, _) = shortcut_tests::fixture(Some(action))?;
+            let mut state = State::new("one".into(), provider::Provider::Claude);
+            state.tab = Tab::Allow;
+            if let Some(field) = field {
+                state.begin_edit(true);
+                state.form.as_mut().context("form")?.field = field;
+            }
+            state.searching = searching;
+            ui.modal = Some(Modal::Permissions(Box::new(state)));
+            for width in [80, 160] {
+                let text = render(&mut ui, width, 40)?;
+                assert!(text.contains("F12"), "{action:?} width={width}: {text}");
+            }
+        }
+        Ok(())
+    }
+
+    // Removing semantic dispatch makes F12 inert; retaining a raw alias mutates
+    // the state during the explicit old-key assertion below.
+    #[test]
+    fn permission_list_actions_replace_all_legacy_keys_at_real_dispatch() -> Result<()> {
+        use crate::shortcuts::ids::*;
+        for (action, aliases, want) in [
+            (PERMISSIONS_SEARCH, vec![KeyCode::Char('/')], "search"),
+            (
+                PERMISSIONS_PREVIOUS_TAB,
+                vec![KeyCode::BackTab, KeyCode::Left],
+                "Mode",
+            ),
+            (
+                PERMISSIONS_NEXT_TAB,
+                vec![KeyCode::Tab, KeyCode::Right],
+                "Allow",
+            ),
+            (PERMISSIONS_ADD, vec![KeyCode::Char('a')], "new"),
+            (PERMISSIONS_EDIT, vec![KeyCode::Char('e')], "edit"),
+            (
+                PERMISSIONS_DELETE,
+                vec![KeyCode::Char('d'), KeyCode::Delete],
+                "delete",
+            ),
+        ] {
+            for alias in aliases {
+                for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                    let (mut ui, _dir, _) = shortcut_tests::binding_fixture(action, phase)?;
+                    let mut state = State::new("one".into(), provider::Provider::Claude);
+                    state.tab = if want == "Mode" || want == "Allow" {
+                        Tab::Denied
+                    } else {
+                        Tab::Allow
+                    };
+                    state.data.rows.push(permissions::SettingRow {
+                        kind: SettingKind::Allow,
+                        scope: Some(Scope::Project),
+                        value: "Read(*)".into(),
+                        editable: true,
+                        source: "fixture".into(),
+                        revision: "r1".into(),
+                    });
+                    ui.modal = Some(Modal::Permissions(Box::new(state)));
+                    let unchanged = |ui: &Ui| -> Result<()> {
+                        let Some(Modal::Permissions(state)) = &ui.modal else {
+                            anyhow::bail!("permissions closed")
+                        };
+                        assert!(!state.searching && state.form.is_none());
+                        assert_eq!(
+                            state.tab,
+                            if want == "Mode" || want == "Allow" {
+                                Tab::Denied
+                            } else {
+                                Tab::Allow
+                            }
+                        );
+                        Ok(())
+                    };
+                    if custom {
+                        ui.key(KeyEvent::new(alias, KeyModifiers::NONE));
+                        unchanged(&ui)?;
+                    }
+                    ui.key(KeyEvent::new(
+                        if custom { KeyCode::F(12) } else { alias },
+                        KeyModifiers::NONE,
+                    ));
+                    let Some(Modal::Permissions(state)) = &ui.modal else {
+                        anyhow::bail!("permissions")
+                    };
+                    match want {
+                        "search" => assert!(state.searching),
+                        "Mode" => assert_eq!(state.tab, Tab::Mode),
+                        "Allow" => assert_eq!(state.tab, Tab::Allow),
+                        "new" => assert!(
+                            state
+                                .form
+                                .as_ref()
+                                .is_some_and(|f| f.before.is_none() && !f.delete)
+                        ),
+                        "edit" => {
+                            assert!(state.form.as_ref().is_some_and(|f| f.before.as_deref()
+                                == Some("Read(*)")
+                                && !f.delete))
+                        }
+                        "delete" => {
+                            assert!(
+                                state.form.as_ref().is_some_and(
+                                    |f| f.delete && f.before.as_deref() == Some("Read(*)")
+                                )
+                            )
+                        }
+                        _ => anyhow::bail!("expectation"),
+                    }
+                    ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                    assert_eq!(
+                        ui.positions.get("one").context("draft")?.draft.text(),
+                        "unsent draft"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn permission_form_navigation_uses_actual_field_context_and_preserves_editing() -> Result<()> {
+        use crate::shortcuts::{contexts::*, ids::*};
+        for (action, code, modifier, start, want) in [
+            (
+                NAVIGATION_NEXT_FOCUS,
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+                1,
+                2,
+            ),
+            (
+                NAVIGATION_PREVIOUS_FOCUS,
+                KeyCode::BackTab,
+                KeyModifiers::NONE,
+                1,
+                0,
+            ),
+            (
+                PERMISSIONS_PREVIOUS_VALUE,
+                KeyCode::Left,
+                KeyModifiers::NONE,
+                1,
+                1,
+            ),
+            (
+                PERMISSIONS_NEXT_VALUE,
+                KeyCode::Right,
+                KeyModifiers::NONE,
+                1,
+                1,
+            ),
+            (
+                PERMISSIONS_ACTIVATE,
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                2,
+                3,
+            ),
+            (
+                PERMISSIONS_ACTIVATE,
+                KeyCode::Enter,
+                KeyModifiers::SHIFT,
+                2,
+                3,
+            ),
+            (
+                NAVIGATION_NEXT_FOCUS,
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+                0,
+                1,
+            ),
+            (
+                NAVIGATION_NEXT_FOCUS,
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+                2,
+                3,
+            ),
+            (
+                NAVIGATION_NEXT_FOCUS,
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+                3,
+                0,
+            ),
+            (
+                NAVIGATION_NEXT_FOCUS,
+                KeyCode::Tab,
+                KeyModifiers::NONE,
+                4,
+                3,
+            ),
+            (
+                NAVIGATION_PREVIOUS_FOCUS,
+                KeyCode::BackTab,
+                KeyModifiers::NONE,
+                0,
+                3,
+            ),
+            (
+                NAVIGATION_PREVIOUS_FOCUS,
+                KeyCode::BackTab,
+                KeyModifiers::NONE,
+                2,
+                1,
+            ),
+            (
+                NAVIGATION_PREVIOUS_FOCUS,
+                KeyCode::BackTab,
+                KeyModifiers::NONE,
+                3,
+                2,
+            ),
+            (
+                NAVIGATION_PREVIOUS_FOCUS,
+                KeyCode::BackTab,
+                KeyModifiers::NONE,
+                4,
+                1,
+            ),
+            (
+                PERMISSIONS_ACTIVATE,
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+                4,
+                3,
+            ),
+        ] {
+            for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                let (mut ui, _dir, _) = shortcut_tests::binding_fixture(action, phase)?;
+                let mut state = State::new("one".into(), provider::Provider::Claude);
+                state.tab = Tab::Allow;
+                state.begin_edit(true);
+                let form = state.form.as_mut().context("form")?;
+                let start_field = if start == 4 { 2 } else { start };
+                form.field = start_field;
+                if start == 4 {
+                    form.kind = SettingKind::AutoEnvironment;
+                }
+                form.value = Editor::from("value");
+                ui.modal = Some(Modal::Permissions(Box::new(state)));
+                if custom {
+                    ui.key(KeyEvent::new(code, modifier));
+                    let Some(Modal::Permissions(state)) = &ui.modal else {
+                        anyhow::bail!("permissions")
+                    };
+                    assert_eq!(state.form.as_ref().context("form")?.field, start_field);
+                    assert_eq!(state.form.as_ref().context("form")?.scope, Scope::Session);
+                }
+                ui.key(KeyEvent::new(
+                    if custom { KeyCode::F(12) } else { code },
+                    if custom { KeyModifiers::NONE } else { modifier },
+                ));
+                let Some(Modal::Permissions(state)) = &mut ui.modal else {
+                    anyhow::bail!("permissions")
+                };
+                let form = state.form.as_mut().context("form")?;
+                assert_eq!(form.field, want);
+                if action == PERMISSIONS_PREVIOUS_VALUE {
+                    assert_eq!(form.scope, Scope::User);
+                }
+                if action == PERMISSIONS_NEXT_VALUE {
+                    assert_eq!(form.scope, Scope::Project);
+                }
+                form.field = 2;
+                form.value = Editor::from("value");
+                assert_eq!(
+                    ui.shortcut_context(),
+                    if start == 4 {
+                        AGENT_PERMISSION_MULTILINE
+                    } else {
+                        AGENT_PERMISSION_FORM
+                    }
+                );
+                ui.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+                let Some(Modal::Permissions(state)) = &ui.modal else {
+                    anyhow::bail!("permissions")
+                };
+                assert_eq!(
+                    state.editor().context("editor")?.selected_text().as_deref(),
+                    Some("e")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn permission_search_finish_replaces_enter_and_keeps_raw_typing() -> Result<()> {
+        use crate::shortcuts::ids::PERMISSIONS_FINISH_SEARCH;
+        for (phase, custom) in shortcut_tests::BINDING_PHASES {
+            let (mut ui, _dir, _) =
+                shortcut_tests::binding_fixture(PERMISSIONS_FINISH_SEARCH, phase)?;
+            let mut state = State::new("one".into(), provider::Provider::Claude);
+            state.searching = true;
+            ui.modal = Some(Modal::Permissions(Box::new(state)));
+            ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            if custom {
+                ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                assert!(matches!(&ui.modal, Some(Modal::Permissions(state)) if state.searching));
+            }
+            ui.key(KeyEvent::new(
+                if custom {
+                    KeyCode::F(12)
+                } else {
+                    KeyCode::Enter
+                },
+                KeyModifiers::NONE,
+            ));
+            assert!(
+                matches!(&ui.modal, Some(Modal::Permissions(state)) if !state.searching && state.query.text().starts_with('x'))
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn provider_panel_renders_current_pending_errors_tabs_and_multiline_forms() -> Result<()> {
         let dir = tempfile::tempdir()?;

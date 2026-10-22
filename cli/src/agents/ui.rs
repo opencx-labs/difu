@@ -2709,12 +2709,8 @@ impl Ui {
             Action::PermissionTab(index) => self.permissions_tab(index),
             Action::PermissionItem(index) => self.permissions_select(Some(index)),
             Action::PermissionField(index) => self.permissions_field(index),
-            Action::PermissionSave => {
-                self.permissions_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL))
-            }
-            Action::PermissionSearch => {
-                self.permissions_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
-            }
+            Action::PermissionSave => self.permissions_save(),
+            Action::PermissionSearch => self.permissions_search(),
             Action::Link(url) => {
                 let sender = self.sender.clone();
                 thread::spawn(move || {
@@ -2841,23 +2837,9 @@ impl Ui {
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 if matches!(self.modal, Some(Modal::Permissions(_))) {
-                    let code = if event.kind == MouseEventKind::ScrollDown {
-                        KeyCode::Down
-                    } else {
-                        KeyCode::Up
-                    };
-                    for _ in 0..3 {
-                        self.permissions_key(KeyEvent::new(code, KeyModifiers::NONE));
-                    }
+                    self.permissions_scroll(event.kind == MouseEventKind::ScrollDown);
                 } else if matches!(self.modal, Some(Modal::Mcp(_))) {
-                    let code = if event.kind == MouseEventKind::ScrollDown {
-                        KeyCode::Down
-                    } else {
-                        KeyCode::Up
-                    };
-                    for _ in 0..3 {
-                        self.mcp_key(KeyEvent::new(code, KeyModifiers::NONE));
-                    }
+                    self.mcp_scroll(event.kind == MouseEventKind::ScrollDown);
                 } else if self.scroll_modal(if event.kind == MouseEventKind::ScrollDown {
                     3
                 } else {
