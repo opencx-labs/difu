@@ -276,5 +276,65 @@ pub(super) fn build() -> Vec<ActionSpec> {
             }
         }
     }
+    // Refine mixed forms to the field that actually owns input. Defaults Save
+    // has no Editor; rules Enter selects a repository or activates a button,
+    // while the Rules text field retains its native multiline Enter.
+    for entry in &mut entries {
+        for (base, added) in [
+            (contexts::AGENT_DEFAULTS, contexts::AGENT_DEFAULTS_BUTTON),
+            (contexts::AGENT_RULES, contexts::AGENT_RULES_REPOSITORY),
+            (contexts::AGENT_RULES, contexts::AGENT_RULES_BUTTON),
+        ] {
+            if !entry.contexts.contains(&base)
+                || (base == contexts::AGENT_DEFAULTS
+                    && [ids::NAVIGATION_UP, ids::NAVIGATION_DOWN].contains(&entry.id))
+            {
+                continue;
+            }
+            if !entry.contexts.contains(&added) {
+                entry.contexts.push(added);
+            }
+            for binding in &mut entry.defaults {
+                if binding.contexts.contains(&base) && !binding.contexts.contains(&added) {
+                    binding.contexts.push(added);
+                }
+            }
+        }
+        if entry.id == ids::NAVIGATION_ACTIVATE {
+            entry.contexts.retain(|c| *c != contexts::AGENT_RULES);
+            for binding in &mut entry.defaults {
+                binding.contexts.retain(|c| *c != contexts::AGENT_RULES);
+            }
+        }
+        // These legacy predicates explicitly accept extra modifiers; enumerate
+        // all capturable combinations so capture/conflict validation agrees.
+        if [
+            ids::DEFAULTS_SAVE,
+            ids::DEFAULTS_REPOSITORY_RULES,
+            ids::RULES_SAVE,
+        ]
+        .contains(&entry.id)
+        {
+            let modifiers: &[u8] = if entry.id == ids::RULES_SAVE {
+                &[1, 8, 3, 5, 9, 10, 12, 7, 11, 13, 14, 15]
+            } else {
+                &[1, 3, 5, 7, 9, 11, 13, 15]
+            };
+            entry.defaults = modifiers
+                .iter()
+                .map(|m| DefaultBinding {
+                    chord: key(
+                        if entry.id == ids::DEFAULTS_REPOSITORY_RULES {
+                            BindingKey::Character('r')
+                        } else {
+                            BindingKey::Enter
+                        },
+                        *m,
+                    ),
+                    contexts: entry.contexts.clone(),
+                })
+                .collect();
+        }
+    }
     entries
 }

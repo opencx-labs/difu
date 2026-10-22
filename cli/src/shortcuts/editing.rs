@@ -83,6 +83,7 @@ fn reserved(context: Context, chord: &KeyChord) -> bool {
         AGENT_PERMISSION_FORM,
         AGENT_PERMISSION_MULTILINE,
         AGENT_RULES,
+        AGENT_RULES_REPOSITORY,
         AGENT_SLACK,
         AGENT_TWEAKS,
         AGENT_REPOSITORY,

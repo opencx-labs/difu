@@ -604,8 +604,10 @@ fn agent_help_and_voice_controls_render_effective_keys() -> Result<()> {
     Ok(())
 }
 
-#[test]
-fn creation_permission_and_interrupt_keys_reach_the_real_service_boundary() -> Result<()> {
+pub(super) fn request_at_connected_boundary_with(
+    ui: &mut Ui,
+    dispatch: impl FnOnce(&mut Ui, &mpsc::Receiver<std::io::Result<String>>),
+) -> Result<Request> {
     use std::{
         io::{BufRead, BufReader},
         process::{Child, Command, Stdio},
@@ -641,6 +643,43 @@ while True:
             print(json.dumps(request),flush=True)
             break
 "#;
+    let socket = super::super::server::socket(&ui.storage)?;
+    let child = Command::new("python3")
+        .args(["-u", "-c", SERVER])
+        .arg(socket)
+        .arg(env!("CARGO_PKG_VERSION"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut service = Service(child);
+    let stdout = service.0.stdout.take().context("fixture stdout")?;
+    let (tx, rx) = mpsc::channel();
+    let reader = thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    assert_eq!(rx.recv_timeout(Duration::from_secs(3))??, "ready");
+    dispatch(ui, &rx);
+    let result = rx
+        .recv_timeout(Duration::from_secs(3))
+        .context("fixture request")
+        .and_then(|line| line.map_err(anyhow::Error::from))
+        .and_then(|line| serde_json::from_str(&line).map_err(anyhow::Error::from));
+    // Terminate before joining even on an absent/broken dispatch, so no reader
+    // can outlive its scoped temporary service.
+    let _ = service.0.kill();
+    let _ = service.0.wait();
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("fixture reader"))?;
+    result
+}
+
+#[test]
+fn creation_permission_and_interrupt_keys_reach_the_real_service_boundary() -> Result<()> {
     for (action, code, modifiers) in [
         (ids::SESSION_NEW, KeyCode::Char('n'), KeyModifiers::NONE),
         (
@@ -662,48 +701,24 @@ while True:
             if action == ids::CONVERSATION_INTERRUPT {
                 ui.sessions.get_mut("one").context("session")?.status = Status::Running;
             }
-            let socket = super::super::server::socket(&ui.storage)?;
-            let child = Command::new("python3")
-                .args(["-u", "-c", SERVER])
-                .arg(socket)
-                .arg(env!("CARGO_PKG_VERSION"))
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()?;
-            let mut service = Service(child);
-            let stdout = service.0.stdout.take().context("fixture stdout")?;
-            let (tx, rx) = mpsc::channel();
-            let reader = thread::spawn(move || {
-                for line in BufReader::new(stdout).lines() {
-                    if tx.send(line).is_err() {
-                        break;
-                    }
-                }
-            });
-            assert_eq!(rx.recv_timeout(Duration::from_secs(3))??, "ready");
-            if custom {
-                press(&mut ui, code, modifiers);
-                assert!(
-                    rx.recv_timeout(Duration::from_millis(30)).is_err(),
-                    "old {action:?} contacted service"
-                );
-            }
-            press(
-                &mut ui,
-                if custom { KeyCode::F(12) } else { code },
+            let request = request_at_connected_boundary_with(&mut ui, |ui, rx| {
                 if custom {
-                    KeyModifiers::NONE
-                } else {
-                    modifiers
-                },
-            );
-            let line = rx
-                .recv_timeout(Duration::from_secs(3))
-                .with_context(|| format!("{action:?} custom={custom}"))??;
-            let request: Request = serde_json::from_str(&line)?;
-            reader
-                .join()
-                .map_err(|_| anyhow::anyhow!("fixture reader"))?;
+                    press(ui, code, modifiers);
+                    assert!(
+                        rx.recv_timeout(Duration::from_millis(30)).is_err(),
+                        "old {action:?} contacted service"
+                    );
+                }
+                press(
+                    ui,
+                    if custom { KeyCode::F(12) } else { code },
+                    if custom {
+                        KeyModifiers::NONE
+                    } else {
+                        modifiers
+                    },
+                );
+            })?;
             match action {
                 ids::SESSION_NEW => assert!(matches!(request, Request::NewAgent { .. })),
                 ids::COMPOSER_PERMISSION_MODE => assert!(
@@ -1315,6 +1330,305 @@ fn plan_and_inline_questions_keep_priority_over_early_main_actions() -> Result<(
             ui.key(event);
             assert!(ui.inline_question());
             assert!(ui.list_visible && !ui.changes_visible);
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn owned_modal_context(
+    install: impl Fn(&mut Ui),
+    context: crate::shortcuts::Context,
+    copied: Option<&str>,
+) -> Result<()> {
+    for (action, code) in [
+        (ids::AGENTS_SIDEBAR, KeyCode::Char('[')),
+        (ids::AGENTS_CHANGES, KeyCode::Char('d')),
+        (ids::AGENTS_MODELS, KeyCode::Char('m')),
+        (ids::QUESTION_OPEN, KeyCode::Up),
+    ] {
+        for (phase, custom) in BINDING_PHASES {
+            let (mut ui, _dir, _) = binding_fixture(action, phase)?;
+            ui.model_completion.options = vec![crate::model::ModelInfo {
+                id: "fixture-one".into(),
+                name: "One".into(),
+                efforts: vec![],
+            }];
+            install(&mut ui);
+            assert_eq!(ui.shortcut_context(), context);
+            let picker = matches!(ui.modal, Some(Modal::ModelPicker(_)));
+            if custom {
+                ui.key(KeyEvent::new(code, KeyModifiers::ALT));
+                assert_eq!(ui.shortcut_context(), context);
+                assert!(ui.list_visible && !ui.changes_visible);
+            }
+            ui.key(KeyEvent::new(
+                if custom { KeyCode::F(12) } else { code },
+                if custom {
+                    KeyModifiers::NONE
+                } else {
+                    KeyModifiers::ALT
+                },
+            ));
+            match action {
+                ids::AGENTS_SIDEBAR => assert!(!ui.list_visible),
+                ids::AGENTS_CHANGES => assert!(ui.changes_visible),
+                ids::AGENTS_MODELS => {
+                    assert_eq!(matches!(ui.modal, Some(Modal::ModelPicker(_))), !picker)
+                }
+                ids::QUESTION_OPEN => assert!(matches!(ui.modal, Some(Modal::Pending { .. }))),
+                _ => anyhow::bail!("early action"),
+            }
+        }
+    }
+    for (phase, custom) in BINDING_PHASES {
+        let (mut ui, _dir, _) = binding_fixture(ids::SELECTION_COPY, phase)?;
+        install(&mut ui);
+        ui.positions
+            .get_mut("one")
+            .context("draft")?
+            .draft
+            .key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        if custom {
+            ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
+            assert!(ui.clipboard.is_none());
+        }
+        ui.key(KeyEvent::new(
+            if custom {
+                KeyCode::F(12)
+            } else {
+                KeyCode::Char('c')
+            },
+            if custom {
+                KeyModifiers::NONE
+            } else {
+                KeyModifiers::SUPER
+            },
+        ));
+        assert_eq!(ui.clipboard.as_deref(), copied, "copy {context:?} {phase}");
+        ui.clipboard = None;
+        ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(ui.clipboard.as_deref(), copied, "CtrlC focused selection");
+        assert_eq!(
+            ui.positions.get("one").context("draft")?.draft.text(),
+            "unsent draft"
+        );
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.modal.is_none(), "safe escape");
+    }
+    let (mut ui, _dir, mut config) = fixture(None)?;
+    install(&mut ui);
+    config.preferences.keyboard.bindings.insert(
+        ids::SETTINGS_OPEN.0.into(),
+        chord(BindingKey::Character('z'), 0),
+    );
+    ui.apply_settings(&config);
+    let mut shell = crate::shell::Shell::new(ui.storage.clone(), config, None);
+    shell.agents = ui;
+    shell.agents_active = true;
+    shell.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+    assert_eq!(
+        shell.settings.is_none(),
+        copied.is_some(),
+        "Shell editor protection {context:?}"
+    );
+    if copied.is_some() {
+        assert!(
+            shell
+                .agents
+                .focused_editor()
+                .context("focused editor")?
+                .text()
+                .ends_with('z')
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn repository_dialog_activation_replaces_enter_and_sends_exact_existing_requests() -> Result<()> {
+    for change in [false, true] {
+        for (phase, custom) in BINDING_PHASES {
+            let (mut ui, _dir, _) = binding_fixture(ids::NAVIGATION_ACTIVATE, phase)?;
+            let install = |ui: &mut Ui| {
+                let editor = Editor::from(" /temporary/repository ");
+                ui.modal = Some(if change {
+                    Modal::ChangeRepository(editor)
+                } else {
+                    Modal::Repository(editor)
+                });
+            };
+            install(&mut ui);
+            let dispatch = |ui: &mut Ui| {
+                if custom {
+                    ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    assert!(!ui.busy);
+                    assert!(
+                        ui.focused_editor()
+                            .is_some_and(|e| e.text().ends_with('\n'))
+                    );
+                    install(ui);
+                }
+                ui.key(KeyEvent::new(
+                    if custom {
+                        KeyCode::F(12)
+                    } else {
+                        KeyCode::Enter
+                    },
+                    KeyModifiers::NONE,
+                ));
+            };
+            let request = if change {
+                request_at_boundary_with(&mut ui, dispatch)?
+            } else {
+                request_at_connected_boundary_with(&mut ui, |ui, _rx| dispatch(ui))?
+            };
+            if change {
+                anyhow::ensure!(
+                    matches!(request,Request::Repository{id,repository}if id=="one"&&repository==std::path::Path::new("/temporary/repository")),
+                    "repository change payload"
+                );
+            } else {
+                anyhow::ensure!(
+                    matches!(request,Request::NewAgent{defaults,cwd,remember_repository:true}if defaults.repository==Some(std::path::PathBuf::from("/temporary/repository"))&&cwd==std::env::current_dir()?),
+                    "repository launch payload"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+#[test]
+fn repository_dialogs_keep_editor_globals_copy_escape_and_guards() -> Result<()> {
+    for change in [false, true] {
+        owned_modal_context(
+            |ui| {
+                let mut e = Editor::from("focused");
+                e.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+                ui.modal = Some(if change {
+                    Modal::ChangeRepository(e)
+                } else {
+                    Modal::Repository(e)
+                });
+            },
+            if change {
+                crate::shortcuts::contexts::AGENT_CHANGE_REPOSITORY
+            } else {
+                crate::shortcuts::contexts::AGENT_REPOSITORY
+            },
+            Some("d"),
+        )?;
+        for busy in [false, true] {
+            let (mut ui, _dir, _) = fixture(Some(ids::NAVIGATION_ACTIVATE))?;
+            ui.busy = busy;
+            ui.modal = Some(if change {
+                Modal::ChangeRepository(Editor::from("  "))
+            } else {
+                Modal::Repository(Editor::from("  "))
+            });
+            ui.key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+            assert_eq!(ui.busy, busy);
+            assert!(ui.modal.is_some());
+        }
+        let (mut ui, _dir, _) = fixture(Some(ids::NAVIGATION_ACTIVATE))?;
+        ui.selected = None;
+        ui.modal = Some(Modal::ChangeRepository(Editor::from(
+            "/temporary/repository",
+        )));
+        ui.key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        assert!(!ui.busy);
+    }
+    Ok(())
+}
+
+/// Render the complete production UI and derive targets only from visible cells.
+pub(super) fn native_target(ui: &mut Ui, width: u16, label: &str) -> Result<MouseEvent> {
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 44))?;
+    terminal.draw(|frame| ui.draw(frame))?;
+    let buffer = terminal.backend().buffer();
+    let (x, y) = (0..buffer.area.height)
+        .find_map(|y| {
+            let mut row = String::new();
+            let mut starts = Vec::new();
+            for x in 0..buffer.area.width {
+                if let Some(cell) = buffer.cell((x, y)) {
+                    starts.push((row.len(), x));
+                    row.push_str(cell.symbol());
+                }
+            }
+            row.find(label).and_then(|offset| {
+                starts
+                    .into_iter()
+                    .find_map(|(byte, x)| (byte == offset).then_some((x, y)))
+            })
+        })
+        .with_context(|| format!("visible {label}"))?;
+    assert_eq!(buffer.cell((x, y)).map(|c| c.symbol()), label.get(..1));
+    Ok(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    })
+}
+pub(super) fn native_blank_below(ui: &mut Ui, width: u16, label: &str) -> Result<MouseEvent> {
+    let visible = native_target(ui, width, label)?;
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 44))?;
+    terminal.draw(|frame| ui.draw(frame))?;
+    let blank = MouseEvent {
+        row: visible.row + 1,
+        ..visible
+    };
+    assert_eq!(
+        terminal
+            .backend()
+            .buffer()
+            .cell((blank.column, blank.row))
+            .map(|c| c.symbol()),
+        Some(" ")
+    );
+    Ok(blank)
+}
+
+#[test]
+fn repository_native_buttons_use_remapped_hint_and_real_visible_mouse_target() -> Result<()> {
+    for width in [40, 80, 160] {
+        for change in [false, true] {
+            let (mut ui, _dir, _) = fixture(Some(ids::NAVIGATION_ACTIVATE))?;
+            ui.modal = Some(if change {
+                Modal::ChangeRepository(Editor::from("/temporary/repository"))
+            } else {
+                Modal::Repository(Editor::from("/temporary/repository"))
+            });
+            let label = if change {
+                "F12 · Change"
+            } else {
+                "F12 · Save"
+            };
+            let click = native_target(&mut ui, width, label)?;
+            let request = if change {
+                request_at_boundary_with(&mut ui, |ui| ui.mouse(click))?
+            } else {
+                request_at_connected_boundary_with(&mut ui, |ui, _rx| ui.mouse(click))?
+            };
+            if change {
+                assert!(
+                    matches!(request,Request::Repository{id,repository}if id=="one"&&repository==std::path::Path::new("/temporary/repository"))
+                );
+            } else {
+                assert!(
+                    matches!(request,Request::NewAgent{defaults,remember_repository:true,..}if defaults.repository==Some(std::path::PathBuf::from("/temporary/repository")))
+                );
+            }
+            let (mut ui, _dir, _) = fixture(Some(ids::NAVIGATION_ACTIVATE))?;
+            ui.modal = Some(if change {
+                Modal::ChangeRepository(Editor::from("/temporary/repository"))
+            } else {
+                Modal::Repository(Editor::from("/temporary/repository"))
+            });
+            let blank = native_blank_below(&mut ui, width, label)?;
+            ui.mouse(blank);
+            assert!(!ui.busy);
+            assert!(ui.modal.is_some());
         }
     }
     Ok(())

@@ -125,6 +125,36 @@ impl<'a> Bindings<'a> {
         {
             return true;
         }
+        // These forms used explicit Control / Super predicates, including opaque
+        // terminal modifiers. A committed override removes the whole predicate.
+        if [
+            ids::DEFAULTS_SAVE,
+            ids::DEFAULTS_REPOSITORY_RULES,
+            ids::RULES_SAVE,
+        ]
+        .contains(&action)
+            && spec(action).is_some_and(|spec| spec.contexts.contains(&context))
+            && !self
+                .config
+                .preferences
+                .keyboard
+                .bindings
+                .contains_key(action.0)
+            && event.modifiers.intersects(M::HYPER | M::META)
+            && if action == ids::RULES_SAVE {
+                event.code == KeyCode::Enter && event.modifiers.intersects(M::CONTROL | M::SUPER)
+            } else {
+                event.modifiers.contains(M::CONTROL)
+                    && event.code
+                        == if action == ids::DEFAULTS_REPOSITORY_RULES {
+                            KeyCode::Char('r')
+                        } else {
+                            KeyCode::Enter
+                        }
+            }
+        {
+            return true;
+        }
         let Some(chord) = capture(event) else {
             return false;
         };

@@ -189,6 +189,13 @@ fn exported_preferences_exclude_rules_connections_and_session_content() -> Resul
     config
         .repositories
         .insert("secret/repo".into(), "/secret".into());
+    config.preferences.keyboard.bindings.insert(
+        "defaults.repository_rules".into(),
+        KeyChord {
+            key: BindingKey::Function(12),
+            modifiers: KeyModifiers::default(),
+        },
+    );
     let mut draft = SettingsDraft::new(config);
     draft.set(SettingId::WrapDiff, SettingValue::Bool(true))?;
     let export: serde_json::Value = serde_json::from_str(&export_preferences(draft.config())?)?;
@@ -196,12 +203,29 @@ fn exported_preferences_exclude_rules_connections_and_session_content() -> Resul
         export.get("diff.wrap"),
         Some(&serde_json::json!({"Bool":true}))
     );
-    let text = export.to_string();
-    assert!(
-        !text.contains("PRIVATE")
-            && !text.contains("connections")
-            && !text.contains("repository_rules")
+    // A shortcut can truthfully name repository rules without exporting any
+    // rule content. Check the flat export fields and private fixture values.
+    assert_eq!(
+        export.get("keyboard.binding.defaults.repository_rules"),
+        Some(&serde_json::json!({"Shortcut":{
+            "key":{"Function":12},
+            "modifiers":{"control":false,"alt":false,"shift":false,"super_key":false}
+        }}))
     );
+    for field in [
+        "repository_rules",
+        "agents.rules",
+        "connections.providers",
+        "connections.mcp",
+        "connections.slack",
+        "connections.remote",
+        "pinned_sessions",
+        "repositories",
+    ] {
+        assert!(export.get(field).is_none(), "private field {field}");
+    }
+    let text = export.to_string();
+    assert!(!text.contains("PRIVATE") && !text.contains("/secret"));
     Ok(())
 }
 

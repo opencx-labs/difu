@@ -387,3 +387,106 @@ fn permission_control_aliases_are_authoritative_contextual_and_replaceable() -> 
     );
     Ok(())
 }
+
+#[test]
+fn model_default_rules_contexts_aliases_conflicts_and_old_reset_id_are_truthful() -> Result<()> {
+    use contexts::*;
+    for (action, contexts, expected_count) in [
+        (
+            ids::DEFAULTS_SAVE,
+            vec![AGENT_DEFAULTS, AGENT_DEFAULTS_BUTTON],
+            8,
+        ),
+        (
+            ids::DEFAULTS_REPOSITORY_RULES,
+            vec![AGENT_DEFAULTS, AGENT_DEFAULTS_BUTTON],
+            8,
+        ),
+        (
+            ids::RULES_SAVE,
+            vec![AGENT_RULES, AGENT_RULES_REPOSITORY, AGENT_RULES_BUTTON],
+            12,
+        ),
+    ] {
+        let config = Config::default();
+        let bindings = Bindings::new(&config);
+        for context in contexts {
+            assert_eq!(bindings.effective(action, context).len(), expected_count);
+            for bits in 0..16 {
+                let mut mods = M::NONE;
+                for (bit, m) in [(1, M::CONTROL), (2, M::ALT), (4, M::SHIFT), (8, M::SUPER)] {
+                    if bits & bit != 0 {
+                        mods |= m;
+                    }
+                }
+                let code = if action == ids::DEFAULTS_REPOSITORY_RULES {
+                    KeyCode::Char('r')
+                } else {
+                    KeyCode::Enter
+                };
+                let event = KeyEvent::new(code, mods);
+                let expected = if action == ids::RULES_SAVE {
+                    bits & 9 != 0
+                } else {
+                    bits & 1 != 0
+                };
+                assert_eq!(
+                    bindings.matches(action, context, event),
+                    expected,
+                    "{} {context:?} {bits}",
+                    action.0
+                );
+                assert!(!bindings.matches(action, AGENT_MODEL_PICKER, event));
+                assert!(!bindings.matches(
+                    action,
+                    context,
+                    KeyEvent {
+                        kind: KeyEventKind::Release,
+                        ..event
+                    }
+                ));
+            }
+        }
+    }
+    let mut config = Config::default();
+    config
+        .preferences
+        .keyboard
+        .bindings
+        .insert(ids::NAVIGATION_ACTIVATE.0.into(), key(BindingKey::Enter, 5));
+    assert!(
+        Bindings::new(&config)
+            .conflicts()
+            .iter()
+            .any(|s| s.contains("Save agent defaults")),
+        "combined Control alias must participate in conflicts"
+    );
+    assert!(find("defaults.reset").is_none());
+    let dir = tempfile::tempdir()?;
+    let storage = crate::storage::Storage {
+        config: dir.path().join("config.json"),
+        cache: dir.path().join("cache"),
+    };
+    let mut config = Config::default();
+    config
+        .preferences
+        .keyboard
+        .bindings
+        .insert("defaults.reset".into(), key(BindingKey::Function(11), 0));
+    storage.save_config(&config)?;
+    let mut draft = storage.settings_draft()?;
+    draft.set(
+        crate::settings::SettingId::VoiceEnabled,
+        crate::settings::SettingValue::Bool(!config.voice_enabled),
+    )?;
+    let saved = storage.save_settings_draft(&mut draft)?;
+    assert_eq!(
+        saved.preferences.keyboard.bindings.get("defaults.reset"),
+        Some(&key(BindingKey::Function(11), 0))
+    );
+    assert_eq!(
+        Bindings::new(&saved).resolve(AGENT_DEFAULTS, KeyEvent::new(KeyCode::F(11), M::NONE)),
+        None
+    );
+    Ok(())
+}

@@ -561,8 +561,8 @@ pub(super) fn entries() -> Vec<ActionSpec> {
             &[key(BindingKey::Enter, 1)],
         ),
         entry(
-            ids::DEFAULTS_RESET,
-            "Reset agent defaults",
+            ids::DEFAULTS_REPOSITORY_RULES,
+            "Edit default repository rules",
             &[contexts::AGENT_DEFAULTS],
             &[key(BindingKey::Character('r'), 1)],
         ),
@@ -580,7 +580,7 @@ pub(super) fn entries() -> Vec<ActionSpec> {
         ),
         entry(
             ids::MODELS_SAVE,
-            "Save model without closing",
+            "Use model for this session only",
             &[contexts::AGENT_MODEL_PICKER],
             &[key(BindingKey::Character('s'), 0)],
         ),
@@ -671,13 +671,13 @@ pub(super) fn entries() -> Vec<ActionSpec> {
         entry(
             ids::RULES_REPOSITORY_PREVIOUS,
             "Previous rules repository",
-            &[contexts::AGENT_RULES],
+            &[contexts::AGENT_RULES_REPOSITORY],
             &[key(BindingKey::Up, 0)],
         ),
         entry(
             ids::RULES_REPOSITORY_NEXT,
             "Next rules repository",
-            &[contexts::AGENT_RULES],
+            &[contexts::AGENT_RULES_REPOSITORY],
             &[key(BindingKey::Down, 0)],
         ),
     ]

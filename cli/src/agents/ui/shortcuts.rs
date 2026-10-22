@@ -26,8 +26,18 @@ impl Ui {
                 Modal::Transcript { .. } => AGENT_TRANSCRIPT,
                 Modal::InstallBrowser { .. } => AGENT_RESOURCE_PICKER,
                 Modal::Resources { .. } => AGENT_RESOURCE_LIST,
-                Modal::AgentDefaults(_) => AGENT_DEFAULTS,
-                Modal::RepositoryRules(_) => AGENT_RULES,
+                Modal::AgentDefaults(form) => {
+                    if form.field < 3 {
+                        AGENT_DEFAULTS
+                    } else {
+                        AGENT_DEFAULTS_BUTTON
+                    }
+                }
+                Modal::RepositoryRules(form) => match form.field {
+                    0 => AGENT_RULES_REPOSITORY,
+                    1 => AGENT_RULES,
+                    _ => AGENT_RULES_BUTTON,
+                },
                 Modal::Tweaks { .. } => AGENT_TWEAKS,
                 Modal::Theme { .. } => AGENT_THEMES,
                 Modal::Remote => AGENT_REMOTE,

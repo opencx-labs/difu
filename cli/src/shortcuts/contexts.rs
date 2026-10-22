@@ -25,6 +25,9 @@ pub const AGENT_MENU: Context = Context("AgentMenu");
 pub const AGENT_HELP: Context = Context("AgentHelp");
 pub const AGENT_MODEL: Context = Context("AgentModel");
 pub const AGENT_MODEL_PICKER: Context = Context("AgentModelPicker");
+pub const AGENT_DEFAULTS_BUTTON: Context = Context("AgentDefaultsButton");
+pub const AGENT_RULES_REPOSITORY: Context = Context("AgentRulesRepository");
+pub const AGENT_RULES_BUTTON: Context = Context("AgentRulesButton");
 pub const AGENT_DEFAULTS: Context = Context("AgentDefaults");
 pub const AGENT_PERMISSIONS: Context = Context("AgentPermissions");
 pub const AGENT_PERMISSION_SEARCH: Context = Context("AgentPermissionSearch");
@@ -114,6 +117,9 @@ pub const ALL: &[Context] = &[
     AGENT_MODEL,
     AGENT_MODEL_PICKER,
     AGENT_DEFAULTS,
+    AGENT_DEFAULTS_BUTTON,
+    AGENT_RULES_REPOSITORY,
+    AGENT_RULES_BUTTON,
     AGENT_PERMISSIONS,
     AGENT_PERMISSION_SEARCH,
     AGENT_PERMISSION_FORM,
@@ -195,6 +201,9 @@ pub const AGENT_GENERIC_MODALS: &[Context] = &[
     AGENT_RESOURCE_PICKER,
     AGENT_RESOURCE_LIST,
     AGENT_DEFAULTS,
+    AGENT_DEFAULTS_BUTTON,
+    AGENT_RULES_REPOSITORY,
+    AGENT_RULES_BUTTON,
     AGENT_RULES,
     AGENT_TWEAKS,
     AGENT_THEMES,

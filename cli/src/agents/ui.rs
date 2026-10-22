@@ -2397,6 +2397,32 @@ impl Ui {
             self.modal = None;
             return;
         }
+        if matches!(
+            self.modal,
+            Some(Modal::Repository(_) | Modal::ChangeRepository(_))
+        ) {
+            if self.shortcut(key) == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) {
+                self.action(if matches!(self.modal, Some(Modal::Repository(_))) {
+                    Action::ChooseRepository
+                } else {
+                    Action::ChangeRepository
+                });
+            } else {
+                match &mut self.modal {
+                    Some(Modal::Repository(editor))
+                        if key.code == KeyCode::Char('u')
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        editor.clear()
+                    }
+                    Some(Modal::Repository(editor) | Modal::ChangeRepository(editor)) => {
+                        editor.key(key)
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let menu = self.menu_entries();
         let mut action = None;
@@ -2431,18 +2457,6 @@ impl Ui {
                     _ => *scroll,
                 };
             }
-            Some(Modal::ChangeRepository(editor)) => match key.code {
-                KeyCode::Enter => action = Some(Action::ChangeRepository),
-                KeyCode::Esc => self.modal = None,
-                _ => {
-                    editor.key(key);
-                }
-            },
-            Some(Modal::Repository(editor)) => match key.code {
-                KeyCode::Enter => action = Some(Action::ChooseRepository),
-                KeyCode::Char('u') if ctrl => editor.clear(),
-                _ => editor.key(key),
-            },
             Some(Modal::Menu { query, selected }) => {
                 let matching: Vec<_> = menu
                     .iter()
@@ -3968,8 +3982,8 @@ impl Ui {
         let title = match self.modal {
             Some(Modal::Transcript { .. }) => "Message · ↑/↓ Scroll · PgUp/PgDn Page · Esc Close",
             Some(Modal::InstallBrowser { .. }) => "Optional HTML preview · Esc cancels",
-            Some(Modal::AgentDefaults(_)) => "New agent defaults · Tab fields · Esc cancels",
-            Some(Modal::RepositoryRules(_)) => "Repository rules · Tab fields",
+            Some(Modal::AgentDefaults(_)) => "New agent defaults",
+            Some(Modal::RepositoryRules(_)) => "Repository rules",
             Some(Modal::Slack(_)) => "Slack setup · Tab fields · Esc closes",
             Some(Modal::Tweaks { .. }) => "Tweaks · chat animations",
             Some(Modal::Theme { .. }) => "Theme",
@@ -3988,7 +4002,7 @@ impl Ui {
             Some(Modal::QueuedEdit { .. }) => "Edit queued message",
             Some(Modal::Rename(_)) => "Rename session",
             Some(Modal::Model { .. }) => "Session model",
-            Some(Modal::ModelPicker(_)) => "Select model · ↑/↓ Select · ←/→ Effort · Esc Cancel",
+            Some(Modal::ModelPicker(_)) => "Select model",
             Some(Modal::Approval { .. }) => "Agent needs your input",
             Some(Modal::Resources {
                 artifacts: true, ..
@@ -3999,6 +4013,30 @@ impl Ui {
             Some(Modal::Help(_)) => "Search agent shortcuts",
             None => "",
         };
+        let bindings = crate::shortcuts::Bindings::new(&self.shortcut_config);
+        let context = self.shortcut_context();
+        let hint = |action| bindings.primary_hint_in(action, context);
+        let owned_title = match self.modal {
+            Some(Modal::AgentDefaults(_)) => Some(format!(
+                "New agent defaults · {}/{} fields · Esc cancels",
+                hint(crate::shortcuts::ids::NAVIGATION_NEXT_FOCUS),
+                hint(crate::shortcuts::ids::NAVIGATION_PREVIOUS_FOCUS)
+            )),
+            Some(Modal::RepositoryRules(_)) => Some(format!(
+                "Repository rules · {}/{} fields",
+                hint(crate::shortcuts::ids::NAVIGATION_NEXT_FOCUS),
+                hint(crate::shortcuts::ids::NAVIGATION_PREVIOUS_FOCUS)
+            )),
+            Some(Modal::ModelPicker(_)) => Some(format!(
+                "Select model · {}/{} Select · {}/{} Effort · Esc Cancel",
+                hint(crate::shortcuts::ids::NAVIGATION_UP),
+                hint(crate::shortcuts::ids::NAVIGATION_DOWN),
+                hint(crate::shortcuts::ids::MODELS_PREVIOUS_EFFORT),
+                hint(crate::shortcuts::ids::MODELS_NEXT_EFFORT)
+            )),
+            _ => None,
+        };
+        let title = owned_title.as_deref().unwrap_or(title);
         let area = panel(frame, rect, title, true);
         if let Some(Modal::Transcript {
             entry,
@@ -4109,6 +4147,10 @@ impl Ui {
             self.draw_resources(frame, area, artifacts, selected);
             return;
         }
+        let activate_hint = crate::shortcuts::Bindings::new(&self.shortcut_config).primary_hint_in(
+            crate::shortcuts::ids::NAVIGATION_ACTIVATE,
+            self.shortcut_context(),
+        );
         match &mut self.modal {
             Some(
                 Modal::Transcript { .. }
@@ -4122,7 +4164,7 @@ impl Ui {
                 editor(frame, input, "Local repository", value, true);
                 deferred.push((
                     Rect::new(area.x, area.y.saturating_add(4), area.width, 1).intersection(area),
-                    "[ Enter · Change repository ]".into(),
+                    format!("[ {activate_hint} · Change repository ]"),
                     Action::ChangeRepository,
                     true,
                 ));
@@ -4144,7 +4186,7 @@ impl Ui {
                     Rect::new(area.x, area.y.saturating_add(4), area.width, 1).intersection(area);
                 deferred.push((
                     button,
-                    "[ Enter · Save and open session ]".into(),
+                    format!("[ {activate_hint} · Save and open session ]"),
                     Action::ChooseRepository,
                     true,
                 ));
