@@ -2563,3 +2563,176 @@ fn claude_exit_plan_choices_use_native_permission_updates_and_feedback() -> Resu
     service.stop()?;
     Ok(())
 }
+
+#[test]
+fn new_defaults_choose_explicit_provider_and_acknowledge_mode_before_first_turn() -> Result<()> {
+    use difu::{agents::provider::Provider, storage::AgentDefaults};
+    for provider in [Provider::Codex, Provider::Claude] {
+        let temp = tempfile::tempdir()?;
+        let (storage, _service, repo) = setup(temp.path())?;
+        let Reply::Launched(id) = client::request(
+            &storage,
+            Request::NewAgent {
+                defaults: AgentDefaults {
+                    provider: Some(provider),
+                    starting_mode: Some("plan".into()),
+                    repository: Some(repo.clone()),
+                    model: None,
+                    ..Default::default()
+                },
+                cwd: repo,
+                remember_repository: false,
+            },
+        )?
+        else {
+            anyhow::bail!("Expected new session")
+        };
+        let ready = wait(&storage, &id, |s| s.status == Status::Idle)?;
+        assert_eq!(ready.provider, provider);
+        assert_eq!(ready.permission_state.pending_mode.as_deref(), Some("plan"));
+        assert!(matches!(
+            ready.job,
+            Job::Coding(Launch { isolated: true, .. })
+        ));
+        assert!(ready.entries.iter().all(|e| e.kind != "user"));
+        message(&storage, &id, "settings first turn")?;
+        let completed = wait(&storage, &id, |s| s.completed_turn.is_some())?;
+        assert_eq!(completed.permission_state.mode.as_deref(), Some("plan"));
+        assert!(completed.permission_state.pending_mode.is_none());
+        if provider == Provider::Codex {
+            let frames = frames(temp.path(), "protocol.jsonl")?;
+            let turn = frames
+                .iter()
+                .find(|v| v.get("method").and_then(Value::as_str) == Some("turn/start"))
+                .context("first turn")?;
+            assert_eq!(
+                turn.pointer("/params/collaborationMode/mode")
+                    .and_then(Value::as_str),
+                Some("plan")
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn rejected_starting_mode_stays_pending_and_sends_no_first_turn() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    fs::write(temp.path().join("reject-mode-update"), "")?;
+    let (storage, _service, repo) = setup(temp.path())?;
+    let Reply::Launched(id) = client::request(
+        &storage,
+        Request::NewAgent {
+            defaults: difu::storage::AgentDefaults {
+                provider: Some(difu::agents::provider::Provider::Codex),
+                starting_mode: Some("plan".into()),
+                repository: Some(repo.clone()),
+                ..Default::default()
+            },
+            cwd: repo,
+            remember_repository: false,
+        },
+    )?
+    else {
+        anyhow::bail!("new session")
+    };
+    wait(&storage, &id, |s| s.status == Status::Idle)?;
+    message(&storage, &id, "blocked first turn")?;
+    let failed = wait(&storage, &id, |s| s.status == Status::Failed)?;
+    assert_eq!(
+        failed.permission_state.pending_mode.as_deref(),
+        Some("plan")
+    );
+    assert!(
+        frames(temp.path(), "protocol.jsonl")?
+            .iter()
+            .all(|f| f.get("method").and_then(Value::as_str) != Some("turn/start"))
+    );
+    fs::remove_file(temp.path().join("reject-mode-update"))?;
+    control(&storage, &id, Control::Resume)?;
+    let ready = wait(&storage, &id, |s| s.status == Status::Idle)?;
+    assert_eq!(ready.permission_state.mode.as_deref(), Some("plan"));
+    assert!(ready.permission_state.pending_mode.is_none());
+    Ok(())
+}
+
+#[test]
+fn claude_starting_modes_use_native_arguments_and_repository_restrictions() -> Result<()> {
+    for mode in [
+        "default",
+        "acceptEdits",
+        "auto",
+        "dontAsk",
+        "bypassPermissions",
+    ] {
+        let temp = tempfile::tempdir()?;
+        let (storage, _service, repo) = setup(temp.path())?;
+        let Reply::Launched(id) = client::request(
+            &storage,
+            Request::NewAgent {
+                defaults: difu::storage::AgentDefaults {
+                    provider: Some(difu::agents::provider::Provider::Claude),
+                    starting_mode: Some(mode.into()),
+                    repository: Some(repo.clone()),
+                    ..Default::default()
+                },
+                cwd: repo,
+                remember_repository: false,
+            },
+        )?
+        else {
+            anyhow::bail!("new session")
+        };
+        wait(&storage, &id, |s| s.status == Status::Idle)?;
+        message(&storage, &id, "native mode first turn")?;
+        let completed = wait(&storage, &id, |s| s.completed_turn.is_some())
+            .with_context(|| format!("Starting mode {mode}"))?;
+        assert_eq!(completed.permission_state.mode.as_deref(), Some(mode));
+        let starts = frames(temp.path(), "claude-starts.jsonl")?;
+        let args = starts
+            .first()
+            .and_then(|f| f.get("args"))
+            .and_then(Value::as_array)
+            .context("native args")?;
+        assert!(args.windows(2).any(|pair|matches!(pair,[flag,value] if flag.as_str()==Some("--permission-mode") && value.as_str()==Some(mode))));
+        assert_eq!(
+            args.iter()
+                .any(|v| v.as_str() == Some("--allow-dangerously-skip-permissions")),
+            mode == "bypassPermissions"
+        );
+    }
+    let temp = tempfile::tempdir()?;
+    let (storage, _service, repo) = setup(temp.path())?;
+    fs::create_dir(repo.join(".claude"))?;
+    fs::write(
+        repo.join(".claude/settings.json"),
+        r#"{"permissions":{"disableBypassPermissionsMode":"disable"}}"#,
+    )?;
+    git(&repo, &["add", ".claude/settings.json"])?;
+    git(&repo, &["commit", "-m", "native permission restriction"])?;
+    let Reply::Launched(id) = client::request(
+        &storage,
+        Request::NewAgent {
+            defaults: difu::storage::AgentDefaults {
+                provider: Some(difu::agents::provider::Provider::Claude),
+                starting_mode: Some("bypassPermissions".into()),
+                repository: Some(repo.clone()),
+                ..Default::default()
+            },
+            cwd: repo,
+            remember_repository: false,
+        },
+    )?
+    else {
+        anyhow::bail!("new session")
+    };
+    wait(&storage, &id, |s| s.status == Status::Idle)?;
+    message(&storage, &id, "must not send")?;
+    let failed = wait(&storage, &id, |s| s.status == Status::Failed)?;
+    assert_eq!(
+        failed.permission_state.pending_mode.as_deref(),
+        Some("bypassPermissions")
+    );
+    assert!(!temp.path().join("claude-starts.jsonl").exists());
+    Ok(())
+}

@@ -303,6 +303,8 @@ impl Ui {
         );
     }
     pub(super) fn plan_key(&mut self, key: KeyEvent) {
+        use crate::shortcuts::ids::*;
+        let shortcut = self.shortcut(key);
         let Some(Modal::Plan(prompt)) = &mut self.modal else {
             return;
         };
@@ -310,26 +312,23 @@ impl Ui {
             return;
         }
         if prompt.feedback_active {
-            match key.code {
-                KeyCode::Esc => prompt.feedback_active = false,
-                KeyCode::Enter
-                    if key.kind == crossterm::event::KeyEventKind::Press
-                        && !key.modifiers.contains(KeyModifiers::SHIFT) =>
-                {
+            match shortcut {
+                _ if key.code == KeyCode::Esc => prompt.feedback_active = false,
+                Some(PLAN_FEEDBACK) if key.kind == crossterm::event::KeyEventKind::Press => {
                     self.choose_plan(2)
                 }
                 _ => prompt.feedback.key(key),
             }
             return;
         }
-        match key.code {
-            KeyCode::PageUp => prompt.scroll = prompt.scroll.saturating_sub(10),
-            KeyCode::PageDown => {
+        match shortcut {
+            Some(NAVIGATION_PAGE_UP) => prompt.scroll = prompt.scroll.saturating_sub(10),
+            Some(NAVIGATION_PAGE_DOWN) => {
                 prompt.scroll = prompt.scroll.saturating_add(10).min(prompt.maximum)
             }
-            KeyCode::Home => prompt.scroll = 0,
-            KeyCode::End => prompt.scroll = prompt.maximum,
-            KeyCode::Esc => {
+            Some(NAVIGATION_FIRST) => prompt.scroll = 0,
+            Some(NAVIGATION_LAST) => prompt.scroll = prompt.maximum,
+            _ if key.code == KeyCode::Esc => {
                 self.plans.feedbacks.insert(
                     prompt.id.clone(),
                     (prompt.plan_id.clone(), prompt.feedback.text()),
@@ -342,11 +341,9 @@ impl Ui {
                     .insert(prompt.id.clone(), prompt.plan_id.clone());
                 self.modal = None;
             }
-            KeyCode::Up | KeyCode::BackTab => prompt.selected = prompt.selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => {
-                prompt.selected = (prompt.selected + 1).min(LABELS.len() - 1)
-            }
-            KeyCode::Enter if key.kind == crossterm::event::KeyEventKind::Press => {
+            Some(NAVIGATION_UP) => prompt.selected = prompt.selected.saturating_sub(1),
+            Some(NAVIGATION_DOWN) => prompt.selected = (prompt.selected + 1).min(LABELS.len() - 1),
+            Some(NAVIGATION_ACTIVATE) if key.kind == crossterm::event::KeyEventKind::Press => {
                 let selected = prompt.selected;
                 self.choose_plan(selected);
             }
@@ -587,13 +584,24 @@ impl Ui {
                 ));
             }
         }
-        let footer = error.as_deref().unwrap_or(if submitting {
-            "Applying choice…"
+        let bindings = crate::shortcuts::Bindings::new(&self.shortcut_config);
+        let hint = |id| bindings.primary_hint_in(id, self.shortcut_context());
+        let help = if submitting {
+            "Applying choice…".into()
         } else if feedback {
-            "enter send feedback · esc choices"
+            format!(
+                "{} send feedback · Esc choices",
+                hint(crate::shortcuts::ids::PLAN_FEEDBACK)
+            )
         } else {
-            "enter select · esc back · PgUp/PgDn read plan"
-        });
+            format!(
+                "{} select · Esc back · {}/{} read plan",
+                hint(crate::shortcuts::ids::NAVIGATION_ACTIVATE),
+                hint(crate::shortcuts::ids::NAVIGATION_PAGE_UP),
+                hint(crate::shortcuts::ids::NAVIGATION_PAGE_DOWN)
+            )
+        };
+        let footer = error.as_deref().unwrap_or(&help);
         frame.render_widget(
             Paragraph::new(footer).style(Style::default().fg(if error.is_some() {
                 RED
@@ -615,6 +623,116 @@ mod tests {
     use super::*;
     use crate::agents::plan::Proposal;
     use anyhow::{Context, Result};
+    #[test]
+    fn plan_activation_and_visible_mouse_choice_send_exact_intent_after_remap() -> Result<()> {
+        use crate::shortcuts::ids::NAVIGATION_ACTIVATE;
+        for (phase, custom) in super::super::shortcut_tests::BINDING_PHASES {
+            for mouse in [false, true] {
+                let (mut ui, _dir, _) =
+                    super::super::shortcut_tests::binding_fixture(NAVIGATION_ACTIVATE, phase)?;
+                ui.sessions.get_mut("one").context("session")?.plan_prompt = Some(Proposal {
+                    id: "plan-one".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    text: "Plan".into(),
+                });
+                ui.open_plan_prompt();
+                let click = if mouse {
+                    Some(super::super::shortcut_tests::native_target(
+                        &mut ui,
+                        80,
+                        "Yes, implement this plan",
+                    )?)
+                } else {
+                    None
+                };
+                let request =
+                    super::super::shortcut_tests::request_at_boundary_with(&mut ui, |ui| {
+                        if custom && !mouse {
+                            ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                            assert!(ui.plans.sending.is_empty());
+                        }
+                        if let Some(click) = click {
+                            ui.mouse(click);
+                        } else {
+                            ui.key(KeyEvent::new(
+                                if custom {
+                                    KeyCode::F(12)
+                                } else {
+                                    KeyCode::Enter
+                                },
+                                KeyModifiers::NONE,
+                            ));
+                        }
+                    })?;
+                assert!(
+                    matches!(request,Request::Control{id,control:Control::DecidePlan{plan_id,choice:Choice::Implement}} if id=="one"&&plan_id=="plan-one")
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn plan_navigation_replaces_each_literal_alias_and_preserves_modal_priority() -> Result<()> {
+        use crate::shortcuts::ids::*;
+        for (phase, custom) in super::super::shortcut_tests::BINDING_PHASES {
+            for (action, old, want) in [
+                (NAVIGATION_UP, KeyCode::Up, 0),
+                (NAVIGATION_UP, KeyCode::BackTab, 0),
+                (NAVIGATION_DOWN, KeyCode::Down, 2),
+                (NAVIGATION_DOWN, KeyCode::Tab, 2),
+                (NAVIGATION_PAGE_UP, KeyCode::PageUp, 10),
+                (NAVIGATION_PAGE_DOWN, KeyCode::PageDown, 30),
+                (NAVIGATION_FIRST, KeyCode::Home, 0),
+                (NAVIGATION_LAST, KeyCode::End, 100),
+            ] {
+                let (mut ui, _dir, _) =
+                    super::super::shortcut_tests::binding_fixture(action, phase)?;
+                ui.sessions.get_mut("one").context("session")?.plan_prompt = Some(Proposal {
+                    id: "plan-one".into(),
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                    text: "Plan".into(),
+                });
+                ui.open_plan_prompt();
+                if let Some(Modal::Plan(prompt)) = &mut ui.modal {
+                    prompt.selected = 1;
+                    prompt.scroll = 20;
+                    prompt.maximum = 100;
+                }
+                if custom {
+                    ui.key(KeyEvent::new(old, KeyModifiers::NONE));
+                    if let Some(Modal::Plan(prompt)) = &ui.modal {
+                        assert_eq!(prompt.selected, 1);
+                        assert_eq!(prompt.scroll, 20);
+                    }
+                }
+                ui.key(KeyEvent::new(
+                    if custom { KeyCode::F(12) } else { old },
+                    KeyModifiers::NONE,
+                ));
+                let Some(Modal::Plan(prompt)) = &ui.modal else {
+                    anyhow::bail!("plan")
+                };
+                assert_eq!(
+                    if [NAVIGATION_UP, NAVIGATION_DOWN].contains(&action) {
+                        prompt.selected
+                    } else {
+                        prompt.scroll
+                    },
+                    want
+                );
+                ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT));
+                assert!(
+                    matches!(ui.modal, Some(Modal::Plan(_))),
+                    "question early-main key does not replace Plan"
+                );
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn claude_picker_dispatches_only_explicit_native_choices() -> Result<()> {
         use std::io::{BufRead, BufReader, Write};

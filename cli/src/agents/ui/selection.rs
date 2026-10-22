@@ -11,6 +11,7 @@ struct Point {
 }
 #[derive(Default)]
 pub(super) struct Selection {
+    retained_text: Option<String>,
     documents: HashMap<usize, std::collections::BTreeMap<usize, Line<'static>>>,
     visible: Vec<(Rect, usize, usize)>,
     anchor: Option<Point>,
@@ -25,6 +26,7 @@ impl Selection {
         self.visible.clear();
     }
     pub fn clear(&mut self) {
+        self.retained_text = None;
         self.documents.clear();
         self.anchor = None;
         self.end = None;
@@ -34,6 +36,7 @@ impl Selection {
         self.pending_click = None;
     }
     fn press(&mut self, point: Point, action: Option<Action>, now: Instant) {
+        self.retained_text = None;
         let double = self.last_click.is_some_and(|(last, at)| {
             last.region == point.region
                 && last.row == point.row
@@ -106,6 +109,43 @@ impl Selection {
                 .collect();
         }
     }
+    /// Keep a selection's copy source across preference-driven message spacing changes.
+    /// Endpoints track the same message; a new selection uses the newly laid out rows.
+    pub fn reflow(
+        &mut self,
+        region: usize,
+        previous: &[transcript::Section],
+        next: &[transcript::Section],
+    ) {
+        if self.retained_text.is_none() {
+            self.retained_text = self.text();
+        }
+        let map_row = |row: usize| {
+            let Some(old) = previous.iter().rev().find(|section| section.row <= row) else {
+                return row;
+            };
+            let Some(index) = next.iter().position(|section| section.id == old.id) else {
+                return row;
+            };
+            let Some(new) = next.get(index) else {
+                return row;
+            };
+            let moved = new.row.saturating_add(row.saturating_sub(old.row));
+            next.get(index + 1)
+                .map_or(moved, |end| moved.min(end.row.saturating_sub(1)))
+        };
+        for point in [&mut self.anchor, &mut self.end].into_iter().flatten() {
+            if point.region == region {
+                point.row = map_row(point.row);
+            }
+        }
+        if let Some(rows) = self.documents.get_mut(&region) {
+            *rows = std::mem::take(rows)
+                .into_iter()
+                .map(|(row, line)| (map_row(row), line))
+                .collect();
+        }
+    }
     pub fn register_window(
         &mut self,
         region: usize,
@@ -144,6 +184,9 @@ impl Selection {
         (a != b).then_some((a.min(b), a.max(b)))
     }
     pub fn text(&self) -> Option<String> {
+        if let Some(text) = &self.retained_text {
+            return Some(text.clone());
+        }
         let (start, end) = self.range()?;
         let mut output = Vec::new();
         for region in start.region..=end.region {
@@ -214,6 +257,13 @@ impl Ui {
         }
     }
     pub fn copy_chat_selection(&mut self) -> bool {
+        if self.modal.is_none()
+            && self.panels.focused
+            && self.panels.visible()
+            && let Some(super::panels::View::PullRequest { app }) = &mut self.panels.view
+        {
+            return app.copy_selection();
+        }
         if let Some(text) = self.focused_editor().and_then(Editor::selected_text) {
             self.clipboard = Some(text);
             return true;
@@ -254,6 +304,7 @@ impl Ui {
                 true
             }
             MouseEventKind::Drag(MouseButton::Left) if self.text_selection.anchor.is_some() => {
+                self.text_selection.retained_text = None;
                 self.text_selection.dragging = true;
                 if let Some(point) = point {
                     self.text_selection.end = Some(point);
@@ -404,6 +455,60 @@ mod tests {
                 .is_none()
         );
     }
+    #[test]
+    fn appearance_reflow_keeps_selected_copy_and_tracks_message_rows() {
+        let mut selection = Selection::default();
+        let area = Rect::new(0, 0, 20, 3);
+        selection.register_window(
+            1,
+            area,
+            0,
+            0,
+            &[Line::from("alpha"), Line::default(), Line::from("beta")],
+        );
+        selection.anchor = selection.point(0, 0);
+        selection.end = selection.point(4, 2);
+        let sections = |row| {
+            vec![
+                transcript::Section {
+                    id: "a".into(),
+                    row: 0,
+                    tool: false,
+                },
+                transcript::Section {
+                    id: "b".into(),
+                    row,
+                    tool: false,
+                },
+            ]
+        };
+        selection.reflow(1, &sections(2), &sections(1));
+        selection.register_window(
+            1,
+            area,
+            0,
+            0,
+            &[Line::from("alpha"), Line::from("beta"), Line::from("────")],
+        );
+        assert_eq!(selection.end.map(|p| p.row), Some(1));
+        assert_eq!(selection.text().as_deref(), Some("alpha\n\nbeta"));
+        selection.press(
+            Point {
+                region: 1,
+                row: 1,
+                column: 0,
+            },
+            None,
+            Instant::now(),
+        );
+        selection.end = Some(Point {
+            region: 1,
+            row: 1,
+            column: 4,
+        });
+        assert_eq!(selection.text().as_deref(), Some("beta"));
+    }
+
     #[test]
     fn selection_survives_loading_and_rebasing_virtual_rows() {
         let mut s = Selection::default();

@@ -21,6 +21,8 @@ pub mod process;
 pub mod repaint;
 pub mod repo;
 pub mod review;
+pub mod settings;
+pub mod shortcuts;
 pub mod storage;
 pub mod theme;
 pub mod tree;

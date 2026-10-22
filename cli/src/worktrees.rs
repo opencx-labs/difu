@@ -108,9 +108,16 @@ fn inspect(marker: &Marker, cancel: &Cancel) -> Result<()> {
     );
     Ok(())
 }
+fn temporary_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = crate::process::fixture::worktree_root() {
+        return root;
+    }
+    std::env::temp_dir()
+}
 pub fn list(cancel: &Cancel) -> Result<Vec<Entry>> {
     let mut entries = Vec::new();
-    for item in fs::read_dir(std::env::temp_dir())? {
+    for item in fs::read_dir(temporary_root())? {
         cancel.check()?;
         let item = item?;
         if !item
@@ -139,7 +146,7 @@ pub fn list(cancel: &Cancel) -> Result<Vec<Entry>> {
 }
 pub fn delete(directory: &Path, cancel: &Cancel) -> Result<()> {
     ensure!(
-        directory.parent() == Some(std::env::temp_dir().as_path()),
+        directory.parent() == Some(temporary_root().as_path()),
         "Not a difu temporary directory"
     );
     ensure!(

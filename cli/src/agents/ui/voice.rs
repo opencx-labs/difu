@@ -45,6 +45,7 @@ enum Phase {
 }
 
 pub(super) struct Hold {
+    key: crate::settings::BindingKey,
     session: String,
     mode: Mode,
     before: Editor,
@@ -71,6 +72,7 @@ impl Hold {
         let now = Instant::now();
         Self {
             session,
+            key: crate::settings::BindingKey::Character(' '),
             mode: Mode::Dictate,
             before,
             started: now,
@@ -182,9 +184,20 @@ impl Ui {
         )
     }
     pub(super) fn voice_key(&mut self, key: KeyEvent) -> bool {
-        let space = key.code == KeyCode::Char(' ') && key.modifiers.is_empty();
+        use crate::shortcuts::{Bindings, contexts, ids};
+        if !self.voice.enabled {
+            self.cancel_voice();
+            return false;
+        }
+        let space = crate::shortcuts::capture(key).is_some_and(|chord| {
+            Bindings::new(&self.shortcut_config)
+                .effective(ids::VOICE_HOLD, contexts::AGENT_COMPOSER)
+                .contains(&chord)
+        });
         if key.kind == KeyEventKind::Release {
-            if space && let Some(hold) = &mut self.voice.hold {
+            if let Some(hold) = &mut self.voice.hold
+                && crate::shortcuts::capture(key).is_some_and(|chord| chord.key == hold.key)
+            {
                 let Some(voice) = &hold.voice else {
                     self.voice.hold = None;
                     return true;
@@ -259,13 +272,22 @@ impl Ui {
         } else {
             let position = self.positions.entry(id.clone()).or_default();
             let before = position.draft.clone();
-            position.draft.insert(" ");
-            self.voice.hold = Some(Hold::new(id, before));
+            // Only an unmodified Space tap types a provisional space. Function or
+            // modified hold keys must never alter the draft on a short press.
+            if key.code == KeyCode::Char(' ') && key.modifiers.is_empty() {
+                position.draft.insert(" ");
+            }
+            let mut hold = Hold::new(id, before);
+            if let Some(chord) = crate::shortcuts::capture(key) {
+                hold.key = chord.key;
+            }
+            self.voice.hold = Some(hold);
         }
         true
     }
     pub(super) fn tick_voice(&mut self, visible: bool) {
         if !visible
+            || !self.voice.enabled
             || self.focus != Focus::Composer
             || self.modal.is_some()
             || self
@@ -371,7 +393,14 @@ impl Ui {
                 } else {
                     transcript
                 });
-                ("Dictation inserted · Enter to send".into(), false)
+                (
+                    format!(
+                        "Dictation inserted · {} to send",
+                        crate::shortcuts::Bindings::new(&self.shortcut_config)
+                            .hint(crate::shortcuts::ids::COMPOSER_SEND)
+                    ),
+                    false,
+                )
             }
         });
     }
@@ -417,6 +446,16 @@ impl Ui {
         }
     }
     /// Rows the voice strip (and live dictation) need above the composer.
+    fn voice_preview(&self, hold: &Hold, width: u16, now: Instant) -> Vec<Line<'static>> {
+        if self.preferences.motion.reply() {
+            hold.flap.lines(width, now, flap::preview_board())
+        } else {
+            wrapped(&crate::model::clean(&hold.transcript()), width)
+                .into_iter()
+                .map(|text| Line::from(Span::styled(text, flap::preview_board())))
+                .collect()
+        }
+    }
     pub(super) fn voice_rows(&self, width: u16) -> u16 {
         let Some(hold) = self.voice.hold.as_ref().filter(|h| h.voice.is_some()) else {
             return 0;
@@ -424,13 +463,8 @@ impl Ui {
         if hold.mode == Mode::Converse {
             return 2;
         }
-        let preview = hold
-            .flap
-            .lines(
-                width.saturating_sub(2),
-                Instant::now(),
-                flap::preview_board(),
-            )
+        let preview = self
+            .voice_preview(hold, width.saturating_sub(2), Instant::now())
             .len()
             .min(PREVIEW_ROWS);
         2 + u16::try_from(preview).unwrap_or(0)
@@ -452,6 +486,9 @@ impl Ui {
         }
         let now = Instant::now();
         let spinner = || {
+            if self.preferences.motion.level != crate::settings::Motion::Full {
+                return "●";
+            }
             let frame = now
                 .saturating_duration_since(hold.phase_started)
                 .as_millis()
@@ -491,7 +528,12 @@ impl Ui {
         let hint = |verb: &'static str, rest: &'static str, end: &'static str| {
             vec![
                 Span::styled(verb, dim),
-                Span::styled("space", key),
+                Span::styled(
+                    crate::shortcuts::Bindings::new(&self.shortcut_config)
+                        .hint(crate::shortcuts::ids::VOICE_HOLD)
+                        .to_lowercase(),
+                    key,
+                ),
                 Span::styled(rest, dim),
                 Span::styled("esc", key),
                 Span::styled(end, dim),
@@ -559,7 +601,7 @@ impl Ui {
         if hold.mode == Mode::Converse {
             return;
         }
-        let lines = hold.flap.lines(area.width, now, flap::preview_board());
+        let lines = self.voice_preview(hold, area.width, now);
         let shown = lines.len().min(usize::from(area.height.saturating_sub(2)));
         let tail: Vec<_> = lines.into_iter().rev().take(shown).rev().collect();
         frame.render_widget(
@@ -583,8 +625,11 @@ impl Ui {
                 self.voice.enabled = enabled;
                 self.notice = Some(if enabled {
                     (
-                        "Voice on · hold Space in the composer to talk · uses your Codex login"
-                            .into(),
+                        format!(
+                            "Voice on · hold {} in the composer to talk · uses your Codex login",
+                            crate::shortcuts::Bindings::new(&self.shortcut_config)
+                                .hint(crate::shortcuts::ids::VOICE_HOLD)
+                        ),
                         false,
                     )
                 } else {
@@ -637,9 +682,18 @@ fn intensity(peak: u16) -> u8 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use anyhow::{Context, Result};
+    pub(crate) fn active_dictation(ui: &mut Ui) -> Result<mpsc::Sender<Event>> {
+        let id = ui.selected.clone().context("selected")?;
+        let before = ui.positions.get(&id).context("position")?.draft.clone();
+        let (voice, tx) = crate::voice::fixture();
+        let mut hold = Hold::new(id, before);
+        hold.voice = Some(voice);
+        ui.voice.hold = Some(hold);
+        Ok(tx)
+    }
     fn fixture() -> Result<(Ui, tempfile::TempDir)> {
         let tmp = tempfile::tempdir()?;
         let mut ui = Ui::new(
@@ -712,6 +766,171 @@ mod tests {
             .collect())
     }
     #[test]
+    fn remapped_hold_repeat_keeps_listening_and_repeat_gap_releases() -> Result<()> {
+        let (mut ui, _tmp) = fixture()?;
+        let mut config = Config {
+            voice_enabled: true,
+            ..Config::default()
+        };
+        config.preferences.keyboard.bindings.insert(
+            "voice.hold".into(),
+            crate::shortcuts::key(crate::settings::BindingKey::Function(8), 0),
+        );
+        ui.apply_settings(&config);
+        ui.key(KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE));
+        let (voice, tx) = crate::voice::fixture();
+        ui.voice.hold.as_mut().context("hold")?.voice = Some(voice);
+        tx.send(Event::Listening)?;
+        ui.tick_voice(true);
+        assert!(
+            ui.voice
+                .hold
+                .as_ref()
+                .is_some_and(|h| h.phase == Phase::Listening)
+        );
+        ui.voice.hold.as_mut().context("hold")?.last = Instant::now() - Duration::from_secs(1);
+        ui.key(KeyEvent::new_with_kind(
+            KeyCode::F(8),
+            KeyModifiers::NONE,
+            KeyEventKind::Repeat,
+        ));
+        ui.tick_voice(true);
+        assert!(
+            ui.voice
+                .hold
+                .as_ref()
+                .is_some_and(|h| h.phase == Phase::Listening)
+        );
+        ui.voice.hold.as_mut().context("hold")?.last = Instant::now() - Duration::from_secs(1);
+        ui.tick_voice(true);
+        assert!(
+            ui.voice
+                .hold
+                .as_ref()
+                .is_some_and(|h| h.phase == Phase::Released)
+        );
+        assert_eq!(draft(&ui)?, "keep this draft");
+        ui.cancel_voice();
+        assert!(tx.send(Event::Listening).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn unrelated_refresh_preserves_hold_and_modifier_first_release_stops_microphone() -> Result<()>
+    {
+        use crate::settings::{BindingKey, KeyChord};
+        let (mut ui, _tmp) = fixture()?;
+        let mut config = Config {
+            voice_enabled: true,
+            ..Config::default()
+        };
+        config.preferences.keyboard.bindings.insert(
+            "voice.hold".into(),
+            KeyChord {
+                key: BindingKey::Function(8),
+                modifiers: crate::settings::KeyModifiers {
+                    shift: true,
+                    ..Default::default()
+                },
+            },
+        );
+        ui.apply_settings(&config);
+        ui.key(KeyEvent::new(KeyCode::F(8), KeyModifiers::SHIFT));
+        let (voice, tx) = crate::voice::fixture();
+        ui.voice.hold.as_mut().context("hold")?.voice = Some(voice);
+        config.theme = Some("test-theme".into());
+        ui.apply_settings(&config);
+        assert!(
+            ui.voice.hold.is_some(),
+            "unrelated refresh must keep the hold"
+        );
+        tx.send(Event::Listening)?;
+        ui.key(KeyEvent::new_with_kind(
+            KeyCode::F(8),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert!(
+            ui.voice
+                .hold
+                .as_ref()
+                .is_some_and(|h| h.phase == Phase::Released)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn committed_disable_cancels_live_transport_and_preserves_selected_draft() -> Result<()> {
+        let (mut ui, _tmp) = fixture()?;
+        ui.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        let tx = talking(&mut ui, Mode::Dictate)?;
+        tx.send(Event::Delta(Role::User, "discarded".into()))?;
+        let config = Config {
+            voice_enabled: false,
+            ..Config::default()
+        };
+        ui.apply_settings(&config);
+        assert!(
+            ui.voice.hold.is_none(),
+            "committed disable must stop an active hold"
+        );
+        assert!(
+            tx.send(Event::Listening).is_err(),
+            "transport must be dropped"
+        );
+        let p = ui.positions.get("voice-test").context("position")?;
+        assert_eq!(p.draft.text(), "keep this draft");
+        assert_eq!(p.draft.selected_text().as_deref(), Some("t"));
+        release(&mut ui);
+        assert!(ui.voice.hold.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn committed_rebind_cancels_hold_and_remapped_tap_does_not_type_space() -> Result<()> {
+        use crate::settings::{BindingKey, KeyChord};
+        let (mut ui, _tmp) = fixture()?;
+        let tx = talking(&mut ui, Mode::Converse)?;
+        let mut config = Config {
+            voice_enabled: true,
+            ..Config::default()
+        };
+        config.preferences.keyboard.bindings.insert(
+            "voice.hold".into(),
+            KeyChord {
+                key: BindingKey::Function(8),
+                modifiers: Default::default(),
+            },
+        );
+        ui.apply_settings(&config);
+        assert!(
+            ui.voice.hold.is_none(),
+            "rebind must cancel original held chord"
+        );
+        assert!(tx.send(Event::Listening).is_err());
+        release(&mut ui);
+        ui.key(KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE));
+        assert!(
+            ui.voice.hold.is_some(),
+            "effective hold key starts pending hold"
+        );
+        assert_eq!(draft(&ui)?, "keep this draft");
+        ui.key(KeyEvent::new_with_kind(
+            KeyCode::F(8),
+            KeyModifiers::NONE,
+            KeyEventKind::Release,
+        ));
+        assert!(ui.voice.hold.is_none());
+        ui.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert!(
+            ui.voice.hold.is_none(),
+            "old key is ordinary editing after rebind"
+        );
+        assert_eq!(draft(&ui)?, "keep this draft ");
+        Ok(())
+    }
+
+    #[test]
     fn space_tap_types_and_finished_dictation_inserts_without_sending() -> Result<()> {
         let (mut ui, _tmp) = fixture()?;
         ui.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
@@ -778,6 +997,34 @@ mod tests {
         assert_eq!(ui.voice_mode("voice-test"), Mode::Dictate);
         Ok(())
     }
+    #[test]
+    fn reduced_and_off_voice_show_received_words_without_flapping() -> Result<()> {
+        for motion in [
+            crate::settings::Motion::Reduced,
+            crate::settings::Motion::Off,
+        ] {
+            let (mut ui, _tmp) = fixture()?;
+            ui.preferences.motion.level = motion;
+            ui.list_visible = false;
+            let mut session = coding();
+            session.status = Status::Idle;
+            ui.sessions.insert(session.id.clone(), session);
+            let tx = talking(&mut ui, Mode::Dictate)?;
+            tx.send(Event::Delta(Role::User, "complete spoken words".into()))?;
+            ui.tick_voice(true);
+            let first = screen(&mut ui, 100)?;
+            assert!(first.contains("complete spoken words"), "{first}");
+            ui.voice.hold.as_mut().context("hold")?.phase_started -= Duration::from_millis(350);
+            assert_eq!(
+                screen(&mut ui, 100)?,
+                first,
+                "decorative spinner must remain static"
+            );
+            assert_eq!(draft(&ui)?, "keep this draft");
+        }
+        Ok(())
+    }
+
     #[test]
     fn dictation_strip_shows_codex_states_meter_and_transcript() -> Result<()> {
         for width in [48, 100] {

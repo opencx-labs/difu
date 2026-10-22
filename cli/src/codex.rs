@@ -590,6 +590,12 @@ pub(crate) fn resolve_conflicts(
 /// Discover real model/effort combinations through Codex's supported protocol.
 /// This starts no model turn and does not change Codex settings.
 pub fn models(cancel: &Cancel) -> Result<Vec<ModelInfo>> {
+    discover_models(cancel, false).map(|(models, _)| models)
+}
+pub(crate) fn model_capabilities(cancel: &Cancel) -> Result<(Vec<ModelInfo>, Value)> {
+    discover_models(cancel, true)
+}
+fn discover_models(cancel: &Cancel, modes: bool) -> Result<(Vec<ModelInfo>, Value)> {
     let mut command = Command::new("codex");
     command
         .args(["app-server"])
@@ -618,11 +624,11 @@ pub fn models(cancel: &Cancel) -> Result<Vec<ModelInfo>> {
                 }
             }
         })?;
-    let result = (|| -> Result<Vec<ModelInfo>> {
+    let result = (|| -> Result<(Vec<ModelInfo>, Value)> {
         writeln!(
             input,
             "{}",
-            json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"difu","version":env!("CARGO_PKG_VERSION")},"capabilities":{}}})
+            json!({"id":1,"method":"initialize","params":{"clientInfo":{"name":"difu","version":env!("CARGO_PKG_VERSION")},"capabilities":if modes { json!({"experimentalApi":true}) } else { json!({}) }}})
         )?;
         let receive = |id: u64| -> Result<Value> {
             loop {
@@ -702,7 +708,21 @@ pub fn models(cancel: &Cancel) -> Result<Vec<ModelInfo>> {
             }
             id += 1;
         }
-        Ok(all)
+        let modes = if modes {
+            id += 1;
+            writeln!(
+                input,
+                "{}",
+                json!({"id":id,"method":"collaborationMode/list","params":{}})
+            )?;
+            receive(id)?
+                .get("data")
+                .cloned()
+                .context("Codex returned no mode capabilities")?
+        } else {
+            Value::Null
+        };
+        Ok((all, modes))
     })();
     child.stop()?;
     drop(input);

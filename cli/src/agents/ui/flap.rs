@@ -1058,8 +1058,10 @@ pub(super) fn apply(
             continue;
         };
         let animated = rows(role, width, |width, board| flap.lines(width, now, board));
-        if let Some(target) = lines.get_mut(range)
-            && target.len() == animated.len()
+        // Animate only the voice text; optional entry separators stay outside its board.
+        if let Some(target) = lines
+            .get_mut(range)
+            .and_then(|rows| rows.get_mut(..animated.len()))
         {
             target.clone_from_slice(&animated);
         }
@@ -1134,6 +1136,7 @@ mod tests {
             ("live", "userMessage", "user", "hello there", None),
         ] {
             session.entries.push(Entry {
+                timestamp: None,
                 id: id.into(),
                 kind: kind.into(),
                 text: text.to_owned().into(),
@@ -1142,23 +1145,38 @@ mod tests {
                 finished_at,
             });
         }
-        let mut position = Position::default();
-        let frame = |position: &mut Position, at: Instant| {
-            let (mut lines, sections) = transcript::render(&session, position, 40, false);
-            let total = lines.len();
-            apply(position, &session, &sections, 0, total, &mut lines, 40, at);
-            plain(&lines)
-        };
-        let start = Instant::now();
-        let first = frame(&mut position, start);
-        assert!(first.contains("• Earlier spoken reply"), "{first}");
-        assert!(
-            first.contains("› ") && !first.contains("hello there"),
-            "{first}"
-        );
-        assert!(!position.voice_flaps.contains_key("old"));
-        let settled = frame(&mut position, start + Duration::from_secs(1));
-        assert!(settled.contains("› hello there"), "{settled}");
+        for separators in [false, true] {
+            let mut position = Position::default();
+            let frame = |position: &mut Position, at: Instant| {
+                let (mut lines, sections, _) = transcript::render_entries_with_appearance(
+                    &session,
+                    &session.entries,
+                    position,
+                    40,
+                    false,
+                    &crate::settings::Appearance {
+                        message_separators: separators,
+                        ..Default::default()
+                    },
+                );
+                let total = lines.len();
+                apply(position, &session, &sections, 0, total, &mut lines, 40, at);
+                plain(&lines)
+            };
+            let start = Instant::now();
+            let first = frame(&mut position, start);
+            assert!(first.contains("• Earlier spoken reply"), "{first}");
+            assert!(
+                first.contains("› ") && !first.contains("hello there"),
+                "{first}"
+            );
+            if separators {
+                assert_eq!(first.matches('─').count(), 80);
+            }
+            assert!(!position.voice_flaps.contains_key("old"));
+            let settled = frame(&mut position, start + Duration::from_secs(1));
+            assert!(settled.contains("› hello there"), "{settled}");
+        }
     }
 
     #[test]

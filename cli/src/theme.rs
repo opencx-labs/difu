@@ -86,6 +86,14 @@ impl Theme {
     /// Resolve a drawn colour. Themes with their own background also replace
     /// the terminal's default colours.
     fn present(&self, color: Color, foreground: bool) -> Color {
+        if high_contrast()
+            && foreground
+            && [Role::Dim, Role::Border, Role::Comment]
+                .into_iter()
+                .any(|role| color == slot(role))
+        {
+            return self.color(Role::Text);
+        }
         match color {
             Color::Indexed(index) if is_slot(color) => self
                 .colors
@@ -590,6 +598,28 @@ thread_local! {
     static ACTIVE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(not(test))]
+static HIGH_CONTRAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+thread_local! { static HIGH_CONTRAST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+pub fn set_contrast(contrast: crate::settings::Contrast) {
+    let enabled = contrast == crate::settings::Contrast::High;
+    #[cfg(not(test))]
+    HIGH_CONTRAST.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    HIGH_CONTRAST.with(|value| value.set(enabled));
+}
+fn high_contrast() -> bool {
+    #[cfg(not(test))]
+    {
+        HIGH_CONTRAST.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    {
+        HIGH_CONTRAST.with(std::cell::Cell::get)
+    }
+}
+
 pub fn active_index() -> usize {
     #[cfg(not(test))]
     let index = ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
@@ -718,6 +748,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn high_contrast_resolves_muted_roles_without_mutating_cached_cells() {
+        select(0);
+        let source = slot(Role::Dim);
+        set_contrast(crate::settings::Contrast::High);
+        assert_eq!(resolve(source), active().color(Role::Text));
+        assert_eq!(resolve(slot(Role::Border)), active().color(Role::Text));
+        assert_eq!(resolve(slot(Role::Accent)), active().color(Role::Accent));
+        set_contrast(crate::settings::Contrast::Standard);
+        assert_eq!(resolve(source), active().color(Role::Dim));
     }
 
     #[test]

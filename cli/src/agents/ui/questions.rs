@@ -99,6 +99,8 @@ impl Ui {
     }
     pub(super) fn question_or_queue_key(&mut self, key: KeyEvent) -> bool {
         let mut action = None;
+        use crate::shortcuts::ids::*;
+        let shortcut = self.shortcut(key);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let session = self.selected.as_ref().and_then(|id| self.sessions.get(id));
@@ -112,13 +114,13 @@ impl Ui {
                         s.pending.len()
                     }
                 });
-                match key.code {
-                    KeyCode::Esc => self.modal = None,
-                    KeyCode::Up => *selected = selected.saturating_sub(1),
-                    KeyCode::Down => {
+                match shortcut {
+                    _ if key.code == KeyCode::Esc => self.modal = None,
+                    Some(NAVIGATION_UP) => *selected = selected.saturating_sub(1),
+                    Some(NAVIGATION_DOWN) => {
                         *selected = selected.saturating_add(1).min(count.saturating_sub(1))
                     }
-                    KeyCode::Enter if count > 0 => {
+                    Some(NAVIGATION_ACTIVATE) if count > 0 => {
                         action = Some(if queue {
                             Action::EditQueued(*selected)
                         } else {
@@ -128,12 +130,16 @@ impl Ui {
                     _ => {}
                 }
             }
-            Some(Modal::QueuedEdit { editor, focus, .. }) => match key.code {
-                KeyCode::Esc => self.modal = Some(Modal::Queue { selected: 0 }),
-                KeyCode::Tab => *focus = (*focus + 1) % 3,
-                KeyCode::BackTab => *focus = (*focus + 2) % 3,
-                KeyCode::Enter if ctrl || *focus == 1 => action = Some(Action::SaveQueued(false)),
-                KeyCode::Enter if *focus == 2 => action = Some(Action::SaveQueued(true)),
+            Some(Modal::QueuedEdit { editor, focus, .. }) => match shortcut {
+                _ if key.code == KeyCode::Esc => self.modal = Some(Modal::Queue { selected: 0 }),
+                Some(NAVIGATION_NEXT_FOCUS) => *focus = (*focus + 1) % 3,
+                Some(NAVIGATION_PREVIOUS_FOCUS) => *focus = (*focus + 2) % 3,
+                Some(QUEUE_SAVE) | Some(QUEUE_ACTIVATE)
+                    if shortcut == Some(QUEUE_SAVE) || *focus == 1 =>
+                {
+                    action = Some(Action::SaveQueued(false))
+                }
+                Some(QUEUE_ACTIVATE) if *focus == 2 => action = Some(Action::SaveQueued(true)),
                 _ if *focus == 0 => editor.key(key),
                 _ => {}
             },
@@ -202,6 +208,11 @@ impl Ui {
         true
     }
     pub(super) fn draw_questions_or_queue(&mut self, frame: &mut Frame, area: Rect) -> bool {
+        use crate::shortcuts::{Bindings, ids::*};
+        let config = self.shortcut_config.clone();
+        let bindings = Bindings::new(&config);
+        let context = self.shortcut_context();
+        let hint = |id| bindings.primary_hint_in(id, context);
         let session = self
             .selected
             .as_ref()
@@ -266,8 +277,13 @@ impl Ui {
                     );
                 }
                 frame.render_widget(
-                    Paragraph::new("↑↓ choose · Enter open · Esc close")
-                        .style(Style::default().fg(DIM)),
+                    Paragraph::new(format!(
+                        "{}/{} choose · {} open · Esc close",
+                        hint(NAVIGATION_UP),
+                        hint(NAVIGATION_DOWN),
+                        hint(NAVIGATION_ACTIVATE)
+                    ))
+                    .style(Style::default().fg(DIM)),
                     Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
                 );
             }
@@ -291,14 +307,29 @@ impl Ui {
                 self.button(
                     frame,
                     Rect::new(area.x, area.bottom().saturating_sub(3), area.width, 1),
-                    "Save changes · Ctrl+Enter",
+                    &format!(
+                        "Save changes · {}{}",
+                        hint(QUEUE_SAVE),
+                        if focus == 1 {
+                            format!(" / {}", hint(QUEUE_ACTIVATE))
+                        } else {
+                            String::new()
+                        }
+                    ),
                     Action::SaveQueued(false),
                     focus == 1,
                 );
                 self.button(
                     frame,
                     Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
-                    "Remove from queue",
+                    &format!(
+                        "Remove from queue{}",
+                        if focus == 2 {
+                            format!(" · {}", hint(QUEUE_ACTIVATE))
+                        } else {
+                            String::new()
+                        }
+                    ),
                     Action::SaveQueued(true),
                     focus == 2,
                 );
@@ -426,7 +457,11 @@ impl Ui {
                 self.button(
                     frame,
                     Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
-                    "Submit answers · Ctrl+Enter    Tab next question · Esc dismiss",
+                    &format!(
+                        "Submit answers · {}    {} next question · Esc dismiss",
+                        hint(QUESTION_SUBMIT),
+                        hint(QUESTION_NEXT_FIELD)
+                    ),
                     Action::Approve(0),
                     false,
                 );

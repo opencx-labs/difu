@@ -123,10 +123,203 @@ impl FileContext {
     }
 }
 
+/// Project canonical hunks without changing their identity or source coordinates.
+pub fn project<'a>(
+    hunk: &'a crate::diff::Hunk,
+    data: Option<&'a FileContext>,
+    expansion: Expansion,
+    context: u32,
+) -> Vec<Part<'a>> {
+    use crate::diff::LineKind;
+    let changed = hunk
+        .lines
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            matches!(l.kind, LineKind::Add | LineKind::Remove | LineKind::Meta).then_some(i)
+        })
+        .collect::<Vec<_>>();
+    let (Some(first), Some(last)) = (changed.first().copied(), changed.last().copied()) else {
+        return data.map_or_else(
+            || {
+                vec![Part {
+                    owner: Some(&hunk.id),
+                    lines: &hunk.lines,
+                }]
+            },
+            |data| data.parts(&hunk.id, expansion),
+        );
+    };
+    let count = context as usize;
+    let original = data.and_then(|data| data.original(&hunk.id));
+    let offset = original.as_ref().map_or(0, |r| r.start);
+    let lines = data
+        .filter(|_| original.is_some())
+        .map_or(hunk.lines.as_slice(), |d| d.lines.as_slice());
+    let start = (offset + first)
+        .saturating_sub(count)
+        .min(if expansion.above > 0 {
+            offset.saturating_sub(expansion.above)
+        } else {
+            usize::MAX
+        });
+    let end = (offset + last + 1)
+        .saturating_add(count)
+        .max(if expansion.below > 0 {
+            offset + hunk.lines.len() + expansion.below
+        } else {
+            0
+        })
+        .min(lines.len());
+    let mut parts: Vec<Part<'a>> = Vec::new();
+    let mut run = None;
+    for index in start..=end {
+        let visible = index < end
+            && ((expansion.above > 0 && index < offset + first)
+                || (expansion.below > 0 && index > offset + last)
+                || {
+                    let next = changed.partition_point(|change| offset + change < index);
+                    changed
+                        .get(next)
+                        .is_some_and(|change| index.abs_diff(offset + change) <= count)
+                        || next
+                            .checked_sub(1)
+                            .and_then(|i| changed.get(i))
+                            .is_some_and(|change| index.abs_diff(offset + change) <= count)
+                });
+        let owner = data
+            .and_then(|d| {
+                d.ranges
+                    .iter()
+                    .find(|(_, r)| r.contains(&index))
+                    .map(|(id, _)| id.as_str())
+            })
+            .or_else(|| {
+                (index >= offset && index < offset + hunk.lines.len()).then_some(hunk.id.as_str())
+            });
+        if let Some((begin, previous)) = run
+            && (!visible || previous != owner)
+        {
+            if let Some(slice) = lines.get(begin..index) {
+                parts.push(Part {
+                    owner: previous,
+                    lines: slice,
+                });
+            }
+            run = None;
+        }
+        if visible && run.is_none() {
+            run = Some((index, owner));
+        }
+    }
+    parts
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::diff::{Hunk, LineKind};
+
+    #[test]
+    fn zero_context_keeps_no_newline_markers() {
+        let hunk = Hunk {
+            id: "marker".into(),
+            header: "@@ -1 +1 @@".into(),
+            lines: vec![
+                DiffLine {
+                    kind: LineKind::Remove,
+                    old: Some(1),
+                    new: None,
+                    text: "old".into(),
+                },
+                DiffLine {
+                    kind: LineKind::Meta,
+                    old: None,
+                    new: None,
+                    text: "\\ No newline at end of file".into(),
+                },
+                DiffLine {
+                    kind: LineKind::Add,
+                    old: None,
+                    new: Some(1),
+                    text: "new".into(),
+                },
+                DiffLine {
+                    kind: LineKind::Meta,
+                    old: None,
+                    new: None,
+                    text: "\\ No newline at end of file".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            project(&hunk, None, Expansion::default(), 0)
+                .iter()
+                .map(|p| p.lines.len())
+                .sum::<usize>(),
+            4
+        );
+    }
+
+    #[test]
+    fn presentation_context_keeps_canonical_identity_and_manual_expansion() -> Result<()> {
+        let mut lines = (1..=31)
+            .map(|n| DiffLine {
+                kind: LineKind::Context,
+                old: Some(n),
+                new: Some(n),
+                text: format!("line {n}"),
+            })
+            .collect::<Vec<_>>();
+        lines.get_mut(15).context("change")?.kind = LineKind::Add;
+        let hunk = Hunk {
+            id: "stable-review-anchor".into(),
+            header: "@@ -13,7 +13,7 @@".into(),
+            lines: lines.get(12..19).context("hunk")?.to_vec(),
+        };
+        let file = DiffFile {
+            path: "file.ts".into(),
+            old_path: "file.ts".into(),
+            status: "M".into(),
+            additions: 1,
+            deletions: 0,
+            hunks: vec![hunk],
+        };
+        let data = FileContext::new(&file, lines)?;
+        let hunk = file.hunks.first().context("hunk")?;
+        for (count, start, end) in [(0, 16, 16), (3, 13, 19), (5, 11, 21), (10, 6, 26)] {
+            let projected = project(hunk, Some(&data), Expansion::default(), count);
+            let shown = projected.iter().flat_map(|p| p.lines).collect::<Vec<_>>();
+            assert_eq!(shown.first().and_then(|l| l.new), Some(start));
+            assert_eq!(shown.last().and_then(|l| l.new), Some(end));
+            assert_eq!(hunk.id, "stable-review-anchor");
+            assert_eq!(hunk.lines.len(), 7);
+        }
+        let expanded = project(
+            hunk,
+            Some(&data),
+            Expansion {
+                above: 10,
+                below: 0,
+            },
+            0,
+        );
+        assert_eq!(
+            expanded
+                .first()
+                .and_then(|p| p.lines.first())
+                .and_then(|l| l.new),
+            Some(3)
+        );
+        assert_eq!(
+            project(hunk, None, Expansion::default(), 0)
+                .iter()
+                .map(|p| p.lines.len())
+                .sum::<usize>(),
+            1
+        );
+        Ok(())
+    }
 
     fn fixture() -> Result<(DiffFile, FileContext)> {
         let lines = (1..=60)

@@ -7,6 +7,26 @@ pub struct Settings {
     saved: Option<super::super::slack::Settings>,
     pub(super) field: usize,
 }
+impl Settings {
+    pub(super) fn copy_editor(&self) -> Option<&Editor> {
+        // Masked token fields must never reach the clipboard handoff.
+        if (2..4).contains(&self.field) {
+            self.fields.get(self.field)
+        } else {
+            None
+        }
+    }
+}
+// Shared form behavior is portable; only the production entrypoint is macOS-only.
+#[cfg(test)]
+pub(super) fn test_form() -> Settings {
+    Settings {
+        fields: vec![Editor::default(); 4],
+        status: "Slack is not connected".into(),
+        saved: None,
+        field: 0,
+    }
+}
 #[derive(Default)]
 pub(super) struct State {
     saving: Option<mpsc::Receiver<Result<super::super::slack::Settings, String>>>,
@@ -119,6 +139,8 @@ impl Ui {
         self.modal = None;
     }
     pub(super) fn slack_key(&mut self, key: KeyEvent) {
+        use crate::shortcuts::ids::*;
+        let shortcut = self.shortcut(key);
         if key.code == KeyCode::Esc {
             self.modal = None;
             return;
@@ -126,12 +148,12 @@ impl Ui {
         let Some(Modal::Slack(form)) = &mut self.modal else {
             return;
         };
-        match key.code {
-            KeyCode::Tab | KeyCode::Down => form.field = (form.field + 1) % 6,
-            KeyCode::BackTab | KeyCode::Up => form.field = (form.field + 5) % 6,
-            KeyCode::Enter if form.field == 4 => self.save_slack(),
-            KeyCode::Enter if form.field == 5 => self.disable_slack(),
-            KeyCode::Enter => form.field = (form.field + 1) % 6,
+        match shortcut {
+            Some(NAVIGATION_NEXT_FOCUS) => form.field = (form.field + 1) % 6,
+            Some(NAVIGATION_PREVIOUS_FOCUS) => form.field = (form.field + 5) % 6,
+            Some(NAVIGATION_ACTIVATE) if form.field == 4 => self.save_slack(),
+            Some(NAVIGATION_ACTIVATE) if form.field == 5 => self.disable_slack(),
+            Some(NAVIGATION_ACTIVATE) => form.field = (form.field + 1) % 6,
             _ => {
                 if let Some(editor) = form.fields.get_mut(form.field) {
                     editor.key(key);
@@ -213,6 +235,30 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_slack_entrypoint_preserves_draft_and_does_not_open_or_activate() -> Result<()> {
+        let (mut ui, _dir, _) = super::super::shortcut_tests::fixture(None)?;
+        ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
+        ui.open_slack();
+        assert!(ui.modal.is_none());
+        assert_eq!(
+            ui.notice,
+            Some(("Slack is available on macOS in this release".into(), true))
+        );
+        let draft = &ui
+            .positions
+            .get("one")
+            .ok_or_else(|| anyhow::anyhow!("draft"))?
+            .draft;
+        assert_eq!(draft.text(), "unsent draft");
+        assert_eq!(draft.selected_text().as_deref(), Some("unsent draft"));
+        assert!(ui.slack.saving.is_none());
+        assert!(!ui.storage.config.exists());
+        assert!(!ui.storage.cache.exists());
+        Ok(())
+    }
 
     #[test]
     fn setup_masks_tokens_and_does_not_expose_them_to_copy_or_the_composer() -> Result<()> {

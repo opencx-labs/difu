@@ -20,6 +20,7 @@ pub(super) struct Decoder {
     input: HashMap<String, String>,
     state: Option<String>,
     result_received: bool,
+    result_outcome: Option<(Option<String>, bool)>,
     interruption: Option<Interruption>,
 }
 fn text(value: &Value) -> String {
@@ -86,6 +87,7 @@ fn block_entry(
         }
     } else {
         session.entries.push(Entry {
+            timestamp: Some(chrono::Utc::now().timestamp_millis()),
             id: id.clone(),
             kind: entry_kind.into(),
             text: content.into(),
@@ -132,6 +134,7 @@ impl Decoder {
     }
     pub fn sending(&mut self) {
         self.result_received = false;
+        self.result_outcome = None;
     }
     fn finish(&self, session: &mut Session) {
         if !self.result_received
@@ -144,6 +147,10 @@ impl Decoder {
             session.status = Status::Idle;
         }
         if let Some(turn) = session.turn_id.take() {
+            session.completed_turn_successful = self
+                .result_outcome
+                .as_ref()
+                .is_some_and(|(id, success)| *success && id.as_deref() == Some(&turn));
             session.completed_turn = Some(turn);
         }
         session
@@ -234,6 +241,7 @@ impl Decoder {
                         self.blocks.clear();
                         self.input.clear();
                         self.result_received = false;
+                        self.result_outcome = None;
                         if session.turn_id.is_none() {
                             session.turn_id = Some(self.message.clone());
                             session.turn_started_at = Some(now);
@@ -289,6 +297,7 @@ impl Decoder {
             Some("assistant") => {
                 if frame.get("parent_tool_use_id").is_none_or(Value::is_null) {
                     self.result_received = false;
+                    self.result_outcome = None;
                 }
                 let message = frame.get("message").unwrap_or(&Value::Null);
                 let message_id = message
@@ -396,6 +405,7 @@ impl Decoder {
                     session.permission_state.denials.drain(..excess);
                 }
                 self.result_received = true;
+                self.result_outcome = Some((session.turn_id.clone(), !failed && !cancelled));
                 if cancelled {
                     if let Some(intent) = interruption {
                         if failed {
@@ -531,6 +541,81 @@ mod tests {
         session.status = Status::Running;
         session.turn_id = Some("turn".into());
         session
+    }
+    #[test]
+    fn notifications_from_real_claude_reducer_exclude_both_cancellation_paths() -> anyhow::Result<()>
+    {
+        use crate::agents::{
+            notifications::{Capabilities, Command, Delivery, Dispatcher, Event, Kind},
+            server::Store,
+        };
+        struct Boundary;
+        impl Delivery for Boundary {
+            fn status(&mut self) -> anyhow::Result<Capabilities> {
+                Ok(Capabilities::default())
+            }
+            fn authorize(&mut self) -> anyhow::Result<Capabilities> {
+                anyhow::bail!("Unexpected authorization")
+            }
+            fn desktop(&mut self, _: &Event) -> anyhow::Result<()> {
+                anyhow::bail!("Unexpected desktop delivery")
+            }
+            fn sound(&mut self) -> anyhow::Result<()> {
+                anyhow::bail!("Unexpected audio")
+            }
+        }
+        let temp = tempfile::tempdir()?;
+        let mut store = Store::fixture(temp.path().into(), vec![session()]);
+        store.notifications = Some(Dispatcher::start(store.storage.clone(), Boundary)?);
+        let dispatcher = store
+            .notifications
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("dispatcher"))?;
+        let first = dispatcher.request(Command::Poll {
+            client: "test".into(),
+            focused: false,
+            viewed: None,
+            cursor: None,
+        })?;
+        let mut decoder = Decoder::default();
+        for (turn, failed, interrupted) in [
+            ("success", false, None),
+            ("failed", true, None),
+            ("stopped", false, Some(false)),
+            ("replace", false, Some(true)),
+            ("success-later", false, None),
+        ] {
+            decoder.sending();
+            store.update("claude", |s| {
+                s.turn_id = Some(turn.into());
+                decoder.apply(
+                    s,
+                    &json!({"type":"system","subtype":"session_state_changed","state":"running"}),
+                );
+            })?;
+            if let Some(send_next) = interrupted {
+                store.inspect("claude", |s| decoder.interrupting(s, send_next))?;
+            }
+            store.update("claude",|s|decoder.apply(s,&json!({"type":"result","subtype":if failed{"error_during_execution"}else{"success"},"is_error":failed,"errors":if failed{vec!["private error"]}else{vec![]},"usage":{}})))?;
+            store.update("claude", |s| {
+                decoder.apply(
+                    s,
+                    &json!({"type":"system","subtype":"session_state_changed","state":"idle"}),
+                )
+            })?;
+        }
+        dispatcher.request(Command::Status)?;
+        let snapshot = dispatcher.request(Command::Poll {
+            client: "test".into(),
+            focused: false,
+            viewed: None,
+            cursor: first.cursor,
+        })?;
+        assert_eq!(
+            snapshot.events.iter().map(|e| e.kind).collect::<Vec<_>>(),
+            vec![Kind::Completion, Kind::Error, Kind::Completion]
+        );
+        Ok(())
     }
     #[test]
     fn tool_completion_releases_steering_and_native_idle_finishes_coalesced_messages() {
@@ -690,5 +775,26 @@ mod tests {
                 .as_deref()
                 .is_some_and(|error| error.contains("genuine fatal"))
         );
+    }
+    #[test]
+    fn assistant_receipt_timestamps_survive_full_frame_reconciliation() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let mut session = session();
+        let mut decoder = Decoder::default();
+        let before = chrono::Utc::now().timestamp_millis();
+        let frame = json!({"type":"assistant","message":{"id":"timed","content":[{"type":"text","text":"New assistant words"}]}});
+        decoder.apply(&mut session, &frame);
+        let receipt = session
+            .entries
+            .last()
+            .and_then(|e| e.timestamp)
+            .context("receipt time")?;
+        assert!((before..=chrono::Utc::now().timestamp_millis()).contains(&receipt));
+        decoder.apply(&mut session, &frame);
+        assert_eq!(
+            session.entries.last().context("entry")?.timestamp,
+            Some(receipt)
+        );
+        Ok(())
     }
 }

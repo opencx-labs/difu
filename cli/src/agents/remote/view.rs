@@ -811,6 +811,7 @@ mod tests {
     fn tools_are_labelled_and_long_output_keeps_its_tail() {
         let mut session = session();
         session.entries.push(Entry {
+            timestamp: None,
             id: "cmd".into(),
             kind: "commandExecution".into(),
             text: format!("$ cargo test\n{}done", "x".repeat(10_000)).into(),

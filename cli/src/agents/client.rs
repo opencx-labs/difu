@@ -14,7 +14,12 @@ use std::{
 pub fn read_line(reader: &mut impl BufRead) -> Result<String> {
     let mut line = Vec::new();
     loop {
-        let buffer = reader.fill_buf()?;
+        // Continue the same frame after a signal; never resend the request.
+        let buffer = match reader.fill_buf() {
+            Ok(buffer) => buffer,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.into()),
+        };
         ensure!(!buffer.is_empty(), "Connection closed");
         let end = buffer.iter().position(|b| *b == b'\n').map(|n| n + 1);
         let n = end.unwrap_or(buffer.len());
@@ -317,5 +322,63 @@ pub fn review_job(
             observer.check()?;
             thread::sleep(Duration::from_millis(100));
         }
+    }
+}
+
+#[cfg(test)]
+mod wire_tests {
+    use super::*;
+    use std::io::{self, Cursor, Read};
+
+    struct InterruptedReader {
+        source: Cursor<&'static [u8]>,
+        reads: usize,
+        error: io::ErrorKind,
+    }
+    impl Read for InterruptedReader {
+        fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            if matches!(self.reads, 1 | 3) {
+                return Err(self.error.into());
+            }
+            self.source.read(bytes)
+        }
+    }
+    #[test]
+    fn interrupted_reads_preserve_partial_frames_and_other_errors_still_fail() -> Result<()> {
+        let mut reader = BufReader::with_capacity(
+            2,
+            InterruptedReader {
+                source: Cursor::new(b"first\nsecond\n"),
+                reads: 0,
+                error: io::ErrorKind::Interrupted,
+            },
+        );
+        assert_eq!(read_line(&mut reader)?, "first\n");
+        assert_eq!(read_line(&mut reader)?, "second\n");
+        assert!(read_line(&mut reader).is_err(), "EOF must still disconnect");
+        for error in [
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionReset,
+        ] {
+            let mut reader = BufReader::with_capacity(
+                2,
+                InterruptedReader {
+                    source: Cursor::new(b"partial\n"),
+                    reads: 1,
+                    error,
+                },
+            );
+            let Err(actual) = read_line(&mut reader) else {
+                anyhow::bail!("A non-interruption must remain an error");
+            };
+            assert_eq!(
+                actual.downcast_ref::<io::Error>().map(io::Error::kind),
+                Some(error)
+            );
+            assert_eq!(reader.get_ref().source.position(), 2);
+        }
+        Ok(())
     }
 }

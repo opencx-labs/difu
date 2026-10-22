@@ -170,6 +170,10 @@ pub(super) fn restore_mode(
         return Ok(());
     };
     if mode == "default" && response.get("collaborationMode").is_none() {
+        store.update(id, |s| {
+            s.permission_state.mode = Some(mode.into());
+            s.permission_state.pending_mode = None;
+        })?;
         return Ok(());
     }
     let mut session = store.get(id)?;
@@ -189,8 +193,19 @@ pub(super) fn restore_mode(
         && response.pointer("/collaborationMode/settings/reasoning_effort")
             == settings.pointer("/settings/reasoning_effort")
     {
+        store.update(id, |s| {
+            s.permission_state.mode = Some(mode.into());
+            s.permission_state.pending_mode = None;
+        })?;
         return Ok(());
     }
+    ensure!(
+        super::super::permissions::snapshot(&session)
+            .modes
+            .iter()
+            .any(|choice| choice.id == mode && choice.available),
+        "Codex has not reported support for mode {mode}"
+    );
     update_mode(rpc, store, id, mode, settings.clone(), cancel)?;
     put(response, "collaborationMode", settings)
 }

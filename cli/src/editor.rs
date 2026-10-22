@@ -81,7 +81,11 @@ impl Editor {
         self.edit(|editor| editor.insert_raw(text));
     }
     pub fn paste(&mut self, text: &str) {
-        self.edit(|editor| editor.paste_raw(text));
+        self.paste_with_threshold(text, Some(500));
+    }
+    /// Collapse only the presentation token; source text and undo remain intact.
+    pub fn paste_with_threshold(&mut self, text: &str, threshold: Option<u32>) {
+        self.edit(|editor| editor.paste_raw(text, threshold));
     }
     /// Insert an atomic attachment label without treating typed lookalikes as media.
     pub fn insert_attachment(&mut self, label: &str) {
@@ -221,7 +225,7 @@ impl Editor {
         let range = self.selection().unwrap_or(self.cursor..self.cursor);
         self.replace(range, text);
     }
-    fn paste_raw(&mut self, text: &str) {
+    fn paste_raw(&mut self, text: &str, threshold: Option<u32>) {
         if self
             .folds
             .iter()
@@ -251,7 +255,7 @@ impl Editor {
                 .iter()
                 .any(|prefix| line.starts_with(prefix))
             });
-        if text.chars().count() < 500 {
+        if threshold.is_none_or(|limit| text.chars().count() < limit as usize) {
             self.insert_raw(text);
             return;
         }

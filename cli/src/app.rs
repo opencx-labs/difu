@@ -249,6 +249,9 @@ pub enum Modal {
 pub struct App {
     pub hover: crate::hover::State,
     pub preserve_diff_position: bool,
+    pub(crate) diff_visual: Option<Config>,
+    pub(crate) diff_reading: Option<crate::ui::DiffReading>,
+    pub(crate) diff_style: Option<(bool, bool, crate::settings::Code)>,
     pub(crate) clipboard_id: u64,
     pub(crate) clipboard: Option<String>,
     pub filters: crate::filter::State,
@@ -340,6 +343,9 @@ impl App {
             repo_selected: None,
             hover: Default::default(),
             preserve_diff_position: false,
+            diff_visual: None,
+            diff_reading: None,
+            diff_style: None,
             clipboard_id: 0,
             clipboard: None,
             inbox_refreshed: None,
@@ -420,10 +426,15 @@ impl App {
         let sender = self.sender.clone();
         let cancel = Cancel::default();
         let token = cancel.clone();
+        #[cfg(test)]
+        let fixture = crate::process::fixture::worker();
         match thread::Builder::new()
             .name("difu-worker".into())
-            .spawn(move || work(sender, token))
-        {
+            .spawn(move || {
+                #[cfg(test)]
+                let _fixture = fixture.map(crate::process::fixture::WorkerHandle::enter);
+                work(sender, token)
+            }) {
             Ok(handle) => self.jobs.push((cancel.clone(), handle)),
             Err(error) => {
                 cancel.cancel();
@@ -446,6 +457,54 @@ impl App {
     }
     pub fn review(&self) -> Option<&Review> {
         self.key().and_then(|key| self.reviews.get(&key))
+    }
+    pub(crate) fn diff_config(&self) -> &Config {
+        self.diff_visual.as_ref().unwrap_or(&self.config)
+    }
+    pub(crate) fn preview_diff_settings(&mut self, config: Option<&Config>) {
+        let before = self.diff_config();
+        let after = config.unwrap_or(&self.config);
+        let changed = before.unified != after.unified
+            || before.wrap_diff != after.wrap_diff
+            || before.preferences.code != after.preferences.code;
+        self.diff_visual = config.cloned();
+        if changed {
+            self.preserve_diff_position = true;
+            self.invalidate();
+        }
+    }
+    pub(crate) fn ensure_diff_context(&mut self) {
+        if self.home
+            || self.view == View::Overview
+            || self.diff_config().preferences.code.context_lines <= 3
+        {
+            return;
+        }
+        let hunks = self
+            .review()
+            .and_then(|r| r.snapshot.as_ref().map(|s| (r, s)))
+            .map(|(r, s)| {
+                s.files
+                    .iter()
+                    .filter(|f| {
+                        r.context.get(&f.path).is_none_or(|state| {
+                            state.data.is_none()
+                                && state.pending.is_empty()
+                                && state.error.is_none()
+                        })
+                    })
+                    .filter_map(|f| {
+                        f.hunks
+                            .iter()
+                            .find(|h| h.header.starts_with("@@ "))
+                            .map(|h| h.id.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        for hunk in hunks {
+            self.expand_hunk_by(hunk, Direction::Above, 0);
+        }
     }
     pub fn invalidate(&mut self) {
         crate::repaint::request();
@@ -1926,6 +1985,26 @@ impl App {
         }));
     }
     pub fn action(&mut self, action: Action) {
+        if matches!(
+            action,
+            Action::SelectRepository(_)
+                | Action::OpenRepository
+                | Action::SelectPr(_)
+                | Action::OpenPr
+                | Action::SetView(_)
+                | Action::SetInbox(_)
+                | Action::SetState(_)
+                | Action::Back
+                | Action::SelectFile(_)
+                | Action::SelectDirectory(_)
+                | Action::Jump(_)
+                | Action::Chapter(_)
+                | Action::GoToChapter(_)
+                | Action::Scroll(_)
+                | Action::FastScroll(_)
+        ) {
+            self.diff_reading = None;
+        }
         self.preserve_diff_position = false;
         if !matches!(action, Action::Filter) {
             self.filters.focused = None;
@@ -2147,13 +2226,13 @@ impl App {
                     return;
                 }
                 self.horizontal = 0;
-                self.workflow.cursor = None;
-                self.workflow.selection = None;
+                self.preserve_diff_position = true;
                 self.invalidate();
             }
             Action::ToggleLayout => {
                 let unified = !self.config.unified;
                 self.update_config("layout preference", |config| config.unified = unified);
+                self.preserve_diff_position = true;
                 self.invalidate();
             }
             Action::Scroll(delta) => self.move_scroll(delta),
@@ -2165,6 +2244,7 @@ impl App {
         }
     }
     fn move_scroll(&mut self, delta: i32) {
+        self.diff_reading = None;
         if self.focus == Focus::Navigation && self.home {
             if self.repository_directory() {
                 let names = self.visible_repositories();
@@ -2229,139 +2309,213 @@ impl App {
             self.scroll = self.scroll.saturating_add_signed(delta as isize).min(max);
         }
     }
-    pub fn key_event(&mut self, key: KeyEvent) {
-        if self.local_key(key) {
-            return;
-        }
-        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::SUPER) {
-            let editor = match &self.modal {
-                Some(Modal::Help(state)) => Some(&state.query),
-                Some(Modal::Clone { value, .. }) => Some(value),
-                Some(Modal::Models { query, .. }) => Some(query),
-                Some(Modal::Workflow(wizard)) => match wizard.as_ref() {
-                    crate::workflow::Wizard::Controls { query, .. } => Some(query),
-                    crate::workflow::Wizard::Compose(draft) if draft.focus == 0 => {
-                        Some(&draft.editor)
+    pub(crate) fn shortcut_context(&self) -> crate::shortcuts::Context {
+        use crate::shortcuts::contexts::*;
+        if let Some(modal) = &self.modal {
+            return match modal {
+                Modal::Image(_) => REVIEW_IMAGE,
+                Modal::Definition(_) => REVIEW_DEFINITION,
+                Modal::Help(_) => REVIEW_HELP,
+                Modal::Clone { .. } => REVIEW_CLONE,
+                Modal::Models { .. } => REVIEW_MODELS,
+                Modal::Workflow(wizard) => {
+                    use crate::workflow::Wizard;
+                    if self.workflow.busy {
+                        return WORKFLOW_BUSY;
                     }
-                    _ => None,
-                },
-                None => self.filters.focused.map(|kind| self.filters.editor(kind)),
-                _ => None,
+                    match wizard.as_ref() {
+                        Wizard::Reviewers(_) => WORKFLOW_REVIEWERS,
+                        Wizard::Resolve { .. } => WORKFLOW_RESOLVE,
+                        Wizard::Resolving { .. } => WORKFLOW_BUSY,
+                        Wizard::Home(_) => WORKFLOW_HOME,
+                        Wizard::Controls { .. } => WORKFLOW_CONTROLS,
+                        Wizard::Compose(draft) => match draft.focus {
+                            0 if !self.mention_options(draft).is_empty() => WORKFLOW_MENTIONS,
+                            0 => WORKFLOW_COMPOSE,
+                            1 => WORKFLOW_CHOICE,
+                            _ => WORKFLOW_NEXT,
+                        },
+                        Wizard::Confirm { .. } => WORKFLOW_CONFIRM,
+                        Wizard::Result { .. } => WORKFLOW_RESULT,
+                        Wizard::Trees { .. } => WORKFLOW_TREES,
+                        Wizard::Delete { .. } => WORKFLOW_DELETE,
+                    }
+                }
             };
-            if let Some(editor) = editor {
-                self.clipboard = editor.selected_text();
-                return;
-            }
         }
-
+        if self.home && self.inbox_tab == InboxTab::Diffs {
+            return match self.local.setup {
+                Some(local::Setup::Roots(_)) => REVIEW_LOCAL_ROOTS,
+                Some(local::Setup::Select { .. }) => REVIEW_LOCAL_SELECT,
+                None => REVIEW_LOCAL_LIST,
+            };
+        }
+        if self.filters.focused.is_some() {
+            return REVIEW_FILTER;
+        }
+        if self.home {
+            if self.repository_directory() {
+                REVIEW_REPOSITORY
+            } else {
+                REVIEW_HOME
+            }
+        } else if self.view == View::Overview {
+            REVIEW_OVERVIEW
+        } else if self.focus == Focus::Navigation {
+            REVIEW_NAVIGATION
+        } else {
+            REVIEW_CONTENT
+        }
+    }
+    pub(crate) fn hint(&self, action: crate::shortcuts::ActionId) -> String {
+        let bindings = crate::shortcuts::Bindings::new(&self.config);
+        crate::shortcuts::spec(action)
+            .and_then(|spec| {
+                spec.contexts.iter().find_map(|context| {
+                    let hint = bindings.primary_hint_in(action, *context);
+                    (!hint.is_empty()).then_some(hint)
+                })
+            })
+            .unwrap_or_default()
+    }
+    pub(crate) fn shortcut(&self, key: KeyEvent) -> Option<crate::shortcuts::ActionId> {
+        crate::shortcuts::Bindings::new(&self.config).resolve(self.shortcut_context(), key)
+    }
+    pub(crate) fn copy_selection(&mut self) -> bool {
+        let editor = match &self.modal {
+            Some(Modal::Help(state)) => Some(&state.query),
+            Some(Modal::Clone { value, .. }) => Some(value),
+            Some(Modal::Models { query, .. }) => Some(query),
+            Some(Modal::Workflow(wizard)) => match wizard.as_ref() {
+                crate::workflow::Wizard::Controls { query, .. } => Some(query),
+                crate::workflow::Wizard::Compose(draft) if draft.focus == 0 => Some(&draft.editor),
+                _ => None,
+            },
+            None => self.filters.focused.map(|kind| self.filters.editor(kind)),
+            _ => None,
+        };
+        if let Some(editor) = editor {
+            self.clipboard = editor.selected_text();
+            return self.clipboard.is_some();
+        }
+        if self.modal.is_none()
+            && !self.home
+            && self.view != View::Overview
+            && self.focus == Focus::Content
+            && self.workflow.selection.is_some()
+        {
+            self.copy_diff();
+            return true;
+        }
+        false
+    }
+    pub fn key_event(&mut self, key: KeyEvent) {
         if self.hover.key(key) {
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.quit = true;
+        if self.local_key(key) {
+            return;
+        }
+        // Native Control+C copy wins even after either action is remapped.
+        if key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && self.copy_selection()
+        {
+            return;
+        }
+        use crate::shortcuts::ids::*;
+        let shortcut = self.shortcut(key);
+        if shortcut == Some(SELECTION_COPY) {
+            if !self.copy_selection() && self.modal.is_none() && self.filters.focused.is_none() {
+                self.copy_diff();
+            }
+            return;
+        }
+        if shortcut == Some(APP_QUIT) {
+            if !self.copy_selection() {
+                self.quit = true;
+            }
             return;
         }
         if matches!(self.modal, Some(Modal::Workflow(_))) {
             self.workflow_key(key);
-            return;
-        }
-        if self.modal.is_some() {
+        } else if self.modal.is_some() {
             self.modal_key(key);
-            return;
-        }
-        if self.filters.focused.is_some() {
+        } else if self.filters.focused.is_some() {
             self.filter_key(key);
-            return;
+        } else if let Some(action) = shortcut {
+            self.shortcut_action(action);
         }
-        let plain = !key.modifiers.intersects(
-            KeyModifiers::CONTROL
-                | KeyModifiers::ALT
-                | KeyModifiers::SUPER
-                | KeyModifiers::HYPER
-                | KeyModifiers::META,
-        );
-        if matches!(key.code, KeyCode::Up | KeyCode::Down)
-            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SUPER)
-            && self.step_diff_file(key.code == KeyCode::Down)
+    }
+    pub(crate) fn shortcut_action(&mut self, shortcut: crate::shortcuts::ActionId) {
+        use crate::shortcuts::ids::*;
+        // Intent belongs to semantic navigation, irrespective of its physical key.
+        if matches!(
+            shortcut,
+            NAVIGATION_UP
+                | NAVIGATION_DOWN
+                | NAVIGATION_FAST_UP
+                | NAVIGATION_FAST_DOWN
+                | NAVIGATION_FIRST
+                | NAVIGATION_LAST
+                | NAVIGATION_PAGE_UP
+                | NAVIGATION_PAGE_DOWN
+                | NAVIGATION_LEFT
+                | NAVIGATION_RIGHT
+                | NAVIGATION_ACTIVATE
+                | REVIEW_SELECT_UP
+                | REVIEW_SELECT_DOWN
+                | REVIEW_SIDE_LEFT
+                | REVIEW_SIDE_RIGHT
+        ) {
+            self.diff_reading = None;
+        }
+        if matches!(
+            shortcut,
+            NAVIGATION_UP | NAVIGATION_DOWN | NAVIGATION_FAST_UP | NAVIGATION_FAST_DOWN
+        ) && self.step_diff_file(matches!(shortcut, NAVIGATION_DOWN | NAVIGATION_FAST_DOWN))
         {
             return;
         }
-        match key.code {
-            KeyCode::Char('{' | '}') if plain => {
-                self.adjust_focused_hunk(if key.code == KeyCode::Char('}') {
-                    1
-                } else {
-                    -1
-                });
-            }
-            KeyCode::Char('[' | ']') if plain && key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.adjust_focused_hunk(if key.code == KeyCode::Char(']') {
-                    1
-                } else {
-                    -1
-                });
-            }
-            KeyCode::Char('c') if plain || key.modifiers == KeyModifiers::SUPER => {
-                self.action(Action::Copy)
-            }
-            KeyCode::Char('/') => self.workflow_action(crate::workflow::WAction::Open),
-            KeyCode::Up | KeyCode::Down
-                if key.modifiers.contains(KeyModifiers::SHIFT)
-                    && self.focus == Focus::Content
-                    && !self.home
-                    && self.view != View::Overview =>
-            {
-                self.move_diff(if key.code == KeyCode::Up { -1 } else { 1 }, true);
-            }
-            KeyCode::Left | KeyCode::Right
-                if self.focus == Focus::Content
-                    && !self.home
-                    && self.view != View::Overview
-                    && key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                self.workflow.side = if key.code == KeyCode::Left {
+        match shortcut {
+            REVIEW_HUNK_LESS => self.adjust_focused_hunk(-1),
+            REVIEW_HUNK_MORE => self.adjust_focused_hunk(1),
+            REVIEW_CONTROLS => self.workflow_action(crate::workflow::WAction::Open),
+            REVIEW_SELECT_UP => self.move_diff(-1, true),
+            REVIEW_SELECT_DOWN => self.move_diff(1, true),
+            REVIEW_SIDE_LEFT | REVIEW_SIDE_RIGHT => {
+                self.workflow.side = if shortcut == REVIEW_SIDE_LEFT {
                     crate::review::Side::Left
                 } else {
                     crate::review::Side::Right
                 };
                 self.workflow.selection = None;
             }
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.action(Action::Chapter(false))
-            }
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-                self.action(Action::Chapter(true))
-            }
-            KeyCode::Up if key.modifiers.contains(KeyModifiers::SUPER) => {
-                self.action(Action::FastScroll(-10))
-            }
-            KeyCode::Down if key.modifiers.contains(KeyModifiers::SUPER) => {
-                self.action(Action::FastScroll(10))
-            }
-            KeyCode::Esc => {
+            REVIEW_CHAPTER_PREVIOUS => self.action(Action::Chapter(false)),
+            REVIEW_CHAPTER_NEXT => self.action(Action::Chapter(true)),
+            NAVIGATION_FAST_UP => self.action(Action::FastScroll(-10)),
+            NAVIGATION_FAST_DOWN => self.action(Action::FastScroll(10)),
+            REVIEW_BACK => {
                 if self.home
-                    && self.inbox_tab == InboxTab::Repositories
-                    && self.repository.is_some()
+                    && !(self.inbox_tab == InboxTab::Repositories && self.repository.is_some())
                 {
-                    self.action(Action::Back);
-                } else if self.home {
                     self.quit = true;
                 } else {
                     self.action(Action::Back);
                 }
             }
-            KeyCode::Enter => {
+            NAVIGATION_ACTIVATE => {
                 if self.home {
                     self.open();
                 } else if self.view != View::Overview {
                     self.enter_diff();
                 }
             }
-            KeyCode::Up => self.move_scroll(-1),
-            KeyCode::Down => self.move_scroll(1),
-            KeyCode::PageUp => self.move_scroll(-(self.viewport as i32)),
-            KeyCode::PageDown | KeyCode::Char(' ') => self.move_scroll(self.viewport as i32),
-            KeyCode::Home => {
+            NAVIGATION_UP => self.move_scroll(-1),
+            NAVIGATION_DOWN => self.move_scroll(1),
+            NAVIGATION_PAGE_UP => self.move_scroll(-(self.viewport as i32)),
+            NAVIGATION_PAGE_DOWN => self.move_scroll(self.viewport as i32),
+            NAVIGATION_FIRST => {
                 self.workflow.cursor = Some(0);
                 self.workflow.selection = None;
                 self.scroll = 0;
@@ -2369,86 +2523,87 @@ impl App {
                     self.move_scroll(i32::MIN);
                 }
             }
-            KeyCode::End => {
-                self.move_scroll(i32::MAX);
+            NAVIGATION_LAST => self.move_scroll(i32::MAX),
+            NAVIGATION_LEFT | NAVIGATION_RIGHT => {
+                let right = shortcut == NAVIGATION_RIGHT;
+                if self.focus == Focus::Navigation {
+                    self.tree_horizontal = if right {
+                        self.tree_horizontal
+                            .saturating_add(4)
+                            .min(self.tree_max_horizontal)
+                    } else {
+                        self.tree_horizontal.saturating_sub(4)
+                    };
+                } else if self.home || self.view == View::Overview || !self.config.wrap_diff {
+                    self.horizontal = if right {
+                        self.horizontal.saturating_add(4)
+                    } else {
+                        self.horizontal.saturating_sub(4)
+                    };
+                }
             }
-            KeyCode::Left | KeyCode::Right if self.focus == Focus::Navigation => {
-                self.tree_horizontal = if key.code == KeyCode::Left {
-                    self.tree_horizontal.saturating_sub(4)
-                } else {
-                    self.tree_horizontal
-                        .saturating_add(4)
-                        .min(self.tree_max_horizontal)
-                };
-            }
-            KeyCode::Left | KeyCode::Right
-                if !self.home && self.view != View::Overview && self.config.wrap_diff => {}
-            KeyCode::Left => self.horizontal = self.horizontal.saturating_sub(4),
-            KeyCode::Right => self.horizontal = self.horizontal.saturating_add(4),
-            KeyCode::Tab | KeyCode::BackTab => {
+            NAVIGATION_NEXT_FOCUS | NAVIGATION_PREVIOUS_FOCUS => {
                 self.focus =
                     if self.focus == Focus::Content && (self.home || self.view != View::Overview) {
                         Focus::Navigation
                     } else {
                         Focus::Content
-                    }
+                    };
             }
-            KeyCode::Char('1') => self.action(if self.home {
+            REVIEW_TAB_1 => self.action(if self.home {
                 Action::SetInbox(InboxTab::MyPrs)
             } else {
                 Action::SetView(View::Overview)
             }),
-            KeyCode::Char('2') => self.action(if self.home {
+            REVIEW_TAB_2 => self.action(if self.home {
                 Action::SetInbox(InboxTab::Repositories)
             } else {
                 Action::SetView(View::Diff)
             }),
-            KeyCode::Char('3') => self.action(if self.home {
+            REVIEW_TAB_3 => self.action(if self.home {
                 Action::SetInbox(InboxTab::Diffs)
             } else {
                 Action::SetView(View::Guide)
             }),
-            KeyCode::Char('[' | ']') if plain && !self.home => {
-                let next = match (self.view, key.code == KeyCode::Char(']')) {
+            REVIEW_PREVIOUS_VIEW | REVIEW_NEXT_VIEW => {
+                let next = match (self.view, shortcut == REVIEW_NEXT_VIEW) {
                     (View::Overview, true) | (View::Guide, false) => View::Diff,
                     (View::Diff, true) | (View::Overview, false) => View::Guide,
                     (View::Guide, true) | (View::Diff, false) => View::Overview,
                 };
                 self.action(Action::SetView(next));
             }
-            KeyCode::Char('?') if plain => self.action(Action::Help),
-            KeyCode::Char('m') if plain => self.load_models(),
-            KeyCode::Char('s' | '[' | ']')
-                if plain && self.home && !self.repository_directory() =>
-            {
+            REVIEW_HELP => self.action(Action::Help),
+            REVIEW_MODELS => self.load_models(),
+            REVIEW_PREVIOUS_STATE | REVIEW_NEXT_STATE => {
                 let index = PrState::ALL
                     .iter()
                     .position(|s| *s == self.state())
                     .unwrap_or(0);
-                let next = if key.code == KeyCode::Char('[') {
-                    (index + 3) % 4
-                } else {
-                    (index + 1) % 4
-                };
+                let next = (index
+                    + if shortcut == REVIEW_PREVIOUS_STATE {
+                        3
+                    } else {
+                        1
+                    })
+                    % 4;
                 if let Some(state) = PrState::ALL.get(next) {
                     self.action(Action::SetState(*state));
                 }
             }
-            KeyCode::Char('f') if plain => self.action(Action::Filter),
-            KeyCode::Char('*') if plain && self.repository_directory() => {
+            REVIEW_FILTER => self.action(Action::Filter),
+            REVIEW_PIN_REPOSITORY => {
                 if let Some(name) = self.repo_selected.clone() {
                     self.action(Action::PinRepository(name));
                 }
             }
-            KeyCode::Char('w') if plain => self.action(Action::ToggleWrap),
-            KeyCode::Char('r') if plain => self.refresh(),
-            KeyCode::Char('g') if plain => self.action(Action::Regenerate),
-            KeyCode::Char('l') if plain => self.action(Action::Locate),
-            KeyCode::Char('x') if plain => self.cancel(),
-            KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.action(Action::ToggleLayout);
-            }
-            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            REVIEW_WRAP => self.action(Action::ToggleWrap),
+            REVIEW_REFRESH => self.refresh(),
+            REVIEW_REGENERATE => self.action(Action::Regenerate),
+            REVIEW_LOCATE => self.action(Action::Locate),
+            REVIEW_CANCEL => self.cancel(),
+            REVIEW_LAYOUT => self.action(Action::ToggleLayout),
+            REVIEW_OPEN_LINK => {
                 if let Some(pr) = self.review().and_then(|r| r.detail.as_ref()) {
                     self.action(Action::Link(pr.key.url()));
                 }
@@ -2457,6 +2612,8 @@ impl App {
         }
     }
     fn modal_key(&mut self, key: KeyEvent) {
+        use crate::shortcuts::ids::*;
+        let shortcut = self.shortcut(key);
         if key.code == KeyCode::Esc {
             if let Some(Modal::Clone { key: id, .. }) = &self.modal
                 && let Some(review) = self.reviews.get_mut(id)
@@ -2471,7 +2628,7 @@ impl App {
         };
         match modal {
             Modal::Image(request) => {
-                if key.code == KeyCode::Char('o')
+                if shortcut == Some(REVIEW_IMAGE_BROWSER)
                     && let Ok(url) = request.browser_url()
                 {
                     self.action(Action::Link(url.into()));
@@ -2485,24 +2642,32 @@ impl App {
                     .and_then(|r| r.as_ref().ok())
                     .map_or(0, |d| d.source.lines().count());
                 let max = total.saturating_sub(viewer.viewport);
-                let step = if key.modifiers.contains(KeyModifiers::SUPER) {
+                let step = if matches!(shortcut, Some(NAVIGATION_FAST_UP | NAVIGATION_FAST_DOWN)) {
                     10
                 } else {
                     1
                 };
-                match key.code {
-                    KeyCode::Up => viewer.scroll = viewer.scroll.saturating_sub(step),
-                    KeyCode::Down => viewer.scroll = viewer.scroll.saturating_add(step).min(max),
-                    KeyCode::PageUp => {
+                match shortcut {
+                    Some(NAVIGATION_UP | NAVIGATION_FAST_UP) => {
+                        viewer.scroll = viewer.scroll.saturating_sub(step)
+                    }
+                    Some(NAVIGATION_DOWN | NAVIGATION_FAST_DOWN) => {
+                        viewer.scroll = viewer.scroll.saturating_add(step).min(max)
+                    }
+                    Some(NAVIGATION_PAGE_UP) => {
                         viewer.scroll = viewer.scroll.saturating_sub(viewer.viewport)
                     }
-                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                    Some(NAVIGATION_PAGE_DOWN) => {
                         viewer.scroll = viewer.scroll.saturating_add(viewer.viewport).min(max)
                     }
-                    KeyCode::Home => viewer.scroll = 0,
-                    KeyCode::End => viewer.scroll = max,
-                    KeyCode::Left => viewer.horizontal = viewer.horizontal.saturating_sub(4),
-                    KeyCode::Right => viewer.horizontal = viewer.horizontal.saturating_add(4),
+                    Some(NAVIGATION_FIRST) => viewer.scroll = 0,
+                    Some(NAVIGATION_LAST) => viewer.scroll = max,
+                    Some(NAVIGATION_LEFT) => {
+                        viewer.horizontal = viewer.horizontal.saturating_sub(4)
+                    }
+                    Some(NAVIGATION_RIGHT) => {
+                        viewer.horizontal = viewer.horizontal.saturating_add(4)
+                    }
                     _ => {}
                 }
                 self.modal = Some(Modal::Definition(viewer));
@@ -2511,23 +2676,27 @@ impl App {
             Modal::Help(mut state) => {
                 let before = state.query.text();
                 let max = state.rows.saturating_sub(state.viewport);
-                let step = if key.modifiers.contains(KeyModifiers::SUPER) {
+                let step = if matches!(shortcut, Some(NAVIGATION_FAST_UP | NAVIGATION_FAST_DOWN)) {
                     10
                 } else {
                     1
                 };
-                match key.code {
-                    KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                match shortcut {
+                    Some(NAVIGATION_UP | NAVIGATION_FAST_UP) => {
                         state.scroll = state.scroll.saturating_sub(step)
                     }
-                    KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Some(NAVIGATION_DOWN | NAVIGATION_FAST_DOWN) => {
                         state.scroll = state.scroll.saturating_add(step).min(max)
                     }
-                    KeyCode::PageUp => state.scroll = state.scroll.saturating_sub(state.viewport),
-                    KeyCode::PageDown => {
+                    Some(NAVIGATION_PAGE_UP) => {
+                        state.scroll = state.scroll.saturating_sub(state.viewport)
+                    }
+                    Some(NAVIGATION_PAGE_DOWN) => {
                         state.scroll = state.scroll.saturating_add(state.viewport).min(max)
                     }
-                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    _ if key.code == KeyCode::Char('u')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
                         state.query.clear()
                     }
                     _ => state.query.key(key),
@@ -2538,14 +2707,16 @@ impl App {
                 self.modal = Some(Modal::Help(state));
             }
             Modal::Clone { mut value, key: id } => {
-                match key.code {
-                    KeyCode::Enter => {
+                match shortcut {
+                    Some(NAVIGATION_ACTIVATE) => {
                         if !value.text().trim().is_empty() {
                             self.prepare(PathBuf::from(value.text().trim()), false);
                         }
                         return;
                     }
-                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    _ if key.code == KeyCode::Char('u')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
                         value.clear()
                     }
                     _ => value.key(key),
@@ -2558,20 +2729,22 @@ impl App {
                 mut query,
             } => {
                 let options = self.model_options(&query.text());
-                match key.code {
-                    KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                match shortcut {
+                    Some(NAVIGATION_UP | NAVIGATION_FAST_UP) => {
                         selected = selected.saturating_sub(1)
                     }
-                    KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Some(NAVIGATION_DOWN | NAVIGATION_FAST_DOWN) => {
                         selected = (selected + 1).min(options.len().saturating_sub(1))
                     }
-                    KeyCode::Enter => {
+                    Some(NAVIGATION_ACTIVATE) => {
                         if let Some(choice) = options.get(selected) {
                             self.apply_model(choice.clone());
                             return;
                         }
                     }
-                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    _ if key.code == KeyCode::Char('u')
+                        && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
                         query.clear();
                         selected = 0;
                     }
@@ -2603,12 +2776,31 @@ impl App {
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
                 if matches!(self.modal, Some(Modal::Definition(_) | Modal::Help(_))) =>
             {
-                let code = if event.kind == MouseEventKind::ScrollDown {
-                    KeyCode::Down
+                let delta = if event.kind == MouseEventKind::ScrollDown {
+                    1
                 } else {
-                    KeyCode::Up
+                    -1
                 };
-                self.modal_key(KeyEvent::new(code, KeyModifiers::NONE));
+                match &mut self.modal {
+                    Some(Modal::Help(state)) => {
+                        state.scroll = state
+                            .scroll
+                            .saturating_add_signed(delta)
+                            .min(state.rows.saturating_sub(state.viewport))
+                    }
+                    Some(Modal::Definition(viewer)) => {
+                        let total = viewer
+                            .output
+                            .as_ref()
+                            .and_then(|r| r.as_ref().ok())
+                            .map_or(0, |d| d.source.lines().count());
+                        viewer.scroll = viewer
+                            .scroll
+                            .saturating_add_signed(delta)
+                            .min(total.saturating_sub(viewer.viewport));
+                    }
+                    _ => {}
+                }
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp if self.modal.is_none() => {
                 self.focus = self
@@ -2824,7 +3016,9 @@ impl App {
         let Some(kind) = self.filters.focused else {
             return;
         };
-        if matches!(key.code, KeyCode::Enter | KeyCode::Esc) {
+        if key.code == KeyCode::Esc
+            || self.shortcut(key) == Some(crate::shortcuts::ids::REVIEW_FILTER_ACCEPT)
+        {
             self.filters.focused = None;
             self.focus = Focus::Navigation;
             return;
@@ -3562,3 +3756,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "review_shortcut_tests.rs"]
+mod shortcut_tests;

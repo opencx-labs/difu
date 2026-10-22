@@ -32,15 +32,17 @@ impl Ui {
         });
     }
     pub(super) fn tweaks_key(&mut self, key: KeyEvent) {
+        use crate::shortcuts::ids::*;
+        let shortcut = self.shortcut(key);
         let Some(Modal::Tweaks { fields, field }) = &mut self.modal else {
             return;
         };
         // Four numbers, then Save.
-        match key.code {
-            KeyCode::Esc => self.modal = None,
-            KeyCode::Tab | KeyCode::Down => *field = (*field + 1) % 5,
-            KeyCode::BackTab | KeyCode::Up => *field = (*field + 4) % 5,
-            KeyCode::Enter => self.save_tweaks(),
+        match shortcut {
+            _ if key.code == KeyCode::Esc => self.modal = None,
+            Some(NAVIGATION_NEXT_FOCUS) => *field = (*field + 1) % 5,
+            Some(NAVIGATION_PREVIOUS_FOCUS) => *field = (*field + 4) % 5,
+            Some(NAVIGATION_ACTIVATE) => self.save_tweaks(),
             _ => {
                 if let Some(editor) = fields.get_mut(*field) {
                     editor.key(key);
@@ -102,13 +104,15 @@ impl Ui {
         };
         let (fields, field) = (fields.clone(), *field);
         let defaults = Tweaks::default();
+        let bindings = crate::shortcuts::Bindings::new(&self.shortcut_config);
+        let hint = |id| bindings.primary_hint_in(id, self.shortcut_context());
         frame.render_widget(
             Paragraph::new(format!(
-                "Chat text flips in split-flap style. Replies flip in at this speed and speed up when they fall behind the stream; sent and queued messages and input clearing take a fixed time whatever their length. None takes longer than the longest animation. 0 turns an animation off.\nDefaults: {} characters per second · {} ms · {} ms · {} ms.\nTab moves between fields · Enter saves · Esc cancels",
-                defaults.agent_reply_cps,
-                defaults.sent_message_ms,
-                defaults.input_clear_ms,
-                defaults.max_animation_ms
+                "{}/{} fields · {} saves · Esc cancels\nChat text flips in split-flap style. Replies speed up when behind the stream; sent messages and input clearing take a fixed time. 0 turns an animation off.\nDefaults: {} characters per second · {} ms · {} ms · {} ms.",
+                hint(crate::shortcuts::ids::NAVIGATION_NEXT_FOCUS),
+                hint(crate::shortcuts::ids::NAVIGATION_PREVIOUS_FOCUS),
+                hint(crate::shortcuts::ids::NAVIGATION_ACTIVATE),
+                defaults.agent_reply_cps, defaults.sent_message_ms, defaults.input_clear_ms, defaults.max_animation_ms
             ))
             .wrap(Wrap { trim: false })
             .style(Style::default().fg(DIM)),

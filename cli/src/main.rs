@@ -1,11 +1,11 @@
+mod authentication;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crossterm::{
     cursor::SetCursorStyle,
     event::{
-        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-        EnableFocusChange, EnableMouseCapture, Event, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, Event,
+        PopKeyboardEnhancementFlags,
     },
     execute,
 };
@@ -102,14 +102,7 @@ fn main() -> Result<()> {
     } else {
         Shell::new(storage, config, pr)
     };
-    let terminated = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    for signal in [
-        signal_hook::consts::SIGTERM,
-        signal_hook::consts::SIGHUP,
-        signal_hook::consts::SIGINT,
-    ] {
-        signal_hook::flag::register(signal, terminated.clone())?;
-    }
+    let signals = authentication::Signals::register()?;
     let mut terminal = match ratatui::try_init() {
         Ok(terminal) => terminal,
         Err(error) => {
@@ -131,23 +124,11 @@ fn main() -> Result<()> {
         prior(info);
     }));
     let result = (|| -> Result<()> {
-        execute!(
-            io::stdout(),
-            PushKeyboardEnhancementFlags(
-                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
-                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
-                    | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
-                    | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
-            ),
-            SetCursorStyle::BlinkingBlock,
-            EnableMouseCapture,
-            EnableFocusChange,
-            EnableBracketedPaste
-        )?;
+        authentication::enable()?;
         app.reviews.images.detect();
         let mut focused = true;
         let mut redraw = difu::repaint::Schedule::new(Instant::now());
-        while !app.reviews.quit && !terminated.load(std::sync::atomic::Ordering::Relaxed) {
+        while !app.reviews.quit && !signals.quitting() {
             // Read queued input before maintenance. Poll wakes immediately on a
             // key; active animation deadlines never inherit the idle 50 ms wait.
             let mut input = false;
@@ -160,7 +141,10 @@ fn main() -> Result<()> {
                 input = true;
                 redraw.invalidate();
                 match event::read()? {
-                    Event::Key(key) => app.key(key),
+                    Event::Key(key) => {
+                        focused = true;
+                        app.key(key);
+                    }
                     Event::FocusGained => focused = true,
                     Event::FocusLost => {
                         focused = false;
@@ -176,6 +160,31 @@ fn main() -> Result<()> {
                     break;
                 }
             }
+            if let Some(provider) = app.take_sign_in() {
+                app.agents.cancel_voice();
+                let result = authentication::run(
+                    &mut terminal,
+                    &mut authentication::command(provider),
+                    &signals,
+                    || app.notification_tick(false),
+                );
+                // A permanent shutdown must not start post-auth status workers.
+                if signals.quitting() {
+                    break;
+                }
+                match result {
+                    Ok((success, cancelled)) => app.finish_sign_in(success, cancelled),
+                    Err(_) => app.finish_sign_in(false, false),
+                }
+                // Native auth may have moved focus to a browser. Resume presence only
+                // after the terminal reports focus again (or a deliberate input event).
+                focused = false;
+                redraw.invalidate();
+                if !crossterm::terminal::is_raw_mode_enabled()? {
+                    anyhow::bail!("Cannot restore terminal after sign-in");
+                }
+            }
+            app.notification_tick(focused);
             let sent = app.agents.take_send_repaint();
             if !input && !sent {
                 app.tick_focused(focused);

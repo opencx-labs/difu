@@ -1,6 +1,6 @@
 [package]
 name = "difu"
-version = "0.25.1"
+version = "0.26.0"
 edition = "2024"
 rust-version = "1.90"
 description = "Your diff shifu: Codex agents and guided pull request reviews"
@@ -42,6 +42,12 @@ url = "2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+notify-rust = { version = "4.18", default-features = false, features = ["z"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zbus = "5.19"
 
 [profile.release]
 lto = "thin"

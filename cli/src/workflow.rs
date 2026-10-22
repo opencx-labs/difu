@@ -543,6 +543,7 @@ impl App {
                 }
             }
             WAction::Nav(index) => {
+                self.diff_reading = None;
                 self.workflow.nav = index;
                 self.focus = Focus::Navigation;
                 self.workflow.selection = None;
@@ -552,6 +553,7 @@ impl App {
                 }
             }
             WAction::Cursor(row, side) => {
+                self.diff_reading = None;
                 self.focus = Focus::Content;
                 self.workflow.cursor = Some(row);
                 self.workflow.side = side;
@@ -888,9 +890,10 @@ impl App {
         self.invalidate();
     }
     pub fn workflow_key(&mut self, key: KeyEvent) {
+        use crate::shortcuts::ids::*;
+        let shortcut = self.shortcut(key);
         if self.workflow.busy {
-            if (key.code == KeyCode::Esc
-                || (key.code == KeyCode::Char('x') && key.modifiers.is_empty()))
+            if (key.code == KeyCode::Esc || shortcut == Some(WORKFLOW_CANCEL))
                 && self.workflow.conflict_cancel.is_some()
             {
                 self.workflow_action(WAction::CancelResolution);
@@ -909,17 +912,17 @@ impl App {
         match &mut wizard {
             Wizard::Reviewers(picker) => {
                 let visible = picker.visible();
-                match key.code {
-                    KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
-                    KeyCode::Down => {
+                match shortcut {
+                    Some(NAVIGATION_UP) => picker.selected = picker.selected.saturating_sub(1),
+                    Some(NAVIGATION_DOWN) => {
                         picker.selected = (picker.selected + 1).min(visible.len().saturating_sub(1))
                     }
-                    KeyCode::Char(' ') if key.modifiers.is_empty() => {
+                    Some(WORKFLOW_REVIEWER_TOGGLE) => {
                         if let Some(index) = visible.get(picker.selected) {
                             action = Some(WAction::ToggleReviewer(*index));
                         }
                     }
-                    KeyCode::Enter => action = Some(WAction::Next),
+                    Some(NAVIGATION_ACTIVATE) => action = Some(WAction::Next),
                     _ => {
                         picker.query.key(key);
                         picker.selected = 0;
@@ -927,15 +930,15 @@ impl App {
                 }
             }
             Wizard::Resolve { .. } => {
-                if key.code == KeyCode::Enter {
+                if shortcut == Some(WORKFLOW_RESOLVE) {
                     action = Some(WAction::Resolve);
                 }
             }
             Wizard::Resolving { .. } => {}
-            Wizard::Home(selected) => match key.code {
-                KeyCode::Up => *selected = selected.saturating_sub(1),
-                KeyCode::Down => *selected = selected.saturating_add(1).min(3),
-                KeyCode::Enter => action = Some(WAction::Choose(*selected)),
+            Wizard::Home(selected) => match shortcut {
+                Some(NAVIGATION_UP) => *selected = selected.saturating_sub(1),
+                Some(NAVIGATION_DOWN) => *selected = selected.saturating_add(1).min(3),
+                Some(NAVIGATION_ACTIVATE) => action = Some(WAction::Choose(*selected)),
                 _ => {}
             },
             Wizard::Controls {
@@ -945,21 +948,21 @@ impl App {
                 ..
             } => {
                 let commands = control_commands(&query.text(), *draft);
-                match key.code {
-                    KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                        *selected = selected.saturating_sub(1)
-                    }
-                    KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                match shortcut {
+                    Some(NAVIGATION_UP) => *selected = selected.saturating_sub(1),
+                    Some(NAVIGATION_DOWN) => {
                         *selected = selected
                             .saturating_add(1)
                             .min(commands.len().saturating_sub(1))
                     }
-                    KeyCode::Enter => {
+                    Some(NAVIGATION_ACTIVATE) => {
                         if let Some((id, _)) = commands.get(*selected) {
                             action = Some(WAction::Choose(*id));
                         }
                     }
-                    KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                    _ if key.code == KeyCode::Char('u')
+                        && key.modifiers == KeyModifiers::CONTROL =>
+                    {
                         query.clear();
                         *selected = 0;
                     }
@@ -974,71 +977,63 @@ impl App {
             }
             Wizard::Compose(draft) => {
                 let options = self.mention_options(draft);
-                if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::CONTROL {
-                    action = Some(WAction::RefreshMentions);
-                } else if key.code == KeyCode::Enter
-                    && key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    action = Some(WAction::Next);
-                } else if draft.focus == 0
-                    && !options.is_empty()
-                    && !key.modifiers.contains(KeyModifiers::SHIFT)
-                    && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Tab)
-                {
-                    match key.code {
-                        KeyCode::Up => draft.mention = draft.mention.saturating_sub(1),
-                        KeyCode::Down => draft.mention = (draft.mention + 1).min(options.len() - 1),
-                        KeyCode::Tab => {
-                            if let Some(login) = options.get(draft.mention) {
-                                draft.editor.complete(login);
-                                draft.mention = 0;
-                            }
-                        }
-                        _ => {}
+                match shortcut {
+                    Some(WORKFLOW_MENTIONS_REFRESH) => action = Some(WAction::RefreshMentions),
+                    Some(WORKFLOW_NEXT) => action = Some(WAction::Next),
+                    Some(WORKFLOW_MENTION_PREVIOUS) => {
+                        draft.mention = draft.mention.saturating_sub(1)
                     }
-                } else if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
-                    draft.focus = (draft.focus + 1) % 3;
-                } else if draft.focus == 0 {
-                    draft.editor.key(key);
-                    draft.mention = 0;
-                } else if draft.focus == 1 {
-                    match key.code {
-                        KeyCode::Left | KeyCode::Up => {
-                            draft.choice = draft.choice.saturating_sub(1)
-                        }
-                        KeyCode::Right | KeyCode::Down => {
-                            draft.choice = (draft.choice + 1).min(draft.choices().len() - 1)
-                        }
-                        KeyCode::Enter => draft.focus = 2,
-                        _ => {}
+                    Some(WORKFLOW_MENTION_NEXT) => {
+                        draft.mention = (draft.mention + 1).min(options.len().saturating_sub(1))
                     }
-                } else if key.code == KeyCode::Enter {
-                    action = Some(WAction::Next);
+                    Some(WORKFLOW_MENTION_ACCEPT) => {
+                        if let Some(login) = options.get(draft.mention) {
+                            draft.editor.complete(login);
+                            draft.mention = 0;
+                        }
+                    }
+                    Some(NAVIGATION_NEXT_FOCUS | NAVIGATION_PREVIOUS_FOCUS) => {
+                        draft.focus = (draft.focus + 1) % 3
+                    }
+                    Some(WORKFLOW_CHOICE_PREVIOUS) => draft.choice = draft.choice.saturating_sub(1),
+                    Some(WORKFLOW_CHOICE_NEXT) => {
+                        draft.choice =
+                            (draft.choice + 1).min(draft.choices().len().saturating_sub(1))
+                    }
+                    Some(WORKFLOW_CHOICE_ACCEPT) if draft.focus == 1 => draft.focus = 2,
+                    Some(WORKFLOW_CHOICE_ACCEPT) => action = Some(WAction::Next),
+                    _ if draft.focus == 0 => {
+                        draft.editor.key(key);
+                        draft.mention = 0;
+                    }
+                    _ => {}
                 }
                 self.workflow.drafts.insert(draft.id(), draft.clone());
             }
             Wizard::Confirm { .. } => {
-                if key.code == KeyCode::Enter {
+                if shortcut == Some(WORKFLOW_SUBMIT) {
                     action = Some(WAction::Submit);
                 }
             }
             Wizard::Result { .. } => {
-                if key.code == KeyCode::Enter {
+                if shortcut == Some(WORKFLOW_RESULT_BACK) {
                     action = Some(WAction::Back);
                 }
             }
             Wizard::Trees {
                 entries, selected, ..
-            } => match key.code {
-                KeyCode::Up => *selected = selected.saturating_sub(1),
-                KeyCode::Down => *selected = (*selected + 1).min(entries.len().saturating_sub(1)),
-                KeyCode::Delete | KeyCode::Enter => action = Some(WAction::DeleteOne),
-                KeyCode::Char('a') => action = Some(WAction::DeleteStale),
-                KeyCode::Char('r') if key.modifiers.is_empty() => action = Some(WAction::Trees),
+            } => match shortcut {
+                Some(NAVIGATION_UP) => *selected = selected.saturating_sub(1),
+                Some(NAVIGATION_DOWN) => {
+                    *selected = (*selected + 1).min(entries.len().saturating_sub(1))
+                }
+                Some(WORKFLOW_TREE_DELETE) => action = Some(WAction::DeleteOne),
+                Some(WORKFLOW_TREE_PRUNE) => action = Some(WAction::DeleteStale),
+                Some(WORKFLOW_TREE_REFRESH) => action = Some(WAction::Trees),
                 _ => {}
             },
             Wizard::Delete { .. } => {
-                if key.code == KeyCode::Enter {
+                if shortcut == Some(WORKFLOW_DELETE_CONFIRM) {
                     action = Some(WAction::ConfirmDelete);
                 }
             }
@@ -1139,8 +1134,10 @@ impl App {
                 }
                 if !r.interaction.github_loaded {
                     self.load_viewed();
-                    self.notice =
-                        Notice::info("Loading GitHub Viewed state; press Enter again when ready");
+                    self.notice = Notice::info(format!(
+                        "Loading GitHub Viewed state; press {} again when ready",
+                        self.hint(crate::shortcuts::ids::NAVIGATION_ACTIVATE)
+                    ));
                     return;
                 }
                 let operation = Operation::Viewed {
@@ -1162,8 +1159,11 @@ impl App {
                     return;
                 }
                 let Some(mut anchor) = target.line(self.workflow.side) else {
-                    self.notice =
-                        Notice::info("Choose a side with a code line using Alt+Left/Right");
+                    self.notice = Notice::info(format!(
+                        "Choose a side with a code line using {}/{}",
+                        self.hint(crate::shortcuts::ids::REVIEW_SIDE_LEFT),
+                        self.hint(crate::shortcuts::ids::REVIEW_SIDE_RIGHT)
+                    ));
                     return;
                 };
                 if let Some(start) = &self.workflow.selection
@@ -1233,6 +1233,7 @@ impl App {
     }
 
     pub fn move_diff(&mut self, delta: i32, select: bool) {
+        self.diff_reading = None;
         let Some(doc) = &self.document else {
             return;
         };

@@ -1,8 +1,12 @@
 use super::usage::text_lines;
 use super::*;
 use crate::agents::mcp::{self, Snapshot};
+use crate::shortcuts::{contexts::*, ids::*};
 use crate::ui::YELLOW;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+const MCP_CHOICES: [crate::shortcuts::ActionId; 4] =
+    [MCP_CHOOSE_1, MCP_CHOOSE_2, MCP_CHOOSE_3, MCP_CHOOSE_4];
 
 static REQUEST: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,6 +45,14 @@ impl State {
             scroll: 0,
             maximum: 0,
             checked: Instant::now(),
+        }
+    }
+    pub(super) fn shortcut_context(&self) -> crate::shortcuts::Context {
+        match self.page {
+            Page::Servers => AGENT_MCP,
+            Page::Server(_) => AGENT_MCP_SERVER,
+            Page::Tools(_) => AGENT_MCP_TOOLS,
+            Page::Tool(..) => AGENT_MCP_TOOL,
         }
     }
     fn server(&self) -> Option<&mcp::Server> {
@@ -216,11 +228,12 @@ impl Ui {
         }
     }
     pub(super) fn mcp_key(&mut self, key: KeyEvent) {
+        let shortcut = self.shortcut(key);
         let Some(Modal::Mcp(state)) = &mut self.modal else {
             return;
         };
-        match key.code {
-            KeyCode::Esc | KeyCode::Left | KeyCode::Backspace => {
+        match shortcut {
+            _ if key.code == KeyCode::Esc || shortcut == Some(MCP_BACK) => {
                 let (page, selected) = match &state.page {
                     Page::Servers => {
                         self.modal = None;
@@ -252,20 +265,20 @@ impl Ui {
                 state.navigate(page);
                 state.selected = selected;
             }
-            KeyCode::Char('r') => self.request_mcp(mcp::Action::Refresh),
-            KeyCode::Char('o') => {
+            Some(MCP_REFRESH) => self.request_mcp(mcp::Action::Refresh),
+            Some(MCP_OPEN) => {
                 if let Some(url) = state.data.authorization_url.clone() {
                     self.action(Action::Link(url));
                 }
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            Some(NAVIGATION_UP) => {
                 if matches!(state.page, Page::Tool(..)) {
                     state.scroll = state.scroll.saturating_sub(1);
                 } else {
                     state.selected = state.selected.saturating_sub(1);
                 }
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            Some(NAVIGATION_DOWN) => {
                 if matches!(state.page, Page::Tool(..)) {
                     state.scroll = state.scroll.saturating_add(1).min(state.maximum);
                 } else {
@@ -275,7 +288,9 @@ impl Ui {
                         .min(state.count().saturating_sub(1));
                 }
             }
-            KeyCode::PageUp | KeyCode::PageDown | KeyCode::Home | KeyCode::End => {
+            Some(
+                NAVIGATION_PAGE_UP | NAVIGATION_PAGE_DOWN | NAVIGATION_FIRST | NAVIGATION_LAST,
+            ) => {
                 let maximum = if matches!(state.page, Page::Tool(..)) {
                     state.maximum
                 } else {
@@ -286,19 +301,41 @@ impl Ui {
                 } else {
                     &mut state.selected
                 };
-                *position = match key.code {
-                    KeyCode::Home => 0,
-                    KeyCode::End => maximum,
-                    KeyCode::PageUp => position.saturating_sub(10),
+                *position = match shortcut {
+                    Some(NAVIGATION_FIRST) => 0,
+                    Some(NAVIGATION_LAST) => maximum,
+                    Some(NAVIGATION_PAGE_UP) => position.saturating_sub(10),
                     _ => position.saturating_add(10).min(maximum),
                 };
             }
-            KeyCode::Char(digit @ '1'..='9') if matches!(state.page, Page::Server(_)) => {
-                self.mcp_select(Some((digit as usize) - ('1' as usize)));
+            Some(action) if MCP_CHOICES.contains(&action) => {
+                if let Some(index) = MCP_CHOICES.iter().position(|id| *id == action) {
+                    self.mcp_select(Some(index));
+                }
             }
-            KeyCode::Enter | KeyCode::Right => self.mcp_select(None),
+            Some(NAVIGATION_ACTIVATE | MCP_SELECT) => self.mcp_select(None),
             _ => {}
         }
+    }
+    pub(super) fn mcp_scroll(&mut self, down: bool) {
+        let Some(Modal::Mcp(state)) = &mut self.modal else {
+            return;
+        };
+        let maximum = if matches!(state.page, Page::Tool(..)) {
+            state.maximum
+        } else {
+            state.count().saturating_sub(1)
+        };
+        let position = if matches!(state.page, Page::Tool(..)) {
+            &mut state.scroll
+        } else {
+            &mut state.selected
+        };
+        *position = if down {
+            position.saturating_add(3).min(maximum)
+        } else {
+            position.saturating_sub(3)
+        };
     }
     pub(super) fn mcp_select(&mut self, index: Option<usize>) {
         let Some(Modal::Mcp(state)) = &mut self.modal else {
@@ -356,12 +393,15 @@ impl Ui {
         self.draw_mcp(frame, area);
     }
     pub(super) fn draw_mcp(&mut self, frame: &mut Frame, area: Rect) {
+        let bindings = crate::shortcuts::Bindings::new(&self.shortcut_config);
         let Some(Modal::Mcp(state)) = &mut self.modal else {
             return;
         };
         if area.width == 0 || area.height == 0 {
             return;
         }
+        let context = state.shortcut_context();
+        let hint = |id| bindings.primary_hint_in(id, context);
         let title = match &state.page {
             Page::Servers => "Manage MCP servers".into(),
             Page::Server(name) => format!("{name} MCP Server"),
@@ -395,7 +435,7 @@ impl Ui {
             area.x,
             area.y + area.height.min(3),
             area.width,
-            area.height.saturating_sub(5),
+            area.height.saturating_sub(7),
         );
         let mut lines = Vec::new();
         let mut choices = Vec::new();
@@ -465,7 +505,7 @@ impl Ui {
                         "needs-auth" => "needs authentication".into(),
                         "disabled" => String::new(),
                         "pending" | "starting" => "connecting…".into(),
-                        "failed" => "failed · Enter for details".into(),
+                        "failed" => format!("failed · {} for details", hint(NAVIGATION_ACTIVATE)),
                         _ => "status unavailable".into(),
                     };
                     choices.push((lines.len(), index));
@@ -559,7 +599,16 @@ impl Ui {
                                 },
                                 Style::default().fg(ACCENT),
                             ),
-                            Span::styled(format!("{}. ", index + 1), Style::default().fg(DIM)),
+                            Span::styled(
+                                format!(
+                                    "{}. ",
+                                    MCP_CHOICES
+                                        .get(index)
+                                        .map(|id| hint(*id))
+                                        .unwrap_or_default()
+                                ),
+                                Style::default().fg(DIM),
+                            ),
                             Span::styled(
                                 label.clone(),
                                 Style::default().fg(if state.selected == index {
@@ -636,9 +685,9 @@ impl Ui {
         let footer_y = if state.maximum == 0 {
             content_end
                 .saturating_add(2)
-                .min(area.bottom().saturating_sub(1))
+                .min(area.bottom().saturating_sub(3))
         } else {
-            area.bottom().saturating_sub(1)
+            area.bottom().saturating_sub(3)
         };
         if let Some((row, _)) = choices.iter().find(|(_, index)| *index == state.selected) {
             if *row < state.scroll {
@@ -663,7 +712,8 @@ impl Ui {
             Some(state.activity.to_owned())
         } else if state.data.authorization_url.is_some() {
             Some(format!(
-                "o Open authentication for {}",
+                "{} Open authentication for {}",
+                hint(MCP_OPEN),
                 state
                     .data
                     .authentication_server
@@ -682,23 +732,38 @@ impl Ui {
                 Rect::new(area.x, footer_y.saturating_sub(1), area.width, 1),
             );
         }
-        let hint = if state.maximum > 0 {
-            format!(
-                "↑/↓ to navigate · Enter to select · Esc to back · r refresh   {}/{}",
-                state.selected + 1,
-                state.count().max(1)
-            )
+        let select = if matches!(state.page, Page::Tool(..)) {
+            String::new()
         } else {
-            "↑/↓ to navigate · Enter to select · Esc to back · r refresh".into()
+            format!(
+                " · {}/{} select",
+                hint(NAVIGATION_ACTIVATE),
+                hint(MCP_SELECT)
+            )
         };
+        let hint = format!(
+            "{}/{} navigate{} · {}/Esc back · {} refresh",
+            hint(NAVIGATION_UP),
+            hint(NAVIGATION_DOWN),
+            select,
+            hint(MCP_BACK),
+            hint(MCP_REFRESH)
+        );
         if area.height > 1 {
             frame.render_widget(
-                Paragraph::new(hint).style(
-                    Style::default()
-                        .fg(DIM)
-                        .add_modifier(ratatui::style::Modifier::ITALIC),
+                Paragraph::new(hint)
+                    .wrap(ratatui::widgets::Wrap { trim: true })
+                    .style(
+                        Style::default()
+                            .fg(DIM)
+                            .add_modifier(ratatui::style::Modifier::ITALIC),
+                    ),
+                Rect::new(
+                    area.x,
+                    footer_y,
+                    area.width,
+                    area.bottom().saturating_sub(footer_y).min(3),
                 ),
-                Rect::new(area.x, footer_y, area.width, 1),
             );
         }
         for (row, index) in choices {
@@ -842,6 +907,646 @@ mod tests {
             ..Snapshot::default()
         })
     }
+    #[test]
+    fn mcp_numbered_actions_respect_authentication_and_disabled_capabilities() -> Result<()> {
+        for (status, action, code) in [
+            ("needs-auth", MCP_CHOOSE_2, '2'),
+            ("disabled", MCP_CHOOSE_3, '3'),
+        ] {
+            for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                let (mut ui, _dir, _) = shortcut_tests::binding_fixture(action, phase)?;
+                let mut state = State::new("one".into(), provider::Provider::Claude);
+                state.data = snapshot()?;
+                let server = state.data.servers.first_mut().context("server")?;
+                server.status = status.into();
+                server.can_authenticate = true;
+                state.page = Page::Server("fixture".into());
+                ui.modal = Some(Modal::Mcp(Box::new(state)));
+                if custom {
+                    ui.key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE));
+                    assert!(matches!(&ui.modal, Some(Modal::Mcp(s)) if !s.loading));
+                }
+                let request = shortcut_tests::request_at_boundary(
+                    &mut ui,
+                    KeyEvent::new(
+                        if custom {
+                            KeyCode::F(12)
+                        } else {
+                            KeyCode::Char(code)
+                        },
+                        KeyModifiers::NONE,
+                    ),
+                )?;
+                assert!(match request {
+                    Request::Mcp {
+                        id,
+                        action: mcp::Action::Authenticate { name },
+                    } => status == "needs-auth" && id == "one" && name == "fixture",
+                    Request::Mcp {
+                        id,
+                        action:
+                            mcp::Action::Toggle {
+                                name,
+                                enabled: true,
+                            },
+                    } => status == "disabled" && id == "one" && name == "fixture",
+                    _ => false,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_back_rebinding_keeps_each_parent_page_and_modal_escape() -> Result<()> {
+        for page in [
+            Page::Servers,
+            Page::Server("fixture".into()),
+            Page::Tools("fixture".into()),
+            Page::Tool("fixture".into(), "hello".into()),
+        ] {
+            for code in [KeyCode::Left, KeyCode::Backspace] {
+                for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                    let (mut ui, _dir, _) = shortcut_tests::binding_fixture(MCP_BACK, phase)?;
+                    let mut state = State::new("one".into(), provider::Provider::Claude);
+                    state.data = snapshot()?;
+                    state.page = page.clone();
+                    ui.modal = Some(Modal::Mcp(Box::new(state)));
+                    if custom {
+                        ui.key(KeyEvent::new(code, KeyModifiers::NONE));
+                        assert!(matches!(&ui.modal, Some(Modal::Mcp(s)) if s.page == page));
+                    }
+                    ui.key(KeyEvent::new(
+                        if custom { KeyCode::F(12) } else { code },
+                        KeyModifiers::NONE,
+                    ));
+                    match page {
+                        Page::Servers => assert!(ui.modal.is_none()),
+                        Page::Server(_) => assert!(
+                            matches!(&ui.modal, Some(Modal::Mcp(s)) if s.page == Page::Servers)
+                        ),
+                        Page::Tools(_) => assert!(
+                            matches!(&ui.modal, Some(Modal::Mcp(s)) if s.page == Page::Server("fixture".into()))
+                        ),
+                        Page::Tool(..) => assert!(
+                            matches!(&ui.modal, Some(Modal::Mcp(s)) if s.page == Page::Tools("fixture".into()))
+                        ),
+                    }
+                    for _ in 0..4 {
+                        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                    }
+                    assert!(ui.modal.is_none());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_capabilities_offer_at_most_four_actions_and_unknown_slots_stay_opaque() -> Result<()> {
+        let (mut ui, _dir, mut config) = shortcut_tests::fixture(None)?;
+        let mut state = State::new("one".into(), provider::Provider::Claude);
+        state.data = snapshot()?;
+        state.page = Page::Server("fixture".into());
+        for status in ["connected", "disabled", "needs-auth"] {
+            for flags in 0..16 {
+                let server = state.data.servers.first_mut().context("server")?;
+                server.status = status.into();
+                server.can_authenticate = flags & 1 != 0;
+                server.can_clear_auth = flags & 2 != 0;
+                server.can_reconnect = flags & 4 != 0;
+                server.can_toggle = flags & 8 != 0;
+                assert!(state.actions().len() <= 4);
+            }
+        }
+        ui.modal = Some(Modal::Mcp(Box::new(state)));
+        for digit in '5'..='9' {
+            let id = format!("mcp.choose_{digit}");
+            assert!(
+                crate::settings::spec(&crate::settings::SettingId::Shortcut(id.clone())).is_none()
+            );
+            config.preferences.keyboard.bindings.insert(
+                id,
+                crate::shortcuts::key(crate::settings::BindingKey::Function(12), 0),
+            );
+            ui.key(KeyEvent::new(KeyCode::Char(digit), KeyModifiers::NONE));
+            assert!(
+                matches!(&ui.modal, Some(Modal::Mcp(s)) if s.page == Page::Server("fixture".into()) && s.selected == 0 && !s.loading)
+            );
+        }
+        ui.storage.update_config(|saved| *saved = config.clone())?;
+        let mut draft = ui.storage.settings_draft()?;
+        draft.set(
+            crate::settings::SettingId::Shortcut(MCP_SELECT.0.into()),
+            crate::settings::SettingValue::Shortcut(Some(crate::shortcuts::key(
+                crate::settings::BindingKey::Function(11),
+                0,
+            ))),
+        )?;
+        let saved = ui.storage.save_settings_draft(&mut draft)?;
+        for digit in '5'..='9' {
+            assert_eq!(
+                saved
+                    .preferences
+                    .keyboard
+                    .bindings
+                    .get(&format!("mcp.choose_{digit}")),
+                Some(&crate::shortcuts::key(
+                    crate::settings::BindingKey::Function(12),
+                    0
+                ))
+            );
+        }
+        ui.apply_settings(&saved);
+        ui.key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        assert!(
+            matches!(&ui.modal, Some(Modal::Mcp(s)) if s.page == Page::Server("fixture".into()) && s.selected == 0 && !s.loading)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_navigation_affects_the_actual_server_list_action_list_or_source_scroll() -> Result<()> {
+        for page in ["servers", "actions", "source"] {
+            for (action, code, want_list, want_actions, want_source) in [
+                (NAVIGATION_UP, KeyCode::Up, 4, 1, 14),
+                (NAVIGATION_DOWN, KeyCode::Down, 6, 3, 16),
+                (NAVIGATION_PAGE_UP, KeyCode::PageUp, 0, 0, 5),
+                (NAVIGATION_PAGE_DOWN, KeyCode::PageDown, 15, 3, 25),
+                (NAVIGATION_FIRST, KeyCode::Home, 0, 0, 0),
+                (NAVIGATION_LAST, KeyCode::End, 19, 3, 30),
+            ] {
+                for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                    let (mut ui, _dir, _) = shortcut_tests::binding_fixture(action, phase)?;
+                    let mut state = State::new("one".into(), provider::Provider::Claude);
+                    state.data = snapshot()?;
+                    let template = state.data.servers.first().context("server")?.clone();
+                    if page == "servers" {
+                        state.data.servers = (0..20)
+                            .map(|i| {
+                                let mut server = template.clone();
+                                server.name = format!("fixture-{i:02}");
+                                server
+                            })
+                            .collect();
+                        state.selected = 5;
+                    } else if page == "actions" {
+                        state.page = Page::Server("fixture".into());
+                        state.selected = 2;
+                    } else {
+                        state.page = Page::Tool("fixture".into(), "hello".into());
+                        state.scroll = 15;
+                        state.maximum = 30;
+                    }
+                    ui.modal = Some(Modal::Mcp(Box::new(state)));
+                    if custom {
+                        ui.key(KeyEvent::new(code, KeyModifiers::NONE));
+                        assert!(
+                            matches!(&ui.modal, Some(Modal::Mcp(s)) if (page == "servers" && s.selected == 5) || (page == "actions" && s.selected == 2) || (page == "source" && s.scroll == 15))
+                        );
+                    }
+                    ui.key(KeyEvent::new(
+                        if custom { KeyCode::F(12) } else { code },
+                        KeyModifiers::NONE,
+                    ));
+                    let Some(Modal::Mcp(state)) = &ui.modal else {
+                        anyhow::bail!("MCP")
+                    };
+                    if page == "servers" {
+                        assert_eq!(state.selected, want_list);
+                    } else if page == "actions" {
+                        assert_eq!(state.selected, want_actions);
+                    } else {
+                        assert_eq!(state.scroll, want_source);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_page_contexts_keep_early_actions_copy_guards_and_safe_escape() -> Result<()> {
+        for page in [
+            Page::Servers,
+            Page::Server("fixture".into()),
+            Page::Tools("fixture".into()),
+            Page::Tool("fixture".into(), "hello".into()),
+        ] {
+            for (action, code) in [
+                (AGENTS_SIDEBAR, KeyCode::Char('[')),
+                (AGENTS_CHANGES, KeyCode::Char('d')),
+                (AGENTS_MODELS, KeyCode::Char('m')),
+                (QUESTION_OPEN, KeyCode::Up),
+            ] {
+                for custom in [false, true] {
+                    let (mut ui, _dir, _) = shortcut_tests::fixture(custom.then_some(action))?;
+                    ui.model_completion.options.push(crate::model::ModelInfo {
+                        id: "fixture-model".into(),
+                        name: "Fixture model".into(),
+                        efforts: vec!["medium".into()],
+                    });
+                    let mut state = State::new("one".into(), provider::Provider::Claude);
+                    state.data = snapshot()?;
+                    state.page = page.clone();
+                    ui.modal = Some(Modal::Mcp(Box::new(state)));
+                    let context = ui.shortcut_context();
+                    if custom {
+                        ui.key(KeyEvent::new(code, KeyModifiers::ALT));
+                        assert_eq!(ui.shortcut_context(), context);
+                        assert!(ui.list_visible && !ui.changes_visible);
+                    }
+                    ui.key(KeyEvent::new(
+                        if custom { KeyCode::F(12) } else { code },
+                        if custom {
+                            KeyModifiers::NONE
+                        } else {
+                            KeyModifiers::ALT
+                        },
+                    ));
+                    match action {
+                        AGENTS_SIDEBAR => assert!(!ui.list_visible),
+                        AGENTS_CHANGES => assert!(ui.changes_visible),
+                        AGENTS_MODELS => assert!(matches!(ui.modal, Some(Modal::ModelPicker(_)))),
+                        QUESTION_OPEN => assert!(matches!(ui.modal, Some(Modal::Pending { .. }))),
+                        _ => anyhow::bail!("action"),
+                    }
+                }
+            }
+            for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                let (mut ui, _dir, _) = shortcut_tests::binding_fixture(SELECTION_COPY, phase)?;
+                let mut state = State::new("one".into(), provider::Provider::Claude);
+                state.data = snapshot()?;
+                state.page = page.clone();
+                ui.positions
+                    .get_mut("one")
+                    .context("draft")?
+                    .draft
+                    .key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+                ui.modal = Some(Modal::Mcp(Box::new(state)));
+                ui.key(KeyEvent::new(
+                    if custom {
+                        KeyCode::F(12)
+                    } else {
+                        KeyCode::Char('c')
+                    },
+                    if custom {
+                        KeyModifiers::NONE
+                    } else {
+                        KeyModifiers::SUPER
+                    },
+                ));
+                assert!(ui.clipboard.is_none(), "never copy the hidden draft");
+                ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                match &page {
+                    Page::Servers => assert!(ui.modal.is_none()),
+                    Page::Server(_) => {
+                        assert!(matches!(&ui.modal, Some(Modal::Mcp(s)) if s.page == Page::Servers))
+                    }
+                    Page::Tools(_) => assert!(
+                        matches!(&ui.modal, Some(Modal::Mcp(s)) if s.page == Page::Server("fixture".into()))
+                    ),
+                    Page::Tool(..) => assert!(
+                        matches!(&ui.modal, Some(Modal::Mcp(s)) if s.page == Page::Tools("fixture".into()))
+                    ),
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_mouse_wheels_and_clicks_survive_keyboard_rebinding() -> Result<()> {
+        let (mut ui, _dir, mut config) = shortcut_tests::fixture(Some(NAVIGATION_DOWN))?;
+        config.preferences.keyboard.bindings.insert(
+            NAVIGATION_UP.0.into(),
+            crate::shortcuts::key(crate::settings::BindingKey::Function(11), 0),
+        );
+        config.preferences.keyboard.bindings.insert(
+            NAVIGATION_ACTIVATE.0.into(),
+            crate::shortcuts::key(crate::settings::BindingKey::Function(10), 0),
+        );
+        ui.apply_settings(&config);
+        let mut state = State::new("one".into(), provider::Provider::Claude);
+        state.data = snapshot()?;
+        state.data.servers.first_mut().context("server")?.tools = (0..20)
+            .map(|i| mcp::Tool {
+                name: format!("tool-{i}"),
+                description: String::new(),
+                schema: None,
+            })
+            .collect();
+        state.page = Page::Tools("fixture".into());
+        ui.modal = Some(Modal::Mcp(Box::new(state)));
+        let wheel = |kind| MouseEvent {
+            kind,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        ui.mouse(wheel(MouseEventKind::ScrollDown));
+        assert!(matches!(&ui.modal, Some(Modal::Mcp(s)) if s.selected == 3));
+        ui.mouse(wheel(MouseEventKind::ScrollUp));
+        assert!(matches!(&ui.modal, Some(Modal::Mcp(s)) if s.selected == 0));
+        ui.hits = vec![(Rect::new(1, 1, 2, 1), Action::McpSelect(2))];
+        ui.mouse(wheel(MouseEventKind::Down(MouseButton::Left)));
+        assert!(
+            matches!(&ui.modal, Some(Modal::Mcp(s)) if s.page == Page::Tool("fixture".into(), "tool-2".into()))
+        );
+        if let Some(Modal::Mcp(state)) = &mut ui.modal {
+            state.maximum = 20;
+        }
+        ui.mouse(wheel(MouseEventKind::ScrollDown));
+        assert!(matches!(&ui.modal, Some(Modal::Mcp(s)) if s.scroll == 3));
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_refresh_and_select_use_each_real_page_context() -> Result<()> {
+        for page in [
+            Page::Servers,
+            Page::Server("fixture".into()),
+            Page::Tools("fixture".into()),
+            Page::Tool("fixture".into(), "hello".into()),
+        ] {
+            for (action, code) in [
+                (MCP_REFRESH, KeyCode::Char('r')),
+                (MCP_SELECT, KeyCode::Right),
+                (NAVIGATION_ACTIVATE, KeyCode::Enter),
+            ] {
+                for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                    let (mut ui, _dir, _) = shortcut_tests::binding_fixture(action, phase)?;
+                    let mut state = State::new("one".into(), provider::Provider::Claude);
+                    state.data = snapshot()?;
+                    state.page = page.clone();
+                    ui.modal = Some(Modal::Mcp(Box::new(state)));
+                    if custom {
+                        ui.key(KeyEvent::new(code, KeyModifiers::NONE));
+                        assert!(
+                            matches!(&ui.modal, Some(Modal::Mcp(s)) if s.page == page && !s.loading)
+                        );
+                    }
+                    let key = KeyEvent::new(
+                        if custom { KeyCode::F(12) } else { code },
+                        KeyModifiers::NONE,
+                    );
+                    if action == MCP_REFRESH {
+                        let request = shortcut_tests::request_at_boundary(&mut ui, key)?;
+                        assert!(
+                            matches!(request, Request::Mcp { id, action: mcp::Action::Refresh } if id == "one")
+                        );
+                    } else {
+                        ui.key(key);
+                        let Some(Modal::Mcp(state)) = &ui.modal else {
+                            anyhow::bail!("panel")
+                        };
+                        match &page {
+                            Page::Servers => assert_eq!(state.page, Page::Server("fixture".into())),
+                            Page::Server(_) => {
+                                assert_eq!(state.page, Page::Tools("fixture".into()))
+                            }
+                            Page::Tools(_) => {
+                                assert_eq!(state.page, Page::Tool("fixture".into(), "hello".into()))
+                            }
+                            Page::Tool(..) => assert_eq!(state.page, page),
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_open_uses_exact_validated_url_and_rebinding_removes_old_launcher_key() -> Result<()> {
+        for page in [
+            Page::Servers,
+            Page::Server("fixture".into()),
+            Page::Tools("fixture".into()),
+            Page::Tool("fixture".into(), "hello".into()),
+        ] {
+            for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                let launch = crate::process::fixture::UrlScope::new()?;
+                let (mut ui, _dir, _) = shortcut_tests::binding_fixture(MCP_OPEN, phase)?;
+                let mut state = State::new("one".into(), provider::Provider::Claude);
+                state.data = snapshot()?;
+                state.page = page.clone();
+                state.data.authorization_url = Some(launch.url.clone());
+                ui.modal = Some(Modal::Mcp(Box::new(state)));
+                if custom {
+                    ui.key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+                    assert!(
+                        launch
+                            .receiver
+                            .recv_timeout(Duration::from_millis(30))
+                            .is_err()
+                    );
+                }
+                ui.key(KeyEvent::new(
+                    if custom {
+                        KeyCode::F(12)
+                    } else {
+                        KeyCode::Char('o')
+                    },
+                    KeyModifiers::NONE,
+                ));
+                assert_eq!(
+                    launch.receiver.recv_timeout(Duration::from_secs(3))?,
+                    launch.url
+                );
+            }
+        }
+        let cancelled = crate::process::fixture::UrlScope::new()?;
+        let cancel = crate::process::Cancel::default();
+        cancel.cancel();
+        assert!(crate::github::open_url(&cancelled.url, &cancel).is_err());
+        assert!(
+            cancelled
+                .receiver
+                .recv_timeout(Duration::from_millis(30))
+                .is_err()
+        );
+        let launch = crate::process::fixture::UrlScope::new()?;
+        let url = launch.url.clone();
+        drop(launch);
+        assert!(
+            crate::github::open_url(&url, &crate::process::Cancel::default()).is_err(),
+            "late fixture launch fails closed"
+        );
+        assert!(
+            crate::github::open_url("file:///tmp/fixture", &crate::process::Cancel::default())
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_action_keys_replace_old_aliases_and_reach_the_existing_boundary() -> Result<()> {
+        use crate::shortcuts::ids::*;
+        for (action, code, want) in [
+            (MCP_REFRESH, 'r', "refresh"),
+            (MCP_CHOOSE_1, '1', "tools"),
+            (MCP_CHOOSE_2, '2', "clear"),
+            (MCP_CHOOSE_3, '3', "reconnect"),
+            (MCP_CHOOSE_4, '4', "disable"),
+        ] {
+            for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                let (mut ui, _dir, _) = shortcut_tests::binding_fixture(action, phase)?;
+                let mut state = State::new("one".into(), provider::Provider::Claude);
+                state.data = snapshot()?;
+                state.navigate(Page::Server("fixture".into()));
+                ui.modal = Some(Modal::Mcp(Box::new(state)));
+                if custom {
+                    ui.key(KeyEvent::new(KeyCode::Char(code), KeyModifiers::NONE));
+                    assert!(
+                        matches!(&ui.modal, Some(Modal::Mcp(s)) if s.page == Page::Server("fixture".into()) && s.selected == 0 && !s.loading)
+                    );
+                }
+                let key = KeyEvent::new(
+                    if custom {
+                        KeyCode::F(12)
+                    } else {
+                        KeyCode::Char(code)
+                    },
+                    KeyModifiers::NONE,
+                );
+                if want == "tools" {
+                    ui.key(key);
+                    assert!(
+                        matches!(&ui.modal, Some(Modal::Mcp(s)) if s.page == Page::Tools("fixture".into()) && !s.loading)
+                    );
+                } else {
+                    let request = shortcut_tests::request_at_boundary(&mut ui, key)?;
+                    let Request::Mcp { id, action } = request else {
+                        anyhow::bail!("MCP request")
+                    };
+                    assert_eq!(id, "one");
+                    match want {
+                        "refresh" => assert!(matches!(action, mcp::Action::Refresh)),
+                        "clear" => assert!(
+                            matches!(action, mcp::Action::ClearAuth { name } if name == "fixture")
+                        ),
+                        "reconnect" => assert!(
+                            matches!(action, mcp::Action::Reconnect { name } if name == "fixture")
+                        ),
+                        "disable" => assert!(
+                            matches!(action, mcp::Action::Toggle { name, enabled: false } if name == "fixture")
+                        ),
+                        _ => anyhow::bail!("expectation"),
+                    }
+                }
+                assert_eq!(
+                    ui.positions.get("one").context("draft")?.draft.text(),
+                    "unsent draft"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_back_select_and_shared_navigation_replace_every_legacy_alias() -> Result<()> {
+        use crate::shortcuts::ids::*;
+        for (action, aliases, start, want) in [
+            (MCP_BACK, vec![KeyCode::Left, KeyCode::Backspace], 5, 0),
+            (MCP_SELECT, vec![KeyCode::Right], 5, 0),
+            (NAVIGATION_ACTIVATE, vec![KeyCode::Enter], 5, 0),
+            (NAVIGATION_UP, vec![KeyCode::Up, KeyCode::Char('k')], 5, 4),
+            (
+                NAVIGATION_DOWN,
+                vec![KeyCode::Down, KeyCode::Char('j')],
+                5,
+                6,
+            ),
+            (NAVIGATION_PAGE_UP, vec![KeyCode::PageUp], 15, 5),
+            (NAVIGATION_PAGE_DOWN, vec![KeyCode::PageDown], 5, 15),
+            (NAVIGATION_FIRST, vec![KeyCode::Home], 5, 0),
+            (NAVIGATION_LAST, vec![KeyCode::End], 5, 19),
+        ] {
+            for alias in aliases {
+                for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                    let (mut ui, _dir, _) = shortcut_tests::binding_fixture(action, phase)?;
+                    let mut state = State::new("one".into(), provider::Provider::Claude);
+                    state.data = snapshot()?;
+                    let server = state.data.servers.first_mut().context("server")?;
+                    server.tools = (0..20)
+                        .map(|i| mcp::Tool {
+                            name: format!("tool-{i}"),
+                            description: String::new(),
+                            schema: None,
+                        })
+                        .collect();
+                    state.page = Page::Tools("fixture".into());
+                    state.selected = start;
+                    ui.modal = Some(Modal::Mcp(Box::new(state)));
+                    if custom {
+                        ui.key(KeyEvent::new(alias, KeyModifiers::NONE));
+                        assert!(
+                            matches!(&ui.modal, Some(Modal::Mcp(s)) if s.page == Page::Tools("fixture".into()) && s.selected == start)
+                        );
+                    }
+                    ui.key(KeyEvent::new(
+                        if custom { KeyCode::F(12) } else { alias },
+                        KeyModifiers::NONE,
+                    ));
+                    let Some(Modal::Mcp(s)) = &ui.modal else {
+                        anyhow::bail!("MCP panel")
+                    };
+                    if action == MCP_BACK {
+                        assert_eq!(s.page, Page::Server("fixture".into()));
+                    } else if action == MCP_SELECT || action == NAVIGATION_ACTIVATE {
+                        assert_eq!(
+                            s.page,
+                            Page::Tool("fixture".into(), format!("tool-{start}"))
+                        );
+                    } else {
+                        assert_eq!(s.selected, want);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_hints_render_the_effective_page_bindings() -> Result<()> {
+        use crate::shortcuts::ids::*;
+        for action in [
+            MCP_REFRESH,
+            MCP_OPEN,
+            MCP_BACK,
+            MCP_SELECT,
+            MCP_CHOOSE_1,
+            MCP_CHOOSE_2,
+            MCP_CHOOSE_3,
+            MCP_CHOOSE_4,
+            NAVIGATION_UP,
+            NAVIGATION_DOWN,
+            NAVIGATION_ACTIVATE,
+        ] {
+            let (mut ui, _dir, _) = shortcut_tests::fixture(Some(action))?;
+            let mut state = State::new("one".into(), provider::Provider::Claude);
+            state.data = snapshot()?;
+            state.data.authorization_url = Some("https://fixture.invalid/authorize".into());
+            state.navigate(Page::Server("fixture".into()));
+            ui.modal = Some(Modal::Mcp(Box::new(state)));
+            for width in [80, 160] {
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 40))?;
+                terminal.draw(|frame| ui.draw_mcp(frame, frame.area()))?;
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(text.contains("F12"), "{action:?} width={width}: {text}");
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "exports native terminal buffers for visual review; requires DIFU_MCP_PREVIEW_DIR"]
     fn export_mcp_visual_preview() -> Result<()> {

@@ -24,12 +24,18 @@ struct Leaving {
     rows: Vec<Line<'static>>,
     started: Instant,
     duration: Duration,
+    /// Keep the answered rows suppressed until delivery resolves, even when
+    /// a preference refresh stops their visual effect immediately.
+    settled: bool,
 }
 impl Leaving {
     fn done(&self, now: Instant) -> bool {
-        now >= self.started + self.duration + flap::LIFETIME
+        self.settled || now >= self.started + self.duration + flap::LIFETIME
     }
     fn frame(&self, now: Instant) -> Vec<Line<'static>> {
+        if self.settled {
+            return Vec::new();
+        }
         let mut rows = self.rows.clone();
         let total = flap::glyphs(&rows).len();
         flap::vanish(
@@ -45,6 +51,14 @@ impl Leaving {
     }
 }
 impl Flip {
+    pub(super) fn settle_opening(&mut self) {
+        self.board = flap::Board::default();
+    }
+    pub(super) fn settle_leaving(&mut self) {
+        if let Some(leaving) = &mut self.leaving {
+            leaving.settled = true;
+        }
+    }
     pub(super) fn animating(&self, now: Instant) -> bool {
         self.leaving
             .as_ref()
@@ -331,19 +345,19 @@ impl Ui {
         }
     }
     pub(super) fn question_key(&mut self, key: KeyEvent) -> bool {
+        use crate::shortcuts::ids::*;
+        let action = self.shortcut(key);
         if !self.inline_question() {
             return false;
         }
-        if key.modifiers.contains(KeyModifiers::ALT)
-            && matches!(key.code, KeyCode::Up | KeyCode::Down)
-        {
+        if matches!(action, Some(QUESTION_PREVIOUS | QUESTION_NEXT)) {
             let index = self.question_index().unwrap_or(0);
-            if key.code == KeyCode::Down && index == 0 {
+            if action == Some(QUESTION_NEXT) && index == 0 {
                 self.remember_answers();
                 self.modal = None;
                 self.focus = Focus::Composer;
             } else {
-                let next = if key.code == KeyCode::Up {
+                let next = if action == Some(QUESTION_PREVIOUS) {
                     (index + 1).min(self.question_slots().len().saturating_sub(1))
                 } else {
                     index - 1
@@ -352,7 +366,7 @@ impl Ui {
             }
             return true;
         }
-        if key.code == KeyCode::Char(']') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if action == Some(QUESTION_SKIP) {
             self.submit_question(true);
             return true;
         }
@@ -366,17 +380,17 @@ impl Ui {
             self.focus = Focus::Composer;
             return true;
         }
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        if matches!(action, Some(QUESTION_NEXT_FIELD | QUESTION_PREVIOUS_FIELD)) {
             let count = self.question_slots().len().max(1);
             let index = self.question_index().unwrap_or(0);
-            self.open_question(if key.code == KeyCode::Tab {
+            self.open_question(if action == Some(QUESTION_NEXT_FIELD) {
                 (index + 1) % count
             } else {
                 (index + count - 1) % count
             });
             return true;
         }
-        if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
+        if action == Some(QUESTION_SUBMIT) {
             self.submit_question(false);
             return true;
         }
@@ -387,21 +401,15 @@ impl Ui {
             self.question_reveal = true;
             return true;
         }
-        if key.code == KeyCode::Char(' ')
-            && key.modifiers.is_empty()
-            && self.toggle_question_check()
-        {
+        if action == Some(QUESTION_TOGGLE) && self.toggle_question_check() {
             self.remember_answers();
             return true;
         }
-        if key.code == KeyCode::Char('n')
-            && key.modifiers.is_empty()
-            && self.question_note_key().is_some()
-        {
+        if action == Some(QUESTION_NOTE) && self.question_note_key().is_some() {
             self.open_question_note();
             return true;
         }
-        self.question_reveal = !matches!(key.code, KeyCode::PageUp | KeyCode::PageDown);
+        self.question_reveal = !matches!(action, Some(NAVIGATION_PAGE_UP | NAVIGATION_PAGE_DOWN));
         if let Some(Modal::Approval {
             pending,
             field,
@@ -419,11 +427,11 @@ impl Ui {
                 .and_then(|q| q.get("options"))
                 .and_then(Value::as_array)
                 .map_or(0, Vec::len);
-            match key.code {
-                KeyCode::Up if key.modifiers.is_empty() => *selected = selected.saturating_sub(1),
-                KeyCode::Down if key.modifiers.is_empty() => *selected = (*selected + 1).min(count),
-                KeyCode::PageUp => *scroll = scroll.saturating_sub(3),
-                KeyCode::PageDown => *scroll = scroll.saturating_add(3),
+            match action {
+                Some(NAVIGATION_UP) => *selected = selected.saturating_sub(1),
+                Some(NAVIGATION_DOWN) => *selected = (*selected + 1).min(count),
+                Some(NAVIGATION_PAGE_UP) => *scroll = scroll.saturating_sub(3),
+                Some(NAVIGATION_PAGE_DOWN) => *scroll = scroll.saturating_add(3),
                 _ => {
                     *selected = count;
                     if let Some(answer) = answers.get_mut(*field) {
@@ -468,13 +476,15 @@ impl Ui {
         let question_id = question_id.to_owned();
         let index = self.question_index().unwrap_or(0);
         self.remember_answers();
-        let clear = self.tweaks.capped(self.tweaks.input_clear_ms);
+        let tweaks = self.preferences.motion.tweaks(self.tweaks);
+        let clear = tweaks.capped(tweaks.input_clear_ms);
         if clear > 0 && !self.question_flip.drawn.is_empty() {
             self.question_flip.leaving = Some(Leaving {
                 session: id.clone(),
                 rows: self.question_flip.drawn.clone(),
                 started: Instant::now(),
                 duration: Duration::from_millis(u64::from(clear)),
+                settled: false,
             });
         }
         self.question_send = Some((id.clone(), request.clone(), question_id.clone(), index));
@@ -785,7 +795,7 @@ impl Ui {
             _ => None,
         };
         let sending = self.question_send.is_some();
-        let tweaks = self.tweaks;
+        let tweaks = self.preferences.motion.tweaks(self.tweaks);
         let flip = &mut self.question_flip;
         if let Some((rows, ..)) = &shown {
             flip.drawn.clone_from(rows);
@@ -878,22 +888,146 @@ impl Ui {
         *scroll
     }
     fn draw_question_bar(&mut self, frame: &mut Frame, area: Rect) {
+        use crate::shortcuts::{Bindings, ids::*};
+        let bindings = Bindings::new(&self.shortcut_config);
+        let active_hint = |id| bindings.primary_hint_in(id, self.shortcut_context());
+        let hint = if self.question_send.is_some() {
+            "Sending answer…".into()
+        } else if self.question_note_focused {
+            format!(
+                "{} submit with note · Esc choices · {}/{} questions",
+                active_hint(QUESTION_SUBMIT),
+                active_hint(QUESTION_PREVIOUS),
+                active_hint(QUESTION_NEXT)
+            )
+        } else if area.width < 80 {
+            format!(
+                "{} submit · {} note · Esc back",
+                active_hint(QUESTION_SUBMIT),
+                active_hint(QUESTION_NOTE)
+            )
+        } else {
+            format!(
+                "{}{} add note · {} submit · {} skip · {} previous/input · {} next",
+                if self.multi_select_key().is_some() {
+                    format!("{} choose · ", active_hint(QUESTION_TOGGLE))
+                } else {
+                    String::new()
+                },
+                active_hint(QUESTION_NOTE),
+                active_hint(QUESTION_SUBMIT),
+                active_hint(QUESTION_SKIP),
+                active_hint(QUESTION_NEXT),
+                active_hint(QUESTION_PREVIOUS)
+            )
+        };
         self.button(
             frame,
             Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
-            if self.question_send.is_some() {
-                "Sending answer…"
-            } else {
-                if self.question_note_focused {
-                    "Enter submit with note · Esc choices · Alt+↑↓ questions"
-                } else if self.multi_select_key().is_some() {
-                    "Space choose · n add note · Enter submit · Ctrl+] skip · Alt+↓ previous/input · Alt+↑ next"
-                } else {
-                    "n add note · Enter submit · Ctrl+] skip · Alt+↓ previous/input · Alt+↑ next"
-                }
-            },
+            &hint,
             Action::SubmitQuestion(false),
             false,
         );
+    }
+}
+
+#[cfg(test)]
+mod settings_refresh_tests {
+    use super::*;
+    use anyhow::Context;
+    #[test]
+    fn committed_refresh_settles_clearing_without_redisplaying_an_inflight_answer()
+    -> anyhow::Result<()> {
+        for change in 0..5 {
+            let dir = tempfile::tempdir()?;
+            let storage = Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().into(),
+            };
+            let mut ui = Ui::new(storage.clone(), &Config::default());
+            let mut session = Session::new(
+                "one".into(),
+                super::super::super::Job::Coding(super::super::super::Launch {
+                    repository: "/synthetic/settings-preview".into(),
+                    isolated: false,
+                    base: "HEAD".into(),
+                    prompt: "Sample".into(),
+                    model: None,
+                    effort: None,
+                }),
+            );
+            session.status = Status::Idle;
+            session.pending.push(Pending {id: serde_json::json!("request"), method: "item/tool/requestUserInput".into(), responded: true, params: serde_json::json!({"difuAsync":true,"questions":[{"id":"q","question":"Choose scope","options":[{"label":"Small"}]}]})});
+            ui.sessions.insert("one".into(), session);
+            ui.selected = Some("one".into());
+            ui.drilled = true;
+            ui.open_question(0);
+            ui.positions.entry("one".into()).or_default().draft.chars =
+                "Unsent draft".chars().collect();
+            let now = Instant::now();
+            ui.question_flip.leaving = Some(Leaving {
+                session: "one".into(),
+                rows: vec![Line::from("Choose scope")],
+                started: now,
+                duration: Duration::from_secs(10),
+                settled: false,
+            });
+            let pending = Some(("one".into(), serde_json::json!("request"), "q".into(), 0));
+            ui.question_send = pending.clone();
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 12))?;
+            terminal.draw(|f| ui.draw_inline_question(f, f.area()))?;
+            assert!(ui.question_flip.animating(Instant::now()));
+            storage.update_config(|config| match change {
+                0 => config.preferences.motion.sent_message = false,
+                1 => config.tweaks.input_clear_ms = 0,
+                2 => config.preferences.motion.level = crate::settings::Motion::Off,
+                3 => config.preferences.motion.level = crate::settings::Motion::Reduced,
+                _ => config.tweaks.agent_reply_cps = 0,
+            })?;
+            ui.apply_settings(&storage.refresh_settings()?);
+            terminal.draw(|f| ui.draw_inline_question(f, f.area()))?;
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(
+                !ui.question_flip.animating(Instant::now()),
+                "refresh {change} must finish clearing"
+            );
+            assert!(
+                !screen.contains("Choose scope"),
+                "refresh {change} must keep the answered question hidden"
+            );
+            assert!(screen.contains("Sending answer"));
+            assert_eq!(ui.question_send, pending);
+            assert_eq!(
+                ui.positions
+                    .get("one")
+                    .context("position")?
+                    .draft
+                    .chars
+                    .iter()
+                    .collect::<String>(),
+                "Unsent draft"
+            );
+            // A failed delivery makes the retained answer available for retry.
+            ui.question_send = None;
+            terminal.draw(|f| ui.draw_inline_question(f, f.area()))?;
+            ui.question_flip.age(Duration::from_secs(2));
+            terminal.draw(|f| ui.draw_inline_question(f, f.area()))?;
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(screen.contains("Choose scope"));
+            assert_eq!(ui.selected_question_answer().as_deref(), Some("Small"));
+        }
+        Ok(())
     }
 }

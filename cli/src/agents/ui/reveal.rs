@@ -101,7 +101,9 @@ impl Typing {
 
 impl Position {
     pub(super) fn animating(&self) -> bool {
-        let now = Instant::now();
+        self.animating_at(Instant::now())
+    }
+    pub(super) fn animating_at(&self, now: Instant) -> bool {
         self.sent.is_some()
             || self.clearing.is_some()
             || !self.voice_flaps.is_empty()
@@ -394,6 +396,119 @@ mod tests {
         apply(
             position, session, sections, 0, total, lines, tweaks, 80, now, now,
         );
+    }
+
+    #[test]
+    fn preference_modes_and_reply_toggle_use_real_reveal_speed_and_zero_cap() {
+        use crate::settings::{Motion, MotionPreferences};
+        for (level, enabled, speed, cap, complete) in [
+            (Motion::Full, true, 1, 0, false),
+            (Motion::Full, true, 200, 0, true),
+            (Motion::Full, true, 1, 50, true),
+            (Motion::Full, true, 0, 0, true),
+            (Motion::Full, false, 1, 0, true),
+            (Motion::Reduced, true, 1, 0, true),
+            (Motion::Off, true, 1, 0, true),
+        ] {
+            let stored = Tweaks {
+                agent_reply_cps: speed,
+                max_animation_ms: cap,
+                ..Default::default()
+            };
+            let preferences = MotionPreferences {
+                level,
+                reply_tool: enabled,
+                ..Default::default()
+            };
+            let effective = preferences.tweaks(stored);
+            let start = Instant::now();
+            let mut session = session(Status::Idle);
+            let reply = "word ".repeat(40).trim_end().to_owned();
+            session.note("agentMessage", reply.clone());
+            let mut position = Position {
+                replies_seen: true,
+                ..Default::default()
+            };
+            frame(&mut position, &session, effective, start);
+            frame(
+                &mut position,
+                &session,
+                effective,
+                start + Duration::from_secs(2),
+            );
+            let rendered = frame(
+                &mut position,
+                &session,
+                effective,
+                start + Duration::from_secs(3),
+            );
+            assert_eq!(
+                rendered.last() == Some(&reply),
+                complete,
+                "{level:?}, enabled={enabled}, speed={speed}, cap={cap}"
+            );
+            assert_eq!(stored.agent_reply_cps, speed);
+            assert_eq!(stored.max_animation_ms, cap);
+        }
+    }
+
+    #[test]
+    fn sent_and_clear_preferences_bound_real_animation_without_touching_new_drafts() {
+        use crate::settings::{Motion, MotionPreferences};
+        for (level, enabled, sent, clear, cap, sent_active, clear_active) in [
+            (Motion::Full, true, 1600, 1200, 0, true, true),
+            (Motion::Full, true, 1600, 1200, 100, false, false),
+            (Motion::Full, true, 0, 1200, 0, false, true),
+            (Motion::Full, true, 1600, 0, 0, true, false),
+            (Motion::Full, false, 1600, 1200, 0, false, false),
+            (Motion::Reduced, true, 1600, 1200, 0, false, false),
+            (Motion::Off, true, 1600, 1200, 0, false, false),
+        ] {
+            let stored = Tweaks {
+                sent_message_ms: sent,
+                input_clear_ms: clear,
+                max_animation_ms: cap,
+                ..Default::default()
+            };
+            let preferences = MotionPreferences {
+                level,
+                sent_message: enabled,
+                ..Default::default()
+            };
+            let effective = preferences.tweaks(stored);
+            let start = Instant::now();
+            let mut session = session(Status::Idle);
+            session.note("userMessage", "abcdefghij");
+            let mut position = Position {
+                sent: Typing::start(
+                    "abcdefghij",
+                    effective.capped(effective.sent_message_ms),
+                    start,
+                ),
+                clearing: Typing::start(
+                    "abcdefghij",
+                    effective.capped(effective.input_clear_ms),
+                    start,
+                ),
+                ..Default::default()
+            };
+            frame(
+                &mut position,
+                &session,
+                effective,
+                start + Duration::from_secs(1),
+            );
+            assert_eq!(position.sent.is_some(), sent_active);
+            assert_eq!(
+                clearing(&mut position, start + Duration::from_secs(1)).is_some(),
+                clear_active
+            );
+            position.draft = Editor::from("new draft");
+            assert!(clearing(&mut position, start).is_none());
+            assert_eq!(position.draft.text(), "new draft");
+            assert_eq!(stored.sent_message_ms, sent);
+            assert_eq!(stored.input_clear_ms, clear);
+        }
     }
 
     #[test]

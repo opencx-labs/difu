@@ -1,3 +1,6 @@
+use crate::shortcuts::ids::*;
+#[path = "ui_diff_reading.rs"]
+mod diff_reading;
 use crate::{
     app::{Action, App, Focus, Modal, Review, View},
     context::Direction,
@@ -5,6 +8,7 @@ use crate::{
     model::{InboxTab, PrState, PrSummary, clean},
     theme::{Role, slot},
 };
+pub(crate) use diff_reading::Reading as DiffReading;
 use ratatui::{
     Frame,
     layout::Rect,
@@ -41,6 +45,7 @@ pub struct TextRow {
     pub hunk: Option<String>,
     pub images: Vec<crate::images::PreviewRow>,
     pub spans: Vec<Span<'static>>,
+    pub marked_spans: Option<Vec<Span<'static>>>,
     pub action: Option<Action>,
     pub target: Option<crate::workflow::Target>,
     pub code_links: Vec<CodeLink>,
@@ -105,6 +110,7 @@ fn file_header(
     width: usize,
     chapter: Option<usize>,
     review: &Review,
+    activate: &str,
 ) -> Vec<TextRow> {
     let hint = match chapter {
         Some(chapter)
@@ -114,19 +120,24 @@ fn file_header(
                 .completed
                 .contains(&(chapter, file.path.clone())) =>
         {
-            "Enter: reopen section"
+            "reopen section"
         }
-        Some(_) => "Enter: complete section",
+        Some(_) => "complete section",
         None if review.interaction.github.viewed.contains(&file.path)
             && review
                 .snapshot
                 .as_ref()
                 .is_some_and(|s| s.head == review.interaction.github.head) =>
         {
-            "Enter: mark unviewed"
+            "mark unviewed"
         }
         None if review.local.is_some() => "Local diff",
-        None => "Enter: mark viewed",
+        None => "mark viewed",
+    };
+    let hint = if hint == "Local diff" {
+        hint.to_owned()
+    } else {
+        format!("{activate}: {hint}")
     };
     wrapped_text(
         &format!(
@@ -156,6 +167,7 @@ pub(crate) fn text(value: impl Into<String>, color: Color) -> TextRow {
         action: None,
         target: None,
         code_links: Vec::new(),
+        marked_spans: None,
         images: Vec::new(),
         hunk: None,
         style: Style::default(),
@@ -170,6 +182,7 @@ pub(crate) fn bold(value: impl Into<String>, color: Color) -> TextRow {
         action: None,
         target: None,
         code_links: Vec::new(),
+        marked_spans: None,
         images: Vec::new(),
         hunk: None,
         style: Style::default(),
@@ -186,6 +199,7 @@ pub(crate) fn link(value: impl Into<String>, action: Action) -> TextRow {
         action: Some(action),
         target: None,
         code_links: Vec::new(),
+        marked_spans: None,
         images: Vec::new(),
         hunk: None,
         style: Style::default(),
@@ -248,7 +262,14 @@ pub(crate) fn crop(value: &str, offset: usize, width: usize) -> String {
     output
 }
 
-fn code(line: Option<&DiffLine>, old: bool, width: usize, horizontal: usize) -> Vec<Span<'static>> {
+fn code(
+    line: Option<&DiffLine>,
+    old: bool,
+    width: usize,
+    horizontal: usize,
+    numbers: bool,
+    whitespace: bool,
+) -> Vec<Span<'static>> {
     let Some(line) = line else {
         return vec![span(" ".repeat(width), DIM)];
     };
@@ -258,18 +279,27 @@ fn code(line: Option<&DiffLine>, old: bool, width: usize, horizontal: usize) -> 
         _ => BG,
     };
     let number = if old { line.old } else { line.new };
-    let prefix = format!(
-        "{:>5} {} ",
-        number.map(|n| n.to_string()).unwrap_or_default(),
-        match line.kind {
-            LineKind::Add => '+',
-            LineKind::Remove => '-',
-            _ => ' ',
-        }
-    );
+    let marker = match line.kind {
+        LineKind::Add => '+',
+        LineKind::Remove => '-',
+        _ => ' ',
+    };
+    let prefix = if numbers {
+        format!(
+            "{:>5} {marker} ",
+            number.map(|n| n.to_string()).unwrap_or_default()
+        )
+    } else {
+        format!("{marker} ")
+    };
     let prefix = crop(&prefix, 0, width);
     let code_width = width.saturating_sub(prefix.width());
-    let content = crop(&line.text, horizontal, code_width);
+    let display = if whitespace {
+        line.text.replace('\t', "→···").replace(' ', "·")
+    } else {
+        line.text.clone()
+    };
+    let content = crop(&display, horizontal, code_width);
     let mut spans = vec![Span::styled(
         prefix,
         Style::default()
@@ -436,6 +466,7 @@ fn code_links(
     width: usize,
     horizontal: usize,
     offset: usize,
+    numbers: bool,
 ) -> Vec<CodeLink> {
     if !crate::navigation::supported(path) {
         return Vec::new();
@@ -446,7 +477,11 @@ fn code_links(
     let Some(number) = (if old { line.old } else { line.new }) else {
         return Vec::new();
     };
-    let prefix = format!("{number:>5}   ").width();
+    let prefix = if numbers {
+        format!("{number:>5}   ").width()
+    } else {
+        2
+    };
     let available = width.saturating_sub(prefix);
     let mut links = Vec::new();
     let mut chars = line.text.char_indices().peekable();
@@ -558,6 +593,7 @@ fn code_offsets(
     old: bool,
     width: usize,
     layout: (usize, bool),
+    numbers: bool,
 ) -> Vec<usize> {
     let (horizontal, wrap) = layout;
     if !wrap {
@@ -565,11 +601,15 @@ fn code_offsets(
     }
     let Some(line) = line else { return Vec::new() };
     let number = if old { line.old } else { line.new };
-    let prefix = format!(
-        "{:>5}   ",
-        number.map(|n| n.to_string()).unwrap_or_default()
-    )
-    .width();
+    let prefix = if numbers {
+        format!(
+            "{:>5}   ",
+            number.map(|n| n.to_string()).unwrap_or_default()
+        )
+        .width()
+    } else {
+        2
+    };
     let available = width.saturating_sub(prefix);
     let mut offsets = vec![0];
     if available == 0 {
@@ -589,13 +629,90 @@ fn code_offsets(
     offsets
 }
 
-pub(crate) fn code_rows(
+impl TextRow {
+    /// Reveal whitespace on the selected source side without altering its peer.
+    pub(crate) fn selected_spans(
+        &self,
+        side: crate::review::Side,
+        split: bool,
+        width: usize,
+    ) -> Vec<Span<'static>> {
+        let Some(marked) = &self.marked_spans else {
+            return self.spans.clone();
+        };
+        if !split {
+            return marked.clone();
+        }
+        let boundary = width.saturating_sub(1) / 2;
+        let (left, right) = if side == crate::review::Side::Left {
+            (marked, &self.spans)
+        } else {
+            (&self.spans, marked)
+        };
+        let mut spans = Vec::new();
+        for (source, start, end) in [(left, 0, boundary), (right, boundary, width)] {
+            let mut position: usize = 0;
+            for span in source {
+                let next = position + span.width();
+                let from = position.max(start);
+                let to = next.min(end);
+                if from < to {
+                    spans.push(Span::styled(
+                        crop(&span.content, from - position, to - from),
+                        span.style,
+                    ));
+                }
+                position = next;
+            }
+        }
+        spans
+    }
+}
+
+pub(crate) fn code_rows_with_preferences(
     path: &str,
     lines: &[DiffLine],
     width: usize,
     split: bool,
     layout: (usize, bool),
+    preferences: &crate::settings::Code,
 ) -> Vec<TextRow> {
+    use crate::settings::Whitespace;
+    let mut rows = render_code_rows(
+        path,
+        lines,
+        width,
+        split,
+        layout,
+        (
+            preferences.line_numbers,
+            preferences.whitespace == Whitespace::AllLines,
+        ),
+    );
+    if preferences.whitespace == Whitespace::SelectedLines {
+        for (row, marked) in rows.iter_mut().zip(render_code_rows(
+            path,
+            lines,
+            width,
+            split,
+            layout,
+            (preferences.line_numbers, true),
+        )) {
+            row.marked_spans = Some(marked.spans);
+        }
+    }
+    rows
+}
+
+fn render_code_rows(
+    path: &str,
+    lines: &[DiffLine],
+    width: usize,
+    split: bool,
+    layout: (usize, bool),
+    style: (bool, bool),
+) -> Vec<TextRow> {
+    let (numbers, whitespace) = style;
     let mut rows = Vec::new();
     if split {
         let left = width.saturating_sub(1) / 2;
@@ -606,17 +723,32 @@ pub(crate) fn code_rows(
             lines: lines.to_vec(),
         };
         for (old, new) in split_rows(&hunk) {
-            let old_offsets = code_offsets(old, true, left, layout);
-            let new_offsets = code_offsets(new, false, right, layout);
+            let old_offsets = code_offsets(old, true, left, layout, numbers);
+            let new_offsets = code_offsets(new, false, right, layout, numbers);
             for index in 0..old_offsets.len().max(new_offsets.len()) {
                 let old_offset = old_offsets.get(index).copied();
                 let new_offset = new_offsets.get(index).copied();
                 let old = old.filter(|_| old_offset.is_some());
                 let new = new.filter(|_| new_offset.is_some());
-                let mut spans = code(old, true, left, old_offset.unwrap_or(0));
+                let mut spans = code(
+                    old,
+                    true,
+                    left,
+                    old_offset.unwrap_or(0),
+                    numbers,
+                    whitespace,
+                );
                 spans.push(span("│", BORDER));
-                spans.extend(code(new, false, right, new_offset.unwrap_or(0)));
-                let mut links = code_links(path, old, true, left, old_offset.unwrap_or(0), 0);
+                spans.extend(code(
+                    new,
+                    false,
+                    right,
+                    new_offset.unwrap_or(0),
+                    numbers,
+                    whitespace,
+                ));
+                let mut links =
+                    code_links(path, old, true, left, old_offset.unwrap_or(0), 0, numbers);
                 links.extend(code_links(
                     path,
                     new,
@@ -624,9 +756,11 @@ pub(crate) fn code_rows(
                     right,
                     new_offset.unwrap_or(0),
                     left + 1,
+                    numbers,
                 ));
                 rows.push(TextRow {
                     spans,
+                    marked_spans: None,
                     code_links: links,
                     images: Vec::new(),
                     hunk: None,
@@ -643,10 +777,11 @@ pub(crate) fn code_rows(
     } else {
         for line in lines {
             let old = line.kind == LineKind::Remove;
-            for offset in code_offsets(Some(line), old, width, layout) {
+            for offset in code_offsets(Some(line), old, width, layout, numbers) {
                 rows.push(TextRow {
-                    spans: code(Some(line), old, width, offset),
-                    code_links: code_links(path, Some(line), old, width, offset, 0),
+                    marked_spans: None,
+                    spans: code(Some(line), old, width, offset, numbers, whitespace),
+                    code_links: code_links(path, Some(line), old, width, offset, 0, numbers),
                     images: Vec::new(),
                     hunk: None,
                     style: Style::default(),
@@ -705,13 +840,21 @@ fn hunk_rows(
     hunk: &Hunk,
     width: usize,
     split: bool,
-    horizontal: (usize, bool),
+    presentation: (&crate::settings::Code, (usize, bool)),
     with_title: (bool, Option<usize>),
-    review: &Review,
+    context: (&Review, &App),
 ) -> Vec<TextRow> {
+    let (review, app) = context;
+    let (preferences, horizontal) = presentation;
     let mut rows = Vec::new();
     if with_title.0 {
-        rows.extend(file_header(file, width, with_title.1, review));
+        rows.extend(file_header(
+            file,
+            width,
+            with_title.1,
+            review,
+            &app.hint(NAVIGATION_ACTIVATE),
+        ));
     }
     rows.push(text(format!(" {}", hunk.header), DIM));
     if let Some(button) = expansion_button(review, file, hunk, Direction::Above) {
@@ -724,7 +867,10 @@ fn hunk_rows(
         .and_then(|state| state.error.as_ref())
     {
         rows.extend(prose(
-            &format!("Could not read file boundaries: {error}. Press r to retry."),
+            &format!(
+                "Could not read file boundaries: {error}. Press {} to retry.",
+                app.hint(REVIEW_REFRESH)
+            ),
             width,
         ));
     }
@@ -735,10 +881,28 @@ fn hunk_rows(
         ));
     }
     let data = state.and_then(|s| s.data.as_ref());
+    if preferences.context_lines > 3
+        && data.is_none()
+        && state.and_then(|s| s.error.as_ref()).is_none()
+    {
+        rows.push(text(
+            if review.root.is_some() {
+                "Loading extra context…"
+            } else {
+                "Extra context needs a local clone. Open the repository in Reviews."
+            },
+            DIM,
+        ));
+    }
     let expanded = review.expanded.get(&hunk.id).copied().unwrap_or_default();
-    if let Some(data) = data.filter(|_| hunk.header.starts_with("@@ ")) {
+    {
         let expanded_view = expanded.above > 0 || expanded.below > 0;
-        for part in data.parts(&hunk.id, expanded) {
+        for part in crate::context::project(
+            hunk,
+            data.map(AsRef::as_ref),
+            expanded,
+            preferences.context_lines,
+        ) {
             if expanded_view {
                 match part.owner {
                     Some(id) if id != hunk.id => {
@@ -767,10 +931,15 @@ fn hunk_rows(
                     None => rows.push(text("── Context ──", DIM)),
                 }
             }
-            rows.extend(code_rows(&file.path, part.lines, width, split, horizontal));
+            rows.extend(code_rows_with_preferences(
+                &file.path,
+                part.lines,
+                width,
+                split,
+                horizontal,
+                preferences,
+            ));
         }
-    } else {
-        rows.extend(code_rows(&file.path, &hunk.lines, width, split, horizontal));
     }
     if let Some(button) = expansion_button(review, file, hunk, Direction::Below) {
         rows.push(button);
@@ -800,16 +969,23 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
             append(&mut doc.rows, TextRow::default());
             append(
                 &mut doc.rows,
-                link("Enter · Open pull requests", Action::OpenRepository),
+                link(
+                    format!("{} · Open pull requests", app.hint(NAVIGATION_ACTIVATE)),
+                    Action::OpenRepository,
+                ),
             );
             append(
                 &mut doc.rows,
                 link(
-                    if app.config.pinned_repositories.contains(name) {
-                        "* · Unpin repository"
-                    } else {
-                        "* · Pin repository"
-                    },
+                    format!(
+                        "{} · {} repository",
+                        app.hint(REVIEW_PIN_REPOSITORY),
+                        if app.config.pinned_repositories.contains(name) {
+                            "Unpin"
+                        } else {
+                            "Pin"
+                        }
+                    ),
                     Action::PinRepository(name.clone()),
                 ),
             );
@@ -890,7 +1066,7 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
         doc.left_width = if wide { (width / 4).clamp(30, 44) } else { 0 };
         let code_width = width.saturating_sub(if wide { doc.left_width + 3 } else { 0 }) as usize;
         let code_width = code_width.saturating_sub(2);
-        let split = wide && !app.config.unified;
+        let split = wide && !app.diff_config().unified;
         let mut previous_category = None;
         let mut category_start = 0;
         let mut category_header = TextRow::default();
@@ -975,7 +1151,13 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
                     if title {
                         headers.push((
                             right.len(),
-                            file_header(file, code_width, Some(chapter_index), review),
+                            file_header(
+                                file,
+                                code_width,
+                                Some(chapter_index),
+                                review,
+                                &app.hint(NAVIGATION_ACTIVATE),
+                            ),
                         ));
                     }
                     let collapsed = review
@@ -990,9 +1172,15 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
                                 code_width,
                                 Some(chapter_index),
                                 review,
+                                &app.hint(NAVIGATION_ACTIVATE),
                             ));
-                            right
-                                .push(text("✓ Chapter section completed · Enter to reopen", GREEN));
+                            right.push(text(
+                                format!(
+                                    "✓ Chapter section completed · {} to reopen",
+                                    app.hint(NAVIGATION_ACTIVATE)
+                                ),
+                                GREEN,
+                            ));
                         }
                         continue;
                     }
@@ -1001,9 +1189,12 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
                         hunk,
                         code_width,
                         split,
-                        (app.horizontal, app.config.wrap_diff),
+                        (
+                            &app.diff_config().preferences.code,
+                            (app.horizontal, app.diff_config().wrap_diff),
+                        ),
                         (title, Some(chapter_index)),
-                        review,
+                        (review, app),
                     ));
                 }
             }
@@ -1116,12 +1307,24 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
             let collapsed = review.interaction.github.viewed.contains(&file.path)
                 && review.interaction.github.head == snapshot.head;
             if collapsed {
-                for row in file_header(file, width.saturating_sub(2) as usize, None, review) {
+                for row in file_header(
+                    file,
+                    width.saturating_sub(2) as usize,
+                    None,
+                    review,
+                    &app.hint(NAVIGATION_ACTIVATE),
+                ) {
                     append(&mut doc.rows, row);
                 }
                 append(
                     &mut doc.rows,
-                    text("✓ Viewed on GitHub · Enter to reopen", GREEN),
+                    text(
+                        format!(
+                            "✓ Viewed on GitHub · {} to reopen",
+                            app.hint(NAVIGATION_ACTIVATE)
+                        ),
+                        GREEN,
+                    ),
                 );
             }
             for (i, hunk) in file.hunks.iter().enumerate().filter(|_| !collapsed) {
@@ -1129,10 +1332,13 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
                     file,
                     hunk,
                     width.saturating_sub(2) as usize,
-                    width >= 80 && !app.config.unified,
-                    (app.horizontal, app.config.wrap_diff),
+                    width >= 80 && !app.diff_config().unified,
+                    (
+                        &app.diff_config().preferences.code,
+                        (app.horizontal, app.diff_config().wrap_diff),
+                    ),
                     (i == 0, None),
-                    review,
+                    (review, app),
                 ) {
                     append(&mut doc.rows, row);
                 }
@@ -1140,7 +1346,13 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
             doc.files.push(FileSection {
                 start,
                 end: doc.rows.len(),
-                header: file_header(file, width.saturating_sub(2) as usize, None, review),
+                header: file_header(
+                    file,
+                    width.saturating_sub(2) as usize,
+                    None,
+                    review,
+                    &app.hint(NAVIGATION_ACTIVATE),
+                ),
             });
         }
     }
@@ -1186,8 +1398,8 @@ fn paint_diff(
     }
     let code = Rect::new(rect.x + 2, rect.y, rect.width.saturating_sub(2), 1);
     paint(frame, code, row, app);
-    let split =
-        !app.config.unified && (doc.guide_columns || (app.view == View::Diff && doc.width >= 80));
+    let split = !app.diff_config().unified
+        && (doc.guide_columns || (app.view == View::Diff && doc.width >= 80));
     if row.target.is_some() {
         let left = if split { code.width / 2 } else { code.width };
         let side = if !split
@@ -1247,6 +1459,17 @@ fn paint_diff(
                 && (start.start.min(end.end)..=start.start.max(end.end)).contains(&line.start)
         })
     });
+    if selected && row.marked_spans.is_some() {
+        frame.render_widget(
+            Paragraph::new(Line::from(row.selected_spans(
+                app.workflow.side,
+                split,
+                usize::from(code.width),
+            )))
+            .style(row.style),
+            code,
+        );
+    }
     if focused || selected {
         let offset = if split && app.workflow.side == crate::review::Side::Right {
             code.width / 2 + 1
@@ -1353,6 +1576,7 @@ fn relocated_row(old: &Document, new: &Document, position: usize) -> Option<usiz
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.ensure_diff_context();
     if app.home && app.inbox_tab == InboxTab::Diffs {
         crate::app::local::draw(frame, app);
         return;
@@ -1388,17 +1612,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let tabs = if app.home {
         vec![
             (
-                "1 My PRs",
+                format!("{} My PRs", app.hint(REVIEW_TAB_1)),
                 app.inbox_tab == InboxTab::MyPrs,
                 Action::SetInbox(InboxTab::MyPrs),
             ),
             (
-                "2 Repositories",
+                format!("{} Repositories", app.hint(REVIEW_TAB_2)),
                 app.inbox_tab == InboxTab::Repositories,
                 Action::SetInbox(InboxTab::Repositories),
             ),
             (
-                "3 Diffs",
+                format!("{} Diffs", app.hint(REVIEW_TAB_3)),
                 app.inbox_tab == InboxTab::Diffs,
                 Action::SetInbox(InboxTab::Diffs),
             ),
@@ -1407,20 +1631,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         vec![
             (
                 if app.render_area.is_some() {
-                    "1 Preview"
+                    format!("{} Preview", app.hint(REVIEW_TAB_1))
                 } else {
-                    "1 Overview"
+                    format!("{} Overview", app.hint(REVIEW_TAB_1))
                 },
                 app.view == View::Overview,
                 Action::SetView(View::Overview),
             ),
             (
-                "2 Diff",
+                format!("{} Diff", app.hint(REVIEW_TAB_2)),
                 app.view == View::Diff,
                 Action::SetView(View::Diff),
             ),
             (
-                "3 Guide",
+                format!("{} Guide", app.hint(REVIEW_TAB_3)),
                 app.view == View::Guide,
                 Action::SetView(View::Guide),
             ),
@@ -1430,8 +1654,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         if app.render_area.is_some() && matches!(action, Action::Back) {
             continue;
         }
-        if x + label.len() as u16 + 4 < area.right() {
-            x = button(frame, app, x, area.y + 3, label, selected, action);
+        if x + label.width() as u16 + 4 < area.right() {
+            x = button(frame, app, x, area.y + 3, &label, selected, action);
         }
     }
     let filters = app.home && !app.repository_directory() && area.height >= 14;
@@ -1544,15 +1768,42 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         d.epoch != app.epoch || d.width != main.width || d.horizontal != app.horizontal
     }) {
         let next = build(app, main.width);
-        if app.preserve_diff_position
-            && let Some(previous) = &app.document
-        {
-            if let Some(cursor) = app.workflow.cursor {
-                app.workflow.cursor = relocated_row(previous, &next, cursor).or(Some(cursor));
+        let style = (
+            app.diff_config().unified,
+            app.diff_config().wrap_diff,
+            app.diff_config().preferences.code.clone(),
+        );
+        if let Some(previous) = &app.document {
+            if app.diff_reading.is_none()
+                && app.view != View::Overview
+                && (app.preserve_diff_position
+                    || app.diff_style.as_ref() != Some(&style)
+                    || previous.width != next.width)
+            {
+                app.diff_reading = Some(DiffReading::capture(
+                    previous,
+                    app.workflow.cursor,
+                    app.scroll,
+                    app.workflow.side,
+                ));
             }
-            app.scroll = relocated_row(previous, &next, app.scroll).unwrap_or(app.scroll);
+            if let Some(reading) = &app.diff_reading {
+                let (cursor, scroll) = reading.project(&next);
+                if cursor.is_some() {
+                    app.workflow.cursor = cursor;
+                }
+                if let Some(scroll) = scroll {
+                    app.scroll = scroll;
+                }
+                if cursor.is_none() && scroll.is_none() {
+                    app.diff_reading = None;
+                }
+            } else if app.preserve_diff_position {
+                app.scroll = relocated_row(previous, &next, app.scroll).unwrap_or(app.scroll);
+            }
         }
         app.preserve_diff_position = false;
+        app.diff_style = Some(style);
         app.document = Some(next);
     }
     let Some(doc) = app.document.take() else {
@@ -1725,19 +1976,27 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.document = Some(doc);
     let mut status = if app.repository_directory() {
         if let Some(error) = &app.repositories_error {
-            format!("Could not refresh repositories: {} · r retry", clean(error))
+            format!(
+                "Could not refresh repositories: {} · {} retry",
+                clean(error),
+                app.hint(REVIEW_REFRESH)
+            )
         } else if app.repositories_loading {
             "Showing cached repositories · refreshing…".into()
         } else {
             format!(
-                "{} repositories · * pin/unpin",
-                app.repository_options.len()
+                "{} repositories · {} pin/unpin",
+                app.repository_options.len(),
+                app.hint(REVIEW_PIN_REPOSITORY)
             )
         }
     } else if app.home && app.inbox_loading && !app.inbox.is_empty() {
         "Showing cached PRs · Refreshing…".into()
     } else if app.home && app.inbox_error.is_some() && !app.inbox.is_empty() {
-        "Showing cached PRs · Refresh failed · r retry".into()
+        format!(
+            "Showing cached PRs · Refresh failed · {} retry",
+            app.hint(REVIEW_REFRESH)
+        )
     } else if let Some(review) = app.review() {
         if let Some(job) = &review.generation {
             format!(
@@ -1763,16 +2022,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             format!("[{bar}] {step}/5 · {elapsed}s · {}", clean(activity))
         } else if let Some(error) = &review.guide_error {
             format!(
-                "{}: {} · g retry",
+                "{}: {} · {} retry",
                 if review.preparation_failed {
                     "Snapshot"
                 } else {
                     "Guide"
                 },
-                clean(error).replace('\n', " ")
+                clean(error).replace('\n', " "),
+                app.hint(REVIEW_REGENERATE)
             )
         } else if review.newer.is_some() {
-            "● Remote PR updated · r to sync and refresh".into()
+            format!(
+                "● Remote PR updated · {} to sync and refresh",
+                app.hint(REVIEW_REFRESH)
+            )
         } else if let Some(model) = &review.guide_model {
             format!("Guide ready · {model}")
         } else {
@@ -1832,12 +2095,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let footer = if app.home {
         vec![
             (
-                "/ Actions",
+                format!("{} Actions", app.hint(REVIEW_CONTROLS)),
                 Action::Workflow(crate::workflow::WAction::Open),
             ),
-            ("? Help", Action::Help),
+            (format!("{} Help", app.hint(REVIEW_HELP)), Action::Help),
             (
-                "[ / ] State",
+                format!(
+                    "{}/{} State",
+                    app.hint(REVIEW_PREVIOUS_STATE),
+                    app.hint(REVIEW_NEXT_STATE)
+                ),
                 Action::SetState(match app.state() {
                     PrState::Open => PrState::Merged,
                     PrState::Merged => PrState::Closed,
@@ -1845,60 +2112,105 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     PrState::All => PrState::Open,
                 }),
             ),
-            ("f Filter", Action::Filter),
             (
-                "* Pin",
+                format!("{} Filter", app.hint(REVIEW_FILTER)),
+                Action::Filter,
+            ),
+            (
+                format!("{} Pin", app.hint(REVIEW_PIN_REPOSITORY)),
                 Action::PinRepository(app.repo_selected.clone().unwrap_or_default()),
             ),
-            ("Esc Repositories", Action::Back),
-            ("r Refresh", Action::Refresh),
-            ("Enter Open", Action::OpenPr),
-            ("Cmd+↑/↓ 10 lines", Action::FastScroll(10)),
+            (
+                format!("{} Repositories", app.hint(REVIEW_BACK)),
+                Action::Back,
+            ),
+            (
+                format!("{} Refresh", app.hint(REVIEW_REFRESH)),
+                Action::Refresh,
+            ),
+            (
+                format!("{} Open", app.hint(NAVIGATION_ACTIVATE)),
+                Action::OpenPr,
+            ),
+            (
+                format!(
+                    "{}/{} 10 lines",
+                    app.hint(NAVIGATION_FAST_UP),
+                    app.hint(NAVIGATION_FAST_DOWN)
+                ),
+                Action::FastScroll(10),
+            ),
         ]
     } else {
         vec![
             (
-                "/ Actions",
+                format!("{} Actions", app.hint(REVIEW_CONTROLS)),
                 Action::Workflow(crate::workflow::WAction::Open),
             ),
-            ("c / Cmd+C Copy", Action::Copy),
-            ("Cmd/Ctrl+click Definition", Action::Help),
-            ("Alt+↑/↓ Chapters", Action::Chapter(true)),
-            ("f Filter", Action::Filter),
+            (format!("{} Copy", app.hint(SELECTION_COPY)), Action::Copy),
+            ("Cmd/Ctrl+click Definition".into(), Action::Help),
             (
-                if app.config.wrap_diff {
-                    "w Unwrap"
-                } else {
-                    "w Wrap"
-                },
+                format!(
+                    "{}/{} Chapters",
+                    app.hint(REVIEW_CHAPTER_PREVIOUS),
+                    app.hint(REVIEW_CHAPTER_NEXT)
+                ),
+                Action::Chapter(true),
+            ),
+            (
+                format!("{} Filter", app.hint(REVIEW_FILTER)),
+                Action::Filter,
+            ),
+            (
+                format!(
+                    "{} {}",
+                    app.hint(REVIEW_WRAP),
+                    if app.diff_config().wrap_diff {
+                        "Unwrap"
+                    } else {
+                        "Wrap"
+                    }
+                ),
                 Action::ToggleWrap,
             ),
-            ("Cmd+↑/↓ 10 lines", Action::FastScroll(10)),
-            ("? Help", Action::Help),
-            ("m Model", Action::Models),
-            ("r Refresh", Action::Refresh),
-            ("g Generate", Action::Regenerate),
-            ("x Cancel", Action::Cancel),
-            ("Ctrl+B Split", Action::ToggleLayout),
+            (
+                format!(
+                    "{}/{} 10 lines",
+                    app.hint(NAVIGATION_FAST_UP),
+                    app.hint(NAVIGATION_FAST_DOWN)
+                ),
+                Action::FastScroll(10),
+            ),
+            (format!("{} Help", app.hint(REVIEW_HELP)), Action::Help),
+            (format!("{} Model", app.hint(REVIEW_MODELS)), Action::Models),
+            (
+                format!("{} Refresh", app.hint(REVIEW_REFRESH)),
+                Action::Refresh,
+            ),
+            (
+                format!("{} Generate", app.hint(REVIEW_REGENERATE)),
+                Action::Regenerate,
+            ),
+            (
+                format!("{} Cancel", app.hint(REVIEW_CANCEL)),
+                Action::Cancel,
+            ),
+            (
+                format!("{} Split", app.hint(REVIEW_LAYOUT)),
+                Action::ToggleLayout,
+            ),
         ]
     };
     for (label, action) in footer {
-        if app.render_area.is_some() && matches!(action, Action::Back) {
-            continue;
-        }
-        if matches!(label, "c / Cmd+C Copy" | "Cmd/Ctrl+click Definition")
-            && app.view == View::Overview
-        {
-            continue;
-        }
-        if label == "Alt+↑/↓ Chapters" && app.view != View::Guide {
-            continue;
-        }
-        if (label == "[ / ] State" && app.repository_directory())
-            || (label == "* Pin" && !app.repository_directory())
-            || (label == "Esc Repositories"
+        if (app.render_area.is_some() && matches!(action, Action::Back))
+            || ((matches!(action, Action::Copy) || label == "Cmd/Ctrl+click Definition")
+                && app.view == View::Overview)
+            || (matches!(action, Action::Chapter(_)) && app.view != View::Guide)
+            || (matches!(action, Action::SetState(_)) && app.repository_directory())
+            || (matches!(action, Action::PinRepository(_)) && !app.repository_directory())
+            || (matches!(action, Action::Back)
                 && (app.inbox_tab != InboxTab::Repositories || app.repository.is_none()))
-            || (label == "f Filter" && app.filter_kind().is_none())
+            || (matches!(action, Action::Filter) && app.filter_kind().is_none())
         {
             continue;
         }
@@ -1919,7 +2231,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (_, _, View::Overview, _) => "Overview",
         _ => "Diff",
     };
-    let mut focus_line = vec![span(format!("Focus: {focused} · Tab to switch"), ACCENT)];
+    let mut focus_line = vec![span(
+        format!(
+            "Focus: {focused} · {} to switch",
+            app.hint(NAVIGATION_NEXT_FOCUS)
+        ),
+        ACCENT,
+    )];
     let notice_in_modal = matches!(
         &app.modal,
         Some(Modal::Workflow(wizard))
@@ -1949,7 +2267,7 @@ pub(crate) fn notice_color(kind: crate::app::NoticeKind) -> Color {
     }
 }
 
-fn inbox_rows(pr: &PrSummary, width: usize, selected: bool) -> Vec<TextRow> {
+fn inbox_rows(pr: &PrSummary, width: usize, selected: bool, refresh: &str) -> Vec<TextRow> {
     let width = width.max(1);
     let mut rows = vec![
         text(
@@ -2025,15 +2343,15 @@ fn inbox_rows(pr: &PrSummary, width: usize, selected: bool) -> Vec<TextRow> {
         }
         rows.push(line);
         if pr.stats_error {
-            rows.push(text("Stats stale · r retry", DIM));
+            rows.push(text(format!("Stats stale · {refresh} retry"), DIM));
         }
     } else {
         rows.extend(
             wrapped_text(
-                if pr.stats_error {
-                    "Stats unavailable · r retry"
+                &if pr.stats_error {
+                    format!("Stats unavailable · {refresh} retry")
                 } else {
-                    "Loading stats…"
+                    "Loading stats…".to_owned()
                 },
                 width,
             )
@@ -2187,15 +2505,14 @@ fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
     let selected = visible.iter().position(|i| *i == app.selected).unwrap_or(0);
     app.nav_scroll = app.nav_scroll.min(selected);
     let mut start = selected;
-    let mut needed = app
-        .inbox
-        .get(app.selected)
-        .map_or(0, |pr| inbox_rows(pr, width, true).len());
+    let mut needed = app.inbox.get(app.selected).map_or(0, |pr| {
+        inbox_rows(pr, width, true, &app.hint(REVIEW_REFRESH)).len()
+    });
     while start > app.nav_scroll {
         let Some(pr) = visible.get(start - 1).and_then(|i| app.inbox.get(*i)) else {
             break;
         };
-        let height = inbox_rows(pr, width, false).len() + 1;
+        let height = inbox_rows(pr, width, false, &app.hint(REVIEW_REFRESH)).len() + 1;
         if needed + height > available {
             break;
         }
@@ -2212,7 +2529,7 @@ fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
             break;
         };
         let selected = index == app.selected;
-        let rows = inbox_rows(pr, width, selected);
+        let rows = inbox_rows(pr, width, selected, &app.hint(REVIEW_REFRESH));
         let height = rows.len().min(usize::from(rect.bottom() - y)) as u16;
         let hit = Rect::new(rect.x, y, rect.width.saturating_sub(1), height);
         frame.render_widget(
@@ -2383,6 +2700,7 @@ fn draw_definition(frame: &mut Frame, app: &mut App) {
                     body.width as usize,
                     viewer.horizontal,
                     0,
+                    true,
                 ) {
                     if offset == 0
                         && let Action::Definition { column, .. } = &mut link.action
@@ -2397,6 +2715,8 @@ fn draw_definition(frame: &mut Frame, app: &mut App) {
                         false,
                         body.width as usize,
                         viewer.horizontal,
+                        true,
+                        false,
                     ))),
                     Rect::new(body.x, body.y + i as u16, body.width, 1),
                 );
@@ -2426,9 +2746,15 @@ fn draw_definition(frame: &mut Frame, app: &mut App) {
     if inner.height > 0 {
         let footer = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
         frame.render_widget(
-            Paragraph::new(
-                "Esc Close   Cmd/Ctrl+click Definition   ↑/↓ Scroll   ←/→ Pan   PgUp/PgDn Page",
-            )
+            Paragraph::new(format!(
+                "Esc Close   Cmd/Ctrl+click Definition   {}/{} Scroll   {}/{} Pan   {}/{} Page",
+                app.hint(NAVIGATION_UP),
+                app.hint(NAVIGATION_DOWN),
+                app.hint(NAVIGATION_LEFT),
+                app.hint(NAVIGATION_RIGHT),
+                app.hint(NAVIGATION_PAGE_UP),
+                app.hint(NAVIGATION_PAGE_DOWN)
+            ))
             .style(Style::default().fg(ACCENT)),
             footer,
         );
@@ -2476,7 +2802,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
     if cursor_x < inner.right() && inner.height > 0 {
         frame.set_cursor_position((cursor_x, inner.y));
     }
-    let matches = crate::help::entries(&state.query.text());
+    let matches = crate::help::entries(&state.query.text(), &app.config);
     let mut rows = Vec::new();
     for (key, description) in &matches {
         rows.extend(prose(
@@ -2495,8 +2821,12 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
     if inner.height > 1 {
         frame.render_widget(
             Paragraph::new(format!(
-                "{} matches · ↑↓ scroll · Ctrl+U clear · Esc close",
-                matches.len()
+                "{} matches · {}/{} scroll · Ctrl+U clear · Esc close",
+                matches.len(),
+                crate::shortcuts::Bindings::new(&app.config)
+                    .primary_hint_in(NAVIGATION_UP, crate::shortcuts::contexts::REVIEW_HELP),
+                crate::shortcuts::Bindings::new(&app.config)
+                    .primary_hint_in(NAVIGATION_DOWN, crate::shortcuts::contexts::REVIEW_HELP)
             ))
             .style(Style::default().fg(DIM)),
             Rect::new(inner.x, inner.y + 1, inner.width, 1),
@@ -2580,7 +2910,10 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
             });
             rows.push(text("", DIM));
             rows.extend(prose(
-                "Enter to open · Ctrl+U to clear · Esc to cancel",
+                &format!(
+                    "{} to open · Ctrl+U to clear · Esc to cancel",
+                    app.hint(NAVIGATION_ACTIVATE)
+                ),
                 inner.width as usize,
             ));
             rows
@@ -2605,7 +2938,15 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
                     spans,
                     ..Default::default()
                 },
-                text("↑↓ select · Enter apply · Esc close", DIM),
+                text(
+                    format!(
+                        "{}/{} select · {} apply · Esc close",
+                        app.hint(NAVIGATION_UP),
+                        app.hint(NAVIGATION_DOWN),
+                        app.hint(NAVIGATION_ACTIVATE)
+                    ),
+                    DIM,
+                ),
                 text("", DIM),
             ];
             if app.models_loading {
@@ -2650,11 +2991,476 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use anyhow::{Context, Result};
 
-    fn guide_app(directory: &std::path::Path) -> App {
+    #[test]
+    fn diff_explicit_navigation_replaces_latent_source_intent() -> Result<()> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+        let dir = tempfile::tempdir()?;
+        for navigation in 0..5 {
+            let mut app = guide_app(dir.path());
+            app.view = View::Diff;
+            app.focus = Focus::Content;
+            app.config.unified = true;
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 25))?;
+            terminal.draw(|f| draw(f, &mut app))?;
+            let row = app
+                .document
+                .as_ref()
+                .context("doc")?
+                .rows
+                .iter()
+                .position(|r| {
+                    matches!(
+                        r.right.target,
+                        Some(crate::workflow::Target::Code { new: Some(40), .. })
+                    )
+                })
+                .context("source")?;
+            app.workflow.cursor = Some(row);
+            app.scroll = row;
+            let mut preview = app.config.clone();
+            preview.preferences.code.line_numbers = false;
+            app.preview_diff_settings(Some(&preview));
+            terminal.draw(|f| draw(f, &mut app))?;
+            match navigation {
+                0 => app.key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT)),
+                1 => app.mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollDown,
+                    column: app.content_rect.x,
+                    row: app.content_rect.y,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                2 => app.action(Action::SelectFile(1)),
+                3 => app.action(Action::GoToChapter(1)),
+                _ => app.workflow_action(crate::workflow::WAction::Cursor(
+                    row + 2,
+                    crate::review::Side::Right,
+                )),
+            }
+            terminal.draw(|f| draw(f, &mut app))?;
+            let before = app
+                .document
+                .as_ref()
+                .and_then(|d| d.rows.get(app.workflow.cursor.unwrap_or(app.scroll)))
+                .and_then(|r| r.right.target.clone());
+            let selection = app
+                .workflow
+                .selection
+                .as_ref()
+                .map(|s| (s.path.clone(), s.start));
+            app.preview_diff_settings(None);
+            terminal.draw(|f| draw(f, &mut app))?;
+            let after = app
+                .document
+                .as_ref()
+                .and_then(|d| d.rows.get(app.workflow.cursor.unwrap_or(app.scroll)))
+                .and_then(|r| r.right.target.clone());
+            assert_eq!(after, before, "navigation {navigation}");
+            assert_eq!(
+                app.workflow
+                    .selection
+                    .as_ref()
+                    .map(|s| (s.path.clone(), s.start)),
+                selection
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reviews_render_every_diff_context_layout_and_whitespace_mode() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        app.view = View::Diff;
+        app.focus = Focus::Content;
+        let mut lines = Vec::new();
+        for n in 1..=31 {
+            lines.push(DiffLine {
+                kind: if n == 16 {
+                    LineKind::Add
+                } else {
+                    LineKind::Context
+                },
+                old: if n == 16 { None } else { Some(n) },
+                new: Some(n),
+                text: if n == 16 {
+                    "\tconst value = longFunctionName(argumentOne, argumentTwo);  ".into()
+                } else {
+                    format!("context {n}")
+                },
+            });
+        }
+        let file = DiffFile {
+            path: "file.ts".into(),
+            old_path: "file.ts".into(),
+            status: "M".into(),
+            additions: 1,
+            deletions: 0,
+            hunks: vec![Hunk {
+                id: "h0".into(),
+                header: "@@ -13,6 +13,7 @@".into(),
+                lines: lines.iter().skip(12).take(7).cloned().collect(),
+            }],
+        };
+        let data = crate::context::FileContext::new(&file, lines)?;
+        let review = app.reviews.values_mut().next().context("review")?;
+        std::sync::Arc::make_mut(review.snapshot.as_mut().context("snapshot")?).files = vec![file];
+        review.context.entry("file.ts".into()).or_default().data = Some(std::sync::Arc::new(data));
+        for unified in [false, true] {
+            app.config.unified = unified;
+            for (count, first, last) in [(0, 16, 16), (3, 13, 19), (5, 11, 21), (10, 6, 26)] {
+                app.config.preferences.code.context_lines = count;
+                let doc = build(&app, 160);
+                let source = doc
+                    .rows
+                    .iter()
+                    .filter_map(|r| match r.right.target {
+                        Some(crate::workflow::Target::Code { new: Some(n), .. }) => Some(n),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(source.first().copied(), Some(first));
+                assert_eq!(source.last().copied(), Some(last));
+                assert!(
+                    doc.rows
+                        .iter()
+                        .filter(|r| matches!(
+                            r.right.target,
+                            Some(crate::workflow::Target::Code { .. })
+                        ))
+                        .all(|r| r.right.hunk.as_deref() == Some("h0"))
+                );
+                let text = doc
+                    .rows
+                    .iter()
+                    .flat_map(|r| &r.right.spans)
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>();
+                assert_eq!(text.contains('│'), !unified);
+            }
+        }
+        app.config.unified = true;
+        app.config.preferences.code.context_lines = 0;
+        app.config.preferences.code.line_numbers = false;
+        app.config.preferences.code.whitespace = crate::settings::Whitespace::SelectedLines;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 25))?;
+        terminal.draw(|f| draw(f, &mut app))?;
+        let row = app
+            .document
+            .as_ref()
+            .context("doc")?
+            .rows
+            .iter()
+            .position(|r| {
+                matches!(
+                    r.right.target,
+                    Some(crate::workflow::Target::Code { new: Some(16), .. })
+                )
+            })
+            .context("code row")?;
+        let screen = |t: &ratatui::Terminal<ratatui::backend::TestBackend>| {
+            t.backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+        assert!(!screen(&terminal).contains("→···const·value"));
+        app.workflow.cursor = Some(row);
+        app.workflow.selection = Some(crate::review::Anchor {
+            path: "file.ts".into(),
+            side: crate::review::Side::Right,
+            start: 16,
+            end: 16,
+        });
+        terminal.draw(|f| draw(f, &mut app))?;
+        assert!(screen(&terminal).contains("→···const·value"));
+        app.action(Action::Copy);
+        assert_eq!(
+            app.clipboard.as_deref(),
+            Some("\tconst value = longFunctionName(argumentOne, argumentTwo);  ")
+        );
+        app.config.preferences.code.whitespace = crate::settings::Whitespace::AllLines;
+        app.workflow.selection = None;
+        app.invalidate();
+        terminal.draw(|f| draw(f, &mut app))?;
+        assert!(screen(&terminal).contains("→···const·value"));
+        app.config.preferences.code.whitespace = crate::settings::Whitespace::Off;
+        app.invalidate();
+        terminal.draw(|f| draw(f, &mut app))?;
+        assert!(!screen(&terminal).contains("→···const·value"));
+        Ok(())
+    }
+
+    #[test]
+    fn split_selected_whitespace_marks_only_the_selected_source_side() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        app.view = View::Diff;
+        app.focus = Focus::Content;
+        app.config.unified = false;
+        app.config.preferences.code.line_numbers = false;
+        app.config.preferences.code.context_lines = 0;
+        app.config.preferences.code.whitespace = crate::settings::Whitespace::SelectedLines;
+        let old = "\told token ".repeat(10);
+        let new = "\tnew token ".repeat(10);
+        let patch = format!(
+            "diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n@@ -1 +1 @@\n-{old}\n+{new}\n"
+        );
+        let files = crate::diff::parse("M\0file.ts\0", &patch)?;
+        let review = app.reviews.values_mut().next().context("review")?;
+        std::sync::Arc::make_mut(review.snapshot.as_mut().context("snapshot")?).files = files;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30))?;
+        for wrap in [false, true] {
+            app.config.wrap_diff = wrap;
+            app.invalidate();
+            terminal.draw(|f| draw(f, &mut app))?;
+            let row = app
+                .document
+                .as_ref()
+                .context("doc")?
+                .rows
+                .iter()
+                .position(|r| {
+                    matches!(
+                        r.right.target,
+                        Some(crate::workflow::Target::Code {
+                            old: Some(1),
+                            new: Some(1),
+                            ..
+                        })
+                    )
+                })
+                .context("paired row")?;
+            for (side, marked, plain, copied) in [
+                (
+                    crate::review::Side::Left,
+                    "→···old·token",
+                    "    new token",
+                    &old,
+                ),
+                (
+                    crate::review::Side::Right,
+                    "→···new·token",
+                    "    old token",
+                    &new,
+                ),
+            ] {
+                app.workflow.cursor = Some(row);
+                app.workflow.side = side;
+                app.workflow.selection = Some(crate::review::Anchor {
+                    path: "file.ts".into(),
+                    side,
+                    start: 1,
+                    end: 1,
+                });
+                terminal.draw(|f| draw(f, &mut app))?;
+                let screen = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(
+                    screen.contains(marked),
+                    "selected {side:?}, wrap {wrap}: {screen}"
+                );
+                assert!(
+                    screen.contains(plain),
+                    "unselected {side:?}, wrap {wrap}: {screen}"
+                );
+                let unwanted = if side == crate::review::Side::Left {
+                    "new·token"
+                } else {
+                    "old·token"
+                };
+                assert!(
+                    !screen.contains(unwanted),
+                    "unselected continuation marked: {screen}"
+                );
+                app.action(Action::Copy);
+                assert_eq!(app.clipboard.as_deref(), Some(copied.as_str()));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn diff_reading_intent_and_selection_survive_wrap_preview_discard() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        app.view = View::Diff;
+        app.config.unified = true;
+        app.config.wrap_diff = true;
+        let review = app.reviews.values_mut().next().context("review")?;
+        let snapshot = std::sync::Arc::make_mut(review.snapshot.as_mut().context("snapshot")?);
+        let file = snapshot.files.first_mut().context("file")?;
+        let path = file.path.clone();
+        for line in &mut file.hunks.first_mut().context("hunk")?.lines {
+            line.text = format!("{} {}", line.text, "long reading text ".repeat(40));
+        }
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))?;
+        terminal.draw(|f| draw(f, &mut app))?;
+        let position = app
+            .document
+            .as_ref()
+            .context("doc")?
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                matches!(
+                    r.right.target,
+                    Some(crate::workflow::Target::Code { new: Some(40), .. })
+                )
+            })
+            .nth(3)
+            .map(|(i, _)| i)
+            .context("wrapped source")?;
+        app.focus = Focus::Content;
+        app.workflow.cursor = Some(position);
+        app.scroll = position;
+        app.workflow.selection = Some(crate::review::Anchor {
+            path,
+            side: crate::review::Side::Right,
+            start: 39,
+            end: 39,
+        });
+        terminal.draw(|f| draw(f, &mut app))?;
+        app.action(Action::Copy);
+        let copied = app.clipboard.clone();
+        assert!(
+            copied
+                .as_ref()
+                .is_some_and(|s| s.contains("line_39") && s.contains("line_40"))
+        );
+        let mut preview = app.config.clone();
+        preview.wrap_diff = false;
+        preview.preferences.code.line_numbers = false;
+        app.preview_diff_settings(Some(&preview));
+        terminal.draw(|f| draw(f, &mut app))?;
+        assert!(app.scroll < position);
+        app.action(Action::Help);
+        terminal.draw(|f| draw(f, &mut app))?;
+        app.key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        app.action(Action::Focus(Focus::Navigation));
+        terminal.draw(|f| draw(f, &mut app))?;
+        app.action(Action::Focus(Focus::Content));
+        app.preview_diff_settings(None);
+        terminal.draw(|f| draw(f, &mut app))?;
+        assert_eq!(app.workflow.cursor, Some(position));
+        assert_eq!(app.scroll, position);
+        app.action(Action::Copy);
+        assert_eq!(app.clipboard, copied);
+        assert_eq!(app.workflow.selection.as_ref().map(|a| a.start), Some(39));
+        app.preview_diff_settings(Some(&preview));
+        terminal.draw(|f| draw(f, &mut app))?;
+        app.config.preferences.keyboard.bindings.insert(
+            crate::shortcuts::ids::NAVIGATION_FIRST.0.into(),
+            crate::shortcuts::key(crate::settings::BindingKey::Function(12), 0),
+        );
+        let clamped = app.workflow.cursor;
+        app.key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Home,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            app.workflow.cursor, clamped,
+            "removed Home keeps latent source intent"
+        );
+        assert!(app.diff_reading.is_some());
+        app.key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(12),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        app.preview_diff_settings(None);
+        terminal.draw(|f| draw(f, &mut app))?;
+        assert_eq!(
+            app.scroll, 0,
+            "explicit navigation replaces latent reading intent"
+        );
+        assert_eq!(app.workflow.cursor, Some(0));
+        Ok(())
+    }
+
+    #[test]
+    fn settings_reviews_and_preview_use_real_diff_preferences() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut app = guide_app(directory.path());
+        app.view = View::Diff;
+        app.config.preferences.code.line_numbers = false;
+        app.config.preferences.code.context_lines = 0;
+        app.config.preferences.code.whitespace = crate::settings::Whitespace::AllLines;
+        let rows = build(&app, 120);
+        let source = rows
+            .rows
+            .iter()
+            .find(|r| matches!(r.right.target, Some(crate::workflow::Target::Code { .. })))
+            .context("code row")?;
+        assert!(
+            !source
+                .right
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+                .contains("    1")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn diff_preferences_hide_gutters_and_mark_whitespace_without_moving_source_links() -> Result<()>
+    {
+        let source = DiffLine {
+            kind: LineKind::Add,
+            old: None,
+            new: Some(42),
+            text: "\tlet 世界 = value;  ".into(),
+        };
+        let options = crate::settings::Code {
+            line_numbers: false,
+            whitespace: crate::settings::Whitespace::AllLines,
+            ..Default::default()
+        };
+        let rows = code_rows_with_preferences(
+            "file.ts",
+            std::slice::from_ref(&source),
+            80,
+            false,
+            (0, true),
+            &options,
+        );
+        let row = rows.first().context("source row")?;
+        let text = row
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(text.starts_with("+ →···let·世界·=·value;··"), "{text}");
+        let link = row
+            .code_links
+            .iter()
+            .find(|l| matches!(&l.action, Action::Definition { column: 14, .. }))
+            .context("value definition")?;
+        assert_eq!(link.column, 17);
+        assert_eq!(source.text, "\tlet 世界 = value;  ");
+        assert!(matches!(
+            &row.target,
+            Some(crate::workflow::Target::Code { new: Some(42), .. })
+        ));
+        Ok(())
+    }
+
+    pub(crate) fn guide_app(directory: &std::path::Path) -> App {
         use crate::{
             app::Review,
             codex::{Chapter, Guide},
@@ -3160,7 +3966,14 @@ mod tests {
         for split in [false, true] {
             for layout in [(0, false), (5, false), (0, true)] {
                 let width = 35;
-                let rows = code_rows("file.ts", &lines, width, split, layout);
+                let rows = code_rows_with_preferences(
+                    "file.ts",
+                    &lines,
+                    width,
+                    split,
+                    layout,
+                    &crate::settings::Code::default(),
+                );
                 for row in rows {
                     let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
                         width as u16,
@@ -3208,7 +4021,9 @@ mod tests {
                 }),
                 false,
                 35,
-                0
+                0,
+                true,
+                false
             )
             .iter()
             .all(|span| span.style.bg == Some(BG))
@@ -3232,13 +4047,20 @@ mod tests {
             text: "short();".into(),
         };
         let width = 26;
-        let offsets = code_offsets(Some(&old), true, width, (0, true));
+        let offsets = code_offsets(Some(&old), true, width, (0, true), true);
         let reconstructed: String = offsets
             .iter()
             .map(|offset| crop(source, *offset, width - 8))
             .collect();
         assert_eq!(reconstructed, source.replace('\t', "    "));
-        let rows = code_rows("file.ts", &[old.clone(), new], 53, true, (0, true));
+        let rows = code_rows_with_preferences(
+            "file.ts",
+            &[old.clone(), new],
+            53,
+            true,
+            (0, true),
+            &crate::settings::Code::default(),
+        );
         assert!(rows.len() > 1);
         assert!(matches!(
             rows.first().and_then(|r| r.target.as_ref()),
@@ -3264,7 +4086,14 @@ mod tests {
             rows.iter()
                 .all(|r| r.spans.iter().map(|s| s.width()).sum::<usize>() <= 53)
         );
-        let unified = code_rows("file.ts", &[old], width, false, (0, true));
+        let unified = code_rows_with_preferences(
+            "file.ts",
+            &[old],
+            width,
+            false,
+            (0, true),
+            &crate::settings::Code::default(),
+        );
         assert_eq!(unified.len(), offsets.len());
         assert!(unified.iter().all(|r| matches!(
             r.target,
@@ -3328,7 +4157,7 @@ mod tests {
                 assert!(
                     matches!(&app.modal, Some(Modal::Clone {value, ..}) if value.text() == "w")
                 );
-                assert!(!app.config.wrap_diff);
+                assert!(!app.diff_config().wrap_diff);
             }
         }
         Ok(())
@@ -3350,8 +4179,8 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(output.contains("Alt+↑/↓ Chapters"));
-        assert!(output.contains("Cmd+↑/↓ 10 lines"));
+        assert!(output.contains("Alt+Up/Alt+Down Chapters"));
+        assert!(output.contains("Super+Up/Super+Down 10 lines"));
         assert!(output.contains("Focus: Diff"));
         app.key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let next_file = app
@@ -4077,8 +4906,14 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app))?;
         app.paste("COPY".into());
         terminal.draw(|frame| draw(frame, &mut app))?;
-        assert_eq!(crate::help::entries("COPY").len(), 1);
-        assert_eq!(crate::help::entries("Cmd+C").len(), 1);
+        for query in ["COPY", "Super+C"] {
+            let matches = crate::help::entries(query, &app.config);
+            let labels = matches
+                .iter()
+                .map(|(_, label)| label.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(labels, ["Copy selection or quit", "Copy selection"]);
+        }
         assert!(app.clipboard.is_none());
         app.key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         terminal.draw(|frame| draw(frame, &mut app))?;

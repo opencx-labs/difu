@@ -489,7 +489,7 @@ impl Shell {
         }
         for (index, label) in self.agents.menu_entries().into_iter().enumerate() {
             items.push(Item {
-                title: label.into(),
+                title: label.clone(),
                 detail: self
                     .agents
                     .selected
@@ -541,7 +541,7 @@ impl Shell {
         let mut matched = items.into_iter().filter_map(|item| {
             if commands_first {
                 match &item.action {
-                    Action::AgentCommand(name) if !session_context || !name.starts_with('/') => return None,
+                    Action::AgentCommand(name) if settings_panel::command_category(name).is_none() && (!session_context || !name.starts_with('/')) => return None,
                     Action::AgentMenu(_) if !session_context => return None,
                     Action::ReviewHome(_) | Action::ReviewCommand(_) if session_context => return None,
                     _ => {}
@@ -567,6 +567,10 @@ impl Shell {
         matched.sort_by_key(|(score, category, item)| {
             (
                 commands_first && matches!(item.action, Action::Session(_) | Action::Preview(_)),
+                commands_first
+                    && !session_context
+                    && query.trim() == "/"
+                    && matches!(item.action, Action::AgentCommand(_)),
                 !matches!(item.action, Action::Session(_)),
                 *score,
                 *category,
@@ -658,34 +662,34 @@ impl Shell {
         });
     }
     pub(super) fn palette_key(&mut self, key: KeyEvent) {
+        use crate::shortcuts::{Bindings, contexts, ids};
+        let action = Bindings::new(&self.reviews.config).resolve(contexts::PALETTE, key);
         let items = self.palette_items();
         let Some(palette) = &mut self.palette else {
             return;
         };
-        match key.code {
-            KeyCode::Esc => self.palette = None,
-            KeyCode::Enter => {
+        if key.code == KeyCode::Esc {
+            self.palette = None;
+            return;
+        }
+        match action {
+            Some(ids::PALETTE_ACTIVATE) => {
                 let selected = palette.selected;
                 self.activate_palette(selected);
             }
-            KeyCode::Up => palette.selected = palette.selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => {
+            Some(ids::PALETTE_UP) => palette.selected = palette.selected.saturating_sub(1),
+            Some(ids::PALETTE_DOWN) => {
                 palette.selected = (palette.selected + 1).min(items.len().saturating_sub(1))
             }
-            KeyCode::BackTab => palette.selected = palette.selected.saturating_sub(1),
-            KeyCode::PageDown => {
+            Some(ids::PALETTE_PAGE_UP) => {
+                palette.selected = palette.selected.saturating_sub(palette.viewport)
+            }
+            Some(ids::PALETTE_PAGE_DOWN) => {
                 palette.selected =
                     (palette.selected + palette.viewport).min(items.len().saturating_sub(1))
             }
-            KeyCode::PageUp => palette.selected = palette.selected.saturating_sub(palette.viewport),
-            KeyCode::Char('c')
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL) =>
-            {
-                self.agents.clipboard = palette.query.selected_text();
-            }
-            KeyCode::Char('p') if key.modifiers == KeyModifiers::SUPER => {
+            Some(ids::PALETTE_COPY) => self.agents.clipboard = palette.query.selected_text(),
+            Some(ids::PALETTE_PIN) => {
                 if let Some(Item {
                     action: Action::Session(id),
                     ..
@@ -738,6 +742,10 @@ impl Shell {
                 app.action(ReviewAction::SetView(View::Overview));
             }
             Action::AgentCommand(name) => {
+                if let Some(category) = settings_panel::command_category(&name) {
+                    self.open_settings(Some(category));
+                    return;
+                }
                 self.switch(true);
                 self.agents.run_palette_command(&name, &query);
             }
@@ -818,7 +826,11 @@ impl Shell {
         frame.render_widget(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Command palette · ⌘K ")
+                .title(format!(
+                    " Command palette · {} ",
+                    crate::shortcuts::Bindings::new(&self.reviews.config)
+                        .hint(crate::shortcuts::ids::PALETTE_OPEN)
+                ))
                 .style(Style::default().bg(INK).fg(TEXT))
                 .border_style(Style::default().fg(ACCENT)),
             rect,
@@ -930,8 +942,16 @@ impl Shell {
             "Searching GitHub…".into()
         } else {
             format!(
-                "{} results · ↑↓ Navigate · Enter Open · ⌘P Pin session · Esc Close",
-                items.len()
+                "{} results · {} / {} Navigate · {} Open · {} Pin · Esc Close",
+                items.len(),
+                crate::shortcuts::Bindings::new(&self.reviews.config)
+                    .hint(crate::shortcuts::ids::PALETTE_UP),
+                crate::shortcuts::Bindings::new(&self.reviews.config)
+                    .hint(crate::shortcuts::ids::PALETTE_DOWN),
+                crate::shortcuts::Bindings::new(&self.reviews.config)
+                    .hint(crate::shortcuts::ids::PALETTE_ACTIVATE),
+                crate::shortcuts::Bindings::new(&self.reviews.config)
+                    .hint(crate::shortcuts::ids::PALETTE_PIN)
             )
         };
         frame.render_widget(
@@ -1277,10 +1297,8 @@ mod tests {
             Some(Action::ReviewHome(_) | Action::ReviewCommand(_))
         ));
         let has_unrelated_controls = items.iter().any(|item| {
-            matches!(
-                item.action,
-                Action::AgentMenu(_) | Action::AgentCommand(_) | Action::ReviewHome(0)
-            )
+            matches!(item.action, Action::AgentMenu(_) | Action::ReviewHome(0))
+                || matches!(&item.action, Action::AgentCommand(name) if settings_panel::command_category(name).is_none())
         });
         assert!(!has_unrelated_controls);
         query(&mut shell, "/PR controls");
@@ -1388,6 +1406,135 @@ mod tests {
         assert!(!shell.reviews.home);
         assert_eq!(shell.reviews.view, View::Overview);
         assert_eq!(shell.reviews.key(), Some(key.id()));
+        Ok(())
+    }
+    #[test]
+    fn settings_command_is_available_in_reviews_without_switching_tabs() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut shell = fixture(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        })?;
+        shell.agents_active = false;
+        query(&mut shell, "/settings");
+        let index = shell
+            .palette_items()
+            .iter()
+            .position(
+                |item| matches!(&item.action, Action::AgentCommand(name) if name == "/settings"),
+            )
+            .context("global Settings command")?;
+        shell.activate_palette(index);
+        assert!(shell.settings.is_some());
+        assert!(!shell.agents_active);
+        Ok(())
+    }
+    #[test]
+    fn palette_defaults_and_remaps_drive_navigation_activation_copy_and_pin() -> Result<()> {
+        use crate::settings::BindingKey;
+        use crate::shortcuts::{ids, key};
+        let cases = [
+            (ids::PALETTE_UP, KeyCode::Up, KeyModifiers::NONE),
+            (ids::PALETTE_DOWN, KeyCode::Down, KeyModifiers::NONE),
+            (ids::PALETTE_PAGE_UP, KeyCode::PageUp, KeyModifiers::NONE),
+            (
+                ids::PALETTE_PAGE_DOWN,
+                KeyCode::PageDown,
+                KeyModifiers::NONE,
+            ),
+            (ids::PALETTE_ACTIVATE, KeyCode::Enter, KeyModifiers::NONE),
+            (ids::PALETTE_COPY, KeyCode::Char('c'), KeyModifiers::SUPER),
+            (ids::PALETTE_PIN, KeyCode::Char('p'), KeyModifiers::SUPER),
+        ];
+        for (action, code, modifiers) in cases {
+            for custom in [false, true] {
+                let dir = tempfile::tempdir()?;
+                let mut shell = fixture(Storage {
+                    config: dir.path().join("config.json"),
+                    cache: dir.path().into(),
+                })?;
+                if action == ids::PALETTE_ACTIVATE {
+                    query(&mut shell, "/settings");
+                } else if action == ids::PALETTE_PIN {
+                    query(&mut shell, "Invoice fixes");
+                } else if action == ids::PALETTE_COPY {
+                    query(&mut shell, "literal copy");
+                    if let Some(p) = &mut shell.palette {
+                        p.query.anchor = Some(0);
+                    }
+                } else {
+                    query(&mut shell, "/");
+                    assert!(shell.palette_items().len() > 4);
+                    if let Some(p) = &mut shell.palette {
+                        p.selected = 2;
+                        p.viewport = 2;
+                    }
+                }
+                if custom {
+                    shell
+                        .reviews
+                        .config
+                        .preferences
+                        .keyboard
+                        .bindings
+                        .insert(action.0.into(), key(BindingKey::Function(10), 0));
+                }
+                shell.key(if custom {
+                    KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE)
+                } else {
+                    KeyEvent::new(code, modifiers)
+                });
+                match action {
+                    ids::PALETTE_UP => {
+                        assert_eq!(shell.palette.as_ref().map(|p| p.selected), Some(1))
+                    }
+                    ids::PALETTE_DOWN => {
+                        assert_eq!(shell.palette.as_ref().map(|p| p.selected), Some(3))
+                    }
+                    ids::PALETTE_PAGE_UP => {
+                        assert_eq!(shell.palette.as_ref().map(|p| p.selected), Some(0))
+                    }
+                    ids::PALETTE_PAGE_DOWN => {
+                        assert_eq!(shell.palette.as_ref().map(|p| p.selected), Some(4))
+                    }
+                    ids::PALETTE_ACTIVATE => assert!(shell.settings.is_some()),
+                    ids::PALETTE_COPY => {
+                        assert_eq!(shell.agents.clipboard.as_deref(), Some("literal copy"))
+                    }
+                    ids::PALETTE_PIN => assert!(
+                        shell
+                            .reviews
+                            .storage
+                            .load_config()?
+                            .pinned_sessions
+                            .iter()
+                            .any(|id| id == "one")
+                    ),
+                    _ => anyhow::bail!("unexpected palette action"),
+                }
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn editing_reservations_keep_invalid_stored_palette_keys_in_the_query() -> Result<()> {
+        use crate::settings::BindingKey;
+        use crate::shortcuts::{ids, key};
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        let mut shell = fixture(storage.clone())?;
+        shell.reviews.config.preferences.keyboard.bindings.insert(
+            ids::PALETTE_PIN.0.into(),
+            key(BindingKey::Character('z'), 0),
+        );
+        query(&mut shell, "");
+        let before = shell.reviews.config.pinned_sessions.clone();
+        shell.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(shell.palette.as_ref().context("palette")?.query.text(), "z");
+        assert_eq!(shell.reviews.config.pinned_sessions, before);
         Ok(())
     }
 }

@@ -11,26 +11,43 @@ mod inline_questions;
 mod mcp_panel;
 mod media;
 mod models;
+#[cfg(test)]
+mod overlay_shortcut_tests;
 mod panels;
 mod patch;
 mod permissions_panel;
 mod plan_prompt;
 mod prompt;
 mod prs;
+pub(crate) mod question_preview;
 mod questions;
 mod remote_control;
 mod reveal;
+#[cfg(test)]
+pub(crate) mod review_shortcut_tests;
 mod rules;
 mod selection;
 mod sends;
+mod settings;
+pub(crate) mod settings_preview;
+#[cfg(test)]
+mod shortcut_tests;
+#[cfg(test)]
+pub(crate) use overlay_shortcut_tests::prepare_slack_copy;
+mod shortcuts;
 mod sidebar;
 mod slack;
 mod themes;
+pub(crate) mod toast;
 pub(in crate::agents) mod transcript;
 mod transcript_window;
 mod tweaks;
 mod usage;
 mod voice;
+#[cfg(test)]
+pub(crate) use browser::shortcut_fixture::{browser_keys, install_browser};
+#[cfg(test)]
+pub(crate) use voice::tests::active_dictation;
 mod watch;
 use crate::{
     editor::Editor,
@@ -121,6 +138,8 @@ pub struct Position {
     saved_attachments: Vec<super::media::Attachment>,
     pub expanded: HashSet<String>,
     pub focused_entry: Option<String>,
+    /// Reading intent: entry ID and unclamped intra-entry row. `conversation`
+    /// is the current bounded display row; navigation clears/replaces this intent.
     pub scroll_anchor: Option<(String, usize)>,
     transcript_viewport: Option<(u16, u16, u64)>,
     keep_transcript_position: bool,
@@ -303,6 +322,7 @@ enum Task {
     List,
     Read(String),
     Changes(changes::Source, u64),
+    ChangesContext(changes::Source, u64, String),
     Statistics(String, u64),
     Shells(String),
     OpenArtifact,
@@ -324,6 +344,9 @@ enum Task {
 }
 
 pub struct Ui {
+    pub(crate) preferences: crate::settings::Preferences,
+    shortcut_config: Config,
+    pub(crate) settings_requested: Option<crate::settings::Category>,
     panels: panels::Panels,
     prs: prs::State,
     pub defaults: crate::storage::AgentDefaults,
@@ -388,6 +411,7 @@ pub struct Ui {
     change_lines: usize,
     change_width: u16,
     change_wrap: bool,
+    change_unified: bool,
     change_rows: std::sync::Arc<Vec<patch::SourceRow>>,
     skills: HashMap<String, (Vec<Skill>, Vec<String>)>,
     skills_loading: Option<String>,
@@ -406,10 +430,26 @@ pub struct Ui {
     media_pending: Option<(String, mpsc::Receiver<Result<super::media::Paste, String>>)>,
 }
 impl Ui {
+    pub(crate) fn notification_viewed_session(&self) -> Option<String> {
+        if self.modal.is_some()
+            || (self.drilled && self.changes_visible)
+            || (self.panels.visible() && !self.panels.right)
+        {
+            None
+        } else {
+            self.selected.clone()
+        }
+    }
+
     pub fn new(storage: Storage, config: &Config) -> Self {
         let (sender, receiver) = mpsc::channel();
         Self {
-            panels: panels::Panels::new(config.agent_panel_right),
+            preferences: config.preferences.clone(),
+            shortcut_config: config.clone(),
+            panels: panels::Panels::new(
+                config.preferences.layout.helper(config.agent_panel_right)
+                    != crate::settings::HelperPlacement::Main,
+            ),
             prs: prs::State::load(&storage),
             defaults: config.agent_defaults.clone(),
             selected: None,
@@ -469,11 +509,13 @@ impl Ui {
             change_lines: 0,
             change_width: 0,
             change_wrap: config.wrap_diff,
+            change_unified: config.unified,
             change_rows: Default::default(),
             skills: HashMap::new(),
             skills_loading: None,
             workspace_paths: HashMap::new(),
             paths_loading: HashSet::new(),
+            settings_requested: None,
             voice: voice::State::new(config.voice_enabled),
             tweaks: config.tweaks,
             theme: crate::theme::index(config.theme.as_deref()),
@@ -499,18 +541,19 @@ impl Ui {
         });
     }
     pub fn redraw_interval(&self) -> Option<Duration> {
-        if self.voice_active()
-            || self.question_flip.animating(Instant::now())
-            || !self.sidebar_highlights.is_empty()
-            || self
-                .sidebar_boards
-                .values()
-                .any(|board| board.animating(Instant::now()))
-            || self
-                .selected
-                .as_ref()
-                .and_then(|id| self.positions.get(id))
-                .is_some_and(Position::animating)
+        if self.preferences.motion.level == crate::settings::Motion::Full
+            && (self.voice_active()
+                || self.question_flip.animating(Instant::now())
+                || !self.sidebar_highlights.is_empty()
+                || self
+                    .sidebar_boards
+                    .values()
+                    .any(|board| board.animating(Instant::now()))
+                || self
+                    .selected
+                    .as_ref()
+                    .and_then(|id| self.positions.get(id))
+                    .is_some_and(Position::animating))
         {
             return Some(crate::repaint::FRAME_INTERVAL);
         }
@@ -523,7 +566,13 @@ impl Ui {
                         || self.list_visible && self.prs.visible.contains(&s.id))
             })
         {
-            return Some(crate::repaint::FRAME_INTERVAL);
+            return Some(
+                if self.preferences.motion.level == crate::settings::Motion::Full {
+                    crate::repaint::FRAME_INTERVAL
+                } else {
+                    Duration::from_secs(1)
+                },
+            );
         }
         if let Some(panels::View::PullRequest { app }) = &self.panels.view {
             return app.redraw_interval();
@@ -576,6 +625,10 @@ impl Ui {
                 self.finish_send(id, *token, message.result);
                 continue;
             }
+            if let Task::ChangesContext(source, request, patch) = &message.kind {
+                self.receive_change_context(source, *request, patch, message.result);
+                continue;
+            }
             if let Task::Changes(source, request) = &message.kind {
                 self.receive_change_result(source, *request, message.result);
                 continue;
@@ -590,7 +643,7 @@ impl Ui {
                     self.refreshed = Some(Instant::now());
                 }
                 Task::Read(_) => {}
-                Task::Changes(..) => {}
+                Task::Changes(..) | Task::ChangesContext(..) => {}
                 Task::Launch
                 | Task::Repository(_)
                 | Task::Clear(_)
@@ -964,6 +1017,9 @@ impl Ui {
                 self.task(Task::Changes(source, self.change_request), request, false);
             }
         }
+        if visible {
+            self.request_change_context();
+        }
         self.tick_plan_prompt(visible);
     }
     fn filtered(&self) -> Vec<Summary> {
@@ -994,9 +1050,17 @@ impl Ui {
                         .contains(&b.id)
                         .cmp(&self.pinned_sessions.contains(&a.id))
                 })
+                .then_with(|| match self.preferences.layout.session_sort {
+                    crate::settings::SessionSort::Manual => std::cmp::Ordering::Equal,
+                    crate::settings::SessionSort::Recent => b.updated.cmp(&a.updated),
+                    crate::settings::SessionSort::ActiveFirst => b
+                        .status
+                        .active()
+                        .cmp(&a.status.active())
+                        .then_with(|| b.updated.cmp(&a.updated)),
+                })
                 .then_with(|| positions.get(&a.id).cmp(&positions.get(&b.id)))
-                // Session IDs start with their creation timestamp. New sessions
-                // appear first; updates and status changes never affect order.
+                // Keep the creation-ID fallback stable inside each ordering group.
                 .then_with(|| b.id.cmp(&a.id))
         });
         if self.orchestrator_list
@@ -1202,7 +1266,7 @@ impl Ui {
             true,
         );
     }
-    pub(crate) fn menu_entries(&self) -> Vec<&'static str> {
+    pub(crate) fn menu_entries(&self) -> Vec<String> {
         let archived = self
             .sessions
             .get(self.selected.as_deref().unwrap_or_default())
@@ -1244,7 +1308,32 @@ impl Ui {
         if self.plan_available() {
             entries.push("Review completed plan");
         }
+        use crate::shortcuts::{Bindings, ids::*};
+        let bindings = Bindings::new(&self.shortcut_config);
         entries
+            .into_iter()
+            .map(|label| {
+                let replacement = match label {
+                    "Change model / reasoning · Alt+M" => {
+                        Some(("Change model / reasoning", AGENTS_MODELS))
+                    }
+                    "Toggle agents list · Alt+[" => Some(("Toggle agents list", AGENTS_SIDEBAR)),
+                    "Toggle Changes · Alt+D" => Some(("Toggle Changes", AGENTS_CHANGES)),
+                    "Pending questions · Alt+↑" => Some(("Pending questions", QUESTION_OPEN)),
+                    "Move shell / artifact pane · Alt+P" => {
+                        Some(("Move shell / artifact pane", HELPER_PLACEMENT))
+                    }
+                    "Permissions and mode · Shift+Tab" => {
+                        Some(("Permissions and mode", COMPOSER_PERMISSION_MODE))
+                    }
+                    _ => None,
+                };
+                replacement.map_or_else(
+                    || label.into(),
+                    |(label, id)| format!("{label} · {}", bindings.hint(id)),
+                )
+            })
+            .collect()
     }
     pub(crate) fn menu_action(&mut self, index: usize) {
         match index {
@@ -1261,7 +1350,7 @@ impl Ui {
             15 => self.open_resources(true),
             16 => {
                 self.modal = None;
-                self.panel_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+                self.move_helper();
             }
             13 => self.modal = Some(Modal::Delete),
             12 => self.open_defaults(),
@@ -1365,11 +1454,15 @@ impl Ui {
             _ => None,
         }
     }
-    fn save_visibility(&mut self) {
+    fn save_visibility(&mut self, moved_helper: bool) {
         let (list, changes) = (self.list_visible, self.changes_visible);
         let result = self.storage.update_config(|config| {
             config.agent_list_visible = list;
             config.agent_changes_visible = changes;
+            if moved_helper {
+                config.agent_panel_right = true;
+                config.preferences.layout.helper_placement = None;
+            }
         });
         if let Err(error) = result {
             self.notice = Some((format!("Could not save pane visibility: {error:#}"), true));
@@ -1384,13 +1477,15 @@ impl Ui {
                 Focus::Conversation
             };
         }
-        self.save_visibility();
+        self.save_visibility(false);
     }
     pub fn toggle_changes(&mut self) {
         self.panels.focused = false;
         self.changes_visible = !self.changes_visible;
-        if self.changes_visible && self.panels.view.is_some() {
+        let moved_helper = self.changes_visible && self.panels.view.is_some() && !self.panels.right;
+        if moved_helper {
             self.panels.right = true;
+            self.preferences.layout.helper_placement = None;
         }
         self.drilled = true;
         self.focus = if self.changes_visible {
@@ -1399,7 +1494,7 @@ impl Ui {
             Focus::Composer
         };
         self.changes_at = None;
-        self.save_visibility();
+        self.save_visibility(moved_helper);
     }
     fn composer_suggestion(&self) -> Option<&str> {
         let id = self.selected.as_ref()?;
@@ -1521,7 +1616,14 @@ impl Ui {
             Some(Modal::Help(state)) => Some(&state.query),
             Some(Modal::Permissions(state)) => state.editor(),
             Some(Modal::Plan(state)) => state.editor(),
-            Some(Modal::Rename(editor) | Modal::QueuedEdit { editor, .. }) => Some(editor),
+            Some(
+                Modal::Rename(editor)
+                | Modal::QueuedEdit {
+                    editor, focus: 0, ..
+                },
+            ) => Some(editor),
+            Some(Modal::Tweaks { fields, field }) => fields.get(*field),
+            Some(Modal::Slack(form)) => form.copy_editor(),
             Some(Modal::Model {
                 model,
                 effort,
@@ -1561,6 +1663,16 @@ impl Ui {
             self.voice_key(key);
             return;
         }
+        use crate::shortcuts::ids::*;
+        if self.shortcut_context() == crate::shortcuts::contexts::AGENT_CHANGES
+            && matches!(self.shortcut(key), Some(NAVIGATION_FIRST | NAVIGATION_LAST))
+            && let Some(document) = self
+                .selected
+                .as_ref()
+                .and_then(|id| self.changes.get_mut(id))
+        {
+            document.clear_reading();
+        }
         self.question_flip.interrupt();
         if self.resource_key(key) || self.panel_key(key) {
             return;
@@ -1576,20 +1688,13 @@ impl Ui {
         {
             self.typing_focus();
         }
-        if key.code == KeyCode::Char('c')
-            && key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        if ((key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL)
+            || self.shortcut(key) == Some(SELECTION_COPY))
             && self.copy_chat_selection()
         {
             return;
         }
-
-        if key.code == KeyCode::Char('c')
-            && key.modifiers.contains(KeyModifiers::SUPER)
-            && let Some(editor) = self.focused_editor()
-        {
-            self.clipboard = editor.selected_text();
+        if self.shortcut(key) == Some(SELECTION_COPY) && self.focused_editor().is_some() {
             return;
         }
         if matches!(self.modal, Some(Modal::Plan(_))) {
@@ -1602,16 +1707,16 @@ impl Ui {
         if self.voice_key(key) {
             return;
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('[') {
+        let shortcut = self.shortcut(key);
+        if shortcut == Some(AGENTS_SIDEBAR) {
             self.toggle_list();
             return;
         }
-        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('d') {
+        if shortcut == Some(AGENTS_CHANGES) {
             self.toggle_changes();
             return;
         }
-        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('m') {
+        if shortcut == Some(AGENTS_MODELS) {
             if matches!(self.modal, Some(Modal::ModelPicker(_))) {
                 self.modal = None;
             } else {
@@ -1619,7 +1724,7 @@ impl Ui {
             }
             return;
         }
-        if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT) {
+        if self.shortcut(key) == Some(crate::shortcuts::ids::QUESTION_OPEN) {
             self.open_questions();
             return;
         }
@@ -1629,19 +1734,17 @@ impl Ui {
             return;
         }
         if self.focus == Focus::List
-            && key.modifiers == KeyModifiers::CONTROL
-            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+            && matches!(shortcut, Some(SESSION_REORDER_UP | SESSION_REORDER_DOWN))
         {
-            self.reorder_session(key.code == KeyCode::Down);
+            self.reorder_session(shortcut == Some(SESSION_REORDER_DOWN));
             return;
         }
         if self.drilled
-            && key.modifiers == KeyModifiers::SUPER
-            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+            && matches!(shortcut, Some(CONVERSATION_PREVIOUS | CONVERSATION_NEXT))
             && matches!(self.focus, Focus::Composer | Focus::Conversation)
         {
             if self.focus == Focus::Composer {
-                if key.code == KeyCode::Up {
+                if shortcut == Some(CONVERSATION_PREVIOUS) {
                     self.focus = Focus::Conversation;
                     if let Some(p) = self
                         .selected
@@ -1660,23 +1763,26 @@ impl Ui {
                     }
                 }
             } else {
-                self.move_transcript(key.code == KeyCode::Down);
+                self.move_transcript(shortcut == Some(CONVERSATION_NEXT));
             }
             return;
         }
         if self.focus == Focus::List
-            && key.code == KeyCode::Enter
+            && shortcut == Some(NAVIGATION_ACTIVATE)
             && !self.orchestrator_list
             && self.selected.as_deref() == Some(super::orchestrator::ID)
         {
             self.open_orchestrator_list();
             return;
         }
-        if self.orchestrator_list && !self.drilled && key.code == KeyCode::Esc {
+        if self.orchestrator_list && !self.drilled && shortcut == Some(AGENTS_BACK) {
             self.close_orchestrator_list();
             return;
         }
-        if self.changes_visible && self.drilled && key.code == KeyCode::Esc {
+        if self.changes_visible
+            && self.drilled
+            && matches!(shortcut, Some(AGENTS_BACK | CONVERSATION_INTERRUPT))
+        {
             self.toggle_changes();
             return;
         }
@@ -1684,13 +1790,12 @@ impl Ui {
             && self.drilled
             && !self.panels.focused
             && matches!(self.focus, Focus::Changes | Focus::ChangeTree)
-            && key.modifiers.is_empty()
-            && matches!(key.code, KeyCode::Char('[' | ']'))
+            && matches!(shortcut, Some(CHANGES_PREVIOUS_PR | CHANGES_NEXT_PR))
         {
-            self.cycle_change_pr(key.code == KeyCode::Char(']'));
+            self.cycle_change_pr(shortcut == Some(CHANGES_NEXT_PR));
             return;
         }
-        if key.code == KeyCode::Esc
+        if shortcut == Some(CONVERSATION_INTERRUPT)
             && self.drilled
             && matches!(self.focus, Focus::Composer | Focus::Conversation)
             && let Some(session) = self.selected.as_ref().and_then(|id| self.sessions.get(id))
@@ -1710,32 +1815,39 @@ impl Ui {
                 return;
             }
         }
-        if matches!(key.code, KeyCode::Up | KeyCode::Down)
-            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SUPER)
-            && self.step_change_file(key.code == KeyCode::Down)
-        {
+        if matches!(
+            shortcut,
+            Some(NAVIGATION_UP | NAVIGATION_DOWN | NAVIGATION_FAST_UP | NAVIGATION_FAST_DOWN)
+        ) && self.step_change_file(matches!(
+            shortcut,
+            Some(NAVIGATION_DOWN | NAVIGATION_FAST_DOWN)
+        )) {
             return;
         }
         if self.focus == Focus::ChangeTree && self.changes_visible {
-            match key.code {
-                KeyCode::Enter => {
+            match shortcut {
+                Some(NAVIGATION_ACTIVATE) => {
                     self.focus = Focus::Changes;
                     return;
                 }
-                KeyCode::Left | KeyCode::Right => {
+                Some(NAVIGATION_LEFT | NAVIGATION_RIGHT) => {
                     if let Some(p) = self
                         .selected
                         .as_ref()
                         .and_then(|id| self.positions.get_mut(id))
                     {
-                        p.change_tree_horizontal = p
-                            .change_tree_horizontal
-                            .saturating_add_signed(if key.code == KeyCode::Left { -4 } else { 4 });
+                        p.change_tree_horizontal = p.change_tree_horizontal.saturating_add_signed(
+                            if shortcut == Some(NAVIGATION_LEFT) {
+                                -4
+                            } else {
+                                4
+                            },
+                        );
                     }
                     return;
                 }
-                KeyCode::Home | KeyCode::End => {
-                    self.move_change_tree(if key.code == KeyCode::Home {
+                Some(NAVIGATION_FIRST | NAVIGATION_LAST) => {
+                    self.move_change_tree(if shortcut == Some(NAVIGATION_FIRST) {
                         i32::MIN
                     } else {
                         i32::MAX
@@ -1746,8 +1858,7 @@ impl Ui {
             }
         }
         if self.focus == Focus::Composer && self.drilled {
-            if key.code == KeyCode::BackTab
-                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+            if shortcut == Some(COMPOSER_PERMISSION_MODE)
                 && !self.changes_visible
                 && !self.panels.focused
                 && !self.question_panel()
@@ -1755,8 +1866,7 @@ impl Ui {
                 self.cycle_permission_mode();
                 return;
             }
-            if key.modifiers.is_empty()
-                && key.code == KeyCode::Right
+            if shortcut == Some(COMPOSER_SUGGESTION)
                 && let Some(suggestion) = self.composer_suggestion().map(str::to_owned)
                 && let Some(id) = self.selected.clone()
             {
@@ -1770,11 +1880,7 @@ impl Ui {
             if self.history_key(key) {
                 return;
             }
-            if key.code == KeyCode::Char('v')
-                && key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
-            {
+            if shortcut == Some(COMPOSER_ATTACH) {
                 if self
                     .selected
                     .as_ref()
@@ -1786,10 +1892,7 @@ impl Ui {
                 self.attach(None);
                 return;
             }
-            if matches!(key.code, KeyCode::Char('$' | '@'))
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            if matches!(shortcut, Some(COMPOSER_SKILLS | COMPOSER_PATHS))
                 && self
                     .selected
                     .as_ref()
@@ -1802,15 +1905,15 @@ impl Ui {
                                 .is_some_and(|c| c.is_whitespace())
                     })
             {
-                if key.code == KeyCode::Char('@') {
+                if shortcut == Some(COMPOSER_PATHS) {
                     self.open_paths();
                 } else {
                     self.open_commands(true);
                 }
                 return;
             }
-            match key.code {
-                KeyCode::Char('/')
+            match shortcut {
+                Some(AGENTS_COMMANDS)
                     if self
                         .selected
                         .as_ref()
@@ -1819,13 +1922,22 @@ impl Ui {
                 {
                     self.open_commands(false)
                 }
-                KeyCode::Esc => {
+                Some(CONVERSATION_INTERRUPT) => {
                     self.drilled = false;
                     self.focus = Focus::List;
                 }
-                KeyCode::Tab | KeyCode::BackTab => self.cycle_focus(key.code == KeyCode::BackTab),
-                KeyCode::Enter if ctrl => self.send(true),
-                KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => self.send(false),
+                Some(
+                    NAVIGATION_NEXT_FOCUS
+                    | NAVIGATION_NEXT_FOCUS_COMPOSER
+                    | NAVIGATION_PREVIOUS_FOCUS,
+                ) => self.cycle_focus(shortcut == Some(NAVIGATION_PREVIOUS_FOCUS)),
+                Some(COMPOSER_QUEUE) => self.send(true),
+                Some(COMPOSER_SEND) => self.send_primary(),
+                Some(COMPOSER_NEWLINE) => {
+                    if let Some(id) = self.selected.clone() {
+                        self.positions.entry(id).or_default().draft.insert("\n");
+                    }
+                }
                 _ => {
                     if let Some(id) = self.selected.clone() {
                         self.positions.entry(id).or_default().draft.key(key);
@@ -1834,26 +1946,26 @@ impl Ui {
             }
             return;
         }
-        match key.code {
-            KeyCode::Char('n') => self.launch(),
-            KeyCode::Char('/') if self.drilled && self.focus != Focus::List => {
+        match shortcut {
+            Some(SESSION_NEW) => self.launch(),
+            Some(AGENTS_COMMANDS) if self.drilled && self.focus != Focus::List => {
                 self.open_commands(false)
             }
-            KeyCode::Char('/') => {
+            Some(AGENTS_COMMANDS) => {
                 self.modal = Some(Modal::Menu {
                     query: Editor::default(),
                     selected: 0,
                 })
             }
-            KeyCode::Char('?') => self.modal = Some(Modal::Help(Default::default())),
-            KeyCode::Char('r') => {
+            Some(AGENTS_HELP) => self.modal = Some(Modal::Help(Default::default())),
+            Some(SESSION_REFRESH) => {
                 self.refreshed = None;
                 self.changes_at = None;
                 if let Some(id) = &self.selected {
                     self.prs.refresh(id);
                 }
             }
-            KeyCode::Enter
+            Some(NAVIGATION_ACTIVATE)
                 if self.drilled
                     && self.focus == Focus::Conversation
                     && self
@@ -1871,7 +1983,7 @@ impl Ui {
                     self.action(Action::ToggleEntry(entry));
                 }
             }
-            KeyCode::Enter if self.changes_visible && self.focus == Focus::List => {
+            Some(NAVIGATION_ACTIVATE) if self.changes_visible && self.focus == Focus::List => {
                 if self.selected.is_some() {
                     self.follow_latest();
                     self.drilled = true;
@@ -1879,13 +1991,13 @@ impl Ui {
                     self.changes_at = None;
                 }
             }
-            KeyCode::Char('i') | KeyCode::Enter if self.drilled => {
+            Some(CONVERSATION_COMPOSE | NAVIGATION_ACTIVATE) if self.drilled => {
                 if self.focus == Focus::List {
                     self.follow_latest();
                 }
                 self.focus = Focus::Composer;
             }
-            KeyCode::Enter => {
+            Some(NAVIGATION_ACTIVATE) => {
                 if self.selected.is_some() {
                     self.follow_latest();
                     self.drilled = true;
@@ -1893,19 +2005,34 @@ impl Ui {
                     self.changes_at = None;
                 }
             }
-            KeyCode::Esc => {
+            Some(AGENTS_BACK | CONVERSATION_INTERRUPT) => {
                 self.drilled = false;
                 self.focus = Focus::List;
             }
-            KeyCode::Tab | KeyCode::BackTab => self.cycle_focus(key.code == KeyCode::BackTab),
-            KeyCode::Up | KeyCode::Down if self.focus == Focus::Conversation => {
-                self.move_transcript(key.code == KeyCode::Down);
+            Some(NAVIGATION_NEXT_FOCUS | NAVIGATION_PREVIOUS_FOCUS) => {
+                self.cycle_focus(shortcut == Some(NAVIGATION_PREVIOUS_FOCUS))
             }
-            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
-                let down = matches!(key.code, KeyCode::Down | KeyCode::PageDown);
-                let amount = if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+            Some(NAVIGATION_UP | NAVIGATION_DOWN) if self.focus == Focus::Conversation => {
+                self.move_transcript(shortcut == Some(NAVIGATION_DOWN));
+            }
+            Some(
+                NAVIGATION_UP | NAVIGATION_DOWN | NAVIGATION_PAGE_UP | NAVIGATION_PAGE_DOWN
+                | NAVIGATION_FAST_UP | NAVIGATION_FAST_DOWN | CHANGES_SELECT_UP
+                | CHANGES_SELECT_DOWN,
+            ) => {
+                let down = matches!(
+                    shortcut,
+                    Some(
+                        NAVIGATION_DOWN
+                            | NAVIGATION_PAGE_DOWN
+                            | NAVIGATION_FAST_DOWN
+                            | CHANGES_SELECT_DOWN
+                    )
+                );
+                let amount = if matches!(shortcut, Some(NAVIGATION_PAGE_UP | NAVIGATION_PAGE_DOWN))
+                {
                     self.viewport.max(1)
-                } else if key.modifiers.contains(KeyModifiers::SUPER) {
+                } else if matches!(shortcut, Some(NAVIGATION_FAST_UP | NAVIGATION_FAST_DOWN)) {
                     10
                 } else {
                     1
@@ -1916,18 +2043,22 @@ impl Ui {
                     } else {
                         -(amount as i32)
                     },
-                    key.modifiers.contains(KeyModifiers::SHIFT),
+                    matches!(shortcut, Some(CHANGES_SELECT_UP | CHANGES_SELECT_DOWN)),
                 );
             }
-            KeyCode::Left | KeyCode::Right if self.focus == Focus::Changes => {
+            Some(NAVIGATION_LEFT | NAVIGATION_RIGHT) if self.focus == Focus::Changes => {
                 if let Some(id) = self.selected.clone() {
                     let p = self.positions.entry(id).or_default();
-                    p.horizontal = p
-                        .horizontal
-                        .saturating_add_signed(if key.code == KeyCode::Left { -4 } else { 4 });
+                    p.horizontal =
+                        p.horizontal
+                            .saturating_add_signed(if shortcut == Some(NAVIGATION_LEFT) {
+                                -4
+                            } else {
+                                4
+                            });
                 }
             }
-            KeyCode::End => {
+            Some(NAVIGATION_LAST) => {
                 self.text_selection.clear();
                 if let Some(id) = self.selected.clone() {
                     let p = self.positions.entry(id).or_default();
@@ -1942,7 +2073,7 @@ impl Ui {
                     }
                 }
             }
-            KeyCode::Home => {
+            Some(NAVIGATION_FIRST) => {
                 if let Some(id) = self.selected.clone() {
                     let p = self.positions.entry(id).or_default();
                     if self.focus == Focus::Changes {
@@ -1956,21 +2087,23 @@ impl Ui {
                     }
                 }
             }
-            KeyCode::Char('c') if self.focus == Focus::Changes => self.copy_change(),
+            Some(SELECTION_COPY) if self.focus == Focus::Changes => self.copy_change(),
             _ => {}
         }
     }
     fn cycle_focus(&mut self, backwards: bool) {
-        let helper = self.drilled && self.panels.right && self.panels.visible();
+        let helper = self.drilled && self.panels.visible();
         // Visible panes cycle in screen order: sessions, composer, helper canvas.
         let mut targets = Vec::new();
         if self.list_visible {
             targets.push(0);
         }
-        if self.changes_visible && self.drilled {
-            targets.extend([3, 4]);
-        } else {
-            targets.push(1);
+        if !(helper && !self.panels.right) {
+            if self.changes_visible && self.drilled {
+                targets.extend([3, 4]);
+            } else {
+                targets.push(1);
+            }
         }
         if helper {
             targets.push(2);
@@ -2089,6 +2222,14 @@ impl Ui {
         }
     }
     fn scroll(&mut self, delta: i32, select: bool) {
+        if self.focus == Focus::Changes
+            && let Some(document) = self
+                .selected
+                .as_ref()
+                .and_then(|id| self.changes.get_mut(id))
+        {
+            document.clear_reading();
+        }
         if self.focus == Focus::ChangeTree {
             self.move_change_tree(delta);
             return;
@@ -2122,27 +2263,14 @@ impl Ui {
         }
     }
     fn copy_change(&mut self) {
-        if let Some(p) = self.selected.as_ref().and_then(|id| self.positions.get(id)) {
-            let start = p.selection.unwrap_or(p.changes).min(p.changes);
-            let end = p.selection.unwrap_or(p.changes).max(p.changes);
-            let mut previous = None;
-            let mut text = Vec::new();
-            for row in self
-                .change_rows
-                .iter()
-                .skip(start)
-                .take(end.saturating_sub(start) + 1)
-            {
-                if let Some((index, source)) = &row.source
-                    && previous != Some(*index)
-                {
-                    text.push(source.clone());
-                    previous = Some(*index);
-                }
-            }
-            if !text.is_empty() {
-                self.clipboard = Some(text.join("\n"));
-            }
+        if let Some(id) = &self.selected
+            && let Some(position) = self.positions.get(id)
+        {
+            self.clipboard = self
+                .changes
+                .get(id)
+                .and_then(|d| d.copied_source(position))
+                .or_else(|| changes::copy_rows(&self.change_rows, position));
         }
     }
     pub fn paste(&mut self, text: &str) {
@@ -2229,7 +2357,11 @@ impl Ui {
             Some(Modal::Help(state)) => state.query.insert(text),
             None if self.focus == Focus::Composer => {
                 if let Some(id) = self.selected.clone() {
-                    self.positions.entry(id).or_default().draft.paste(text);
+                    self.positions
+                        .entry(id)
+                        .or_default()
+                        .draft
+                        .paste_with_threshold(text, self.preferences.input.paste_threshold);
                 }
             }
             _ => {}
@@ -2293,7 +2425,34 @@ impl Ui {
             self.modal = None;
             return;
         }
+        if matches!(
+            self.modal,
+            Some(Modal::Repository(_) | Modal::ChangeRepository(_))
+        ) {
+            if self.shortcut(key) == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) {
+                self.action(if matches!(self.modal, Some(Modal::Repository(_))) {
+                    Action::ChooseRepository
+                } else {
+                    Action::ChangeRepository
+                });
+            } else {
+                match &mut self.modal {
+                    Some(Modal::Repository(editor))
+                        if key.code == KeyCode::Char('u')
+                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        editor.clear()
+                    }
+                    Some(Modal::Repository(editor) | Modal::ChangeRepository(editor)) => {
+                        editor.key(key)
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shortcut = self.shortcut(key);
         let menu = self.menu_entries();
         let mut action = None;
         match &mut self.modal {
@@ -2304,41 +2463,11 @@ impl Ui {
                 ..
             }) => {
                 let maximum = rows.len().saturating_sub(*height);
-                let step = scroll_step(key);
-                *scroll = match key.code {
-                    KeyCode::Up => scroll.saturating_sub(step),
-                    KeyCode::Down => scroll.saturating_add(step).min(maximum),
-                    KeyCode::PageUp => scroll.saturating_sub(*height),
-                    KeyCode::PageDown => scroll.saturating_add(*height).min(maximum),
-                    KeyCode::Home => 0,
-                    KeyCode::End => maximum,
-                    _ => *scroll,
-                };
+                *scroll = shortcut_scroll(shortcut, *scroll, *height, maximum);
             }
             Some(Modal::Status { scroll }) => {
-                let step = scroll_step(key);
-                *scroll = match key.code {
-                    KeyCode::Up => scroll.saturating_sub(step),
-                    KeyCode::Down => scroll.saturating_add(step),
-                    KeyCode::PageUp => scroll.saturating_sub(10),
-                    KeyCode::PageDown => scroll.saturating_add(10),
-                    KeyCode::Home => 0,
-                    KeyCode::End => usize::MAX,
-                    _ => *scroll,
-                };
+                *scroll = shortcut_scroll(shortcut, *scroll, 10, usize::MAX);
             }
-            Some(Modal::ChangeRepository(editor)) => match key.code {
-                KeyCode::Enter => action = Some(Action::ChangeRepository),
-                KeyCode::Esc => self.modal = None,
-                _ => {
-                    editor.key(key);
-                }
-            },
-            Some(Modal::Repository(editor)) => match key.code {
-                KeyCode::Enter => action = Some(Action::ChooseRepository),
-                KeyCode::Char('u') if ctrl => editor.clear(),
-                _ => editor.key(key),
-            },
             Some(Modal::Menu { query, selected }) => {
                 let matching: Vec<_> = menu
                     .iter()
@@ -2347,19 +2476,19 @@ impl Ui {
                         label.to_lowercase().contains(&query.text().to_lowercase())
                     })
                     .collect();
-                match key.code {
-                    KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                match shortcut {
+                    Some(crate::shortcuts::ids::NAVIGATION_UP) => {
                         *selected = selected.saturating_sub(1)
                     }
-                    KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Some(crate::shortcuts::ids::NAVIGATION_DOWN) => {
                         *selected = (*selected + 1).min(matching.len().saturating_sub(1))
                     }
-                    KeyCode::Enter => {
+                    Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) => {
                         action = matching
                             .get(*selected)
                             .map(|(index, _)| Action::MenuItem(*index))
                     }
-                    KeyCode::Char('u') if ctrl => {
+                    _ if key.code == KeyCode::Char('u') && ctrl => {
                         *query = Editor::default();
                         *selected = 0;
                     }
@@ -2370,7 +2499,7 @@ impl Ui {
                 }
             }
             Some(Modal::Rename(editor)) => {
-                if key.code == KeyCode::Enter {
+                if shortcut == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) {
                     if let Some(id) = self.selected.clone() {
                         let title = editor.text();
                         self.busy = true;
@@ -2380,7 +2509,7 @@ impl Ui {
                     editor.key(key);
                 }
             }
-            Some(Modal::Delete) if key.code == KeyCode::Enter => {
+            Some(Modal::Delete) if shortcut == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) => {
                 if let Some(id) = self.selected.clone()
                     && self.deleting.insert(id.clone())
                 {
@@ -2394,7 +2523,7 @@ impl Ui {
                     self.task(Task::Delete(id.clone()), Request::Delete { id }, false);
                 }
             }
-            Some(Modal::Clear) if key.code == KeyCode::Enter => {
+            Some(Modal::Clear) if shortcut == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) => {
                 if !self.busy
                     && let Some(id) = self.selected.clone()
                 {
@@ -2411,13 +2540,20 @@ impl Ui {
                 scroll,
             }) => {
                 let text_input = pending.method == "item/tool/requestUserInput";
-                match key.code {
-                    KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
-                    KeyCode::PageDown => *scroll = scroll.saturating_add(10),
-                    KeyCode::Enter if ctrl || !text_input => {
+                match shortcut {
+                    Some(crate::shortcuts::ids::NAVIGATION_PAGE_UP) => {
+                        *scroll = scroll.saturating_sub(10)
+                    }
+                    Some(crate::shortcuts::ids::NAVIGATION_PAGE_DOWN) => {
+                        *scroll = scroll.saturating_add(10)
+                    }
+                    Some(crate::shortcuts::ids::APPROVAL_SUBMIT) if !text_input => {
                         action = Some(Action::Approve(*selected))
                     }
-                    KeyCode::Tab | KeyCode::BackTab if text_input => {
+                    Some(
+                        crate::shortcuts::ids::NAVIGATION_NEXT_FOCUS
+                        | crate::shortcuts::ids::NAVIGATION_PREVIOUS_FOCUS,
+                    ) if text_input => {
                         *field = if key.code == KeyCode::BackTab {
                             (*field + answers.len().saturating_sub(1)) % answers.len().max(1)
                         } else {
@@ -2425,8 +2561,10 @@ impl Ui {
                         };
                         *scroll = 0
                     }
-                    KeyCode::Up if !text_input => *selected = selected.saturating_sub(1),
-                    KeyCode::Down if !text_input => {
+                    Some(crate::shortcuts::ids::NAVIGATION_UP) if !text_input => {
+                        *selected = selected.saturating_sub(1)
+                    }
+                    Some(crate::shortcuts::ids::NAVIGATION_DOWN) if !text_input => {
                         let last = match pending.method.as_str() {
                             "item/permissions/requestApproval" => 1,
                             "item/commandExecution/requestApproval"
@@ -2443,14 +2581,16 @@ impl Ui {
                     _ => {}
                 }
             }
-            Some(Modal::Help(state)) => match key.code {
-                KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    state.scroll = state.scroll.saturating_sub(scroll_step(key))
+            Some(Modal::Help(state)) => match shortcut {
+                Some(
+                    crate::shortcuts::ids::NAVIGATION_UP
+                    | crate::shortcuts::ids::NAVIGATION_DOWN
+                    | crate::shortcuts::ids::NAVIGATION_FAST_UP
+                    | crate::shortcuts::ids::NAVIGATION_FAST_DOWN,
+                ) => {
+                    state.scroll = shortcut_scroll(shortcut, state.scroll, 10, usize::MAX);
                 }
-                KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    state.scroll = state.scroll.saturating_add(scroll_step(key))
-                }
-                KeyCode::Char('u') if ctrl => {
+                _ if key.code == KeyCode::Char('u') && ctrl => {
                     state.query.clear();
                     state.scroll = 0;
                 }
@@ -2605,12 +2745,8 @@ impl Ui {
             Action::PermissionTab(index) => self.permissions_tab(index),
             Action::PermissionItem(index) => self.permissions_select(Some(index)),
             Action::PermissionField(index) => self.permissions_field(index),
-            Action::PermissionSave => {
-                self.permissions_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL))
-            }
-            Action::PermissionSearch => {
-                self.permissions_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
-            }
+            Action::PermissionSave => self.permissions_save(),
+            Action::PermissionSearch => self.permissions_search(),
             Action::Link(url) => {
                 let sender = self.sender.clone();
                 thread::spawn(move || {
@@ -2670,6 +2806,9 @@ impl Ui {
     /// Flips the whole drawn screen in after a tab switch at `started`;
     /// returns whether the flip is still playing.
     pub fn flip_screen(&self, buffer: &mut ratatui::buffer::Buffer, started: Instant) -> bool {
+        if !self.preferences.motion.screen() {
+            return false;
+        }
         let duration = Duration::from_millis(u64::from(self.tweaks.capped(flap::SCREEN_MS)));
         self.tweaks.agent_reply_cps > 0 && flap::screen(buffer, started, duration, Instant::now())
     }
@@ -2734,23 +2873,9 @@ impl Ui {
             }
             MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
                 if matches!(self.modal, Some(Modal::Permissions(_))) {
-                    let code = if event.kind == MouseEventKind::ScrollDown {
-                        KeyCode::Down
-                    } else {
-                        KeyCode::Up
-                    };
-                    for _ in 0..3 {
-                        self.permissions_key(KeyEvent::new(code, KeyModifiers::NONE));
-                    }
+                    self.permissions_scroll(event.kind == MouseEventKind::ScrollDown);
                 } else if matches!(self.modal, Some(Modal::Mcp(_))) {
-                    let code = if event.kind == MouseEventKind::ScrollDown {
-                        KeyCode::Down
-                    } else {
-                        KeyCode::Up
-                    };
-                    for _ in 0..3 {
-                        self.mcp_key(KeyEvent::new(code, KeyModifiers::NONE));
-                    }
+                    self.mcp_scroll(event.kind == MouseEventKind::ScrollDown);
                 } else if self.scroll_modal(if event.kind == MouseEventKind::ScrollDown {
                     3
                 } else {
@@ -2805,12 +2930,24 @@ fn provider_error_text(error: &str) -> &str {
     }
 }
 
-/// Rows an arrow key scrolls a modal: ten with Cmd held.
-fn scroll_step(key: KeyEvent) -> usize {
-    if key.modifiers.contains(KeyModifiers::SUPER) {
-        10
-    } else {
-        1
+/// Scroll by semantic intent so custom physical keys retain the same motion.
+fn shortcut_scroll(
+    action: Option<crate::shortcuts::ActionId>,
+    current: usize,
+    page: usize,
+    maximum: usize,
+) -> usize {
+    use crate::shortcuts::ids::*;
+    match action {
+        Some(NAVIGATION_UP) => current.saturating_sub(1),
+        Some(NAVIGATION_DOWN) => current.saturating_add(1).min(maximum),
+        Some(NAVIGATION_FAST_UP) => current.saturating_sub(10),
+        Some(NAVIGATION_FAST_DOWN) => current.saturating_add(10).min(maximum),
+        Some(NAVIGATION_PAGE_UP) => current.saturating_sub(page),
+        Some(NAVIGATION_PAGE_DOWN) => current.saturating_add(page).min(maximum),
+        Some(NAVIGATION_FIRST) => 0,
+        Some(NAVIGATION_LAST) => maximum,
+        _ => current,
     }
 }
 
@@ -2972,31 +3109,52 @@ impl Ui {
         );
         self.viewport = content.height.saturating_sub(2) as usize;
         let list_width = if self.list_visible {
-            (content.width / 4)
-                .clamp(20, 38)
-                .min(content.width.saturating_sub(20))
+            let requested = self.preferences.layout.sidebar_width;
+            if requested == 0 {
+                (content.width / 4).clamp(20, 38)
+            } else {
+                requested.clamp(20, 40) as u16
+            }
+            .min(content.width.saturating_sub(20))
         } else {
             0
         };
         let panel = self.panels.visible();
-        let changes_width = if self.drilled && panel && self.panels.right {
+        let bottom = panel
+            && self.panels.right
+            && self.preferences.layout.helper_placement
+                == Some(crate::settings::HelperPlacement::Bottom);
+        let changes_width = if self.drilled && panel && self.panels.right && !bottom {
             (content.width.saturating_sub(list_width) / 2).max(12)
         } else {
             0
         };
         let list = Rect::new(content.x, content.y, list_width, content.height);
-        let conversation = Rect::new(
+        let mut conversation = Rect::new(
             content.x + list_width,
             content.y,
             content.width.saturating_sub(list_width + changes_width),
             content.height,
         );
-        let changes = Rect::new(
-            conversation.right(),
-            content.y,
-            changes_width,
-            content.height,
-        );
+        let changes = if bottom {
+            let height = (content.height / 2)
+                .max(4)
+                .min(content.height.saturating_sub(4));
+            conversation.height = conversation.height.saturating_sub(height);
+            Rect::new(
+                conversation.x,
+                conversation.bottom(),
+                conversation.width,
+                height,
+            )
+        } else {
+            Rect::new(
+                conversation.right(),
+                content.y,
+                changes_width,
+                content.height,
+            )
+        };
         self.prs.visible.clear();
         if list_width > 0 {
             self.draw_list(frame, list);
@@ -3008,7 +3166,7 @@ impl Ui {
         } else {
             self.draw_conversation(frame, conversation);
         }
-        if changes_width > 0 {
+        if changes.width > 0 && changes.height > 0 {
             self.draw_panel(frame, changes);
         }
         let mut x = conversation.x;
@@ -3062,7 +3220,7 @@ impl Ui {
             (Some((text, error)), Some((previous, was_error, started)))
                 if text == previous && error == was_error =>
             {
-                if now.saturating_duration_since(*started) >= Duration::from_secs(5) {
+                if now.saturating_duration_since(*started) >= toast::LIFETIME {
                     self.notice = None;
                     self.toast_started = None;
                 }
@@ -3077,38 +3235,7 @@ impl Ui {
         let Some((notice, error)) = &self.notice else {
             return;
         };
-        let area = frame.area();
-        let width = area.width.saturating_sub(2).min(64);
-        if width < 4 {
-            return;
-        }
-        let text = crate::model::clean(notice);
-        let rows = wrapped(&text, width.saturating_sub(2));
-        let height = (rows.len() as u16)
-            .saturating_add(2)
-            .min(area.height.saturating_sub(2));
-        if height < 3 {
-            return;
-        }
-        let rect = Rect::new(
-            area.right().saturating_sub(width + 1),
-            area.bottom().saturating_sub(height + 1),
-            width,
-            height,
-        );
-        let color = if *error { RED } else { GREEN };
-        frame.render_widget(Clear, rect);
-        frame.render_widget(
-            Paragraph::new(rows.into_iter().map(Line::from).collect::<Vec<_>>())
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(color)),
-                )
-                .style(Style::default().fg(color).bg(BG)),
-            rect,
-        );
-        self.toast_rect = rect;
+        self.toast_rect = toast::draw(frame, frame.area(), notice, *error);
     }
     fn draw_list(&mut self, frame: &mut Frame, rect: Rect) {
         let area = panel(
@@ -3169,7 +3296,12 @@ impl Ui {
         let mut offset = 0;
         let now = Instant::now();
         // Cards flip as their text changes; those listed first show at once.
-        let settled = !self.sidebar_seen || self.tweaks.agent_reply_cps == 0;
+        let settled = !self.sidebar_seen
+            || self.tweaks.agent_reply_cps == 0
+            || !self.preferences.motion.sidebar();
+        if settled {
+            self.sidebar_highlights.clear();
+        }
         let order: Vec<String> = list.iter().map(|session| session.id.clone()).collect();
         if !settled && order != self.sidebar_order {
             // A card moving into a slot flips from the text that was there.
@@ -3419,7 +3551,10 @@ impl Ui {
                 .layout(usize::from(area.width.saturating_sub(2)))
                 .0
                 .len()
-                .clamp(1, 10) as u16;
+                .clamp(
+                    1,
+                    self.preferences.input.composer_max_height.clamp(3, 20) as usize,
+                ) as u16;
             (lines + 3 + self.voice_rows(area.width)).min(area.height.saturating_sub(3))
         } else {
             0
@@ -3451,12 +3586,16 @@ impl Ui {
         activity_rows.extend(waiting);
         if let Some(position) = self.positions.get_mut(&id) {
             let now = Instant::now();
-            let tweaks = self.tweaks;
+            let tweaks = self.preferences.motion.tweaks(self.tweaks);
             let (working, waiting) = activity_rows.split_at_mut(working);
             if working.is_empty() {
                 position.activity = flap::Board::default();
             } else {
-                position.activity.show(working, now, ACCENT, area.width);
+                if self.preferences.motion.level == crate::settings::Motion::Full {
+                    position.activity.show(working, now, ACCENT, area.width);
+                } else {
+                    position.activity.settle(working, now);
+                }
             }
             // Queued messages flip in over the sent-message time.
             let sent = Duration::from_millis(u64::from(tweaks.capped(tweaks.sent_message_ms)));
@@ -3508,7 +3647,11 @@ impl Ui {
         }
         position.transcript_viewport = Some((body.width, body.height, session.version));
         let before_measure = position.conversation;
-        let tweaks = self.tweaks;
+        let tweaks = self.preferences.motion.tweaks(self.tweaks);
+        let appearance_changed = self.transcript_window.appearance != self.preferences.appearance
+            || self.transcript_window.conversation != self.preferences.conversation;
+        self.transcript_window.appearance = self.preferences.appearance.clone();
+        self.transcript_window.conversation = self.preferences.conversation.clone();
         let view = self.transcript_window.render(
             session,
             position,
@@ -3516,8 +3659,10 @@ impl Ui {
             body.height,
             self.focus == Focus::Conversation,
         );
-        self.text_selection
-            .rebase(1, position.conversation as isize - before_measure as isize);
+        if !appearance_changed {
+            self.text_selection
+                .rebase(1, position.conversation as isize - before_measure as isize);
+        }
         let transcript_window::View {
             mut lines,
             mut links,
@@ -3532,9 +3677,13 @@ impl Ui {
         reveal::apply(
             position, session, &sections, start, total, &mut lines, tweaks, body.width, now, turn,
         );
-        flap::apply(
-            position, session, &sections, start, total, &mut lines, body.width, now,
-        );
+        if self.preferences.motion.reply() {
+            flap::apply(
+                position, session, &sections, start, total, &mut lines, body.width, now,
+            );
+        } else {
+            position.voice_flaps.clear();
+        }
         // Rows still waiting for their first character take no space yet.
         let dropped = flap::grow(
             &mut sections,
@@ -3549,7 +3698,12 @@ impl Ui {
         } else {
             usize::from(body.height)
         });
-        position.conversation = if position.follow && !position.keep_transcript_position {
+        position.conversation = if match self.preferences.conversation.auto_scroll {
+            crate::settings::AutoScroll::WhenAtBottom => position.follow,
+            crate::settings::AutoScroll::Always => true,
+            crate::settings::AutoScroll::Manual => false,
+        } && !position.keep_transcript_position
+        {
             maximum
         } else {
             position.conversation.saturating_sub(dropped).min(maximum)
@@ -3602,6 +3756,10 @@ impl Ui {
         }
         self.hits
             .extend(transcript::link_hits(&links, body, position.conversation));
+        if appearance_changed {
+            self.text_selection
+                .reflow(1, &self.conversation_sections, &sections);
+        }
         self.conversation_sections = sections;
         self.text_selection
             .register_window(1, body, position.conversation, start, &lines);
@@ -3631,7 +3789,11 @@ impl Ui {
                 || format!("{question_count} question(s)"),
                 |index| format!("{} of {question_count} questions", index + 1),
             );
-            let header = format!("{questions} · {approval_count} approval(s) · Alt+↑ Questions");
+            let header = format!(
+                "{questions} · {approval_count} approval(s) · {} Questions",
+                crate::shortcuts::Bindings::new(&self.shortcut_config)
+                    .hint(crate::shortcuts::ids::QUESTION_OPEN)
+            );
             self.button(
                 frame,
                 Rect::new(area.x, body.bottom() + activity_height, area.width, 1),
@@ -3699,7 +3861,11 @@ impl Ui {
             let status_y = composer.bottom().saturating_sub(1);
             if let Some(session) = self.sessions.get(&id) {
                 frame.render_widget(
-                    Paragraph::new(permissions_panel::composer_status(session)),
+                    Paragraph::new(permissions_panel::composer_status(
+                        session,
+                        &crate::shortcuts::Bindings::new(&self.shortcut_config)
+                            .hint(crate::shortcuts::ids::COMPOSER_PERMISSION_MODE),
+                    )),
                     Rect::new(
                         composer.x.saturating_add(1),
                         status_y,
@@ -3766,7 +3932,11 @@ impl Ui {
             self.button(
                 frame,
                 Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
-                "Enter · Open session",
+                &format!(
+                    "{} · Open session",
+                    crate::shortcuts::Bindings::new(&self.shortcut_config)
+                        .hint(crate::shortcuts::ids::NAVIGATION_ACTIVATE)
+                ),
                 Action::Open,
                 false,
             );
@@ -3818,11 +3988,11 @@ impl Ui {
         );
         let menu_entries = self.menu_entries();
         let title = match self.modal {
-            Some(Modal::Transcript { .. }) => "Message · ↑/↓ Scroll · PgUp/PgDn Page · Esc Close",
+            Some(Modal::Transcript { .. }) => "Message",
             Some(Modal::InstallBrowser { .. }) => "Optional HTML preview · Esc cancels",
-            Some(Modal::AgentDefaults(_)) => "New agent defaults · Tab fields · Esc cancels",
-            Some(Modal::RepositoryRules(_)) => "Repository rules · Tab fields",
-            Some(Modal::Slack(_)) => "Slack setup · Tab fields · Esc closes",
+            Some(Modal::AgentDefaults(_)) => "New agent defaults",
+            Some(Modal::RepositoryRules(_)) => "Repository rules",
+            Some(Modal::Slack(_)) => "Slack setup",
             Some(Modal::Tweaks { .. }) => "Tweaks · chat animations",
             Some(Modal::Theme { .. }) => "Theme",
             Some(Modal::Remote) => "Remote control · iPhone",
@@ -3830,27 +4000,90 @@ impl Ui {
             Some(Modal::ChangeRepository(_)) => "Change session repository",
             Some(Modal::Menu { .. }) => "Agent actions",
             Some(Modal::Commands { .. }) => "Session commands",
-            Some(Modal::Status { .. }) => "Session status · ↑/↓ Scroll · Esc Close",
+            Some(Modal::Status { .. }) => "Session status",
             Some(Modal::Permissions(_)) => "Permissions",
             Some(Modal::Plan(_)) => "Implement this plan?",
-            Some(Modal::Mcp(_)) => "MCP · ↑/↓ Select · Enter Open · r Refresh · Esc Back",
-            Some(Modal::Usage { .. }) => "Provider usage · ↑/↓ Scroll · r Refresh · Esc Close",
+            Some(Modal::Mcp(_)) => "MCP",
+            Some(Modal::Usage { .. }) => "Provider usage",
             Some(Modal::Pending { .. }) => "Pending questions and approvals",
             Some(Modal::Queue { .. }) => "Queued outgoing messages",
             Some(Modal::QueuedEdit { .. }) => "Edit queued message",
             Some(Modal::Rename(_)) => "Rename session",
             Some(Modal::Model { .. }) => "Session model",
-            Some(Modal::ModelPicker(_)) => "Select model · ↑/↓ Select · ←/→ Effort · Esc Cancel",
+            Some(Modal::ModelPicker(_)) => "Select model",
             Some(Modal::Approval { .. }) => "Agent needs your input",
             Some(Modal::Resources {
                 artifacts: true, ..
-            }) => "HTML artifacts · Enter open",
-            Some(Modal::Resources { .. }) => "Open shells · Enter view",
+            }) => "HTML artifacts",
+            Some(Modal::Resources { .. }) => "Open shells",
             Some(Modal::Delete) => "Stop and delete chat",
             Some(Modal::Clear) => "Clear session",
             Some(Modal::Help(_)) => "Search agent shortcuts",
             None => "",
         };
+        let bindings = crate::shortcuts::Bindings::new(&self.shortcut_config);
+        let context = self.shortcut_context();
+        let hint = |action| bindings.primary_hint_in(action, context);
+        let owned_title = match self.modal {
+            Some(Modal::Transcript { .. }) => Some(format!(
+                "Message · {}/{} Scroll · {}/{} Page · Esc Close",
+                hint(crate::shortcuts::ids::NAVIGATION_UP),
+                hint(crate::shortcuts::ids::NAVIGATION_DOWN),
+                hint(crate::shortcuts::ids::NAVIGATION_PAGE_UP),
+                hint(crate::shortcuts::ids::NAVIGATION_PAGE_DOWN)
+            )),
+            Some(Modal::Status { .. }) => Some(format!(
+                "Session status · {}/{} Scroll · Esc Close",
+                hint(crate::shortcuts::ids::NAVIGATION_UP),
+                hint(crate::shortcuts::ids::NAVIGATION_DOWN)
+            )),
+            Some(Modal::Usage { .. }) => Some(format!(
+                "Provider usage · {} Refresh · {}/{} Scroll · Esc Close",
+                hint(crate::shortcuts::ids::USAGE_REFRESH),
+                hint(crate::shortcuts::ids::NAVIGATION_UP),
+                hint(crate::shortcuts::ids::NAVIGATION_DOWN)
+            )),
+            Some(Modal::Slack(_)) => Some(format!(
+                "Slack setup · {}/{} fields · Esc closes",
+                hint(crate::shortcuts::ids::NAVIGATION_NEXT_FOCUS),
+                hint(crate::shortcuts::ids::NAVIGATION_PREVIOUS_FOCUS)
+            )),
+            Some(Modal::Mcp(_)) => Some(format!(
+                "MCP · {}/{} Select · {} Open · {} Refresh · Esc Back",
+                hint(crate::shortcuts::ids::NAVIGATION_UP),
+                hint(crate::shortcuts::ids::NAVIGATION_DOWN),
+                hint(crate::shortcuts::ids::NAVIGATION_ACTIVATE),
+                hint(crate::shortcuts::ids::MCP_REFRESH)
+            )),
+            Some(Modal::Resources { artifacts, .. }) => Some(format!(
+                "{} · {} open",
+                if artifacts {
+                    "HTML artifacts"
+                } else {
+                    "Open shells"
+                },
+                hint(crate::shortcuts::ids::NAVIGATION_ACTIVATE)
+            )),
+            Some(Modal::AgentDefaults(_)) => Some(format!(
+                "New agent defaults · {}/{} fields · Esc cancels",
+                hint(crate::shortcuts::ids::NAVIGATION_NEXT_FOCUS),
+                hint(crate::shortcuts::ids::NAVIGATION_PREVIOUS_FOCUS)
+            )),
+            Some(Modal::RepositoryRules(_)) => Some(format!(
+                "Repository rules · {}/{} fields",
+                hint(crate::shortcuts::ids::NAVIGATION_NEXT_FOCUS),
+                hint(crate::shortcuts::ids::NAVIGATION_PREVIOUS_FOCUS)
+            )),
+            Some(Modal::ModelPicker(_)) => Some(format!(
+                "Select model · {}/{} Select · {}/{} Effort · Esc Cancel",
+                hint(crate::shortcuts::ids::NAVIGATION_UP),
+                hint(crate::shortcuts::ids::NAVIGATION_DOWN),
+                hint(crate::shortcuts::ids::MODELS_PREVIOUS_EFFORT),
+                hint(crate::shortcuts::ids::MODELS_NEXT_EFFORT)
+            )),
+            _ => None,
+        };
+        let title = owned_title.as_deref().unwrap_or(title);
         let area = panel(frame, rect, title, true);
         if let Some(Modal::Transcript {
             entry,
@@ -3961,6 +4194,26 @@ impl Ui {
             self.draw_resources(frame, area, artifacts, selected);
             return;
         }
+        let activate_hint = crate::shortcuts::Bindings::new(&self.shortcut_config).primary_hint_in(
+            crate::shortcuts::ids::NAVIGATION_ACTIVATE,
+            self.shortcut_context(),
+        );
+        let approval_submit_hint = crate::shortcuts::Bindings::new(&self.shortcut_config)
+            .primary_hint_in(
+                crate::shortcuts::ids::APPROVAL_SUBMIT,
+                self.shortcut_context(),
+            );
+        let approval_page_hint = format!(
+            "{}/{}",
+            crate::shortcuts::Bindings::new(&self.shortcut_config).primary_hint_in(
+                crate::shortcuts::ids::NAVIGATION_PAGE_UP,
+                self.shortcut_context()
+            ),
+            crate::shortcuts::Bindings::new(&self.shortcut_config).primary_hint_in(
+                crate::shortcuts::ids::NAVIGATION_PAGE_DOWN,
+                self.shortcut_context()
+            )
+        );
         match &mut self.modal {
             Some(
                 Modal::Transcript { .. }
@@ -3974,7 +4227,7 @@ impl Ui {
                 editor(frame, input, "Local repository", value, true);
                 deferred.push((
                     Rect::new(area.x, area.y.saturating_add(4), area.width, 1).intersection(area),
-                    "[ Enter · Change repository ]".into(),
+                    format!("[ {activate_hint} · Change repository ]"),
                     Action::ChangeRepository,
                     true,
                 ));
@@ -3996,7 +4249,7 @@ impl Ui {
                     Rect::new(area.x, area.y.saturating_add(4), area.width, 1).intersection(area);
                 deferred.push((
                     button,
-                    "[ Enter · Save and open session ]".into(),
+                    format!("[ {activate_hint} · Save and open session ]"),
                     Action::ChooseRepository,
                     true,
                 ));
@@ -4029,16 +4282,16 @@ impl Ui {
                 editor(
                     frame,
                     Rect::new(area.x, area.y, area.width, 3.min(area.height)),
-                    "Name · Enter save",
+                    &format!("Name · {activate_hint} save"),
                     value,
                     true,
                 );
             }
             Some(Modal::Delete) => {
-                frame.render_widget(Paragraph::new("Stop this agent and permanently delete its difu chat, saved questions, queue, and attachments? Its unlocked difu-owned worktree will also be removed, including all uncommitted, untracked, and ignored files. Existing directories, named branches, commits, and native provider history are not deleted.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
+                frame.render_widget(Paragraph::new(format!("Stop this agent and permanently delete its difu chat, saved questions, queue, and attachments? Its unlocked difu-owned worktree will also be removed, including all uncommitted, untracked, and ignored files. Existing directories, named branches, commits, and native provider history are not deleted.\n\n{activate_hint} confirms · Esc cancels")).wrap(Wrap { trim:false }), area);
             }
             Some(Modal::Clear) => {
-                frame.render_widget(Paragraph::new("Stop this agent and start this session over? Its chat, conversation context, queue, questions, artifacts, and PR links are removed, and the next message starts a new conversation. Its difu-owned worktree and local branch are discarded, including uncommitted and unpushed work, and a fresh worktree is created from the latest origin/main. Pushed branches, open PRs, registered external worktrees, and native provider history are not deleted.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
+                frame.render_widget(Paragraph::new(format!("Stop this agent and start this session over? Its chat, conversation context, queue, questions, artifacts, and PR links are removed, and the next message starts a new conversation. Its difu-owned worktree and local branch are discarded, including uncommitted and unpushed work, and a fresh worktree is created from the latest origin/main. Pushed branches, open PRs, registered external worktrees, and native provider history are not deleted.\n\n{activate_hint} confirms · Esc cancels")).wrap(Wrap { trim:false }), area);
             }
             Some(Modal::Help(state)) => {
                 let search = Rect::new(area.x, area.y, area.width, 3.min(area.height));
@@ -4049,7 +4302,7 @@ impl Ui {
                     &state.query,
                     true,
                 );
-                let help = agent_help(&state.query.text());
+                let help = agent_help(&state.query.text(), &self.shortcut_config);
                 let lines = help
                     .into_iter()
                     .flat_map(|(key, desc)| wrapped(&format!("{key:22} {desc}"), area.width))
@@ -4177,7 +4430,7 @@ impl Ui {
                         .map(|entry| entry.text.as_str())
                         .unwrap_or_default();
                     let mut description = format!(
-                        "{} · PageUp/Down scroll\n\n{}\n\n{}",
+                        "{} · {approval_page_hint} scroll\n\n{}\n\n{}",
                         pending.method, content, related
                     );
                     let unsupported = !matches!(
@@ -4217,7 +4470,14 @@ impl Ui {
                                 area.width,
                                 1,
                             ),
-                            format!("{} {label}", if *selected == index { ">" } else { " " }),
+                            format!(
+                                "{} {label}",
+                                if *selected == index {
+                                    format!("> {approval_submit_hint} ·")
+                                } else {
+                                    " ".into()
+                                }
+                            ),
                             Action::Approve(index),
                             *selected == index,
                         ));
@@ -4263,7 +4523,15 @@ impl Ui {
         }
     }
 }
-fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
+fn agent_help(query: &str, config: &Config) -> Vec<(String, &'static str)> {
+    use crate::shortcuts::{Bindings, ids::*};
+    let bindings = Bindings::new(config);
+    let hints = |ids: &[crate::shortcuts::ActionId]| {
+        ids.iter()
+            .map(|id| bindings.hint(*id))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    };
     let query = query.to_lowercase();
     [
         ("⌥+1 / ⌥+2", "Switch Agents / Reviews"),
@@ -4292,7 +4560,7 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
         ),
         (
             "Tab / Shift+Tab",
-            "Cycle visible panes; Shift+Tab in composer changes permission mode",
+            "Cycle visible panes; composer permission mode has its own shortcut",
         ),
         ("Drag · Ctrl+C / Cmd+C", "Select and copy conversation text"),
         (
@@ -4312,12 +4580,10 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
         ),
         (
             "Enter in composer",
-            "Send message; steer active turn immediately",
+            "Send message using the configured running-turn behavior",
         ),
-        (
-            "Ctrl+Enter",
-            "Queue message for the next turn / submit launch or answers",
-        ),
+        ("Ctrl+Enter", "Queue message for the next turn"),
+        ("Question answer", "Submit the current question answer"),
         (
             "Alt+↑ / ↓",
             "Next / previous question; previous from first returns to input",
@@ -4325,7 +4591,7 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
         ("Ctrl+]", "Skip the current question without answering"),
         (
             "n (question choice)",
-            "Add a note beneath the selected answer; Enter submits both",
+            "Add a note beneath the selected answer; submitting sends both",
         ),
         (
             "/ · $ · @",
@@ -4381,6 +4647,61 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
         ),
     ]
     .into_iter()
+    .map(|(key, description)| {
+        let key = match key {
+            "⌥+1 / ⌥+2" => hints(&[SHELL_AGENTS, SHELL_REVIEWS]),
+            "n" => hints(&[SESSION_NEW]),
+            "↑ / ↓" if description.starts_with("Up in") => {
+                hints(&[COMPOSER_HISTORY_PREVIOUS, COMPOSER_HISTORY_NEXT])
+            }
+            "↑ / ↓" => hints(&[NAVIGATION_UP, NAVIGATION_DOWN]),
+            "Enter on a tool" => hints(&[NAVIGATION_ACTIVATE]),
+            "PageUp / PageDown / wheel" => format!(
+                "{} / wheel",
+                hints(&[NAVIGATION_PAGE_UP, NAVIGATION_PAGE_DOWN])
+            ),
+            "Enter / Esc" => hints(&[NAVIGATION_ACTIVATE, CONVERSATION_INTERRUPT]),
+            "Cmd+K" => hints(&[PALETTE_OPEN]),
+            "Ctrl+↑ / ↓ in sessions" => hints(&[SESSION_REORDER_UP, SESSION_REORDER_DOWN]),
+            "Tab / Shift+Tab" => hints(&[NAVIGATION_NEXT_FOCUS, NAVIGATION_PREVIOUS_FOCUS]),
+            "Drag · Ctrl+C / Cmd+C" => format!("Drag · Ctrl+C / {}", hints(&[SELECTION_COPY])),
+            "Ctrl+V / Cmd+V" => hints(&[COMPOSER_ATTACH]),
+            "Alt+[" => hints(&[AGENTS_SIDEBAR]),
+            "Alt+D" => hints(&[AGENTS_CHANGES]),
+            "Alt+M" => hints(&[AGENTS_MODELS]),
+            "Enter in composer" => hints(&[COMPOSER_SEND]),
+            "Ctrl+Enter" => hints(&[COMPOSER_QUEUE]),
+            "Question answer" => bindings
+                .primary_hint_in(QUESTION_SUBMIT, crate::shortcuts::contexts::AGENT_QUESTION),
+            "Alt+]" => hints(&[HELPER_VISIBILITY]),
+            "Alt+P" => hints(&[HELPER_PLACEMENT]),
+            "Alt+↑ / ↓" => hints(&[QUESTION_OPEN, QUESTION_PREVIOUS, QUESTION_NEXT]),
+            "Ctrl+]" => hints(&[QUESTION_SKIP]),
+            "n (question choice)" => hints(&[QUESTION_NOTE]),
+            "/ · $ · @" => hints(&[AGENTS_COMMANDS, COMPOSER_SKILLS, COMPOSER_PATHS]),
+            "Shift+Enter" => hints(&[COMPOSER_NEWLINE]),
+            "Shift+Tab (composer)" => hints(&[COMPOSER_PERMISSION_MODE]),
+            "Hold Space" => format!("Hold {}", hints(&[VOICE_HOLD])),
+            "Cmd+A / Cmd+C" => format!("Cmd+A / {}", hints(&[SELECTION_COPY])),
+            "i" => hints(&[CONVERSATION_COMPOSE]),
+            "/" => hints(&[AGENTS_COMMANDS]),
+            "r" => hints(&[SESSION_REFRESH]),
+            "← / →" => hints(&[NAVIGATION_LEFT, NAVIGATION_RIGHT]),
+            "Cmd+↑ / ↓" => hints(&[
+                CONVERSATION_PREVIOUS,
+                CONVERSATION_NEXT,
+                NAVIGATION_FAST_UP,
+                NAVIGATION_FAST_DOWN,
+            ]),
+            "Shift+↑ / ↓" => hints(&[CHANGES_SELECT_UP, CHANGES_SELECT_DOWN]),
+            "c / Cmd+C" => hints(&[SELECTION_COPY]),
+            "Home / End" => hints(&[NAVIGATION_FIRST, NAVIGATION_LAST]),
+            "?" => hints(&[AGENTS_HELP]),
+            "Ctrl+C" => format!("Ctrl+C copy / {} exit", hints(&[APP_QUIT])),
+            _ => key.into(),
+        };
+        (key, description)
+    })
     .filter(|(key, description)| {
         format!("{key} {description}")
             .to_lowercase()
@@ -4422,6 +4743,45 @@ mod tests {
         ui.sessions.insert(session.id.clone(), session);
         ui.select("one".into());
         ui
+    }
+    #[test]
+    fn notification_presence_follows_conversation_visibility_with_helper_placements() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let storage = Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        };
+        let mut ui = Ui::new(storage, &Config::default());
+        ui.selected = Some("selected".into());
+        ui.drilled = true;
+        ui.panels.session = Some("remembered-helper-session".into());
+        ui.panels.view = Some(panels::View::Shell {
+            id: "shell".into(),
+            command: "example".into(),
+        });
+        for placement in [
+            crate::settings::HelperPlacement::Right,
+            crate::settings::HelperPlacement::Bottom,
+        ] {
+            ui.preferences.layout.helper_placement = Some(placement);
+            ui.panels.right = true;
+            assert_eq!(
+                ui.notification_viewed_session().as_deref(),
+                Some("selected")
+            );
+        }
+        ui.preferences.layout.helper_placement = Some(crate::settings::HelperPlacement::Main);
+        ui.panels.right = false;
+        assert_eq!(ui.notification_viewed_session(), None);
+        ui.panels.hidden = true;
+        assert_eq!(
+            ui.notification_viewed_session().as_deref(),
+            Some("selected")
+        );
+        ui.changes_visible = true;
+        assert_eq!(ui.notification_viewed_session(), None);
+        Ok(())
     }
     #[test]
     fn permissions_command_and_actions_open_for_both_providers() -> Result<()> {
@@ -7966,7 +8326,7 @@ mod tests {
                 .iter()
                 .any(|(name, _, _)| name == "/tweaks")
         );
-        ui.run_palette_command("/tweaks", "/tweaks");
+        ui.open_tweaks();
         let (screen, _) = draw(&mut ui, 120, 40)?;
         assert!(screen.contains("Agent reply speed") && screen.contains("200"));
         let set = |ui: &mut Ui, value: &str| {
@@ -8027,7 +8387,7 @@ mod tests {
         // Moving previews live; Esc returns to the saved theme. The picker
         // leaves the conversation visible so the preview shows on it.
         ui.drilled = true;
-        ui.run_palette_command("/theme", "/theme");
+        ui.open_theme();
         let (screen, _) = draw(&mut ui, 120, 40)?;
         assert!(
             screen.contains("Default")
@@ -8052,13 +8412,13 @@ mod tests {
         assert_eq!(storage.load_config()?.theme, None);
 
         // A preview never outlives the picker, however it closes.
-        ui.run_palette_command("/theme", "/theme");
+        ui.open_theme();
         key(&mut ui, KeyCode::Down);
         ui.modal = None;
         ui.tick(false);
         assert_eq!(theme::active().id, "default");
 
-        ui.run_palette_command("/theme", "/theme");
+        ui.open_theme();
         for _ in 0..theme::index(Some("dracula")) {
             key(&mut ui, KeyCode::Down);
         }
@@ -8070,7 +8430,7 @@ mod tests {
         assert_eq!(theme::active().id, "dracula", "a saved theme stays");
 
         // Choosing Default goes back to the original colours and clears the setting.
-        ui.run_palette_command("/theme", "/theme");
+        ui.open_theme();
         key(&mut ui, KeyCode::Home);
         key(&mut ui, KeyCode::Enter);
         assert_eq!(theme::active().id, "default");
@@ -8507,7 +8867,7 @@ mod tests {
         assert!(
             screen
                 .lines()
-                .any(|line| line.contains("1 of 3") && line.contains("Alt+↑ Questions"))
+                .any(|line| line.contains("1 of 3") && line.contains("Alt+Up Questions"))
         );
         let header_row = ui
             .hits

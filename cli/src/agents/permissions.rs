@@ -317,10 +317,44 @@ pub fn detected_preset(value: &Value) -> Option<CodexPreset> {
         _ => None,
     }
 }
+/// Native mode vocabulary shared by runtime snapshots and offline preference validation.
+pub(crate) fn mode_choices(provider: Provider) -> Vec<Choice> {
+    match provider {
+        Provider::Codex => vec![
+            choice("default", "Regular", "Native coding mode"),
+            choice("plan", "Plan", "Native planning mode"),
+        ],
+        Provider::Claude => vec![
+            choice("default", "Manual", "Ask when Claude needs permission"),
+            choice(
+                "acceptEdits",
+                "Accept edits",
+                "Accept file edits with native checks",
+            ),
+            choice("plan", "Plan", "Explore and plan with native restrictions"),
+            choice(
+                "bypassPermissions",
+                "Bypass permissions",
+                "Explicitly enable Claude's native bypass mode",
+            ),
+            choice(
+                "auto",
+                "Auto",
+                "Native Claude automatic permission decisions",
+            ),
+            choice(
+                "dontAsk",
+                "Don't ask",
+                "Deny operations requiring an approval",
+            ),
+        ],
+    }
+}
 pub fn snapshot(session: &Session) -> Snapshot {
     let state = &session.permission_state;
     let mut result = Snapshot {
         provider: session.provider,
+        modes: mode_choices(session.provider),
         active_mode: state.mode.clone(),
         pending_mode: state.pending_mode.clone(),
         active_preset: detected_preset(&session.permissions),
@@ -331,10 +365,6 @@ pub fn snapshot(session: &Session) -> Snapshot {
     };
     match session.provider {
         Provider::Codex => {
-            result.modes = vec![
-                choice("default", "Regular", "Native coding mode"),
-                choice("plan", "Plan", "Native planning mode"),
-            ];
             for mode in &mut result.modes {
                 if !state
                     .capabilities
@@ -379,30 +409,7 @@ pub fn snapshot(session: &Session) -> Snapshot {
                     .and_then(Value::as_str)
                     .map(String::from)
             });
-            result.modes = vec![
-                choice("default", "Manual", "Ask when Claude needs permission"),
-                choice(
-                    "acceptEdits",
-                    "Accept edits",
-                    "Accept file edits with native checks",
-                ),
-                choice("plan", "Plan", "Explore and plan with native restrictions"),
-                choice(
-                    "bypassPermissions",
-                    "Bypass permissions",
-                    "Explicitly enable Claude's native bypass mode",
-                ),
-                choice(
-                    "auto",
-                    "Auto",
-                    "Native Claude automatic permission decisions",
-                ),
-                choice(
-                    "dontAsk",
-                    "Don't ask",
-                    "Deny operations requiring an approval",
-                ),
-            ];
+
             let cwd = session.workspace.as_deref().unwrap_or(session.job.root());
             let auto_disabled = settings::has_auto_disabled(cwd);
             let bypass_disabled = settings::has_bypass_disabled(cwd);

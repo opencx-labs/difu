@@ -378,8 +378,14 @@ fn preview(
     entry: &Entry,
     width: u16,
     focused: bool,
+    conversation: &crate::settings::Conversation,
 ) -> (Vec<Line<'static>>, Vec<Link>) {
-    let budget = usize::from(width.max(1)).saturating_mul(16);
+    let limit = if conversation.tool_display == crate::settings::ToolDisplay::Collapsed {
+        1
+    } else {
+        conversation.tool_preview_lines.max(1) as usize
+    };
+    let budget = usize::from(width.max(1)).saturating_mul(limit.max(16));
     let mut data = serde_json::Map::new();
     for key in [
         "command", "server", "tool", "query", "path", "status", "exitCode", "review",
@@ -418,6 +424,7 @@ fn preview(
         data: Value::Object(data).into(),
         started_at: entry.started_at,
         finished_at: entry.finished_at,
+        timestamp: None,
     };
     let mut position = Position::default();
     position.expanded.insert(entry.id.clone());
@@ -432,7 +439,7 @@ fn preview(
         focused,
     );
     // A multiline command or very long JSON response shares the same preview budget.
-    rows.truncate(4);
+    rows.truncate(limit);
     links.retain(|link| link.row < rows.len());
     rows.push(Line::from(Span::styled(
         "    Enter/click to expand",
@@ -459,6 +466,76 @@ pub(super) fn render_entries(
     width: u16,
     focused: bool,
 ) -> (Vec<Line<'static>>, Vec<Section>, Vec<Link>) {
+    render_entries_with_appearance(
+        session,
+        entries,
+        position,
+        width,
+        focused,
+        &Default::default(),
+    )
+}
+
+fn entry_spacing(
+    lines: &mut Vec<Line<'static>>,
+    width: u16,
+    appearance: &crate::settings::Appearance,
+) {
+    if appearance.message_separators {
+        lines.push(Line::from(Span::styled(
+            "─".repeat(usize::from(width)),
+            Style::default().fg(DIM),
+        )));
+    } else if appearance.density == crate::settings::Density::Comfortable {
+        lines.push(Line::default());
+    }
+}
+
+pub(super) fn render_entries_with_appearance(
+    session: &Session,
+    entries: &[Entry],
+    position: &Position,
+    width: u16,
+    focused: bool,
+    appearance: &crate::settings::Appearance,
+) -> (Vec<Line<'static>>, Vec<Section>, Vec<Link>) {
+    render_entries_with_preferences(
+        session,
+        entries,
+        position,
+        width,
+        focused,
+        appearance,
+        &Default::default(),
+    )
+}
+
+fn timestamp_row(
+    lines: &mut Vec<Line<'static>>,
+    entry: &Entry,
+    conversation: &crate::settings::Conversation,
+) {
+    if conversation.timestamps
+        && let Some(time) = entry
+            .timestamp
+            .and_then(chrono::DateTime::from_timestamp_millis)
+    {
+        lines.push(Line::styled(
+            time.format("%H:%M:%S UTC").to_string(),
+            Style::default().fg(DIM),
+        ));
+    }
+}
+
+pub(super) fn render_entries_with_preferences(
+    session: &Session,
+    entries: &[Entry],
+    position: &Position,
+    width: u16,
+    focused: bool,
+    appearance: &crate::settings::Appearance,
+    conversation: &crate::settings::Conversation,
+) -> (Vec<Line<'static>>, Vec<Section>, Vec<Link>) {
     let mut links = Vec::new();
     let mut lines = Vec::new();
     let mut sections = Vec::new();
@@ -472,13 +549,20 @@ pub(super) fn render_entries(
             row: lines.len(),
             tool: is_tool,
         });
-        if is_tool && !position.expanded.contains(&entry.id) {
-            let (rows, targets) = preview(
+        if is_tool
+            && !position.expanded.contains(&entry.id)
+            && conversation.tool_display != crate::settings::ToolDisplay::Expanded
+        {
+            let (mut rows, targets) = preview(
                 session,
                 entry,
                 width,
                 focused && position.focused_entry.as_ref() == Some(&entry.id),
+                conversation,
             );
+            rows.pop(); // The shared entry spacer controls the preview's trailing gap.
+            timestamp_row(&mut rows, entry, conversation);
+            entry_spacing(&mut rows, width, appearance);
             links.extend(targets.into_iter().map(|mut link| {
                 link.row += lines.len();
                 link
@@ -493,6 +577,10 @@ pub(super) fn render_entries(
                     .map(|text| Line::from(Span::styled(text, board)))
                     .collect()
             }));
+            timestamp_row(&mut lines, entry, conversation);
+            if appearance.message_separators {
+                entry_spacing(&mut lines, width, appearance);
+            }
             continue;
         }
         if entry.data.get("difuVoiceHandoff").is_some() {
@@ -501,6 +589,10 @@ pub(super) fn render_entries(
                     .into_iter()
                     .map(|text| Line::from(Span::styled(text, Style::default().fg(DIM)))),
             );
+            timestamp_row(&mut lines, entry, conversation);
+            if appearance.message_separators {
+                entry_spacing(&mut lines, width, appearance);
+            }
             continue;
         }
         match entry.kind.as_str() {
@@ -535,6 +627,11 @@ pub(super) fn render_entries(
                 }
             }
             "agentMessage" | "result" => append_prose(&mut lines, &mut links, &entry.text, width),
+            "reasoning"
+                if conversation.reasoning_expanded || position.expanded.contains(&entry.id) =>
+            {
+                append_prose(&mut lines, &mut links, &entry.text, width);
+            }
             "reasoning" => {
                 let heading = entry
                     .text
@@ -730,7 +827,8 @@ pub(super) fn render_entries(
                             );
                             lines.extend(patch);
                         }
-                        lines.push(Line::default());
+                        timestamp_row(&mut lines, entry, conversation);
+                        entry_spacing(&mut lines, width, appearance);
                         continue;
                     }
                 } else {
@@ -837,7 +935,8 @@ pub(super) fn render_entries(
                 ));
             }
         }
-        lines.push(Line::default());
+        timestamp_row(&mut lines, entry, conversation);
+        entry_spacing(&mut lines, width, appearance);
     }
     (lines, sections, links)
 }

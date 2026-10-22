@@ -10,7 +10,7 @@ track chapter completion, and merge or close PRs without leaving the terminal.
 
 ## Requirements
 
-- **macOS or Linux** with an interactive terminal.
+- **macOS 11+ or Linux** with an interactive terminal.
 - **Git** and an existing local clone of any repository whose diff you want to open.
 - **[GitHub CLI](https://cli.github.com/)** (`gh`) for GitHub authentication and PR data.
 - **[Codex CLI](https://github.com/openai/codex)** for guide generation using your
@@ -59,6 +59,12 @@ cargo install --path cli --locked
 Cargo installs the executable into its binary directory, normally `~/.cargo/bin`.
 Make sure that directory is on your `PATH`.
 
+On macOS, native desktop notifications also need the bundled helper. Release and
+Homebrew packages include it. Source builds can use
+`sh cli/scripts/build-notifications.sh arm64 "$HOME/.cargo/bin"` (use `x86_64`
+on Intel). Building the helper requires Apple's command-line tools; running a
+prebuilt package does not. In-app notifications work without the helper.
+
 ### First-time login
 
 Authenticate GitHub CLI and Codex once, unless you are already logged in:
@@ -69,6 +75,7 @@ codex login
 ```
 
 Difu reuses those logins for coding, reviews and voice; voice needs no API key.
+Codex and Claude sign-in are also available in **/settings → Connections**.
 
 ## Quick start
 
@@ -83,6 +90,15 @@ your place. An explicit PR argument opens Reviews.
 PR tabs are **1 Overview**, **2 Diff**, and **3 Guide**. Guide generation always
 requires **g** (Generate), including after opening or refreshing a PR. A matching
 cached guide may load automatically without starting a model run.
+
+### Settings
+
+Open **/settings**, **Ctrl+,**, or Settings in **Cmd+K**. The native panel covers
+appearance, motion, conversations, layout, diffs, input and voice, shortcuts,
+notifications, new-agent defaults, and connections. Search by intent, preview
+changes, then Save or Discard. Every setting shows when it takes effect.
+See [Settings](docs/settings.md) for all controls, notification setup, and
+assigning **Shift+Left** to open questions.
 
 ### Command palette
 

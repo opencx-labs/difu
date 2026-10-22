@@ -299,11 +299,94 @@ fn comparison(
         .with_context(|| format!("Cannot find the workspace merge base against {base}"))
 }
 
+pub(crate) fn changes_context(
+    session: &Session,
+    storage: &crate::storage::Storage,
+    pr: Option<&crate::model::PrKey>,
+    patch: &str,
+    files: &[crate::diff::DiffFile],
+    cancel: &Cancel,
+) -> Result<Vec<(String, Vec<crate::diff::DiffLine>)>> {
+    let current = || match pr {
+        Some(pr) => crate::github::pr_diff(pr, cancel),
+        None => changes(session, storage, cancel),
+    };
+    ensure!(
+        current()? == patch,
+        "Changes moved since this diff opened. Refresh before loading context."
+    );
+    let canonical = crate::diff::parse_patch(patch)?;
+    ensure!(
+        files == canonical,
+        "Context files do not match the canonical patch. Refresh and retry."
+    );
+    let mut result = Vec::new();
+    if let Some(pr) = pr {
+        let config = storage.load_config()?;
+        let mut candidates = session.workspace.iter().cloned().collect::<Vec<_>>();
+        if let Job::Coding(job) = &session.job {
+            candidates.push(job.repository.clone());
+        }
+        candidates.extend(config.repositories.get(&pr.repository()).cloned());
+        let root = repo::review_root(&candidates, pr, cancel)?
+            .context("Choose a local clone for this PR in Reviews before loading its context")?;
+        let detail = crate::github::detail(pr, cancel)?;
+        let snapshot = repo::snapshot(&root, &detail, cancel)?;
+        for file in files {
+            let lines = repo::file_context(&root, &snapshot, file, cancel)?;
+            crate::context::FileContext::new(file, lines.clone())?;
+            result.push((file.path.clone(), lines));
+        }
+    } else {
+        let full = changes_with_context(session, storage, cancel, 2_147_483_647)?;
+        let names = files
+            .iter()
+            .map(|file| {
+                if file.old_path != file.path {
+                    format!("R\0{}\0{}\0", file.old_path, file.path)
+                } else {
+                    format!("{}\0{}\0", file.status, file.path)
+                }
+            })
+            .collect::<String>();
+        let expanded = crate::diff::parse(&names, &full)?;
+        for file in files {
+            let expanded = expanded
+                .iter()
+                .find(|f| f.path == file.path && f.old_path == file.old_path)
+                .context("File moved since this diff opened")?;
+            let lines = expanded
+                .hunks
+                .iter()
+                .filter(|h| h.header.starts_with("@@ "))
+                .flat_map(|h| h.lines.iter().cloned())
+                .collect::<Vec<_>>();
+            if file.hunks.iter().any(|h| h.header.starts_with("@@ ")) {
+                crate::context::FileContext::new(file, lines.clone())?;
+            }
+            result.push((file.path.clone(), lines));
+        }
+    }
+    ensure!(
+        current()? == patch,
+        "Changes moved while loading context. Refresh and retry."
+    );
+    Ok(result)
+}
+
 /// Read worktree changes without touching its index, checking out code or fetching.
 pub fn changes(
     session: &Session,
     storage: &crate::storage::Storage,
     cancel: &Cancel,
+) -> Result<String> {
+    changes_with_context(session, storage, cancel, 3)
+}
+fn changes_with_context(
+    session: &Session,
+    storage: &crate::storage::Storage,
+    cancel: &Cancel,
+    context: u32,
 ) -> Result<String> {
     ensure!(
         !session.workspace_removed,
@@ -322,6 +405,7 @@ pub fn changes(
     let mut command = repo::git(path);
     command.env("GIT_OPTIONAL_LOCKS", "0").args([
         "diff",
+        &format!("--unified={context}"),
         "--no-ext-diff",
         "--no-textconv",
         "--no-color",
@@ -711,6 +795,86 @@ mod tests {
         )
         .map(|s| s.trim().to_owned())
     }
+    #[test]
+    fn changes_context_reads_matching_source_and_rejects_changed_worktree() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        git(root, &["init", "-b", "main"])?;
+        let text = (1..=31).map(|n| format!("line {n}\n")).collect::<String>();
+        fs::write(root.join("file.ts"), &text)?;
+        fs::write(root.join("second.ts"), "old second\n")?;
+        git(root, &["add", "."])?;
+        git(root, &["commit", "-m", "base"])?;
+        let mut session = Session::new(
+            "context-test".into(),
+            Job::Coding(Launch {
+                repository: root.into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.workspace = Some(root.into());
+        session.workspace_ready = true;
+        session.comparison_base = Some("HEAD".into());
+        let storage = Storage {
+            config: root.join("config.json"),
+            cache: root.join("cache"),
+        };
+        let cancel = Cancel::default();
+        fs::write(root.join("file.ts"), text.replace("line 16", "changed 16"))?;
+        let patch = changes(&session, &storage, &cancel)?;
+        let files = crate::diff::parse("M\0file.ts\0", &patch)?;
+        for variant in 0..4 {
+            let mut invalid = files.clone();
+            let file = invalid.first_mut().context("file")?;
+            match variant {
+                0 => {
+                    file.path = "unrelated.ts".into();
+                    file.old_path = file.path.clone();
+                }
+                1 => file.hunks.clear(),
+                2 => {
+                    file.hunks
+                        .first_mut()
+                        .context("hunk")?
+                        .lines
+                        .first_mut()
+                        .context("line")?
+                        .text = "forged".into()
+                }
+                _ => {
+                    invalid.clear();
+                }
+            }
+            assert!(
+                changes_context(&session, &storage, None, &patch, &invalid, &cancel).is_err(),
+                "invalid variant {variant}"
+            );
+        }
+        let result = changes_context(&session, &storage, None, &patch, &files, &cancel)?;
+        let (_, lines) = result.first().context("expanded file")?;
+        assert_eq!(lines.first().and_then(|l| l.new), Some(1));
+        assert_eq!(lines.last().and_then(|l| l.new), Some(31));
+        crate::context::FileContext::new(files.first().context("canonical")?, lines.clone())?;
+        fs::write(root.join("second.ts"), "new second\n")?;
+        let two_patch = changes(&session, &storage, &cancel)?;
+        let mut two_files = crate::diff::parse_patch(&two_patch)?;
+        assert_eq!(
+            changes_context(&session, &storage, None, &two_patch, &two_files, &cancel)?.len(),
+            2
+        );
+        two_files.reverse();
+        assert!(
+            changes_context(&session, &storage, None, &two_patch, &two_files, &cancel).is_err()
+        );
+        fs::write(root.join("file.ts"), "moved\n")?;
+        assert!(changes_context(&session, &storage, None, &patch, &files, &cancel).is_err());
+        Ok(())
+    }
+
     #[test]
     fn discard_cancelled_preparation_removes_partial_worktrees() -> Result<()> {
         let temp = tempfile::tempdir()?;

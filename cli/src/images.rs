@@ -811,7 +811,15 @@ pub(crate) fn draw_modal(frame: &mut Frame, app: &mut App) {
     let footer = Rect::new(inner.x, rect.bottom().saturating_sub(2), inner.width, 1);
     let row = request
         .browser_url()
-        .map(|url| link("o Open in browser · Esc Back", Action::Link(url.into())))
+        .map(|url| {
+            link(
+                format!(
+                    "{} Open in browser · Esc Back",
+                    app.hint(crate::shortcuts::ids::REVIEW_IMAGE_BROWSER)
+                ),
+                Action::Link(url.into()),
+            )
+        })
         .unwrap_or_else(|_| text("Unsupported image URL · Esc Back", TEXT));
     crate::ui::paint(frame, footer, &row, app);
 }

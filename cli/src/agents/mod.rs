@@ -2,12 +2,14 @@
 mod artifacts;
 mod claude;
 pub mod client;
+pub mod connections;
 mod elicitation;
 mod engine;
 mod guidance;
 mod management;
 pub mod mcp;
 pub mod media;
+pub mod notifications;
 mod orchestrator;
 mod peers;
 pub mod permissions;
@@ -142,7 +144,7 @@ impl Status {
         }
     }
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Entry {
     pub id: String,
     pub kind: String,
@@ -151,8 +153,24 @@ pub struct Entry {
     pub data: shared::Shared<Value>,
     #[serde(default)]
     pub started_at: Option<i64>,
+    /// Receipt time for new entries; historical records without it remain undated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<i64>,
     #[serde(default)]
     pub finished_at: Option<i64>,
+}
+impl Default for Entry {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            kind: String::new(),
+            text: String::new().into(),
+            data: Value::Null.into(),
+            started_at: None,
+            finished_at: None,
+            timestamp: Some(chrono::Utc::now().timestamp_millis()),
+        }
+    }
 }
 impl Entry {
     pub fn replace_data(&mut self, mut data: Value) {
@@ -318,6 +336,9 @@ pub struct Session {
     pub usage: Value,
     #[serde(default)]
     pub completed_turn: Option<String>,
+    /// Outcome evidence for notifications; Idle may also mean a cancelled turn.
+    #[serde(default)]
+    pub completed_turn_successful: bool,
     #[serde(default)]
     pub plan_prompt: Option<plan::Proposal>,
     #[serde(default)]
@@ -411,6 +432,7 @@ impl Session {
             token_usage: Value::Null,
             usage: Value::Null,
             completed_turn: None,
+            completed_turn_successful: false,
             plan_prompt: None,
             plan_handled: None,
             model,
@@ -770,6 +792,7 @@ pub enum Control {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
+    Notifications(notifications::Command),
     Permissions {
         id: String,
         action: permissions::Action,
@@ -848,6 +871,12 @@ pub enum Request {
     Changes {
         id: String,
     },
+    ChangesContext {
+        id: String,
+        pr: Option<PrKey>,
+        patch: String,
+        files: Vec<crate::diff::DiffFile>,
+    },
     PrChanges {
         id: String,
         pr: PrKey,
@@ -875,6 +904,7 @@ pub enum Request {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
+    Notifications(notifications::Snapshot),
     Permissions {
         snapshot: permissions::Snapshot,
     },
@@ -894,6 +924,7 @@ pub enum Reply {
     Launched(String),
     ChooseRepository,
     Changes(String),
+    ChangesContext(Vec<(String, Vec<crate::diff::DiffLine>)>),
     Statistics(DiffStatistics),
     WorkspacePaths(Vec<String>),
     Skills {

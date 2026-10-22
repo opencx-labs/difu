@@ -1,3 +1,6 @@
+#[cfg(test)]
+pub(crate) mod fixture;
+
 use anyhow::{Context, Result, bail};
 use nix::{
     sys::signal::{Signal, kill, killpg},
@@ -199,6 +202,12 @@ fn streaming_limit(
     limit: Option<usize>,
 ) -> Result<Output> {
     cancel.check()?;
+    #[cfg(test)]
+    if let Some(result) = fixture::worker_run(command, input.as_deref()) {
+        return result;
+    }
+    #[cfg(test)]
+    fixture::adapt(command)?;
     let name = command.get_program().to_string_lossy().to_string();
     command
         .stdin(if input.is_some() {
@@ -436,5 +445,81 @@ mod tests {
             )
             .is_err()
         );
+    }
+}
+
+/// Run an explicitly requested interactive CLI in the terminal's foreground group.
+/// The caller suspends its UI and owns signal flags; no stdin/output is captured.
+pub fn foreground(
+    command: &mut Command,
+    cancelled: impl Fn() -> bool,
+    mut tick: impl FnMut(),
+) -> Result<bool> {
+    struct Foreground(Child);
+    impl Drop for Foreground {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                if let Ok(pid) = i32::try_from(self.0.id()) {
+                    let _ = stop_descendants(Pid::from_raw(pid));
+                }
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    if cancelled() {
+        return Ok(false);
+    }
+    let mut child = Foreground(
+        command
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()?,
+    );
+    loop {
+        tick();
+        if cancelled() {
+            return Ok(false);
+        }
+        if let Some(status) = child.0.try_wait()? {
+            return Ok(status.success());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[cfg(test)]
+mod foreground_tests {
+    use super::*;
+    use std::time::Instant;
+    #[test]
+    fn native_foreground_success_failure_and_cancellation_are_bounded() -> Result<()> {
+        assert!(foreground(
+            Command::new("/bin/sh").args(["-c", "exit 0"]),
+            || false,
+            || {}
+        )?);
+        assert!(!foreground(
+            Command::new("/bin/sh").args(["-c", "exit 7"]),
+            || false,
+            || {}
+        )?);
+        assert!(
+            foreground(
+                &mut Command::new("/nonexistent/difu-auth-fixture"),
+                || false,
+                || {}
+            )
+            .is_err()
+        );
+        let start = Instant::now();
+        assert!(!foreground(
+            Command::new("/bin/sh").args(["-c", "sleep 60 & wait"]),
+            || start.elapsed() >= Duration::from_millis(60),
+            || {}
+        )?);
+        assert!(start.elapsed() < Duration::from_secs(3));
+        Ok(())
     }
 }

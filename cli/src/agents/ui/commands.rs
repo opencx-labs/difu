@@ -1,6 +1,10 @@
 use super::*;
 
 const COMMANDS: &[(&str, &str)] = &[
+    (
+        "settings",
+        "Preferences, keyboard shortcuts, notifications and connections",
+    ),
     ("slack", "Connect Slack to the difu orchestrator"),
     (
         "remote-control",
@@ -8,7 +12,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "voice",
-        "Turn hold-Space voice on or off; uses your Codex login",
+        "Turn hold-to-talk voice on or off; uses your Codex login",
     ),
     (
         "tweaks",
@@ -286,6 +290,8 @@ impl Ui {
         }
     }
     pub(super) fn command_key(&mut self, key: KeyEvent) {
+        use crate::shortcuts::ids::*;
+        let shortcut = self.shortcut(key);
         let entries = self.command_entries();
         let Some(Modal::Commands {
             query, selected, ..
@@ -293,24 +299,24 @@ impl Ui {
         else {
             return;
         };
-        match key.code {
-            KeyCode::Esc => self.modal = None,
-            KeyCode::Backspace if query.chars.is_empty() => self.modal = None,
-            KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                *selected = selected.saturating_sub(1)
-            }
-            KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+        match shortcut {
+            _ if key.code == KeyCode::Esc => self.modal = None,
+            _ if key.code == KeyCode::Backspace && query.chars.is_empty() => self.modal = None,
+            Some(NAVIGATION_UP) => *selected = selected.saturating_sub(1),
+            Some(NAVIGATION_DOWN) => {
                 *selected = (*selected + 1).min(entries.len().saturating_sub(1))
             }
-            KeyCode::Enter => {
+            Some(NAVIGATION_ACTIVATE) => {
                 let index = *selected;
                 self.run_command(index);
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            _ if key.code == KeyCode::Char('u')
+                && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 query.clear();
                 *selected = 0;
             }
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(COMMANDS_REFRESH) => {
                 if matches!(
                     self.modal,
                     Some(Modal::Commands {
@@ -381,6 +387,11 @@ impl Ui {
         };
         if !args.is_empty() {
             self.run_command_arguments(&name, &args);
+            return;
+        }
+        if let Some(category) = crate::shell::settings_panel::command_category(&name) {
+            self.settings_requested = Some(category);
+            self.modal = None;
             return;
         }
         match name.as_str() {
@@ -560,6 +571,9 @@ impl Ui {
         self.command_entries().len().clamp(1, 8) as u16 + 4
     }
     pub(super) fn draw_commands(&mut self, frame: &mut Frame, area: Rect) {
+        let bindings = crate::shortcuts::Bindings::new(&self.shortcut_config);
+        let context = self.shortcut_context();
+        let hint = |id| bindings.primary_hint_in(id, context);
         let entries = self.command_entries();
         let Some(Modal::Commands {
             query,
@@ -623,7 +637,13 @@ impl Ui {
             } else if entries.is_empty() {
                 "No matching files or folders".into()
             } else {
-                "↑↓ choose · Enter insert path · Ctrl+R reload files · Esc close".into()
+                format!(
+                    "{}/{} choose · {} insert path · {} reload files · Esc close",
+                    hint(crate::shortcuts::ids::NAVIGATION_UP),
+                    hint(crate::shortcuts::ids::NAVIGATION_DOWN),
+                    hint(crate::shortcuts::ids::NAVIGATION_ACTIVATE),
+                    hint(crate::shortcuts::ids::COMMANDS_REFRESH)
+                )
             }
         } else if loading {
             "Loading workspace skills…".into()
@@ -637,7 +657,13 @@ impl Ui {
         } else if entries.is_empty() {
             "No matching commands or skills".into()
         } else {
-            "↑↓ choose · Enter select · Ctrl+R reload skills · Esc close".into()
+            format!(
+                "{}/{} choose · {} select · {} reload skills · Esc close",
+                hint(crate::shortcuts::ids::NAVIGATION_UP),
+                hint(crate::shortcuts::ids::NAVIGATION_DOWN),
+                hint(crate::shortcuts::ids::NAVIGATION_ACTIVATE),
+                hint(crate::shortcuts::ids::COMMANDS_REFRESH)
+            )
         };
         frame.render_widget(
             Paragraph::new(message).style(Style::default().fg(DIM)),

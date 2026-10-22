@@ -1,7 +1,11 @@
 use super::*;
-use crate::storage::AgentDefaults;
+use crate::{
+    shortcuts::{Bindings, ids::*},
+    storage::AgentDefaults,
+};
 
 pub struct Settings {
+    draft: crate::settings::SettingsDraft,
     pub fields: Vec<Editor>,
     pub field: usize,
     pub error: Option<String>,
@@ -18,8 +22,12 @@ pub struct Settings {
 }
 impl Settings {
     fn new(defaults: AgentDefaults) -> Self {
-        let provider = super::super::provider::Provider::for_model(defaults.model.as_deref());
+        let provider = defaults.resolved_provider();
         Self {
+            draft: crate::settings::SettingsDraft::new(Config {
+                agent_defaults: defaults.clone(),
+                ..Config::default()
+            }),
             provider,
             fields: vec![
                 Editor::from(
@@ -45,7 +53,10 @@ impl Settings {
         }
     }
     pub(super) fn changed(&mut self) {
-        let provider = super::super::provider::Provider::for_model(self.value(1).as_deref());
+        let provider = self
+            .value(1)
+            .map(|model| super::super::provider::Provider::for_model(Some(&model)))
+            .unwrap_or(self.draft.config().agent_defaults.resolved_provider());
         if provider != self.provider {
             if let Some(effort) = self.fields.get_mut(2) {
                 *effort = Editor::default();
@@ -104,7 +115,10 @@ impl Settings {
                 Err(error) => self.directory_error = Some(error),
             }
         }
-        if self.field == 2 && self.value(1).is_none() {
+        if self.field == 2
+            && self.value(1).is_none()
+            && self.provider == super::super::provider::Provider::Codex
+        {
             let cwd = self
                 .value(0)
                 .map(std::path::PathBuf::from)
@@ -180,18 +194,34 @@ impl Ui {
         let Some(Modal::AgentDefaults(form)) = &mut self.modal else {
             return;
         };
-        let defaults = AgentDefaults {
-            repository: form.value(0).map(std::path::PathBuf::from),
-            model: form.value(1),
-            effort: form.value(2),
-            isolated: true,
-        };
-        let result = self
-            .storage
-            .update_config(|config| config.agent_defaults = defaults.clone());
+        let result = (|| -> anyhow::Result<Config> {
+            use crate::settings::{SettingId, SettingValue};
+            let model = form.value(1);
+            let effort = form.value(2);
+            if model != form.draft.config().agent_defaults.model {
+                form.draft.select_default_model(model, effort.clone())?;
+            } else if effort != form.draft.config().agent_defaults.effort {
+                form.draft
+                    .set(SettingId::DefaultEffort, SettingValue::Text(effort))?;
+            }
+            let repository = form.value(0);
+            if repository.as_deref()
+                != form
+                    .draft
+                    .config()
+                    .agent_defaults
+                    .repository
+                    .as_ref()
+                    .and_then(|p| p.to_str())
+            {
+                form.draft
+                    .set(SettingId::DefaultRepository, SettingValue::Text(repository))?;
+            }
+            Ok(self.storage.save_settings_draft(&mut form.draft)?)
+        })();
         match result {
-            Ok(_) => {
-                self.defaults = defaults;
+            Ok(config) => {
+                self.defaults = config.agent_defaults;
                 self.modal = None;
                 self.notice = Some(("Agent defaults saved for new sessions".into(), false));
             }
@@ -199,7 +229,12 @@ impl Ui {
         }
     }
     pub(super) fn defaults_key(&mut self, key: KeyEvent) {
-        if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if key.code == KeyCode::Esc {
+            self.modal = None;
+            return;
+        }
+        let action = self.shortcut(key);
+        if action == Some(DEFAULTS_REPOSITORY_RULES) {
             self.default_rules();
             return;
         }
@@ -207,43 +242,55 @@ impl Ui {
             return;
         };
         let options = form.options(&self.model_completion);
-        match key.code {
-            KeyCode::Esc => self.modal = None,
-            KeyCode::Tab | KeyCode::BackTab => {
-                form.field = (form.field + if key.code == KeyCode::Tab { 1 } else { 3 }) % 4;
+        match action {
+            Some(NAVIGATION_NEXT_FOCUS | NAVIGATION_PREVIOUS_FOCUS) => {
+                form.field = (form.field
+                    + if action == Some(NAVIGATION_NEXT_FOCUS) {
+                        1
+                    } else {
+                        3
+                    })
+                    % 4;
                 form.changed();
             }
-            KeyCode::Up | KeyCode::Down if key.modifiers.is_empty() && form.field < 3 => {
-                form.selected = if key.code == KeyCode::Up {
+            Some(NAVIGATION_UP | NAVIGATION_DOWN) => {
+                form.selected = if action == Some(NAVIGATION_UP) {
                     form.selected.saturating_sub(1)
                 } else {
                     (form.selected + 1).min(options.len().saturating_sub(1))
                 };
                 form.filled = false;
             }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::CONTROL) || form.field == 3 => {
-                self.save_defaults()
-            }
-            KeyCode::Enter => {
-                if !form.filled
-                    && let Some(value) = options.get(form.selected)
-                {
-                    if let Some(editor) = form.fields.get_mut(form.field) {
-                        *editor = Editor::from(value.as_str());
-                    }
-                    form.changed();
-                    form.filled = true;
-                } else {
-                    form.field = (form.field + 1) % 4;
-                    form.changed();
-                }
-            }
+            Some(DEFAULTS_SAVE) => self.save_defaults(),
+            Some(NAVIGATION_ACTIVATE) => self.default_activate(),
             _ => {
                 if let Some(editor) = form.fields.get_mut(form.field) {
                     editor.key(key);
                     form.changed();
                 }
             }
+        }
+    }
+    fn default_activate(&mut self) {
+        let Some(Modal::AgentDefaults(form)) = &mut self.modal else {
+            return;
+        };
+        if form.field == 3 {
+            self.save_defaults();
+            return;
+        }
+        let options = form.options(&self.model_completion);
+        if !form.filled
+            && let Some(value) = options.get(form.selected)
+        {
+            if let Some(editor) = form.fields.get_mut(form.field) {
+                *editor = Editor::from(value.as_str());
+            }
+            form.changed();
+            form.filled = true;
+        } else {
+            form.field = (form.field + 1) % 4;
+            form.changed();
         }
     }
     pub(super) fn tick_defaults(&mut self) {
@@ -263,12 +310,15 @@ impl Ui {
             form.selected = index;
             form.filled = false;
         }
-        self.defaults_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        self.default_activate();
     }
     pub(super) fn draw_defaults(&mut self, frame: &mut Frame, area: Rect) {
         let Some(Modal::AgentDefaults(form)) = &self.modal else {
             return;
         };
+        let bindings = Bindings::new(&self.shortcut_config);
+        let context = self.shortcut_context();
+        let hint = |action| bindings.primary_hint_in(action, context);
         let mut buttons = Vec::new();
         let labels = [
             "Default local repository",
@@ -286,8 +336,11 @@ impl Ui {
         let toggle = Rect::new(area.x, area.y + 12, area.width, 1).intersection(area);
         let rules = Rect::new(area.x, area.y + 3, area.width, 1).intersection(area);
         frame.render_widget(
-            Paragraph::new("[ Edit repository rules · Ctrl+R ]")
-                .style(crate::ui::option_style(false)),
+            Paragraph::new(format!(
+                "[ Edit repository rules · {} ]",
+                hint(DEFAULTS_REPOSITORY_RULES)
+            ))
+            .style(crate::ui::option_style(false)),
             rules,
         );
         buttons.push((rules, Action::DefaultRules));
@@ -298,7 +351,7 @@ impl Ui {
         );
         let save = Rect::new(area.x, area.y + 15, area.width, 1).intersection(area);
         frame.render_widget(
-            Paragraph::new("[ Save defaults · Ctrl+Enter ]")
+            Paragraph::new(format!("[ Save defaults · {} ]", hint(DEFAULTS_SAVE)))
                 .style(Style::default().fg(if form.field == 3 { ACCENT } else { TEXT })),
             save,
         );
@@ -353,8 +406,15 @@ impl Ui {
                 );
             }
             frame.render_widget(
-                Paragraph::new("↑/↓ select · Enter fills · Tab fields · Ctrl+Enter saves")
-                    .style(Style::default().fg(DIM)),
+                Paragraph::new(format!(
+                    "{}/{} select · {} fills · {} fields · {} saves",
+                    hint(NAVIGATION_UP),
+                    hint(NAVIGATION_DOWN),
+                    hint(NAVIGATION_ACTIVATE),
+                    hint(NAVIGATION_NEXT_FOCUS),
+                    hint(DEFAULTS_SAVE)
+                ))
+                .style(Style::default().fg(DIM)),
                 Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1)
                     .intersection(area),
             );
@@ -515,6 +575,494 @@ mod tests {
             efforts: vec!["low".into()],
         });
         assert_eq!(form.options(&models).len(), 2); // Empty model query still shows the whole catalog.
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shortcut_regressions {
+    use super::*;
+    use anyhow::{Context, Result};
+    fn setup(ui: &mut Ui, field: usize) {
+        ui.model_completion.options = vec![
+            crate::model::ModelInfo {
+                id: "fixture-one".into(),
+                name: "One".into(),
+                efforts: vec!["low".into(), "high".into()],
+            },
+            crate::model::ModelInfo {
+                id: "fixture-two".into(),
+                name: "Two".into(),
+                efforts: vec!["low".into(), "high".into()],
+            },
+        ];
+        // Match production opening: capture saved defaults before editing fields.
+        let mut form = Settings::new(AgentDefaults::default());
+        for (editor, value) in
+            form.fields
+                .iter_mut()
+                .zip(["/temporary/repository", "fixture-one", "high"])
+        {
+            *editor = Editor::from(value);
+        }
+        form.field = field;
+        ui.modal = Some(Modal::AgentDefaults(Box::new(form)));
+    }
+    fn form(ui: &Ui) -> Result<&Settings> {
+        let Some(Modal::AgentDefaults(form)) = &ui.modal else {
+            anyhow::bail!("defaults closed")
+        };
+        Ok(form)
+    }
+    #[test]
+    fn defaults_focus_and_completion_keys_have_real_remap_and_reset_effects() -> Result<()> {
+        for field in 0..4 {
+            for (action, code, mods, want) in [
+                (
+                    NAVIGATION_NEXT_FOCUS,
+                    KeyCode::Tab,
+                    KeyModifiers::NONE,
+                    (field + 1) % 4,
+                ),
+                (
+                    NAVIGATION_PREVIOUS_FOCUS,
+                    KeyCode::BackTab,
+                    KeyModifiers::SHIFT,
+                    (field + 3) % 4,
+                ),
+            ] {
+                for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                    let (mut ui, _dir, _) = shortcut_tests::binding_fixture(action, phase)?;
+                    setup(&mut ui, field);
+                    if custom {
+                        ui.key(KeyEvent::new(code, mods));
+                        assert_eq!(form(&ui)?.field, field);
+                    }
+                    ui.key(KeyEvent::new(
+                        if custom { KeyCode::F(12) } else { code },
+                        if custom { KeyModifiers::NONE } else { mods },
+                    ));
+                    assert_eq!(form(&ui)?.field, want);
+                }
+            }
+        }
+        for field in 0..3 {
+            for (action, code, start, want) in [
+                (NAVIGATION_UP, KeyCode::Up, 1, 0),
+                (NAVIGATION_DOWN, KeyCode::Down, 0, 1),
+            ] {
+                for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                    let (mut ui, _dir, _) = shortcut_tests::binding_fixture(action, phase)?;
+                    setup(&mut ui, field);
+                    let Some(Modal::AgentDefaults(f)) = &mut ui.modal else {
+                        anyhow::bail!("form")
+                    };
+                    f.directories = vec!["one".into(), "two".into()];
+                    *f.fields.get_mut(field).context("field")? = Editor::default();
+                    if field == 2 {
+                        *f.fields.get_mut(1).context("model")? = Editor::from("fixture-one");
+                    }
+                    f.selected = start;
+                    if custom {
+                        ui.key(KeyEvent::new(code, KeyModifiers::NONE));
+                        assert_eq!(
+                            form(&ui)?.selected,
+                            0,
+                            "removed navigation goes to native editor"
+                        );
+                        if let Some(Modal::AgentDefaults(f)) = &mut ui.modal {
+                            f.selected = start;
+                        }
+                    }
+                    ui.key(KeyEvent::new(
+                        if custom { KeyCode::F(12) } else { code },
+                        KeyModifiers::NONE,
+                    ));
+                    assert_eq!(form(&ui)?.selected, want, "{field} {} {phase}", action.0);
+                }
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn defaults_save_uses_control_predicate_and_separate_repository_rules() -> Result<()> {
+        for field in 0..4 {
+            for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                for extra in 0..32 {
+                    let (mut ui, _dir, _) = shortcut_tests::binding_fixture(DEFAULTS_SAVE, phase)?;
+                    setup(&mut ui, field);
+                    let mut modifiers = KeyModifiers::CONTROL;
+                    for (bit, modifier) in [
+                        (1, KeyModifiers::SHIFT),
+                        (2, KeyModifiers::ALT),
+                        (4, KeyModifiers::SUPER),
+                        (8, KeyModifiers::HYPER),
+                        (16, KeyModifiers::META),
+                    ] {
+                        if extra & bit != 0 {
+                            modifiers |= modifier;
+                        }
+                    }
+                    let old = KeyEvent::new(KeyCode::Enter, modifiers);
+                    if custom {
+                        ui.key(old);
+                        assert!(ui.modal.is_some());
+                        assert!(ui.storage.load_config()?.agent_defaults.model.is_none());
+                        setup(&mut ui, field);
+                    }
+                    ui.key(if custom {
+                        KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE)
+                    } else {
+                        old
+                    });
+                    assert!(ui.modal.is_none(), "{field} {phase} {modifiers:?}");
+                    let saved = ui.storage.load_config()?.agent_defaults;
+                    assert_eq!(saved.model.as_deref(), Some("fixture-one"));
+                    assert_eq!(saved.effort.as_deref(), Some("high"));
+                    assert_eq!(
+                        saved.repository,
+                        Some(std::path::PathBuf::from("/temporary/repository"))
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn defaults_rules_action_preserves_draft_and_failed_save_retains_values() -> Result<()> {
+        // This is the existing CtrlR repository-rules action, never a defaults reset.
+        let action = crate::shortcuts::find("defaults.repository_rules")
+            .context("truthful repository rules action")?;
+        for field in 0..4 {
+            for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                let (mut ui, _dir, _) = shortcut_tests::binding_fixture(action, phase)?;
+                setup(&mut ui, field);
+                if custom {
+                    ui.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+                    assert!(matches!(ui.modal, Some(Modal::AgentDefaults(_))));
+                    setup(&mut ui, field);
+                }
+                ui.key(KeyEvent::new(
+                    if custom {
+                        KeyCode::F(12)
+                    } else {
+                        KeyCode::Char('r')
+                    },
+                    if custom {
+                        KeyModifiers::NONE
+                    } else {
+                        KeyModifiers::CONTROL
+                    },
+                ));
+                assert!(matches!(ui.modal, Some(Modal::RepositoryRules(_))));
+                ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                assert_eq!(form(&ui)?.value(1).as_deref(), Some("fixture-one"));
+                assert_eq!(form(&ui)?.field, field);
+            }
+        }
+        let (mut ui, _dir, _) = shortcut_tests::fixture(Some(DEFAULTS_SAVE))?;
+        setup(&mut ui, 1);
+        std::fs::write(&ui.storage.config, "{malformed")?;
+        ui.key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        assert!(
+            form(&ui)?
+                .error
+                .as_deref()
+                .is_some_and(|s| s.contains("Cannot save"))
+        );
+        assert_eq!(form(&ui)?.value(1).as_deref(), Some("fixture-one"));
+        assert_eq!(std::fs::read_to_string(&ui.storage.config)?, "{malformed");
+        Ok(())
+    }
+    #[test]
+    fn visible_default_option_click_fills_after_activation_remap() -> Result<()> {
+        for width in [40, 80, 160] {
+            let (mut ui, _dir, _) = shortcut_tests::fixture(Some(NAVIGATION_ACTIVATE))?;
+            setup(&mut ui, 1);
+            let Some(Modal::AgentDefaults(f)) = &mut ui.modal else {
+                anyhow::bail!("form")
+            };
+            *f.fields.get_mut(1).context("model")? = Editor::from("fixture");
+            let click = shortcut_tests::native_target(&mut ui, width, "fixture-two")?;
+            ui.mouse(click);
+            assert_eq!(form(&ui)?.value(1).as_deref(), Some("fixture-two"));
+            assert!(ui.storage.load_config()?.agent_defaults.model.is_none());
+        }
+        Ok(())
+    }
+    #[test]
+    fn defaults_field_and_button_contexts_preserve_copy_globals_and_editing() -> Result<()> {
+        for field in 0..4 {
+            shortcut_tests::owned_modal_context(
+                |ui| {
+                    setup(ui, field);
+                    if let Some(Modal::AgentDefaults(f)) = &mut ui.modal
+                        && let Some(editor) = f.fields.get_mut(field)
+                    {
+                        *editor = Editor::from("focused");
+                        editor.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+                    }
+                },
+                if field < 3 {
+                    crate::shortcuts::contexts::AGENT_DEFAULTS
+                } else {
+                    crate::shortcuts::contexts::AGENT_DEFAULTS_BUTTON
+                },
+                (field < 3).then_some("d"),
+            )?;
+        }
+        Ok(())
+    }
+    #[test]
+    fn defaults_activate_fills_or_advances_each_field_and_saves_only_on_button() -> Result<()> {
+        for field in 0..4 {
+            for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                let (mut ui, _dir, _) =
+                    shortcut_tests::binding_fixture(NAVIGATION_ACTIVATE, phase)?;
+                setup(&mut ui, field);
+                if custom {
+                    ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                    assert_eq!(form(&ui)?.field, field);
+                    assert!(!form(&ui)?.filled);
+                    setup(&mut ui, field);
+                }
+                ui.key(KeyEvent::new(
+                    if custom {
+                        KeyCode::F(12)
+                    } else {
+                        KeyCode::Enter
+                    },
+                    KeyModifiers::NONE,
+                ));
+                if field == 3 {
+                    assert!(ui.modal.is_none());
+                    assert_eq!(
+                        ui.storage.load_config()?.agent_defaults.model.as_deref(),
+                        Some("fixture-one")
+                    );
+                } else if field == 0 {
+                    assert_eq!(form(&ui)?.field, 1);
+                } else {
+                    assert!(form(&ui)?.filled);
+                    assert_eq!(form(&ui)?.field, field);
+                    ui.key(KeyEvent::new(
+                        if custom {
+                            KeyCode::F(12)
+                        } else {
+                            KeyCode::Enter
+                        },
+                        KeyModifiers::NONE,
+                    ));
+                    assert_eq!(form(&ui)?.field, field + 1);
+                }
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn defaults_native_hints_follow_each_remapped_field_action() -> Result<()> {
+        for width in [80, 160] {
+            for action in [
+                DEFAULTS_REPOSITORY_RULES,
+                DEFAULTS_SAVE,
+                NAVIGATION_UP,
+                NAVIGATION_DOWN,
+                NAVIGATION_ACTIVATE,
+                NAVIGATION_NEXT_FOCUS,
+            ] {
+                let (mut ui, _dir, _) = shortcut_tests::fixture(Some(action))?;
+                setup(&mut ui, 1);
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 44))?;
+                terminal.draw(|frame| ui.draw(frame))?;
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(text.contains("F12"), "{} {width}: {text}", action.0);
+                if action == DEFAULTS_REPOSITORY_RULES {
+                    assert!(
+                        !text.contains("Ctrl+R"),
+                        "unregistered hardcoded rules hint"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn defaults_visible_buttons_and_blank_option_area_are_keyboard_independent() -> Result<()> {
+        for width in [40, 80, 160] {
+            let (mut ui, _dir, _) = shortcut_tests::fixture(Some(DEFAULTS_SAVE))?;
+            setup(&mut ui, 1);
+            let click = shortcut_tests::native_target(&mut ui, width, "Save defaults · F12")?;
+            ui.mouse(click);
+            assert!(ui.modal.is_none());
+            assert_eq!(
+                ui.storage.load_config()?.agent_defaults.model.as_deref(),
+                Some("fixture-one")
+            );
+            let (mut ui, _dir, _) = shortcut_tests::fixture(Some(DEFAULTS_REPOSITORY_RULES))?;
+            setup(&mut ui, 1);
+            let click = shortcut_tests::native_target(&mut ui, width, "Edit repository rules")?;
+            ui.mouse(click);
+            assert!(matches!(ui.modal, Some(Modal::RepositoryRules(_))));
+            let (mut ui, _dir, _) = shortcut_tests::fixture(Some(NAVIGATION_ACTIVATE))?;
+            setup(&mut ui, 1);
+            if let Some(Modal::AgentDefaults(f)) = &mut ui.modal {
+                *f.fields.get_mut(1).context("model")? = Editor::from("fixture");
+            }
+            let blank = shortcut_tests::native_blank_below(&mut ui, width, "fixture-two")?;
+            ui.mouse(blank);
+            assert_eq!(form(&ui)?.value(1).as_deref(), Some("fixture"));
+            assert!(!form(&ui)?.filled);
+        }
+        Ok(())
+    }
+    #[test]
+    fn repository_rules_control_predicate_keeps_all_modifiers_and_override_removal() -> Result<()> {
+        for field in 0..4 {
+            for (phase, custom) in shortcut_tests::BINDING_PHASES {
+                for extra in 0..32 {
+                    let (mut ui, _dir, _) =
+                        shortcut_tests::binding_fixture(DEFAULTS_REPOSITORY_RULES, phase)?;
+                    setup(&mut ui, field);
+                    let mut mods = KeyModifiers::CONTROL;
+                    for (bit, m) in [
+                        (1, KeyModifiers::SHIFT),
+                        (2, KeyModifiers::ALT),
+                        (4, KeyModifiers::SUPER),
+                        (8, KeyModifiers::HYPER),
+                        (16, KeyModifiers::META),
+                    ] {
+                        if extra & bit != 0 {
+                            mods |= m;
+                        }
+                    }
+                    if custom {
+                        ui.key(KeyEvent::new(KeyCode::Char('r'), mods));
+                        assert!(matches!(ui.modal, Some(Modal::AgentDefaults(_))));
+                        setup(&mut ui, field);
+                    }
+                    ui.key(KeyEvent::new(
+                        if custom {
+                            KeyCode::F(12)
+                        } else {
+                            KeyCode::Char('r')
+                        },
+                        if custom { KeyModifiers::NONE } else { mods },
+                    ));
+                    assert!(
+                        matches!(ui.modal, Some(Modal::RepositoryRules(_))),
+                        "{field} {phase} {mods:?}"
+                    );
+                    ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                    assert_eq!(form(&ui)?.value(1).as_deref(), Some("fixture-one"));
+                }
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn defaults_directory_suggestion_fills_with_remapped_activation_without_saving() -> Result<()> {
+        for (phase, custom) in shortcut_tests::BINDING_PHASES {
+            let (mut ui, dir, _) = shortcut_tests::binding_fixture(NAVIGATION_ACTIVATE, phase)?;
+            setup(&mut ui, 0);
+            let path = dir.path().join("chosen repository");
+            std::fs::create_dir(&path)?;
+            if let Some(Modal::AgentDefaults(f)) = &mut ui.modal {
+                f.directories = vec!["chosen repository".into()];
+                *f.fields.first_mut().context("repository")? =
+                    Editor::from(format!("{}/cho", dir.path().display()));
+            }
+            if custom {
+                ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                assert_eq!(form(&ui)?.field, 0);
+                assert!(!form(&ui)?.filled);
+                if let Some(Modal::AgentDefaults(f)) = &mut ui.modal {
+                    *f.fields.first_mut().context("repository")? =
+                        Editor::from(format!("{}/cho", dir.path().display()));
+                }
+            }
+            ui.key(KeyEvent::new(
+                if custom {
+                    KeyCode::F(12)
+                } else {
+                    KeyCode::Enter
+                },
+                KeyModifiers::NONE,
+            ));
+            assert_eq!(form(&ui)?.value(0), Some(format!("{}/", path.display())));
+            assert_eq!(form(&ui)?.field, 0);
+            assert!(form(&ui)?.filled);
+            assert!(
+                ui.storage
+                    .load_config()?
+                    .agent_defaults
+                    .repository
+                    .is_none()
+            );
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod dependent_defaults_tests {
+    use super::*;
+    use anyhow::{Context, Result};
+    #[test]
+    fn legacy_defaults_patch_fields_and_clear_mode_only_on_provider_change() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        storage.update_config(|c| {
+            c.agent_defaults.provider = Some(super::super::super::provider::Provider::Claude);
+            c.agent_defaults.starting_mode = Some("acceptEdits".into());
+            c.agent_defaults.model = Some("claude/sonnet".into());
+        })?;
+        let mut ui = Ui::new(storage.clone(), &storage.load_config()?);
+        ui.model_completion.options = vec![crate::model::ModelInfo {
+            id: "fixture-model".into(),
+            name: "Fixture".into(),
+            efforts: vec![],
+        }];
+        ui.open_defaults();
+        let Some(Modal::AgentDefaults(form)) = &mut ui.modal else {
+            anyhow::bail!("form")
+        };
+        *form.fields.get_mut(1).context("model")? = Editor::from("fixture-model");
+        storage.update_config(|c| c.agent_defaults.repository = Some("/concurrent-repo".into()))?;
+        ui.save_defaults();
+        let saved = storage.load_config()?;
+        assert_eq!(
+            saved.agent_defaults.provider,
+            Some(super::super::super::provider::Provider::Codex)
+        );
+        assert!(saved.agent_defaults.starting_mode.is_none());
+        assert_eq!(
+            saved.agent_defaults.repository,
+            Some("/concurrent-repo".into())
+        );
+        assert!(ui.modal.is_none());
+        ui.open_defaults();
+        let Some(Modal::AgentDefaults(form)) = &mut ui.modal else {
+            anyhow::bail!("form")
+        };
+        *form.fields.get_mut(1).context("model")? = Editor::from("another-model");
+        storage.update_config(|c| {
+            c.agent_defaults.provider = Some(super::super::super::provider::Provider::Claude)
+        })?;
+        let bytes = std::fs::read(&storage.config)?;
+        ui.save_defaults();
+        assert!(matches!(&ui.modal, Some(Modal::AgentDefaults(form)) if form.error.is_some()));
+        assert_eq!(std::fs::read(&storage.config)?, bytes);
         Ok(())
     }
 }
