@@ -138,6 +138,22 @@ fn connection_failure(error: Option<&str>) -> bool {
     })
 }
 fn readable_error(error: &str, refresh: &str) -> String {
+    if refresh.is_empty() {
+        let message =
+            if error.contains("channel is empty") || error.contains("sending half is closed") {
+                "Agent connection closed.".into()
+            } else if error.contains("No conversation found") {
+                "Agent session could not be resumed.".into()
+            } else {
+                provider_error_text(error)
+                    .lines()
+                    .next()
+                    .unwrap_or("Turn failed")
+                    .trim()
+                    .to_owned()
+            };
+        return format!("{message} Close and reopen permissions to retry.");
+    }
     if error.contains("channel is empty") || error.contains("sending half is closed") {
         format!("Agent connection closed. Press {refresh} to reconnect.")
     } else if error.contains("No conversation found") {
@@ -926,7 +942,16 @@ impl Ui {
         lines.push(Line::styled(current, Style::default().fg(DIM)));
         if let Some(error) = state.error.as_deref().or(failure) {
             usage::text_lines(
-                &readable_error(error, &hint(PERMISSIONS_REFRESH)),
+                &readable_error(
+                    error,
+                    &if state.form.is_some() {
+                        bindings.primary_hint_in(PERMISSIONS_REFRESH_FORM, state.shortcut_context())
+                    } else if state.searching {
+                        format!("Esc, then {}", hint(PERMISSIONS_REFRESH))
+                    } else {
+                        hint(PERMISSIONS_REFRESH)
+                    },
+                ),
                 area.width,
                 Style::default().fg(RED),
                 &mut lines,
@@ -1776,6 +1801,87 @@ mod tests {
             assert_eq!(form.field, want_field);
             assert_eq!(form.value.text(), want_text);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_error_hints_use_the_actual_permission_field_context() -> Result<()> {
+        use crate::settings::BindingKey;
+        use crate::shortcuts::{ids::*, key};
+        for width in [80, 160] {
+            for (field, searching, delete) in [
+                (None, false, false),
+                (None, true, false),
+                (Some(0), false, false),
+                (Some(2), false, false),
+                (Some(3), false, false),
+                (Some(2), false, true),
+            ] {
+                let (mut ui, _dir, mut config) = shortcut_tests::fixture(None)?;
+                let id = if field.is_some() {
+                    PERMISSIONS_REFRESH_FORM
+                } else {
+                    PERMISSIONS_REFRESH
+                };
+                config
+                    .preferences
+                    .keyboard
+                    .bindings
+                    .insert(id.0.into(), key(BindingKey::Function(12), 0));
+                ui.apply_settings(&config);
+                let mut state = field_state(field, searching, delete);
+                state.error = Some("channel is empty".into());
+                ui.modal = Some(Modal::Permissions(Box::new(state)));
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 44))?;
+                terminal.draw(|frame| ui.draw(frame))?;
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(
+                    text.contains(if searching {
+                        "Esc, then F12"
+                    } else {
+                        "Press F12"
+                    }),
+                    "{field:?} search={searching} delete={delete}: {text}"
+                );
+                assert!(!text.contains("Press r to reconnect"));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn suppressed_permission_recovery_key_does_not_print_an_unavailable_shortcut() -> Result<()> {
+        use crate::{
+            settings::BindingKey,
+            shortcuts::{ids::PERMISSIONS_REFRESH_FORM, key},
+        };
+        let (mut ui, _dir, mut config) = shortcut_tests::fixture(None)?;
+        config.preferences.keyboard.bindings.insert(
+            PERMISSIONS_REFRESH_FORM.0.into(),
+            key(BindingKey::Character('a'), 0),
+        );
+        ui.apply_settings(&config);
+        let mut state = field_state(Some(2), false, false);
+        state.error = Some("channel is empty".into());
+        ui.modal = Some(Modal::Permissions(Box::new(state)));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 44))?;
+        terminal.draw(|frame| ui.draw(frame))?;
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Close and reopen permissions to retry."));
+        assert!(!text.contains("Press  to"));
         Ok(())
     }
 

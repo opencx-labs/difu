@@ -23,27 +23,18 @@ impl Ui {
             self.modal = None;
             return;
         }
-        if key.code == KeyCode::Char('r') {
+        if self.shortcut(key) == Some(crate::shortcuts::ids::USAGE_REFRESH) {
             self.open_usage();
             return;
         }
+        let shortcut = self.shortcut(key);
         let Some(Modal::Usage {
             scroll, maximum, ..
         }) = &mut self.modal
         else {
             return;
         };
-        let step = scroll_step(key);
-        *scroll = match key.code {
-            KeyCode::Down => scroll.saturating_add(step),
-            KeyCode::Up => scroll.saturating_sub(step),
-            KeyCode::PageDown => scroll.saturating_add(10),
-            KeyCode::PageUp => scroll.saturating_sub(10),
-            KeyCode::Home => 0,
-            KeyCode::End => *maximum,
-            _ => *scroll,
-        }
-        .min(*maximum);
+        *scroll = shortcut_scroll(shortcut, *scroll, 10, *maximum).min(*maximum);
     }
     pub(super) fn draw_usage(&mut self, frame: &mut Frame, area: Rect) {
         let session_info = match &self.modal {

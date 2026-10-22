@@ -7,6 +7,16 @@ pub struct Settings {
     saved: Option<super::super::slack::Settings>,
     pub(super) field: usize,
 }
+impl Settings {
+    pub(super) fn copy_editor(&self) -> Option<&Editor> {
+        // Masked token fields must never reach the clipboard handoff.
+        if (2..4).contains(&self.field) {
+            self.fields.get(self.field)
+        } else {
+            None
+        }
+    }
+}
 #[derive(Default)]
 pub(super) struct State {
     saving: Option<mpsc::Receiver<Result<super::super::slack::Settings, String>>>,
@@ -119,6 +129,8 @@ impl Ui {
         self.modal = None;
     }
     pub(super) fn slack_key(&mut self, key: KeyEvent) {
+        use crate::shortcuts::ids::*;
+        let shortcut = self.shortcut(key);
         if key.code == KeyCode::Esc {
             self.modal = None;
             return;
@@ -126,12 +138,12 @@ impl Ui {
         let Some(Modal::Slack(form)) = &mut self.modal else {
             return;
         };
-        match key.code {
-            KeyCode::Tab | KeyCode::Down => form.field = (form.field + 1) % 6,
-            KeyCode::BackTab | KeyCode::Up => form.field = (form.field + 5) % 6,
-            KeyCode::Enter if form.field == 4 => self.save_slack(),
-            KeyCode::Enter if form.field == 5 => self.disable_slack(),
-            KeyCode::Enter => form.field = (form.field + 1) % 6,
+        match shortcut {
+            Some(NAVIGATION_NEXT_FOCUS) => form.field = (form.field + 1) % 6,
+            Some(NAVIGATION_PREVIOUS_FOCUS) => form.field = (form.field + 5) % 6,
+            Some(NAVIGATION_ACTIVATE) if form.field == 4 => self.save_slack(),
+            Some(NAVIGATION_ACTIVATE) if form.field == 5 => self.disable_slack(),
+            Some(NAVIGATION_ACTIVATE) => form.field = (form.field + 1) % 6,
             _ => {
                 if let Some(editor) = form.fields.get_mut(form.field) {
                     editor.key(key);

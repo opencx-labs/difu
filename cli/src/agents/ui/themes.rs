@@ -54,20 +54,22 @@ impl Ui {
         }
     }
     pub(super) fn theme_key(&mut self, key: KeyEvent) {
+        use crate::shortcuts::ids::*;
+        let shortcut = self.shortcut(key);
         let Some(Modal::Theme { selected }) = &self.modal else {
             return;
         };
         let (selected, count) = (*selected, theme::themes().len());
-        match key.code {
-            KeyCode::Esc => {
+        match shortcut {
+            _ if key.code == KeyCode::Esc => {
                 self.modal = None;
                 self.tick_theme();
             }
-            KeyCode::Up | KeyCode::BackTab => self.preview_theme((selected + count - 1) % count),
-            KeyCode::Down | KeyCode::Tab => self.preview_theme((selected + 1) % count),
-            KeyCode::Home => self.preview_theme(0),
-            KeyCode::End => self.preview_theme(count.saturating_sub(1)),
-            KeyCode::Enter => self.save_theme(),
+            Some(NAVIGATION_UP) => self.preview_theme((selected + count - 1) % count),
+            Some(NAVIGATION_DOWN) => self.preview_theme((selected + 1) % count),
+            Some(NAVIGATION_FIRST) => self.preview_theme(0),
+            Some(NAVIGATION_LAST) => self.preview_theme(count.saturating_sub(1)),
+            Some(NAVIGATION_ACTIVATE) => self.save_theme(),
             _ => {}
         }
     }
@@ -155,7 +157,22 @@ impl Ui {
             );
         }
         frame.render_widget(
-            Paragraph::new("↑↓ preview · Enter apply · Esc cancel").style(Style::default().fg(DIM)),
+            Paragraph::new(format!(
+                "{}/{} preview · {} apply · Esc cancel",
+                crate::shortcuts::Bindings::new(&self.shortcut_config).primary_hint_in(
+                    crate::shortcuts::ids::NAVIGATION_UP,
+                    self.shortcut_context()
+                ),
+                crate::shortcuts::Bindings::new(&self.shortcut_config).primary_hint_in(
+                    crate::shortcuts::ids::NAVIGATION_DOWN,
+                    self.shortcut_context()
+                ),
+                crate::shortcuts::Bindings::new(&self.shortcut_config).primary_hint_in(
+                    crate::shortcuts::ids::NAVIGATION_ACTIVATE,
+                    self.shortcut_context()
+                )
+            ))
+            .style(Style::default().fg(DIM)),
             Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
         );
     }

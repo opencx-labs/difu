@@ -7,13 +7,13 @@ pub const AGENT_CONVERSATION: Context = Context("AgentConversation");
 pub const AGENT_CHANGES: Context = Context("AgentChanges");
 pub const AGENT_CHANGE_TREE: Context = Context("AgentChangeTree");
 pub const AGENT_RESOURCES: Context = Context("AgentResources");
+pub const AGENT_HELPER_MAIN: Context = Context("AgentHelperMain");
+pub const AGENT_BROWSER_MAIN: Context = Context("AgentBrowserMain");
 pub const AGENT_HELPER: Context = Context("AgentHelper");
-pub const AGENT_TERMINAL: Context = Context("AgentTerminal");
 pub const AGENT_BROWSER: Context = Context("AgentBrowser");
 pub const AGENT_QUESTION: Context = Context("AgentQuestion");
 pub const AGENT_QUESTION_NOTE: Context = Context("AgentQuestionNote");
 pub const AGENT_APPROVAL: Context = Context("AgentApproval");
-pub const AGENT_APPROVAL_TEXT: Context = Context("AgentApprovalText");
 pub const AGENT_PENDING: Context = Context("AgentPending");
 pub const AGENT_QUEUE: Context = Context("AgentQueue");
 pub const AGENT_QUEUE_BUTTON: Context = Context("AgentQueueButton");
@@ -42,6 +42,9 @@ pub const AGENT_MCP_TOOL: Context = Context("AgentMcpTool");
 pub const AGENT_MCP: Context = Context("AgentMcp");
 pub const AGENT_REMOTE: Context = Context("AgentRemote");
 pub const AGENT_RULES: Context = Context("AgentRules");
+pub const AGENT_SLACK_SECRET: Context = Context("AgentSlackSecret");
+pub const AGENT_SLACK_BUTTON: Context = Context("AgentSlackButton");
+pub const AGENT_TWEAKS_BUTTON: Context = Context("AgentTweaksButton");
 pub const AGENT_SLACK: Context = Context("AgentSlack");
 pub const AGENT_THEMES: Context = Context("AgentThemes");
 pub const AGENT_TWEAKS: Context = Context("AgentTweaks");
@@ -99,12 +102,12 @@ pub const ALL: &[Context] = &[
     AGENT_CHANGE_TREE,
     AGENT_RESOURCES,
     AGENT_HELPER,
-    AGENT_TERMINAL,
+    AGENT_HELPER_MAIN,
+    AGENT_BROWSER_MAIN,
     AGENT_BROWSER,
     AGENT_QUESTION,
     AGENT_QUESTION_NOTE,
     AGENT_APPROVAL,
-    AGENT_APPROVAL_TEXT,
     AGENT_PENDING,
     AGENT_QUEUE,
     AGENT_QUEUE_EDITOR,
@@ -134,6 +137,9 @@ pub const ALL: &[Context] = &[
     AGENT_REMOTE,
     AGENT_RULES,
     AGENT_SLACK,
+    AGENT_SLACK_BUTTON,
+    AGENT_SLACK_SECRET,
+    AGENT_TWEAKS_BUTTON,
     AGENT_THEMES,
     AGENT_TWEAKS,
     AGENT_USAGE,
@@ -197,6 +203,9 @@ pub const AGENT_GENERIC_MODALS: &[Context] = &[
     AGENT_PERMISSION_BUTTON,
     AGENT_PERMISSION_DELETE,
     AGENT_SLACK,
+    AGENT_SLACK_BUTTON,
+    AGENT_SLACK_SECRET,
+    AGENT_TWEAKS_BUTTON,
     AGENT_TRANSCRIPT,
     AGENT_RESOURCE_PICKER,
     AGENT_RESOURCE_LIST,

@@ -351,6 +351,21 @@ impl Ui {
             );
         }
     }
+    pub(super) fn move_helper(&mut self) {
+        if !self.panels.visible() {
+            return;
+        }
+        self.panels.right = !self.panels.right;
+        self.preferences.layout.helper_placement = None;
+        let right = self.panels.right;
+        let result = self.storage.update_config(|c| {
+            c.agent_panel_right = right;
+            c.preferences.layout.helper_placement = None;
+        });
+        if let Err(error) = result {
+            self.notice = Some((format!("Cannot save pane placement: {error:#}"), true));
+        }
+    }
     pub(super) fn panel_key(&mut self, key: KeyEvent) -> bool {
         if self.modal.is_some() {
             return false;
@@ -362,23 +377,13 @@ impl Ui {
             app.key_event(key);
             return true;
         }
-        if key.code == KeyCode::Char('p')
-            && key.modifiers == KeyModifiers::ALT
-            && self.panels.visible()
-        {
-            self.panels.right = !self.panels.right;
-            self.preferences.layout.helper_placement = None;
-            let right = self.panels.right;
-            let result = self.storage.update_config(|c| {
-                c.agent_panel_right = right;
-                c.preferences.layout.helper_placement = None;
-            });
-            if let Err(e) = result {
-                self.notice = Some((format!("Cannot save pane placement: {e:#}"), true));
-            }
+        use crate::shortcuts::ids::*;
+        let shortcut = self.shortcut(key);
+        if shortcut == Some(HELPER_PLACEMENT) && self.panels.visible() {
+            self.move_helper();
             return true;
         }
-        if key.code == KeyCode::Char(']') && key.modifiers == KeyModifiers::ALT {
+        if shortcut == Some(HELPER_VISIBILITY) {
             if self.panels.view.is_some() {
                 self.panels.hidden = !self.panels.hidden;
                 self.panels.focused = !self.panels.hidden;
@@ -395,10 +400,14 @@ impl Ui {
         if !self.panels.focused || !self.panels.visible() {
             return false;
         }
-        if self.panels.right && matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        if self.panels.right
+            && matches!(
+                shortcut,
+                Some(NAVIGATION_NEXT_FOCUS | NAVIGATION_PREVIOUS_FOCUS)
+            )
+        {
             // Keep the PR's file/chapter pane reachable before leaving the helper.
-            let backwards =
-                key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
+            let backwards = shortcut == Some(NAVIGATION_PREVIOUS_FOCUS);
             if let Some(View::PullRequest { app }) = &mut self.panels.view
                 && app.view != crate::app::View::Overview
                 && ((!backwards && app.focus == crate::app::Focus::Navigation)
@@ -407,12 +416,10 @@ impl Ui {
                 app.key_event(key);
                 return true;
             }
-            self.cycle_focus(
-                key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT),
-            );
+            self.cycle_focus(shortcut == Some(NAVIGATION_PREVIOUS_FOCUS));
             return true;
         }
-        if key.code == KeyCode::Esc {
+        if shortcut == Some(AGENTS_BACK) {
             self.panels.view = None;
             self.panels.focused = false;
             self.focus = if self.changes_visible {
@@ -422,7 +429,7 @@ impl Ui {
             };
             return true;
         }
-        if key.modifiers == KeyModifiers::ALT && matches!(key.code, KeyCode::Char('[' | 'd')) {
+        if matches!(shortcut, Some(AGENTS_SIDEBAR | AGENTS_CHANGES)) {
             self.panels.focused = false;
             return false;
         }
@@ -438,25 +445,18 @@ impl Ui {
             app.key_event(key);
             return true;
         }
-        match key.code {
-            KeyCode::Up => self.panels.scroll = self.panels.scroll.saturating_sub(1),
-            KeyCode::Down => self.panels.scroll = self.panels.scroll.saturating_add(1),
-            KeyCode::PageUp => {
-                self.panels.scroll = self
-                    .panels
-                    .scroll
-                    .saturating_sub(self.panels.rect.height as usize)
-            }
-            KeyCode::PageDown => {
-                self.panels.scroll = self
-                    .panels
-                    .scroll
-                    .saturating_add(self.panels.rect.height as usize)
-            }
-            KeyCode::Home => self.panels.scroll = 0,
-            KeyCode::End => self.panels.scroll = usize::MAX,
-            KeyCode::Tab => self.cycle_focus(false),
-            _ => {}
+        if matches!(
+            shortcut,
+            Some(NAVIGATION_NEXT_FOCUS | NAVIGATION_PREVIOUS_FOCUS)
+        ) {
+            self.cycle_focus(shortcut == Some(NAVIGATION_PREVIOUS_FOCUS));
+        } else {
+            self.panels.scroll = shortcut_scroll(
+                shortcut,
+                self.panels.scroll,
+                usize::from(self.panels.rect.height),
+                usize::MAX,
+            );
         }
         true
     }
@@ -579,6 +579,8 @@ impl Ui {
         }
     }
     pub(super) fn resource_key(&mut self, key: KeyEvent) -> bool {
+        use crate::shortcuts::ids::*;
+        let shortcut = self.shortcut(key);
         if self.modal.is_none() && !self.panels.focused && self.drilled {
             let mut visible = self
                 .visible_resources()
@@ -589,8 +591,7 @@ impl Ui {
                 visible.extend((0..self.prs.all(id).len()).map(Focus::PullRequest));
             }
             if self.focus == Focus::Composer
-                && key.code == KeyCode::Down
-                && key.modifiers.is_empty()
+                && shortcut == Some(COMPOSER_HISTORY_NEXT)
                 && let Some(first) = visible.first()
             {
                 self.focus = *first;
@@ -601,11 +602,11 @@ impl Ui {
                     self.focus = Focus::Composer;
                     return false;
                 }
-                match key.code {
-                    KeyCode::Up | KeyCode::Esc => self.focus = Focus::Composer,
-                    KeyCode::Left | KeyCode::Right => {
+                match shortcut {
+                    Some(NAVIGATION_UP | AGENTS_BACK) => self.focus = Focus::Composer,
+                    Some(NAVIGATION_LEFT | NAVIGATION_RIGHT) => {
                         let current = visible.iter().position(|f| *f == self.focus).unwrap_or(0);
-                        let next = if key.code == KeyCode::Right {
+                        let next = if shortcut == Some(NAVIGATION_RIGHT) {
                             (current + 1) % visible.len()
                         } else {
                             (current + visible.len() - 1) % visible.len()
@@ -614,13 +615,13 @@ impl Ui {
                             self.focus = *next;
                         }
                     }
-                    KeyCode::Enter => match self.focus {
+                    Some(NAVIGATION_ACTIVATE) => match self.focus {
                         Focus::PullRequest(index) => self.open_pr_panel(index),
                         Focus::Resources(a) => self.open_resources(a),
                         _ => {}
                     },
-                    KeyCode::Tab | KeyCode::BackTab => {
-                        self.cycle_focus(key.code == KeyCode::BackTab)
+                    Some(NAVIGATION_NEXT_FOCUS | NAVIGATION_PREVIOUS_FOCUS) => {
+                        self.cycle_focus(shortcut == Some(NAVIGATION_PREVIOUS_FOCUS))
                     }
                     _ => return false,
                 }
@@ -628,13 +629,13 @@ impl Ui {
             }
         }
         if let Some(Modal::InstallBrowser { selected, .. }) = &mut self.modal {
-            match key.code {
-                KeyCode::Esc => self.modal = None,
-                KeyCode::Up => *selected = selected.saturating_sub(1),
-                KeyCode::Down | KeyCode::Tab => {
+            match shortcut {
+                _ if key.code == KeyCode::Esc => self.modal = None,
+                Some(NAVIGATION_UP) => *selected = selected.saturating_sub(1),
+                Some(NAVIGATION_DOWN) => {
                     *selected = (*selected + 1) % if cfg!(target_os = "macos") { 3 } else { 2 }
                 }
-                KeyCode::Enter => {
+                Some(NAVIGATION_ACTIVATE) => {
                     let index = *selected;
                     self.browser_choice(index);
                 }
@@ -652,13 +653,13 @@ impl Ui {
         let artifacts = *artifacts;
         let selected = *selected;
         let count = self.resources(artifacts).len();
-        match key.code {
-            KeyCode::Esc => self.modal = None,
-            KeyCode::Enter => self.select_resource(artifacts, selected),
-            KeyCode::Up | KeyCode::Down => {
+        match shortcut {
+            _ if key.code == KeyCode::Esc => self.modal = None,
+            Some(NAVIGATION_ACTIVATE) => self.select_resource(artifacts, selected),
+            Some(NAVIGATION_UP | NAVIGATION_DOWN) => {
                 self.modal = Some(Modal::Resources {
                     artifacts,
-                    selected: if key.code == KeyCode::Up {
+                    selected: if shortcut == Some(NAVIGATION_UP) {
                         selected.saturating_sub(1)
                     } else {
                         selected.saturating_add(1).min(count.saturating_sub(1))
@@ -685,8 +686,23 @@ impl Ui {
         let footer = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
         inner.height = inner.height.saturating_sub(2);
         self.panels.rect = inner;
+        let bindings = crate::shortcuts::Bindings::new(&self.shortcut_config);
+        let move_hint = bindings.primary_hint_in(
+            crate::shortcuts::ids::HELPER_PLACEMENT,
+            self.shortcut_context(),
+        );
+        let close_hint = if self.panels.focused {
+            format!(
+                "{} Close",
+                bindings
+                    .primary_hint_in(crate::shortcuts::ids::AGENTS_BACK, self.shortcut_context())
+            )
+        } else {
+            "Click to focus".into()
+        };
         frame.render_widget(
-            Paragraph::new("Alt+P Move · Esc Close").style(Style::default().fg(DIM)),
+            Paragraph::new(format!("{move_hint} Move · {close_hint}"))
+                .style(Style::default().fg(DIM)),
             footer,
         );
         if matches!(self.panels.view, Some(View::Artifact { .. })) {

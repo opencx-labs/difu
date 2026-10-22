@@ -22,7 +22,11 @@ impl Ui {
                     }
                 }
                 Modal::Mcp(state) => state.shortcut_context(),
-                Modal::Slack(_) => AGENT_SLACK,
+                Modal::Slack(form) => match form.field {
+                    0 | 1 => AGENT_SLACK_SECRET,
+                    2 | 3 => AGENT_SLACK,
+                    _ => AGENT_SLACK_BUTTON,
+                },
                 Modal::Transcript { .. } => AGENT_TRANSCRIPT,
                 Modal::InstallBrowser { .. } => AGENT_RESOURCE_PICKER,
                 Modal::Resources { .. } => AGENT_RESOURCE_LIST,
@@ -38,7 +42,13 @@ impl Ui {
                     1 => AGENT_RULES,
                     _ => AGENT_RULES_BUTTON,
                 },
-                Modal::Tweaks { .. } => AGENT_TWEAKS,
+                Modal::Tweaks { field, .. } => {
+                    if *field < 4 {
+                        AGENT_TWEAKS
+                    } else {
+                        AGENT_TWEAKS_BUTTON
+                    }
+                }
                 Modal::Theme { .. } => AGENT_THEMES,
                 Modal::Remote => AGENT_REMOTE,
                 Modal::Repository(_) => AGENT_REPOSITORY,
@@ -54,23 +64,25 @@ impl Ui {
                 Modal::Rename(_) => AGENT_RENAME,
                 Modal::Model { .. } => AGENT_MODEL,
                 Modal::ModelPicker(_) => AGENT_MODEL_PICKER,
-                Modal::Approval { pending, .. } => {
-                    if pending.method == "item/tool/requestUserInput" {
-                        AGENT_APPROVAL_TEXT
-                    } else {
-                        AGENT_APPROVAL
-                    }
-                }
+                Modal::Approval { .. } => AGENT_APPROVAL,
                 Modal::Delete => AGENT_DELETE,
                 Modal::Clear => AGENT_CLEAR,
                 Modal::Help(_) => AGENT_HELP,
             };
         }
         if self.browser_input() {
-            return AGENT_BROWSER;
+            return if self.panels.right {
+                AGENT_BROWSER
+            } else {
+                AGENT_BROWSER_MAIN
+            };
         }
         if self.panels.focused && self.panels.visible() {
-            return AGENT_HELPER;
+            return if self.panels.right {
+                AGENT_HELPER
+            } else {
+                AGENT_HELPER_MAIN
+            };
         }
         match self.focus {
             Focus::List => AGENT_LIST,

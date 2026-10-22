@@ -890,28 +890,35 @@ impl Ui {
     fn draw_question_bar(&mut self, frame: &mut Frame, area: Rect) {
         use crate::shortcuts::{Bindings, ids::*};
         let bindings = Bindings::new(&self.shortcut_config);
+        let active_hint = |id| bindings.primary_hint_in(id, self.shortcut_context());
         let hint = if self.question_send.is_some() {
             "Sending answer…".into()
         } else if self.question_note_focused {
             format!(
                 "{} submit with note · Esc choices · {}/{} questions",
-                bindings.hint(QUESTION_SUBMIT),
-                bindings.hint(QUESTION_PREVIOUS),
-                bindings.hint(QUESTION_NEXT)
+                active_hint(QUESTION_SUBMIT),
+                active_hint(QUESTION_PREVIOUS),
+                active_hint(QUESTION_NEXT)
+            )
+        } else if area.width < 80 {
+            format!(
+                "{} submit · {} note · Esc back",
+                active_hint(QUESTION_SUBMIT),
+                active_hint(QUESTION_NOTE)
             )
         } else {
             format!(
                 "{}{} add note · {} submit · {} skip · {} previous/input · {} next",
                 if self.multi_select_key().is_some() {
-                    format!("{} choose · ", bindings.hint(QUESTION_TOGGLE))
+                    format!("{} choose · ", active_hint(QUESTION_TOGGLE))
                 } else {
                     String::new()
                 },
-                bindings.hint(QUESTION_NOTE),
-                bindings.hint(QUESTION_SUBMIT),
-                bindings.hint(QUESTION_SKIP),
-                bindings.hint(QUESTION_NEXT),
-                bindings.hint(QUESTION_PREVIOUS)
+                active_hint(QUESTION_NOTE),
+                active_hint(QUESTION_SUBMIT),
+                active_hint(QUESTION_SKIP),
+                active_hint(QUESTION_NEXT),
+                active_hint(QUESTION_PREVIOUS)
             )
         };
         self.button(

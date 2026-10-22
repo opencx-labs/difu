@@ -291,7 +291,6 @@ fn legacy_question_aliases_stay_contextual_and_opaque_modifiers_are_not_capturab
             contexts::AGENT_COMPOSER,
             contexts::AGENT_RENAME,
             contexts::AGENT_PLAN,
-            contexts::AGENT_APPROVAL_TEXT,
         ] {
             assert!(!Bindings::new(&config).matches(ids::QUESTION_SUBMIT, context, event));
         }

@@ -336,5 +336,237 @@ pub(super) fn build() -> Vec<ActionSpec> {
                 .collect();
         }
     }
+    // The two form buttons do not own an Editor; all form actions/globals
+    // retain their availability while invalid typing bindings stay field-safe.
+    for entry in &mut entries {
+        for (base, button) in [
+            (contexts::AGENT_SLACK, contexts::AGENT_SLACK_BUTTON),
+            (contexts::AGENT_TWEAKS, contexts::AGENT_TWEAKS_BUTTON),
+        ] {
+            if entry.contexts.contains(&base) {
+                if !entry.contexts.contains(&button) {
+                    entry.contexts.push(button);
+                }
+                for binding in &mut entry.defaults {
+                    if binding.contexts.contains(&base) && !binding.contexts.contains(&button) {
+                        binding.contexts.push(button);
+                    }
+                }
+            }
+        }
+    }
+    // Legacy explicit predicates accepted all Control combinations, and plan
+    // feedback accepted every non-Shift Enter. Keep these meaningful aliases.
+    for entry in &mut entries {
+        if [
+            ids::APPROVAL_SUBMIT,
+            ids::QUEUE_SAVE,
+            ids::COMMANDS_REFRESH,
+            ids::PLAN_FEEDBACK,
+        ]
+        .contains(&entry.id)
+        {
+            let modifiers: &[u8] = if entry.id == ids::PLAN_FEEDBACK {
+                &[0, 1, 2, 3, 8, 9, 10, 11]
+            } else {
+                &[1, 3, 5, 7, 9, 11, 13, 15]
+            };
+            if entry.id != ids::APPROVAL_SUBMIT {
+                entry.defaults.clear();
+            }
+            for modifiers in modifiers {
+                let chord = key(
+                    if entry.id == ids::COMMANDS_REFRESH {
+                        BindingKey::Character('r')
+                    } else {
+                        BindingKey::Enter
+                    },
+                    *modifiers,
+                );
+                if !entry.defaults.iter().any(|binding| binding.chord == chord) {
+                    entry.defaults.push(DefaultBinding {
+                        chord,
+                        contexts: entry.contexts.clone(),
+                    });
+                }
+            }
+        }
+        if [
+            ids::HELPER_PLACEMENT,
+            ids::HELPER_VISIBILITY,
+            ids::AGENTS_BACK,
+        ]
+        .contains(&entry.id)
+        {
+            entry.contexts.push(contexts::AGENT_BROWSER);
+            for binding in &mut entry.defaults {
+                binding.contexts.push(contexts::AGENT_BROWSER);
+            }
+        }
+        // These modal scroll handlers explicitly used Super for ten-row motion.
+        if [ids::NAVIGATION_FAST_UP, ids::NAVIGATION_FAST_DOWN].contains(&entry.id) {
+            for context in [
+                contexts::AGENT_STATUS,
+                contexts::AGENT_TRANSCRIPT,
+                contexts::AGENT_USAGE,
+                contexts::AGENT_HELP,
+            ] {
+                for modifiers in [8, 9, 10, 11, 12, 13, 14, 15] {
+                    if context == contexts::AGENT_HELP && modifiers & 4 != 0 {
+                        continue;
+                    }
+                    let chord = key(
+                        if entry.id == ids::NAVIGATION_FAST_UP {
+                            BindingKey::Up
+                        } else {
+                            BindingKey::Down
+                        },
+                        modifiers,
+                    );
+                    if !entry.defaults.iter().any(|binding| {
+                        binding.chord == chord && binding.contexts.contains(&context)
+                    }) {
+                        entry.defaults.push(DefaultBinding {
+                            chord,
+                            contexts: vec![context],
+                        });
+                    }
+                }
+            }
+        }
+    }
+    // Masked Slack token fields remain native editors but never expose a copy
+    // action; only the unmasked member/channel editors own selected clipboard text.
+    for entry in &mut entries {
+        if entry.id != ids::SELECTION_COPY && entry.contexts.contains(&contexts::AGENT_SLACK) {
+            if !entry.contexts.contains(&contexts::AGENT_SLACK_SECRET) {
+                entry.contexts.push(contexts::AGENT_SLACK_SECRET);
+            }
+            for binding in &mut entry.defaults {
+                if binding.contexts.contains(&contexts::AGENT_SLACK)
+                    && !binding.contexts.contains(&contexts::AGENT_SLACK_SECRET)
+                {
+                    binding.contexts.push(contexts::AGENT_SLACK_SECRET);
+                }
+            }
+        }
+    }
+    // Right and Bottom helpers share host focus cycling. Main placement keeps
+    // its original one-way Tab, and Browser receives those raw main-area events.
+    for entry in &mut entries {
+        if [ids::NAVIGATION_NEXT_FOCUS, ids::NAVIGATION_PREVIOUS_FOCUS].contains(&entry.id) {
+            entry.contexts.push(contexts::AGENT_BROWSER);
+            for binding in &mut entry.defaults {
+                if binding.contexts.contains(&contexts::AGENT_HELPER) {
+                    binding.contexts.push(contexts::AGENT_BROWSER);
+                }
+            }
+        }
+        for (base, main) in [
+            (contexts::AGENT_HELPER, contexts::AGENT_HELPER_MAIN),
+            (contexts::AGENT_BROWSER, contexts::AGENT_BROWSER_MAIN),
+        ] {
+            if !entry.contexts.contains(&base)
+                || (main == contexts::AGENT_HELPER_MAIN
+                    && entry.id == ids::NAVIGATION_PREVIOUS_FOCUS)
+                || (main == contexts::AGENT_BROWSER_MAIN
+                    && [ids::NAVIGATION_NEXT_FOCUS, ids::NAVIGATION_PREVIOUS_FOCUS]
+                        .contains(&entry.id))
+                || (main == contexts::AGENT_HELPER_MAIN
+                    && [ids::AGENTS_MODELS, ids::QUESTION_OPEN].contains(&entry.id))
+            {
+                continue;
+            }
+            entry.contexts.push(main);
+            for binding in &mut entry.defaults {
+                if binding.contexts.contains(&base) {
+                    binding.contexts.push(main);
+                }
+            }
+        }
+    }
+    // Only real selection owners belong in copy metadata. Non-editor modal
+    // bodies have never supported pointer selection; hidden composer text must
+    // not become their clipboard source. Reviews are owned by their consumer.
+    if let Some(entry) = entries
+        .iter_mut()
+        .find(|entry| entry.id == ids::SELECTION_COPY)
+    {
+        let copyable = |context: &Context| {
+            !context.0.starts_with("Agent")
+                || [
+                    contexts::AGENT_LIST,
+                    contexts::AGENT_COMPOSER,
+                    contexts::AGENT_COMPOSER_PANES,
+                    contexts::AGENT_CONVERSATION,
+                    contexts::AGENT_CONVERSATION_INPUT,
+                    contexts::AGENT_CHANGES,
+                    contexts::AGENT_CHANGE_TREE,
+                    contexts::AGENT_RESOURCES,
+                    contexts::AGENT_HELPER,
+                    contexts::AGENT_HELPER_MAIN,
+                    contexts::AGENT_QUESTION,
+                    contexts::AGENT_QUESTION_NOTE,
+                    contexts::AGENT_QUEUE_EDITOR,
+                    contexts::AGENT_PLAN_FEEDBACK,
+                    contexts::AGENT_COMMANDS,
+                    contexts::AGENT_MENU,
+                    contexts::AGENT_HELP,
+                    contexts::AGENT_MODEL,
+                    contexts::AGENT_DEFAULTS,
+                    contexts::AGENT_PERMISSION_SEARCH,
+                    contexts::AGENT_PERMISSION_FORM,
+                    contexts::AGENT_PERMISSION_MULTILINE,
+                    contexts::AGENT_RULES,
+                    contexts::AGENT_RULES_REPOSITORY,
+                    contexts::AGENT_SLACK,
+                    contexts::AGENT_TWEAKS,
+                    contexts::AGENT_TRANSCRIPT,
+                    contexts::AGENT_REPOSITORY,
+                    contexts::AGENT_CHANGE_REPOSITORY,
+                    contexts::AGENT_RENAME,
+                ]
+                .contains(context)
+        };
+        entry.contexts.retain(copyable);
+        for binding in &mut entry.defaults {
+            binding.contexts.retain(copyable);
+        }
+    }
+    // Pending is a request chooser, not a scrollable transcript. Its original
+    // handler consumes all input after Up/Down/Enter; do not advertise no-ops.
+    for entry in &mut entries {
+        if [
+            ids::NAVIGATION_PAGE_UP,
+            ids::NAVIGATION_PAGE_DOWN,
+            ids::NAVIGATION_FIRST,
+            ids::NAVIGATION_LAST,
+        ]
+        .contains(&entry.id)
+        {
+            entry
+                .contexts
+                .retain(|context| *context != contexts::AGENT_PENDING);
+            for binding in &mut entry.defaults {
+                binding
+                    .contexts
+                    .retain(|context| *context != contexts::AGENT_PENDING);
+            }
+        }
+    }
+    // Focused helpers historically consume models/question keys; only sidebar
+    // and Changes pass back to the host. Do not invent new helper actions.
+    for entry in &mut entries {
+        if [ids::AGENTS_MODELS, ids::QUESTION_OPEN].contains(&entry.id) {
+            entry
+                .contexts
+                .retain(|context| *context != contexts::AGENT_HELPER);
+            for binding in &mut entry.defaults {
+                binding
+                    .contexts
+                    .retain(|context| *context != contexts::AGENT_HELPER);
+            }
+        }
+    }
     entries
 }

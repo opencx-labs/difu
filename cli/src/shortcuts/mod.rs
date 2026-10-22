@@ -155,6 +155,44 @@ impl<'a> Bindings<'a> {
         {
             return true;
         }
+        if spec(action).is_some_and(|spec| spec.contexts.contains(&context))
+            && !self
+                .config
+                .preferences
+                .keyboard
+                .bindings
+                .contains_key(action.0)
+            && event.modifiers.intersects(M::HYPER | M::META)
+            && (([ids::APPROVAL_SUBMIT, ids::QUEUE_SAVE, ids::COMMANDS_REFRESH].contains(&action)
+                && event.modifiers.contains(M::CONTROL)
+                && event.code
+                    == if action == ids::COMMANDS_REFRESH {
+                        KeyCode::Char('r')
+                    } else {
+                        KeyCode::Enter
+                    })
+                || (action == ids::PLAN_FEEDBACK
+                    && event.code == KeyCode::Enter
+                    && !event.modifiers.contains(M::SHIFT))
+                || ([ids::NAVIGATION_FAST_UP, ids::NAVIGATION_FAST_DOWN].contains(&action)
+                    && [
+                        contexts::AGENT_STATUS,
+                        contexts::AGENT_TRANSCRIPT,
+                        contexts::AGENT_USAGE,
+                        contexts::AGENT_HELP,
+                    ]
+                    .contains(&context)
+                    && event.modifiers.contains(M::SUPER)
+                    && (context != contexts::AGENT_HELP || !event.modifiers.contains(M::SHIFT))
+                    && event.code
+                        == if action == ids::NAVIGATION_FAST_UP {
+                            KeyCode::Up
+                        } else {
+                            KeyCode::Down
+                        }))
+        {
+            return true;
+        }
         let Some(chord) = capture(event) else {
             return false;
         };

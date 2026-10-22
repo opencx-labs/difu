@@ -509,3 +509,328 @@ fn embedded_browser_receives_raw_ctrl_c_instead_of_copy_or_quit() -> Result<()> 
     }
     Ok(())
 }
+
+#[test]
+fn native_tweaks_and_unmasked_slack_ctrl_c_copy_before_shell_quit() -> Result<()> {
+    use crate::{agents::ui::Modal, editor::Editor};
+    for slack in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let mut shell = Shell::new(storage, Config::default(), None);
+        if slack {
+            crate::agents::ui::prepare_slack_copy(&mut shell.agents, 2);
+        } else {
+            let mut value = Editor::from("123");
+            value.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
+            shell.agents.modal = Some(Modal::Tweaks {
+                fields: Box::new([
+                    value,
+                    Editor::default(),
+                    Editor::default(),
+                    Editor::default(),
+                ]),
+                field: 0,
+            });
+        }
+        shell.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!shell.reviews.quit);
+        assert_eq!(
+            shell.agents.clipboard.as_deref(),
+            Some(if slack { "safe member" } else { "123" })
+        );
+        shell.agents.clipboard = None;
+        if slack {
+            crate::agents::ui::prepare_slack_copy(&mut shell.agents, 0);
+        } else if let Some(Modal::Tweaks { field, .. }) = &mut shell.agents.modal {
+            *field = 4;
+        }
+        shell.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(
+            shell.reviews.quit,
+            "no current copy selection retains original quit fallback"
+        );
+        assert!(shell.agents.clipboard.is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn new_slack_and_tweaks_contexts_protect_editing_from_invalid_stored_globals() -> Result<()> {
+    use crate::{agents::ui::Modal, editor::Editor};
+    for slack in [false, true] {
+        for field in [0, 2, 4] {
+            let dir = tempfile::tempdir()?;
+            let storage = Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().join("cache"),
+            };
+            let mut config = Config::default();
+            config.preferences.keyboard.bindings.insert(
+                ids::PALETTE_OPEN.0.into(),
+                key(BindingKey::Character('q'), 0),
+            );
+            let mut shell = Shell::new(storage, config, None);
+            if slack {
+                crate::agents::ui::prepare_slack_copy(&mut shell.agents, field);
+            } else {
+                let mut value = Editor::from("123");
+                value.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
+                shell.agents.modal = Some(Modal::Tweaks {
+                    fields: Box::new([value.clone(), value.clone(), value, Editor::default()]),
+                    field,
+                });
+            }
+            shell.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE));
+            assert_eq!(
+                shell.palette.is_some(),
+                field == 4,
+                "slack={slack} field={field}"
+            );
+            if field < 4 && !(slack && field == 0) {
+                shell
+                    .agents
+                    .key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
+                assert!(shell.agents.copy_chat_selection());
+                assert_eq!(shell.agents.clipboard.as_deref(), Some("q"));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn embedded_browser_focus_and_raw_protocol_keep_each_placement_and_removed_alias() -> Result<()> {
+    use crate::settings::HelperPlacement;
+    for placement in [
+        HelperPlacement::Right,
+        HelperPlacement::Bottom,
+        HelperPlacement::Main,
+    ] {
+        for (action, code, modifiers) in [
+            (ids::NAVIGATION_NEXT_FOCUS, KeyCode::Tab, KeyModifiers::NONE),
+            (
+                ids::NAVIGATION_PREVIOUS_FOCUS,
+                KeyCode::BackTab,
+                KeyModifiers::NONE,
+            ),
+            (
+                ids::NAVIGATION_PREVIOUS_FOCUS,
+                KeyCode::Tab,
+                KeyModifiers::SHIFT,
+            ),
+        ] {
+            for custom in [false, true] {
+                let dir = tempfile::tempdir()?;
+                let storage = Storage {
+                    config: dir.path().join("config.json"),
+                    cache: dir.path().join("cache"),
+                };
+                let mut config = Config::default();
+                config.preferences.layout.helper_placement = Some(placement);
+                if custom {
+                    config
+                        .preferences
+                        .keyboard
+                        .bindings
+                        .insert(action.0.into(), key(BindingKey::Character('g'), 2));
+                }
+                let mut shell = Shell::new(storage, config, None);
+                shell.agents.drilled = true;
+                shell.agents.selected = Some("sample".into());
+                shell.agents.sessions.insert(
+                    "sample".into(),
+                    crate::agents::Session::new(
+                        "sample".into(),
+                        crate::agents::Job::Coding(crate::agents::Launch {
+                            repository: dir.path().into(),
+                            isolated: false,
+                            base: "HEAD".into(),
+                            prompt: "safe draft".into(),
+                            model: None,
+                            effort: None,
+                        }),
+                    ),
+                );
+                crate::agents::ui::install_browser(&mut shell.agents)?;
+                assert_eq!(
+                    shell.agents.shortcut_context().0,
+                    if placement == HelperPlacement::Main {
+                        "AgentBrowserMain"
+                    } else {
+                        "AgentBrowser"
+                    }
+                );
+                let old = KeyEvent::new(code, modifiers);
+                shell.key(old);
+                let raw = crate::agents::ui::browser_keys(&shell.agents)?;
+                let passes = placement == HelperPlacement::Main || custom;
+                if passes && code == KeyCode::Tab {
+                    assert_eq!(
+                        raw,
+                        vec![
+                            serde_json::json!({"type":"key","key":"tab","kind":"press","mods":{"shift":modifiers.contains(KeyModifiers::SHIFT),"alt":false,"ctrl":false,"super":false}})
+                        ]
+                    );
+                } else {
+                    assert!(
+                        raw.is_empty(),
+                        "placement={placement:?} action={action:?} code={code:?} custom={custom}: {raw:?}"
+                    );
+                }
+                assert_eq!(
+                    shell.agents.browser_input(),
+                    passes,
+                    "placement={placement:?} action={action:?} code={code:?} custom={custom}"
+                );
+                if custom {
+                    shell.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT));
+                    assert_eq!(
+                        shell.agents.browser_input(),
+                        placement == HelperPlacement::Main
+                    );
+                    if placement == HelperPlacement::Main {
+                        assert_eq!(
+                            crate::agents::ui::browser_keys(&shell.agents)?.last(),
+                            Some(
+                                &serde_json::json!({"type":"key","key":"g","kind":"press","mods":{"shift":false,"alt":true,"ctrl":false,"super":false}})
+                            )
+                        );
+                    }
+                }
+            }
+        }
+        for custom_quit in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let storage = Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().join("cache"),
+            };
+            let mut config = Config::default();
+            config.preferences.layout.helper_placement = Some(placement);
+            if custom_quit {
+                config
+                    .preferences
+                    .keyboard
+                    .bindings
+                    .insert(ids::APP_QUIT.0.into(), key(BindingKey::Function(11), 0));
+            }
+            let mut shell = Shell::new(storage, config, None);
+            crate::agents::ui::install_browser(&mut shell.agents)?;
+            shell.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+            assert!(!shell.reviews.quit);
+            assert_eq!(
+                crate::agents::ui::browser_keys(&shell.agents)?.last(),
+                Some(
+                    &serde_json::json!({"type":"key","key":"c","kind":"press","mods":{"shift":false,"alt":false,"ctrl":true,"super":false}})
+                )
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn native_filter_control_u_predicate_cannot_be_stolen_by_stored_globals() -> Result<()> {
+    use crate::{agents::ui::Modal, editor::Editor};
+    for surface in ["commands", "menu", "help", "repository"] {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let mut config = Config::default();
+        config.preferences.keyboard.bindings.insert(
+            ids::PALETTE_OPEN.0.into(),
+            key(BindingKey::Character('u'), 3),
+        );
+        let mut shell = Shell::new(storage, config, None);
+        shell.agents.modal = Some(match surface {
+            "commands" => Modal::Commands {
+                query: Editor::from("filter"),
+                selected: 2,
+                skills_only: false,
+                files_only: false,
+            },
+            "menu" => Modal::Menu {
+                query: Editor::from("filter"),
+                selected: 2,
+            },
+            "help" => Modal::Help(crate::help::State {
+                query: Editor::from("filter"),
+                ..Default::default()
+            }),
+            _ => Modal::Repository(Editor::from("filter")),
+        });
+        shell.key(KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        ));
+        assert!(
+            shell.palette.is_none(),
+            "{surface} explicit ControlU convention"
+        );
+        let value = match &shell.agents.modal {
+            Some(Modal::Commands { query, .. } | Modal::Menu { query, .. }) => query.text(),
+            Some(Modal::Help(state)) => state.query.text(),
+            Some(Modal::Repository(editor)) => editor.text(),
+            _ => anyhow::bail!("lost native editor"),
+        };
+        assert_eq!(value, "");
+    }
+    Ok(())
+}
+
+#[test]
+fn filter_control_u_capture_and_locked_save_reject_only_owned_editing_contexts() -> Result<()> {
+    use crate::settings::{SettingId, SettingValue};
+    let dir = tempfile::tempdir()?;
+    let storage = Storage {
+        config: dir.path().join("config.json"),
+        cache: dir.path().join("cache"),
+    };
+    storage.update_config(|saved| *saved = Config::default())?;
+    let bytes = std::fs::read(&storage.config)?;
+    let mut shell = Shell::new(storage.clone(), Config::default(), None);
+    shell.open_settings(None);
+    shell.settings_action(SettingId::Shortcut(ids::PALETTE_OPEN.0.into()));
+    shell.key(KeyEvent::new(
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ));
+    let panel = shell
+        .settings
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("settings"))?;
+    assert!(
+        panel
+            .error
+            .as_ref()
+            .is_some_and(|error| error.contains("reserved for text editing"))
+    );
+    assert!(panel.draft.edited().is_empty());
+    panel.draft.set(
+        SettingId::Shortcut(ids::PALETTE_OPEN.0.into()),
+        SettingValue::Shortcut(Some(key(BindingKey::Character('u'), 3))),
+    )?;
+    assert!(storage.save_settings_draft(&mut panel.draft).is_err());
+    assert_eq!(std::fs::read(&storage.config)?, bytes);
+    assert!(!panel.draft.edited().is_empty());
+    let mut permitted = Config::default();
+    permitted.preferences.keyboard.bindings.insert(
+        ids::REMOTE_COPY.0.into(),
+        key(BindingKey::Character('u'), 3),
+    );
+    crate::shortcuts::Bindings::new(&permitted).validate()?;
+    assert!(crate::shortcuts::Bindings::new(&permitted).matches(
+        ids::REMOTE_COPY,
+        crate::shortcuts::contexts::AGENT_REMOTE,
+        KeyEvent::new(
+            KeyCode::Char('u'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )
+    ));
+    Ok(())
+}

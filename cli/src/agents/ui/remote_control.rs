@@ -91,6 +91,8 @@ impl Ui {
     }
 
     pub(super) fn remote_key(&mut self, key: KeyEvent) {
+        use crate::shortcuts::ids::*;
+        let shortcut = self.shortcut(key);
         let enabled = self.remote.status.as_ref().is_some_and(|s| s.enabled);
         let devices = self
             .remote
@@ -98,23 +100,23 @@ impl Ui {
             .as_ref()
             .map(|s| s.devices.clone())
             .unwrap_or_default();
-        match key.code {
-            KeyCode::Esc => self.modal = None,
-            KeyCode::Up => self.remote.selected = self.remote.selected.saturating_sub(1),
-            KeyCode::Down => {
+        match shortcut {
+            _ if key.code == KeyCode::Esc => self.modal = None,
+            Some(NAVIGATION_UP) => self.remote.selected = self.remote.selected.saturating_sub(1),
+            Some(NAVIGATION_DOWN) => {
                 self.remote.selected =
                     (self.remote.selected + 1).min(devices.len().saturating_sub(1))
             }
-            KeyCode::Char('c') => {
+            Some(REMOTE_COPY) => {
                 if let Some(link) = self.remote.status.as_ref().and_then(|s| s.pairing.clone()) {
                     // Universal Clipboard carries it to the iPhone's Paste Pairing Link.
                     self.clipboard = Some(link);
                     self.notice = Some(("Pairing link copied".into(), false));
                 }
             }
-            KeyCode::Char('d') if enabled => self.remote_command(Command::Disable, false),
-            KeyCode::Char('e') | KeyCode::Char('n') => self.remote_command(Command::Open, false),
-            KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
+            Some(REMOTE_DISABLE) if enabled => self.remote_command(Command::Disable, false),
+            Some(REMOTE_ENABLE) => self.remote_command(Command::Open, false),
+            Some(REMOTE_REMOVE) => {
                 if let Some(device) = devices.get(self.remote.selected) {
                     self.notice = Some((format!("Forgot {}", device.name), false));
                     self.remote_command(
@@ -176,10 +178,21 @@ impl Ui {
             lines.push(Line::styled(error.clone(), Style::default().fg(RED)));
         }
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), text_area);
+        use crate::shortcuts::{Bindings, ids::*};
+        let bindings = Bindings::new(&self.shortcut_config);
+        let hint = |id| bindings.primary_hint_in(id, self.shortcut_context());
         let hint = if status.enabled {
-            "c copy link · ↑↓ select phone · x forget · n new code · d turn off · Esc close"
+            format!(
+                "{} copy link · {}/{} select · {} forget · {} new code · {} off · Esc close",
+                hint(REMOTE_COPY),
+                hint(NAVIGATION_UP),
+                hint(NAVIGATION_DOWN),
+                hint(REMOTE_REMOVE),
+                hint(REMOTE_ENABLE),
+                hint(REMOTE_DISABLE)
+            )
         } else {
-            "e turn on · Esc close"
+            format!("{} turn on · Esc close", hint(REMOTE_ENABLE))
         };
         frame.render_widget(Paragraph::new(hint).style(Style::default().fg(DIM)), footer);
     }
@@ -398,6 +411,164 @@ mod tests {
         assert!(screen.contains('█'));
         ui.remote_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
         assert_eq!(ui.clipboard.as_deref(), Some("difu://pair?v=1&c=code"));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod shortcut_effect_tests {
+    use super::super::shortcut_tests::{BINDING_PHASES, binding_fixture, request_at_boundary_with};
+    use super::*;
+    use crate::shortcuts::ids::*;
+    use anyhow::Result;
+
+    fn ready(ui: &mut Ui) {
+        ui.modal = Some(Modal::Remote);
+        ui.remote.status = Some(Status {
+            enabled: true,
+            pairing: Some("difu://pair?v=1&c=fake".into()),
+            devices: vec![
+                crate::agents::remote::DeviceStatus {
+                    id: "first".into(),
+                    name: "First".into(),
+                    paired: 0,
+                    seen: None,
+                    connected: false,
+                },
+                crate::agents::remote::DeviceStatus {
+                    id: "second".into(),
+                    name: "Second".into(),
+                    paired: 0,
+                    seen: None,
+                    connected: false,
+                },
+            ],
+            ..Default::default()
+        });
+    }
+    #[test]
+    fn remote_native_hints_show_each_effective_action_in_compact_footer() -> Result<()> {
+        for width in [80, 160] {
+            for action in [REMOTE_COPY, REMOTE_DISABLE, REMOTE_ENABLE, REMOTE_REMOVE] {
+                let (mut ui, _dir, _) = super::super::shortcut_tests::fixture(Some(action))?;
+                ready(&mut ui);
+                let mut terminal =
+                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 44))?;
+                terminal.draw(|frame| ui.draw(frame))?;
+                let text: String = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert!(text.contains("F12"), "{width} {action:?}: {text}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn remote_actions_remap_all_legacy_aliases_without_starting_a_listener() -> Result<()> {
+        for (phase, custom) in BINDING_PHASES {
+            for (action, old) in [
+                (REMOTE_COPY, KeyCode::Char('c')),
+                (REMOTE_DISABLE, KeyCode::Char('d')),
+                (REMOTE_ENABLE, KeyCode::Char('e')),
+                (REMOTE_ENABLE, KeyCode::Char('n')),
+                (REMOTE_REMOVE, KeyCode::Char('x')),
+                (REMOTE_REMOVE, KeyCode::Delete),
+                (REMOTE_REMOVE, KeyCode::Backspace),
+            ] {
+                let (mut ui, _dir, _) = binding_fixture(action, phase)?;
+                ready(&mut ui);
+                if custom {
+                    ui.key(KeyEvent::new(old, KeyModifiers::NONE));
+                    assert!(ui.remote.receiver.is_none());
+                    assert!(ui.clipboard.is_none());
+                }
+                let key = KeyEvent::new(
+                    if custom { KeyCode::F(12) } else { old },
+                    KeyModifiers::NONE,
+                );
+                if action == REMOTE_COPY {
+                    ui.key(key);
+                    assert_eq!(
+                        ui.clipboard.take().as_deref(),
+                        Some("difu://pair?v=1&c=fake")
+                    );
+                } else {
+                    let request = request_at_boundary_with(&mut ui, |ui| ui.key(key))?;
+                    match request {
+                        Request::Remote {
+                            command: Command::Disable,
+                        } if action == REMOTE_DISABLE => {}
+                        Request::Remote {
+                            command: Command::Open,
+                        } if action == REMOTE_ENABLE => {}
+                        Request::Remote {
+                            command: Command::Forget { device },
+                        } if action == REMOTE_REMOVE => assert_eq!(device, "first"),
+                        _ => anyhow::bail!("wrong remote intent"),
+                    }
+                    // Fixture returns Ok rather than Remote status: real error handling keeps the modal.
+                    let deadline = Instant::now() + Duration::from_secs(3);
+                    while ui.remote.receiver.is_some() && Instant::now() < deadline {
+                        ui.tick_remote();
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    assert!(ui.remote.receiver.is_none());
+                    assert!(
+                        ui.remote
+                            .error
+                            .as_deref()
+                            .is_some_and(|error| error.contains("Unexpected remote control reply"))
+                    );
+                    assert!(matches!(ui.modal, Some(Modal::Remote)));
+                }
+            }
+        }
+        Ok(())
+    }
+    #[test]
+    fn remote_navigation_and_action_guards_are_contextual() -> Result<()> {
+        for (phase, custom) in BINDING_PHASES {
+            for (action, old, initial, want) in [
+                (NAVIGATION_UP, KeyCode::Up, 1, 0),
+                (NAVIGATION_DOWN, KeyCode::Down, 0, 1),
+            ] {
+                let (mut ui, _dir, _) = binding_fixture(action, phase)?;
+                ready(&mut ui);
+                ui.remote.selected = initial;
+                if custom {
+                    ui.key(KeyEvent::new(old, KeyModifiers::NONE));
+                    assert_eq!(ui.remote.selected, initial);
+                }
+                ui.key(KeyEvent::new(
+                    if custom { KeyCode::F(12) } else { old },
+                    KeyModifiers::NONE,
+                ));
+                assert_eq!(ui.remote.selected, want);
+            }
+            for action in [REMOTE_COPY, REMOTE_DISABLE, REMOTE_REMOVE] {
+                let (mut ui, _dir, _) = binding_fixture(action, phase)?;
+                ui.modal = Some(Modal::Remote);
+                let code = if custom {
+                    KeyCode::F(12)
+                } else {
+                    KeyCode::Char(if action == REMOTE_COPY {
+                        'c'
+                    } else if action == REMOTE_DISABLE {
+                        'd'
+                    } else {
+                        'x'
+                    })
+                };
+                ui.key(KeyEvent::new(code, KeyModifiers::NONE));
+                assert!(ui.remote.receiver.is_none());
+                assert!(ui.clipboard.is_none());
+            }
+        }
         Ok(())
     }
 }

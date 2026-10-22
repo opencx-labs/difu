@@ -1368,6 +1368,72 @@ mod shortcut_tests {
     };
     use anyhow::{Context, Result};
     #[test]
+    fn helper_and_modal_home_end_preserve_hidden_changes_reading() -> Result<()> {
+        for helper in [false, true] {
+            for (action, code) in [
+                (ids::NAVIGATION_FIRST, KeyCode::Home),
+                (ids::NAVIGATION_LAST, KeyCode::End),
+                (ids::AGENTS_MODELS, KeyCode::Char('m')),
+                (ids::QUESTION_OPEN, KeyCode::Up),
+            ] {
+                let main_action = [ids::AGENTS_MODELS, ids::QUESTION_OPEN].contains(&action);
+                if main_action && !helper {
+                    continue;
+                }
+                for (phase, custom) in super::super::shortcut_tests::BINDING_PHASES {
+                    let (mut ui, _dir, _) =
+                        super::super::shortcut_tests::binding_fixture(action, phase)?;
+                    ui.model_completion.options = vec![crate::model::ModelInfo {
+                        id: "cached".into(),
+                        name: "Cached".into(),
+                        efforts: vec![],
+                    }];
+                    ui.focus = Focus::Changes;
+                    ui.changes_visible = true;
+                    let mut document = Document::from(format!(
+                        "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,3 +1,3 @@\n {}\n-old\n+new\n after\n",
+                        "context ".repeat(30)
+                    ));
+                    let position = ui.positions.get_mut("one").context("position")?;
+                    let code_settings = crate::settings::Code::default();
+                    let _ = document.reflow(position, 40, true, true, &code_settings);
+                    position.changes = 4;
+                    position.selection = Some(2);
+                    let _ = document.reflow(position, 40, true, true, &code_settings);
+                    assert!(document.reading.is_some());
+                    ui.changes.insert("one".into(), document);
+                    if helper {
+                        ui.panels.focused = true;
+                        ui.panels.view = Some(panels::View::Shell {
+                            id: "read-only".into(),
+                            command: "output".into(),
+                        });
+                    } else {
+                        ui.modal = Some(Modal::Status { scroll: 20 });
+                    }
+                    ui.key(KeyEvent::new(
+                        if custom { KeyCode::F(12) } else { code },
+                        if !custom && main_action {
+                            KeyModifiers::ALT
+                        } else {
+                            KeyModifiers::NONE
+                        },
+                    ));
+                    if main_action {
+                        assert!(ui.modal.is_none());
+                        assert!(ui.panels.focused);
+                    }
+                    assert!(
+                        ui.changes.get("one").context("document")?.reading.is_some(),
+                        "{phase} helper={helper} {action:?}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn remapped_navigation_replaces_clamped_source_intent_while_copy_retains_it() -> Result<()> {
         for action in [
             ids::NAVIGATION_FIRST,

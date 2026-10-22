@@ -51,6 +51,14 @@ fn reserved(context: Context, chord: &KeyChord) -> bool {
     let modifiers = &chord.modifiers;
     let printable =
         matches!(chord.key, BindingKey::Character(_)) && !modifiers.control && !modifiers.super_key;
+    // These native filters/repository fields explicitly clear on Control+U
+    // with extra modifiers, rather than using Editor's exact Control alias.
+    if [AGENT_COMMANDS, AGENT_MENU, AGENT_HELP, AGENT_REPOSITORY].contains(&context)
+        && chord.key == BindingKey::Character('u')
+        && modifiers.control
+    {
+        return true;
+    }
     // Coding transcripts forward only unmodified/Shift printable typing to the
     // composer; navigation still belongs to the transcript, not an Editor.
     if context == AGENT_CONVERSATION_INPUT {
@@ -71,7 +79,6 @@ fn reserved(context: Context, chord: &KeyChord) -> bool {
         AGENT_COMPOSER_PANES,
         AGENT_QUESTION,
         AGENT_QUESTION_NOTE,
-        AGENT_APPROVAL_TEXT,
         AGENT_QUEUE_EDITOR,
         AGENT_PLAN_FEEDBACK,
         AGENT_COMMANDS,
@@ -85,6 +92,7 @@ fn reserved(context: Context, chord: &KeyChord) -> bool {
         AGENT_RULES,
         AGENT_RULES_REPOSITORY,
         AGENT_SLACK,
+        AGENT_SLACK_SECRET,
         AGENT_TWEAKS,
         AGENT_REPOSITORY,
         AGENT_CHANGE_REPOSITORY,

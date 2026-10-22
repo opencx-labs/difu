@@ -89,7 +89,6 @@ pub const QUESTION_SKIP: ActionId = ActionId("question.skip");
 pub const QUESTION_TOGGLE: ActionId = ActionId("question.toggle");
 pub const QUESTION_NOTE: ActionId = ActionId("question.note");
 pub const APPROVAL_SUBMIT: ActionId = ActionId("approval.submit");
-pub const APPROVAL_SUBMIT_TEXT: ActionId = ActionId("approval.submit_text");
 pub const QUEUE_SAVE: ActionId = ActionId("queue.save");
 pub const QUEUE_ACTIVATE: ActionId = ActionId("queue.activate");
 pub const PLAN_FEEDBACK: ActionId = ActionId("plan.feedback");

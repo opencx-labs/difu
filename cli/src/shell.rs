@@ -232,8 +232,6 @@ impl Shell {
         use crate::shortcuts::{Bindings, contexts, ids};
         let context = if self.palette.is_some() {
             contexts::PALETTE
-        } else if self.agents_active && self.agents.browser_input() {
-            contexts::AGENT_BROWSER
         } else if self.agents_active {
             self.agents.shortcut_context()
         } else {
@@ -283,7 +281,7 @@ impl Shell {
         // let a legacy view handler turn the removed global default into exit.
         if key.code == KeyCode::Char('c')
             && key.modifiers == KeyModifiers::CONTROL
-            && context != contexts::AGENT_BROWSER
+            && ![contexts::AGENT_BROWSER, contexts::AGENT_BROWSER_MAIN].contains(&context)
             && self
                 .reviews
                 .config

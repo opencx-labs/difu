@@ -359,12 +359,6 @@ pub(super) fn entries() -> Vec<ActionSpec> {
             &[key(BindingKey::Enter, 0), key(BindingKey::Enter, 1)],
         ),
         entry(
-            ids::APPROVAL_SUBMIT_TEXT,
-            "Submit approval answers",
-            &[contexts::AGENT_APPROVAL_TEXT],
-            &[key(BindingKey::Enter, 1)],
-        ),
-        entry(
             ids::QUEUE_SAVE,
             "Save queued message",
             &[contexts::AGENT_QUEUE_EDITOR],

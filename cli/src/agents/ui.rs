@@ -11,6 +11,8 @@ mod inline_questions;
 mod mcp_panel;
 mod media;
 mod models;
+#[cfg(test)]
+mod overlay_shortcut_tests;
 mod panels;
 mod patch;
 mod permissions_panel;
@@ -28,6 +30,8 @@ mod settings;
 pub(crate) mod settings_preview;
 #[cfg(test)]
 mod shortcut_tests;
+#[cfg(test)]
+pub(crate) use overlay_shortcut_tests::prepare_slack_copy;
 mod shortcuts;
 mod sidebar;
 mod slack;
@@ -1302,6 +1306,9 @@ impl Ui {
                     "Toggle agents list · Alt+[" => Some(("Toggle agents list", AGENTS_SIDEBAR)),
                     "Toggle Changes · Alt+D" => Some(("Toggle Changes", AGENTS_CHANGES)),
                     "Pending questions · Alt+↑" => Some(("Pending questions", QUESTION_OPEN)),
+                    "Move shell / artifact pane · Alt+P" => {
+                        Some(("Move shell / artifact pane", HELPER_PLACEMENT))
+                    }
                     "Permissions and mode · Shift+Tab" => {
                         Some(("Permissions and mode", COMPOSER_PERMISSION_MODE))
                     }
@@ -1329,7 +1336,7 @@ impl Ui {
             15 => self.open_resources(true),
             16 => {
                 self.modal = None;
-                self.panel_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+                self.move_helper();
             }
             13 => self.modal = Some(Modal::Delete),
             12 => self.open_defaults(),
@@ -1595,7 +1602,14 @@ impl Ui {
             Some(Modal::Help(state)) => Some(&state.query),
             Some(Modal::Permissions(state)) => state.editor(),
             Some(Modal::Plan(state)) => state.editor(),
-            Some(Modal::Rename(editor) | Modal::QueuedEdit { editor, .. }) => Some(editor),
+            Some(
+                Modal::Rename(editor)
+                | Modal::QueuedEdit {
+                    editor, focus: 0, ..
+                },
+            ) => Some(editor),
+            Some(Modal::Tweaks { fields, field }) => fields.get(*field),
+            Some(Modal::Slack(form)) => form.copy_editor(),
             Some(Modal::Model {
                 model,
                 effort,
@@ -1636,7 +1650,7 @@ impl Ui {
             return;
         }
         use crate::shortcuts::ids::*;
-        if self.focus == Focus::Changes
+        if self.shortcut_context() == crate::shortcuts::contexts::AGENT_CHANGES
             && matches!(self.shortcut(key), Some(NAVIGATION_FIRST | NAVIGATION_LAST))
             && let Some(document) = self
                 .selected
@@ -2424,6 +2438,7 @@ impl Ui {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shortcut = self.shortcut(key);
         let menu = self.menu_entries();
         let mut action = None;
         match &mut self.modal {
@@ -2434,28 +2449,10 @@ impl Ui {
                 ..
             }) => {
                 let maximum = rows.len().saturating_sub(*height);
-                let step = scroll_step(key);
-                *scroll = match key.code {
-                    KeyCode::Up => scroll.saturating_sub(step),
-                    KeyCode::Down => scroll.saturating_add(step).min(maximum),
-                    KeyCode::PageUp => scroll.saturating_sub(*height),
-                    KeyCode::PageDown => scroll.saturating_add(*height).min(maximum),
-                    KeyCode::Home => 0,
-                    KeyCode::End => maximum,
-                    _ => *scroll,
-                };
+                *scroll = shortcut_scroll(shortcut, *scroll, *height, maximum);
             }
             Some(Modal::Status { scroll }) => {
-                let step = scroll_step(key);
-                *scroll = match key.code {
-                    KeyCode::Up => scroll.saturating_sub(step),
-                    KeyCode::Down => scroll.saturating_add(step),
-                    KeyCode::PageUp => scroll.saturating_sub(10),
-                    KeyCode::PageDown => scroll.saturating_add(10),
-                    KeyCode::Home => 0,
-                    KeyCode::End => usize::MAX,
-                    _ => *scroll,
-                };
+                *scroll = shortcut_scroll(shortcut, *scroll, 10, usize::MAX);
             }
             Some(Modal::Menu { query, selected }) => {
                 let matching: Vec<_> = menu
@@ -2465,19 +2462,19 @@ impl Ui {
                         label.to_lowercase().contains(&query.text().to_lowercase())
                     })
                     .collect();
-                match key.code {
-                    KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                match shortcut {
+                    Some(crate::shortcuts::ids::NAVIGATION_UP) => {
                         *selected = selected.saturating_sub(1)
                     }
-                    KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Some(crate::shortcuts::ids::NAVIGATION_DOWN) => {
                         *selected = (*selected + 1).min(matching.len().saturating_sub(1))
                     }
-                    KeyCode::Enter => {
+                    Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) => {
                         action = matching
                             .get(*selected)
                             .map(|(index, _)| Action::MenuItem(*index))
                     }
-                    KeyCode::Char('u') if ctrl => {
+                    _ if key.code == KeyCode::Char('u') && ctrl => {
                         *query = Editor::default();
                         *selected = 0;
                     }
@@ -2488,7 +2485,7 @@ impl Ui {
                 }
             }
             Some(Modal::Rename(editor)) => {
-                if key.code == KeyCode::Enter {
+                if shortcut == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) {
                     if let Some(id) = self.selected.clone() {
                         let title = editor.text();
                         self.busy = true;
@@ -2498,7 +2495,7 @@ impl Ui {
                     editor.key(key);
                 }
             }
-            Some(Modal::Delete) if key.code == KeyCode::Enter => {
+            Some(Modal::Delete) if shortcut == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) => {
                 if let Some(id) = self.selected.clone()
                     && self.deleting.insert(id.clone())
                 {
@@ -2512,7 +2509,7 @@ impl Ui {
                     self.task(Task::Delete(id.clone()), Request::Delete { id }, false);
                 }
             }
-            Some(Modal::Clear) if key.code == KeyCode::Enter => {
+            Some(Modal::Clear) if shortcut == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) => {
                 if !self.busy
                     && let Some(id) = self.selected.clone()
                 {
@@ -2529,13 +2526,20 @@ impl Ui {
                 scroll,
             }) => {
                 let text_input = pending.method == "item/tool/requestUserInput";
-                match key.code {
-                    KeyCode::PageUp => *scroll = scroll.saturating_sub(10),
-                    KeyCode::PageDown => *scroll = scroll.saturating_add(10),
-                    KeyCode::Enter if ctrl || !text_input => {
+                match shortcut {
+                    Some(crate::shortcuts::ids::NAVIGATION_PAGE_UP) => {
+                        *scroll = scroll.saturating_sub(10)
+                    }
+                    Some(crate::shortcuts::ids::NAVIGATION_PAGE_DOWN) => {
+                        *scroll = scroll.saturating_add(10)
+                    }
+                    Some(crate::shortcuts::ids::APPROVAL_SUBMIT) if !text_input => {
                         action = Some(Action::Approve(*selected))
                     }
-                    KeyCode::Tab | KeyCode::BackTab if text_input => {
+                    Some(
+                        crate::shortcuts::ids::NAVIGATION_NEXT_FOCUS
+                        | crate::shortcuts::ids::NAVIGATION_PREVIOUS_FOCUS,
+                    ) if text_input => {
                         *field = if key.code == KeyCode::BackTab {
                             (*field + answers.len().saturating_sub(1)) % answers.len().max(1)
                         } else {
@@ -2543,8 +2547,10 @@ impl Ui {
                         };
                         *scroll = 0
                     }
-                    KeyCode::Up if !text_input => *selected = selected.saturating_sub(1),
-                    KeyCode::Down if !text_input => {
+                    Some(crate::shortcuts::ids::NAVIGATION_UP) if !text_input => {
+                        *selected = selected.saturating_sub(1)
+                    }
+                    Some(crate::shortcuts::ids::NAVIGATION_DOWN) if !text_input => {
                         let last = match pending.method.as_str() {
                             "item/permissions/requestApproval" => 1,
                             "item/commandExecution/requestApproval"
@@ -2561,14 +2567,16 @@ impl Ui {
                     _ => {}
                 }
             }
-            Some(Modal::Help(state)) => match key.code {
-                KeyCode::Up if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    state.scroll = state.scroll.saturating_sub(scroll_step(key))
+            Some(Modal::Help(state)) => match shortcut {
+                Some(
+                    crate::shortcuts::ids::NAVIGATION_UP
+                    | crate::shortcuts::ids::NAVIGATION_DOWN
+                    | crate::shortcuts::ids::NAVIGATION_FAST_UP
+                    | crate::shortcuts::ids::NAVIGATION_FAST_DOWN,
+                ) => {
+                    state.scroll = shortcut_scroll(shortcut, state.scroll, 10, usize::MAX);
                 }
-                KeyCode::Down if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    state.scroll = state.scroll.saturating_add(scroll_step(key))
-                }
-                KeyCode::Char('u') if ctrl => {
+                _ if key.code == KeyCode::Char('u') && ctrl => {
                     state.query.clear();
                     state.scroll = 0;
                 }
@@ -2908,12 +2916,24 @@ fn provider_error_text(error: &str) -> &str {
     }
 }
 
-/// Rows an arrow key scrolls a modal: ten with Cmd held.
-fn scroll_step(key: KeyEvent) -> usize {
-    if key.modifiers.contains(KeyModifiers::SUPER) {
-        10
-    } else {
-        1
+/// Scroll by semantic intent so custom physical keys retain the same motion.
+fn shortcut_scroll(
+    action: Option<crate::shortcuts::ActionId>,
+    current: usize,
+    page: usize,
+    maximum: usize,
+) -> usize {
+    use crate::shortcuts::ids::*;
+    match action {
+        Some(NAVIGATION_UP) => current.saturating_sub(1),
+        Some(NAVIGATION_DOWN) => current.saturating_add(1).min(maximum),
+        Some(NAVIGATION_FAST_UP) => current.saturating_sub(10),
+        Some(NAVIGATION_FAST_DOWN) => current.saturating_add(10).min(maximum),
+        Some(NAVIGATION_PAGE_UP) => current.saturating_sub(page),
+        Some(NAVIGATION_PAGE_DOWN) => current.saturating_add(page).min(maximum),
+        Some(NAVIGATION_FIRST) => 0,
+        Some(NAVIGATION_LAST) => maximum,
+        _ => current,
     }
 }
 
@@ -3980,11 +4000,11 @@ impl Ui {
         );
         let menu_entries = self.menu_entries();
         let title = match self.modal {
-            Some(Modal::Transcript { .. }) => "Message · ↑/↓ Scroll · PgUp/PgDn Page · Esc Close",
+            Some(Modal::Transcript { .. }) => "Message",
             Some(Modal::InstallBrowser { .. }) => "Optional HTML preview · Esc cancels",
             Some(Modal::AgentDefaults(_)) => "New agent defaults",
             Some(Modal::RepositoryRules(_)) => "Repository rules",
-            Some(Modal::Slack(_)) => "Slack setup · Tab fields · Esc closes",
+            Some(Modal::Slack(_)) => "Slack setup",
             Some(Modal::Tweaks { .. }) => "Tweaks · chat animations",
             Some(Modal::Theme { .. }) => "Theme",
             Some(Modal::Remote) => "Remote control · iPhone",
@@ -3992,11 +4012,11 @@ impl Ui {
             Some(Modal::ChangeRepository(_)) => "Change session repository",
             Some(Modal::Menu { .. }) => "Agent actions",
             Some(Modal::Commands { .. }) => "Session commands",
-            Some(Modal::Status { .. }) => "Session status · ↑/↓ Scroll · Esc Close",
+            Some(Modal::Status { .. }) => "Session status",
             Some(Modal::Permissions(_)) => "Permissions",
             Some(Modal::Plan(_)) => "Implement this plan?",
-            Some(Modal::Mcp(_)) => "MCP · ↑/↓ Select · Enter Open · r Refresh · Esc Back",
-            Some(Modal::Usage { .. }) => "Provider usage · ↑/↓ Scroll · r Refresh · Esc Close",
+            Some(Modal::Mcp(_)) => "MCP",
+            Some(Modal::Usage { .. }) => "Provider usage",
             Some(Modal::Pending { .. }) => "Pending questions and approvals",
             Some(Modal::Queue { .. }) => "Queued outgoing messages",
             Some(Modal::QueuedEdit { .. }) => "Edit queued message",
@@ -4006,8 +4026,8 @@ impl Ui {
             Some(Modal::Approval { .. }) => "Agent needs your input",
             Some(Modal::Resources {
                 artifacts: true, ..
-            }) => "HTML artifacts · Enter open",
-            Some(Modal::Resources { .. }) => "Open shells · Enter view",
+            }) => "HTML artifacts",
+            Some(Modal::Resources { .. }) => "Open shells",
             Some(Modal::Delete) => "Stop and delete chat",
             Some(Modal::Clear) => "Clear session",
             Some(Modal::Help(_)) => "Search agent shortcuts",
@@ -4017,6 +4037,45 @@ impl Ui {
         let context = self.shortcut_context();
         let hint = |action| bindings.primary_hint_in(action, context);
         let owned_title = match self.modal {
+            Some(Modal::Transcript { .. }) => Some(format!(
+                "Message · {}/{} Scroll · {}/{} Page · Esc Close",
+                hint(crate::shortcuts::ids::NAVIGATION_UP),
+                hint(crate::shortcuts::ids::NAVIGATION_DOWN),
+                hint(crate::shortcuts::ids::NAVIGATION_PAGE_UP),
+                hint(crate::shortcuts::ids::NAVIGATION_PAGE_DOWN)
+            )),
+            Some(Modal::Status { .. }) => Some(format!(
+                "Session status · {}/{} Scroll · Esc Close",
+                hint(crate::shortcuts::ids::NAVIGATION_UP),
+                hint(crate::shortcuts::ids::NAVIGATION_DOWN)
+            )),
+            Some(Modal::Usage { .. }) => Some(format!(
+                "Provider usage · {} Refresh · {}/{} Scroll · Esc Close",
+                hint(crate::shortcuts::ids::USAGE_REFRESH),
+                hint(crate::shortcuts::ids::NAVIGATION_UP),
+                hint(crate::shortcuts::ids::NAVIGATION_DOWN)
+            )),
+            Some(Modal::Slack(_)) => Some(format!(
+                "Slack setup · {}/{} fields · Esc closes",
+                hint(crate::shortcuts::ids::NAVIGATION_NEXT_FOCUS),
+                hint(crate::shortcuts::ids::NAVIGATION_PREVIOUS_FOCUS)
+            )),
+            Some(Modal::Mcp(_)) => Some(format!(
+                "MCP · {}/{} Select · {} Open · {} Refresh · Esc Back",
+                hint(crate::shortcuts::ids::NAVIGATION_UP),
+                hint(crate::shortcuts::ids::NAVIGATION_DOWN),
+                hint(crate::shortcuts::ids::NAVIGATION_ACTIVATE),
+                hint(crate::shortcuts::ids::MCP_REFRESH)
+            )),
+            Some(Modal::Resources { artifacts, .. }) => Some(format!(
+                "{} · {} open",
+                if artifacts {
+                    "HTML artifacts"
+                } else {
+                    "Open shells"
+                },
+                hint(crate::shortcuts::ids::NAVIGATION_ACTIVATE)
+            )),
             Some(Modal::AgentDefaults(_)) => Some(format!(
                 "New agent defaults · {}/{} fields · Esc cancels",
                 hint(crate::shortcuts::ids::NAVIGATION_NEXT_FOCUS),
@@ -4151,6 +4210,22 @@ impl Ui {
             crate::shortcuts::ids::NAVIGATION_ACTIVATE,
             self.shortcut_context(),
         );
+        let approval_submit_hint = crate::shortcuts::Bindings::new(&self.shortcut_config)
+            .primary_hint_in(
+                crate::shortcuts::ids::APPROVAL_SUBMIT,
+                self.shortcut_context(),
+            );
+        let approval_page_hint = format!(
+            "{}/{}",
+            crate::shortcuts::Bindings::new(&self.shortcut_config).primary_hint_in(
+                crate::shortcuts::ids::NAVIGATION_PAGE_UP,
+                self.shortcut_context()
+            ),
+            crate::shortcuts::Bindings::new(&self.shortcut_config).primary_hint_in(
+                crate::shortcuts::ids::NAVIGATION_PAGE_DOWN,
+                self.shortcut_context()
+            )
+        );
         match &mut self.modal {
             Some(
                 Modal::Transcript { .. }
@@ -4219,16 +4294,16 @@ impl Ui {
                 editor(
                     frame,
                     Rect::new(area.x, area.y, area.width, 3.min(area.height)),
-                    "Name · Enter save",
+                    &format!("Name · {activate_hint} save"),
                     value,
                     true,
                 );
             }
             Some(Modal::Delete) => {
-                frame.render_widget(Paragraph::new("Stop this agent and permanently delete its difu chat, saved questions, queue, and attachments? Its unlocked difu-owned worktree will also be removed, including all uncommitted, untracked, and ignored files. Existing directories, named branches, commits, and native provider history are not deleted.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
+                frame.render_widget(Paragraph::new(format!("Stop this agent and permanently delete its difu chat, saved questions, queue, and attachments? Its unlocked difu-owned worktree will also be removed, including all uncommitted, untracked, and ignored files. Existing directories, named branches, commits, and native provider history are not deleted.\n\n{activate_hint} confirms · Esc cancels")).wrap(Wrap { trim:false }), area);
             }
             Some(Modal::Clear) => {
-                frame.render_widget(Paragraph::new("Stop this agent and start this session over? Its chat, conversation context, queue, questions, artifacts, and PR links are removed, and the next message starts a new conversation. Its difu-owned worktree and local branch are discarded, including uncommitted and unpushed work, and a fresh worktree is created from the latest origin/main. Pushed branches, open PRs, registered external worktrees, and native provider history are not deleted.\n\nEnter confirms · Esc cancels").wrap(Wrap { trim:false }), area);
+                frame.render_widget(Paragraph::new(format!("Stop this agent and start this session over? Its chat, conversation context, queue, questions, artifacts, and PR links are removed, and the next message starts a new conversation. Its difu-owned worktree and local branch are discarded, including uncommitted and unpushed work, and a fresh worktree is created from the latest origin/main. Pushed branches, open PRs, registered external worktrees, and native provider history are not deleted.\n\n{activate_hint} confirms · Esc cancels")).wrap(Wrap { trim:false }), area);
             }
             Some(Modal::Help(state)) => {
                 let search = Rect::new(area.x, area.y, area.width, 3.min(area.height));
@@ -4367,7 +4442,7 @@ impl Ui {
                         .map(|entry| entry.text.as_str())
                         .unwrap_or_default();
                     let mut description = format!(
-                        "{} · PageUp/Down scroll\n\n{}\n\n{}",
+                        "{} · {approval_page_hint} scroll\n\n{}\n\n{}",
                         pending.method, content, related
                     );
                     let unsupported = !matches!(
@@ -4407,7 +4482,14 @@ impl Ui {
                                 area.width,
                                 1,
                             ),
-                            format!("{} {label}", if *selected == index { ">" } else { " " }),
+                            format!(
+                                "{} {label}",
+                                if *selected == index {
+                                    format!("> {approval_submit_hint} ·")
+                                } else {
+                                    " ".into()
+                                }
+                            ),
                             Action::Approve(index),
                             *selected == index,
                         ));
@@ -4512,10 +4594,8 @@ fn agent_help(query: &str, config: &Config) -> Vec<(String, &'static str)> {
             "Enter in composer",
             "Send message using the configured running-turn behavior",
         ),
-        (
-            "Ctrl+Enter",
-            "Queue message for the next turn / submit launch or answers",
-        ),
+        ("Ctrl+Enter", "Queue message for the next turn"),
+        ("Question answer", "Submit the current question answer"),
         (
             "Alt+↑ / ↓",
             "Next / previous question; previous from first returns to input",
@@ -4602,7 +4682,11 @@ fn agent_help(query: &str, config: &Config) -> Vec<(String, &'static str)> {
             "Alt+D" => hints(&[AGENTS_CHANGES]),
             "Alt+M" => hints(&[AGENTS_MODELS]),
             "Enter in composer" => hints(&[COMPOSER_SEND]),
-            "Ctrl+Enter" => format!("{} / Ctrl+Enter answers", hints(&[COMPOSER_QUEUE])),
+            "Ctrl+Enter" => hints(&[COMPOSER_QUEUE]),
+            "Question answer" => bindings
+                .primary_hint_in(QUESTION_SUBMIT, crate::shortcuts::contexts::AGENT_QUESTION),
+            "Alt+]" => hints(&[HELPER_VISIBILITY]),
+            "Alt+P" => hints(&[HELPER_PLACEMENT]),
             "Alt+↑ / ↓" => hints(&[QUESTION_OPEN, QUESTION_PREVIOUS, QUESTION_NEXT]),
             "Ctrl+]" => hints(&[QUESTION_SKIP]),
             "n (question choice)" => hints(&[QUESTION_NOTE]),
