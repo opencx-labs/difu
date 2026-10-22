@@ -2057,6 +2057,9 @@ fn workflow_delete_and_prune_remove_only_registered_owned_worktrees() -> Result<
             std::fs::write(root.join("file"), "owned\n")?;
             git(&["add", "file"])?;
             git(&["commit", "-m", "fixture"])?;
+            // Exercise filter discovery even on hosts without Git LFS configured.
+            git(&["config", "filter.difu_fixture.clean", "cat"])?;
+            git(&["config", "filter.difu_fixture.required", "true"])?;
             let mut entries = vec![];
             let mut expected = vec![];
             for i in 0..2 {
@@ -2120,7 +2123,14 @@ fn workflow_delete_and_prune_remove_only_registered_owned_worktrees() -> Result<
                         ),
                     ];
                     for (path, args) in commands {
-                        let mut command = crate::repo::git(path);
+                        let mut command = if matches!(
+                            args.as_slice(),
+                            ["status", ..] | ["worktree", "remove", ..]
+                        ) {
+                            crate::repo::checkout_git(path, &Cancel::default())?
+                        } else {
+                            crate::repo::git(path)
+                        };
                         command.args(args);
                         expected.push(Expected {
                             program: "git".into(),
