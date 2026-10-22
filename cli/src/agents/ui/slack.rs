@@ -17,6 +17,16 @@ impl Settings {
         }
     }
 }
+// Shared form behavior is portable; only the production entrypoint is macOS-only.
+#[cfg(test)]
+pub(super) fn test_form() -> Settings {
+    Settings {
+        fields: vec![Editor::default(); 4],
+        status: "Slack is not connected".into(),
+        saved: None,
+        field: 0,
+    }
+}
 #[derive(Default)]
 pub(super) struct State {
     saving: Option<mpsc::Receiver<Result<super::super::slack::Settings, String>>>,
@@ -225,6 +235,30 @@ mod tests {
     use super::*;
     use anyhow::Result;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn non_macos_slack_entrypoint_preserves_draft_and_does_not_open_or_activate() -> Result<()> {
+        let (mut ui, _dir, _) = super::super::shortcut_tests::fixture(None)?;
+        ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
+        ui.open_slack();
+        assert!(ui.modal.is_none());
+        assert_eq!(
+            ui.notice,
+            Some(("Slack is available on macOS in this release".into(), true))
+        );
+        let draft = &ui
+            .positions
+            .get("one")
+            .ok_or_else(|| anyhow::anyhow!("draft"))?
+            .draft;
+        assert_eq!(draft.text(), "unsent draft");
+        assert_eq!(draft.selected_text().as_deref(), Some("unsent draft"));
+        assert!(ui.slack.saving.is_none());
+        assert!(!ui.storage.config.exists());
+        assert!(!ui.storage.cache.exists());
+        Ok(())
+    }
 
     #[test]
     fn setup_masks_tokens_and_does_not_expose_them_to_copy_or_the_composer() -> Result<()> {

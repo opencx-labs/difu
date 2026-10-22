@@ -159,7 +159,7 @@ fn remaining_form_focus_and_native_editing_use_exact_contexts() -> Result<()> {
             ] {
                 let (mut ui, _dir, _) = binding_fixture(action, phase)?;
                 if slack {
-                    ui.open_slack();
+                    ui.modal = Some(Modal::Slack(slack::test_form()));
                 } else {
                     ui.open_tweaks();
                 }
@@ -688,7 +688,7 @@ fn remaining_native_action_hints_follow_effective_bindings() -> Result<()> {
                 "delete" => ui.modal = Some(Modal::Delete),
                 "clear" => ui.modal = Some(Modal::Clear),
                 "theme" => ui.open_theme(),
-                "slack" => ui.open_slack(),
+                "slack" => ui.modal = Some(Modal::Slack(slack::test_form())),
                 _ => ui.open_tweaks(),
             }
             let screen = native_text(&mut ui, width)?;
@@ -820,7 +820,7 @@ fn remaining_fields_keep_early_main_actions_in_each_exact_context() -> Result<()
                         efforts: vec!["medium".into()],
                     }];
                     if slack {
-                        ui.open_slack();
+                        ui.modal = Some(Modal::Slack(slack::test_form()));
                         if let Some(Modal::Slack(form)) = &mut ui.modal {
                             form.field = field;
                         }
@@ -859,7 +859,7 @@ fn remaining_fields_keep_early_main_actions_in_each_exact_context() -> Result<()
 fn slack_copy_is_available_only_for_unmasked_active_fields() -> Result<()> {
     for (phase, custom) in BINDING_PHASES {
         let (mut ui, _dir, _) = binding_fixture(SELECTION_COPY, phase)?;
-        ui.open_slack();
+        ui.modal = Some(Modal::Slack(slack::test_form()));
         for field in [0, 2, 3, 4] {
             if let Some(Modal::Slack(form)) = &mut ui.modal {
                 form.field = field;
@@ -1026,7 +1026,7 @@ fn prepare_activation(ui: &mut Ui, surface: &str) -> Result<()> {
             field: 4,
         },
         "slack" => {
-            ui.open_slack();
+            ui.modal = Some(Modal::Slack(slack::test_form()));
             let Some(Modal::Slack(form)) = &mut ui.modal else {
                 anyhow::bail!("slack")
             };
@@ -1341,7 +1341,7 @@ fn copy_metadata_and_hidden_draft_guards_match_real_agents_selection_owners() ->
                     }
                 }
                 _ => {
-                    ui.open_slack();
+                    ui.modal = Some(Modal::Slack(slack::test_form()));
                     if let Some(Modal::Slack(form)) = &mut ui.modal {
                         form.field = if surface == "slack_secret" { 0 } else { 4 };
                     }
@@ -1364,7 +1364,7 @@ fn copy_metadata_and_hidden_draft_guards_match_real_agents_selection_owners() ->
 }
 
 pub(crate) fn prepare_slack_copy(ui: &mut Ui, field: usize) {
-    ui.open_slack();
+    ui.modal = Some(Modal::Slack(slack::test_form()));
     if let Some(Modal::Slack(form)) = &mut ui.modal {
         form.field = field;
     }

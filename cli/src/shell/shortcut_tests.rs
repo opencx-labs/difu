@@ -522,6 +522,7 @@ fn native_tweaks_and_unmasked_slack_ctrl_c_copy_before_shell_quit() -> Result<()
         let mut shell = Shell::new(storage, Config::default(), None);
         if slack {
             crate::agents::ui::prepare_slack_copy(&mut shell.agents, 2);
+            assert_eq!(shell.agents.shortcut_context().0, "AgentSlack");
         } else {
             let mut value = Editor::from("123");
             value.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
@@ -575,6 +576,14 @@ fn new_slack_and_tweaks_contexts_protect_editing_from_invalid_stored_globals() -
             let mut shell = Shell::new(storage, config, None);
             if slack {
                 crate::agents::ui::prepare_slack_copy(&mut shell.agents, field);
+                assert_eq!(
+                    shell.agents.shortcut_context().0,
+                    match field {
+                        0 => "AgentSlackSecret",
+                        2 => "AgentSlack",
+                        _ => "AgentSlackButton",
+                    }
+                );
             } else {
                 let mut value = Editor::from("123");
                 value.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
