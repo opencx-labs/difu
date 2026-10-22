@@ -1,5 +1,6 @@
 //! Local repository discovery and review entry points; never performs GitHub writes.
 use super::*;
+use crate::shortcuts::ids::*;
 use crate::{
     editor::Editor,
     local_diff::{self, Checkout, Comparison},
@@ -300,6 +301,8 @@ impl App {
         if key.kind == crossterm::event::KeyEventKind::Release {
             return true;
         }
+        use crate::shortcuts::ids::*;
+        let shortcut = self.shortcut(key);
         let mut action = None;
         if let Some(setup) = &mut self.local.setup {
             if key.code == KeyCode::Esc {
@@ -313,7 +316,7 @@ impl App {
             }
             match setup {
                 Setup::Roots(editor) => {
-                    if key.code == KeyCode::Enter && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    if shortcut == Some(LOCAL_SCAN) {
                         action = Some(Action::Scan);
                     } else {
                         editor.key(key);
@@ -321,25 +324,27 @@ impl App {
                 }
                 Setup::Select {
                     repos, selected, ..
-                } => match key.code {
-                    KeyCode::Up => *selected = selected.saturating_sub(1),
-                    KeyCode::Down => *selected = (*selected + 1).min(repos.len().saturating_sub(1)),
-                    KeyCode::Char(' ') => action = Some(Action::Toggle(*selected)),
-                    KeyCode::Enter => action = Some(Action::Save),
-                    KeyCode::Char('e') => action = Some(Action::Configure),
+                } => match shortcut {
+                    Some(NAVIGATION_UP) => *selected = selected.saturating_sub(1),
+                    Some(NAVIGATION_DOWN) => {
+                        *selected = (*selected + 1).min(repos.len().saturating_sub(1))
+                    }
+                    Some(LOCAL_TOGGLE) => action = Some(Action::Toggle(*selected)),
+                    Some(NAVIGATION_ACTIVATE) => action = Some(Action::Save),
+                    Some(LOCAL_CONFIGURE) => action = Some(Action::Configure),
                     _ => {}
                 },
             }
         } else {
-            match key.code {
-                KeyCode::Up => self.local.selected = self.local.selected.saturating_sub(1),
-                KeyCode::Down => {
+            match shortcut {
+                Some(NAVIGATION_UP) => self.local.selected = self.local.selected.saturating_sub(1),
+                Some(NAVIGATION_DOWN) => {
                     self.local.selected =
                         (self.local.selected + 1).min(self.local.entries.len().saturating_sub(1))
                 }
-                KeyCode::Enter => action = Some(Action::Open(self.local.selected)),
-                KeyCode::Char('r') => action = Some(Action::Refresh),
-                KeyCode::Char('e') => action = Some(Action::Configure),
+                Some(NAVIGATION_ACTIVATE) => action = Some(Action::Open(self.local.selected)),
+                Some(LOCAL_REFRESH) => action = Some(Action::Refresh),
+                Some(LOCAL_CONFIGURE) => action = Some(Action::Configure),
                 _ => return false,
             }
         }
@@ -373,11 +378,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     let mut x = 2;
     for (label, tab) in [
-        ("1 My PRs", InboxTab::MyPrs),
-        ("2 Repositories", InboxTab::Repositories),
-        ("3 Diffs", InboxTab::Diffs),
+        (
+            format!("{} My PRs", app.hint(REVIEW_TAB_1)),
+            InboxTab::MyPrs,
+        ),
+        (
+            format!("{} Repositories", app.hint(REVIEW_TAB_2)),
+            InboxTab::Repositories,
+        ),
+        (format!("{} Diffs", app.hint(REVIEW_TAB_3)), InboxTab::Diffs),
     ] {
-        let width = (label.len() as u16 + 2).min(area.width.saturating_sub(x));
+        let width = (unicode_width::UnicodeWidthStr::width(label.as_str()) as u16 + 2)
+            .min(area.width.saturating_sub(x));
         let rect = Rect::new(x, 3, width, 1);
         frame.render_widget(
             Paragraph::new(label).style(Style::default().fg(if tab == InboxTab::Diffs {
@@ -403,7 +415,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     match &app.local.setup {
         Some(Setup::Roots(editor)) => {
             rows.push((
-                "Base directories · one path per line · Ctrl+Enter scan · Esc cancel".into(),
+                format!(
+                    "Base directories · one path per line · {} scan · Esc cancel",
+                    app.hint(LOCAL_SCAN)
+                ),
                 None,
             ));
             let (lines, (cx, cy)) = editor.styled_layout(
@@ -434,8 +449,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             ..
         }) => {
             rows.push((
-                "Space toggle · Enter track selected repos and their worktrees · e edit roots"
-                    .into(),
+                format!(
+                    "{} toggle · {} track selected repos and their worktrees · {} edit roots",
+                    app.hint(LOCAL_TOGGLE),
+                    app.hint(NAVIGATION_ACTIVATE),
+                    app.hint(LOCAL_CONFIGURE)
+                ),
                 None,
             ));
             let height = inner.height.saturating_sub(4) as usize;
@@ -465,8 +484,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         None => {
             rows.push((
-                "Local repositories and worktrees · Enter open · r refresh · e configure/rescan"
-                    .into(),
+                format!(
+                    "Local repositories and worktrees · {} open · {} refresh · {} configure/rescan",
+                    app.hint(NAVIGATION_ACTIVATE),
+                    app.hint(LOCAL_REFRESH),
+                    app.hint(LOCAL_CONFIGURE)
+                ),
                 Some(Action::Configure),
             ));
             let height = inner.height.saturating_sub(3) as usize;

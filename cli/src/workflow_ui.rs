@@ -1,3 +1,4 @@
+use crate::shortcuts::ids::*;
 use crate::{
     app::{Action, App, Modal},
     ui::{self, ACCENT, BG, DIM, GREEN, PANEL, TEXT},
@@ -52,7 +53,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 ACCENT,
             ));
             rows.push(ui::text(
-                "Type to filter · ↑↓ select · Space toggle · Enter confirm · Esc cancel",
+                format!(
+                    "Type to filter · {}/{} select · {} toggle · {} confirm · Esc cancel",
+                    app.hint(NAVIGATION_UP),
+                    app.hint(NAVIGATION_DOWN),
+                    app.hint(WORKFLOW_REVIEWER_TOGGLE),
+                    app.hint(NAVIGATION_ACTIVATE)
+                ),
                 DIM,
             ));
             let (lines, (x, y)) = picker.query.styled_layout(
@@ -121,19 +128,33 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             rows.push(ui::bold("Resolve conflicts and push", ACCENT));
             rows.extend(ui::prose(&format!("{}\nRevision: {head}\nModel: {model}\n\nCodex edits only conflicted text files in an isolated worktree. Difu validates, commits and pushes to the PR branch without force. Project checks run in CI.\n\nFailures discard the isolated attempt and report the error; no automatic retry.", key.id()), inner.width as usize));
             rows.push(ui::text("", DIM));
-            rows.push(action("[ Resolve and push · Enter ]", WAction::Resolve));
+            rows.push(action(
+                format!("[ Resolve and push · {} ]", app.hint(WORKFLOW_RESOLVE)),
+                WAction::Resolve,
+            ));
             rows.push(action("[ Back · Esc ]", WAction::Back));
         }
         Wizard::Resolving { activity } => {
             rows.push(ui::bold("Resolving PR conflicts", ACCENT));
             rows.extend(ui::prose(activity, inner.width as usize));
             rows.push(ui::text("", DIM));
-            rows.push(action("[ Cancel · x / Esc ]", WAction::CancelResolution));
+            rows.push(action(
+                format!("[ Cancel · {} / Esc ]", app.hint(WORKFLOW_CANCEL)),
+                WAction::CancelResolution,
+            ));
         }
 
         Wizard::Home(selected) => {
             rows.push(ui::bold("Actions", ACCENT));
-            rows.push(ui::text("↑↓ select · Enter open · Esc close", DIM));
+            rows.push(ui::text(
+                format!(
+                    "{}/{} select · {} open · Esc close",
+                    app.hint(NAVIGATION_UP),
+                    app.hint(NAVIGATION_DOWN),
+                    app.hint(NAVIGATION_ACTIVATE)
+                ),
+                DIM,
+            ));
             rows.push(ui::text("", DIM));
             for (i, label) in [
                 "PR controls",
@@ -160,7 +181,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         } => {
             rows.push(ui::bold(format!("PR controls · {}", key.id()), ACCENT));
             rows.push(ui::text(
-                "Type to filter · ↑↓ select · Enter open · Ctrl+U clear · Esc close",
+                format!(
+                    "Type to filter · {}/{} select · {} open · Ctrl+U clear · Esc close",
+                    app.hint(NAVIGATION_UP),
+                    app.hint(NAVIGATION_DOWN),
+                    app.hint(NAVIGATION_ACTIVATE)
+                ),
                 DIM,
             ));
             let input_width = inner.width.saturating_sub(8) as usize;
@@ -232,7 +258,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 ));
             }
             rows.push(ui::text(
-                "Tab focus/complete @mention · Ctrl+Enter next · Ctrl+R mentions · Esc back",
+                format!(
+                    "{} focus · {} complete @mention · {} next · {} mentions · Esc back",
+                    app.hint(NAVIGATION_NEXT_FOCUS),
+                    app.hint(WORKFLOW_MENTION_ACCEPT),
+                    app.hint(WORKFLOW_NEXT),
+                    app.hint(WORKFLOW_MENTIONS_REFRESH)
+                ),
                 DIM,
             ));
             let top = rows.len() as u16;
@@ -319,9 +351,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             } else {
                 rows.push(action(
                     if app.workflow.mentions_loading.contains(&draft.key.id()) {
-                        "Refreshing mention suggestions…"
+                        "Refreshing mention suggestions…".to_owned()
                     } else {
-                        "[ Refresh @mention suggestions · Ctrl+R ]"
+                        format!(
+                            "[ Refresh @mention suggestions · {} ]",
+                            app.hint(WORKFLOW_MENTIONS_REFRESH)
+                        )
                     },
                     WAction::RefreshMentions,
                 ));
@@ -362,7 +397,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 "GitHub's head must still match this revision.",
                 DIM,
             ));
-            rows.push(action("[ Confirm · Enter ]", WAction::Submit));
+            rows.push(action(
+                format!("[ Confirm · {} ]", app.hint(WORKFLOW_SUBMIT)),
+                WAction::Submit,
+            ));
             rows.push(action("[ Back · Esc ]", WAction::Back));
         }
         Wizard::Result { notice } => {
@@ -373,7 +411,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 }
                 rows.push(row);
             }
-            rows.push(action("[ Close · Enter / Esc ]", WAction::Back));
+            rows.push(action(
+                format!("[ Close · {} / Esc ]", app.hint(WORKFLOW_RESULT_BACK)),
+                WAction::Back,
+            ));
         }
         Wizard::Trees {
             entries,
@@ -392,9 +433,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 ),
                 DIM,
             ));
-            rows.push(action("[ Delete selected · Enter ]", WAction::DeleteOne));
-            rows.push(action("[ Delete all stale · A ]", WAction::DeleteStale));
-            rows.push(action("[ Refresh · r ]", WAction::Trees));
+            rows.push(action(
+                format!("[ Delete selected · {} ]", app.hint(WORKFLOW_TREE_DELETE)),
+                WAction::DeleteOne,
+            ));
+            rows.push(action(
+                format!("[ Delete all stale · {} ]", app.hint(WORKFLOW_TREE_PRUNE)),
+                WAction::DeleteStale,
+            ));
+            rows.push(action(
+                format!("[ Refresh · {} ]", app.hint(WORKFLOW_TREE_REFRESH)),
+                WAction::Trees,
+            ));
             if *loading {
                 rows.push(ui::text("Inspecting worktrees…", DIM));
             }
@@ -439,7 +489,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             {
                 rows.push(ui::text(path.display().to_string(), TEXT));
             }
-            rows.push(action("[ Delete · Enter ]", WAction::ConfirmDelete));
+            rows.push(action(
+                format!("[ Delete · {} ]", app.hint(WORKFLOW_DELETE_CONFIRM)),
+                WAction::ConfirmDelete,
+            ));
             rows.push(action("[ Cancel · Esc ]", WAction::Back));
         }
     }
@@ -460,9 +513,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .retain(|(_, action)| matches!(action, Action::Workflow(WAction::CancelResolution)));
         frame.render_widget(
             Paragraph::new(if app.workflow.conflict_cancel.is_some() {
-                "Working… x / Esc cancels the isolated attempt"
+                format!(
+                    "Working… {} / Esc cancels the isolated attempt",
+                    app.hint(WORKFLOW_CANCEL)
+                )
             } else {
-                "Working… waiting for confirmation"
+                "Working… waiting for confirmation".to_owned()
             })
             .style(Style::default().fg(ACCENT).bg(BG)),
             Rect::new(inner.x, rect.bottom().saturating_sub(2), inner.width, 1),

@@ -203,6 +203,10 @@ fn streaming_limit(
 ) -> Result<Output> {
     cancel.check()?;
     #[cfg(test)]
+    if let Some(result) = fixture::worker_run(command, input.as_deref()) {
+        return result;
+    }
+    #[cfg(test)]
     fixture::adapt(command)?;
     let name = command.get_program().to_string_lossy().to_string();
     command

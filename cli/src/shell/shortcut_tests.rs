@@ -843,3 +843,241 @@ fn filter_control_u_capture_and_locked_save_reject_only_owned_editing_contexts()
     ));
     Ok(())
 }
+
+#[test]
+fn persisted_invalid_global_does_not_steal_review_filter_typing() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = Storage {
+        config: dir.path().join("config.json"),
+        cache: dir.path().into(),
+    };
+    let mut config = Config::default();
+    config.preferences.keyboard.bindings.insert(
+        ids::SETTINGS_OPEN.0.into(),
+        key(BindingKey::Character('z'), 0),
+    );
+    storage.update_config(|saved| *saved = config.clone())?;
+    let mut shell = Shell::new(storage.clone(), storage.load_config()?, None);
+    shell.agents_active = false;
+    shell.reviews_started = true;
+    shell.reviews.filters.focused = Some(crate::filter::Kind::PullRequests);
+    shell.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+    assert!(
+        shell.settings.is_none(),
+        "stored invalid global stole filter input"
+    );
+    assert_eq!(
+        shell
+            .reviews
+            .filters
+            .editor(crate::filter::Kind::PullRequests)
+            .text(),
+        "z"
+    );
+    Ok(())
+}
+
+#[test]
+fn shell_review_filter_selection_copies_before_default_and_custom_quit() -> Result<()> {
+    for custom in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        let mut config = Config::default();
+        if custom {
+            config
+                .preferences
+                .keyboard
+                .bindings
+                .insert(ids::APP_QUIT.0.into(), key(BindingKey::Function(11), 0));
+        }
+        let mut shell = Shell::new(storage, config, None);
+        shell.reviews_started = true;
+        shell.agents_active = false;
+        let kind = crate::filter::Kind::PullRequests;
+        shell.reviews.filters.focused = Some(kind);
+        shell
+            .reviews
+            .filters
+            .editor_mut(kind)
+            .insert("selected filter");
+        shell
+            .reviews
+            .filters
+            .editor_mut(kind)
+            .key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
+        shell.key(if custom {
+            KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE)
+        } else {
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+        });
+        assert!(!shell.reviews.quit);
+        assert_eq!(shell.reviews.clipboard.as_deref(), Some("selected filter"));
+    }
+    Ok(())
+}
+
+#[test]
+fn persisted_invalid_globals_cannot_steal_embedded_review_filter_typing() -> Result<()> {
+    use crate::agents::ui::review_shortcut_tests::{install_review, review};
+    for placement in [
+        crate::settings::HelperPlacement::Right,
+        crate::settings::HelperPlacement::Bottom,
+        crate::settings::HelperPlacement::Main,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        let mut config = Config::default();
+        config.preferences.layout.helper_placement = Some(placement);
+        config.preferences.keyboard.bindings.insert(
+            ids::SETTINGS_OPEN.0.into(),
+            key(BindingKey::Character('z'), 0),
+        );
+        let mut shell = Shell::new(storage, config, None);
+        install_review(&mut shell.agents, true);
+        shell.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(
+            shell.settings.is_none(),
+            "{placement:?} stole embedded editor input"
+        );
+        assert_eq!(
+            review(&shell.agents)?
+                .filters
+                .editor(crate::filter::Kind::Files)
+                .text(),
+            "z"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn embedded_review_forms_own_typing_and_copy_before_custom_quit() -> Result<()> {
+    use crate::{
+        agents::ui::review_shortcut_tests::{install_compose, review},
+        settings::HelperPlacement,
+        workflow::Wizard,
+    };
+    for placement in [
+        HelperPlacement::Right,
+        HelperPlacement::Bottom,
+        HelperPlacement::Main,
+    ] {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        let mut config = Config::default();
+        config.preferences.layout.helper_placement = Some(placement);
+        config.preferences.keyboard.bindings.insert(
+            ids::SETTINGS_OPEN.0.into(),
+            key(BindingKey::Character('z'), 0),
+        );
+        config
+            .preferences
+            .keyboard
+            .bindings
+            .insert(ids::APP_QUIT.0.into(), key(BindingKey::Function(11), 0));
+        config.preferences.keyboard.bindings.insert(
+            ids::SELECTION_COPY.0.into(),
+            key(BindingKey::Function(12), 0),
+        );
+        storage.update_config(|saved| *saved = config.clone())?;
+        let mut shell = Shell::new(storage.clone(), storage.load_config()?, None);
+        install_compose(&mut shell.agents);
+        shell.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert!(shell.settings.is_none());
+        assert!(
+            matches!(&review(&shell.agents)?.modal, Some(crate::app::Modal::Workflow(w)) if matches!(w.as_ref(), Wizard::Compose(d) if d.editor.text() == "draftz"))
+        );
+        shell.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
+        shell.key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL | KeyModifiers::SUPER,
+        ));
+        assert_eq!(review(&shell.agents)?.clipboard.as_deref(), Some("draftz"));
+        assert!(!shell.reviews.quit);
+        shell.key(KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE));
+        assert!(!shell.reviews.quit);
+        assert_eq!(review(&shell.agents)?.clipboard.as_deref(), Some("draftz"));
+        shell.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(review(&shell.agents)?.modal.is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn review_quit_control_predicate_keeps_editor_and_local_setup_exclusions() -> Result<()> {
+    for surface in ["content", "help", "roots", "select"] {
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL | KeyModifiers::SUPER,
+            KeyModifiers::CONTROL | KeyModifiers::META,
+        ] {
+            for custom in [false, true] {
+                let dir = tempfile::tempdir()?;
+                let storage = Storage {
+                    config: dir.path().join("config.json"),
+                    cache: dir.path().into(),
+                };
+                let mut config = Config::default();
+                if custom {
+                    config
+                        .preferences
+                        .keyboard
+                        .bindings
+                        .insert(ids::APP_QUIT.0.into(), key(BindingKey::Function(11), 0));
+                }
+                let mut shell = Shell::new(storage, config, None);
+                shell.agents_active = false;
+                shell.reviews_started = true;
+                match surface {
+                    "help" => {
+                        shell.reviews.modal = Some(crate::app::Modal::Help(Default::default()))
+                    }
+                    "roots" => {
+                        shell.reviews.inbox_tab = crate::model::InboxTab::Diffs;
+                        shell.reviews.local.setup =
+                            Some(crate::app::local::Setup::Roots("query".into()));
+                    }
+                    "select" => {
+                        shell.reviews.inbox_tab = crate::model::InboxTab::Diffs;
+                        shell.reviews.local.setup = Some(crate::app::local::Setup::Select {
+                            roots: vec![],
+                            repos: vec![],
+                            chosen: Default::default(),
+                            selected: 0,
+                        });
+                    }
+                    _ => {}
+                }
+                shell.key(KeyEvent::new(KeyCode::Char('c'), modifiers));
+                let expected = !custom
+                    && if modifiers == KeyModifiers::CONTROL {
+                        true
+                    } else {
+                        surface != "roots"
+                            && surface != "select"
+                            && !(surface == "help" && modifiers.contains(KeyModifiers::SUPER))
+                    };
+                assert_eq!(
+                    shell.reviews.quit, expected,
+                    "{surface} {modifiers:?} custom={custom}"
+                );
+                if custom {
+                    shell.key(KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE));
+                    assert!(shell.reviews.quit);
+                }
+            }
+        }
+    }
+    Ok(())
+}

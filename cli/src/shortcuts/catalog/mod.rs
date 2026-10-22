@@ -568,5 +568,217 @@ pub(super) fn build() -> Vec<ActionSpec> {
             }
         }
     }
+    // Reviews copy only belongs to a real selection owner. Help Home/End
+    // remain native query editing, unlike the read-only definition viewer.
+    for entry in &mut entries {
+        let supported = |context: &Context| {
+            if entry.id == ids::SELECTION_COPY
+                && (context.0.starts_with("Review") || context.0.starts_with("Workflow"))
+            {
+                return [
+                    contexts::REVIEW_CONTENT,
+                    contexts::REVIEW_FILTER,
+                    contexts::REVIEW_HELP,
+                    contexts::REVIEW_CLONE,
+                    contexts::REVIEW_MODELS,
+                    contexts::WORKFLOW_CONTROLS,
+                    contexts::WORKFLOW_COMPOSE,
+                    contexts::WORKFLOW_MENTIONS,
+                ]
+                .contains(context);
+            }
+            !([ids::NAVIGATION_FIRST, ids::NAVIGATION_LAST].contains(&entry.id)
+                && *context == contexts::REVIEW_HELP)
+        };
+        entry.contexts.retain(supported);
+        for binding in &mut entry.defaults {
+            binding.contexts.retain(supported);
+        }
+    }
+    for entry in &mut entries {
+        if [
+            ids::REVIEW_LAYOUT,
+            ids::REVIEW_OPEN_LINK,
+            ids::LOCAL_SCAN,
+            ids::WORKFLOW_NEXT,
+        ]
+        .contains(&entry.id)
+        {
+            let key_code = match entry.id {
+                ids::REVIEW_LAYOUT => BindingKey::Character('b'),
+                ids::REVIEW_OPEN_LINK => BindingKey::Character('o'),
+                _ => BindingKey::Enter,
+            };
+            for flags in [3, 5, 7, 9, 11, 13, 15] {
+                entry.defaults.push(DefaultBinding {
+                    chord: key(key_code.clone(), flags),
+                    contexts: entry.contexts.clone(),
+                });
+            }
+        }
+    }
+    // These predicates were explicit in the native Review handlers. Preserve
+    // Shift source selection and Alt side ownership, not incidental modified
+    // variants of ordinary KeyCode-only navigation.
+    for entry in &mut entries {
+        let modifier = if [ids::REVIEW_SELECT_UP, ids::REVIEW_SELECT_DOWN].contains(&entry.id) {
+            4
+        } else if [ids::REVIEW_SIDE_LEFT, ids::REVIEW_SIDE_RIGHT].contains(&entry.id) {
+            2
+        } else {
+            continue;
+        };
+        let key_code = match entry.id {
+            ids::REVIEW_SELECT_UP => BindingKey::Up,
+            ids::REVIEW_SELECT_DOWN => BindingKey::Down,
+            ids::REVIEW_SIDE_LEFT => BindingKey::Left,
+            _ => BindingKey::Right,
+        };
+        for flags in 0..16 {
+            if flags & modifier != 0 && flags != modifier {
+                entry.defaults.push(DefaultBinding {
+                    chord: key(key_code.clone(), flags),
+                    contexts: entry.contexts.clone(),
+                });
+            }
+        }
+    }
+    // Local list consumes only its own arrows/Enter/configuration; pane focus
+    // and fast scrolling still fall through to the main Review handler.
+    for entry in &mut entries {
+        if [
+            ids::NAVIGATION_NEXT_FOCUS,
+            ids::NAVIGATION_PREVIOUS_FOCUS,
+            ids::NAVIGATION_FAST_UP,
+            ids::NAVIGATION_FAST_DOWN,
+        ]
+        .contains(&entry.id)
+        {
+            entry.contexts.push(contexts::REVIEW_LOCAL_LIST);
+            for binding in &mut entry.defaults {
+                if binding.contexts.contains(&contexts::REVIEW_HOME) {
+                    binding.contexts.push(contexts::REVIEW_LOCAL_LIST);
+                }
+            }
+        }
+        let chapter = [ids::REVIEW_CHAPTER_PREVIOUS, ids::REVIEW_CHAPTER_NEXT].contains(&entry.id);
+        let fast = [ids::NAVIGATION_FAST_UP, ids::NAVIGATION_FAST_DOWN].contains(&entry.id);
+        let mention = [
+            ids::WORKFLOW_MENTION_PREVIOUS,
+            ids::WORKFLOW_MENTION_NEXT,
+            ids::WORKFLOW_MENTION_ACCEPT,
+        ]
+        .contains(&entry.id);
+        if !chapter && !fast && !mention {
+            continue;
+        }
+        let code = match entry.id {
+            ids::REVIEW_CHAPTER_PREVIOUS
+            | ids::NAVIGATION_FAST_UP
+            | ids::WORKFLOW_MENTION_PREVIOUS => BindingKey::Up,
+            ids::WORKFLOW_MENTION_ACCEPT => BindingKey::Tab,
+            _ => BindingKey::Down,
+        };
+        for context in entry.contexts.clone() {
+            if fast && !context.0.starts_with("Review") {
+                continue;
+            }
+            for flags in 0..16 {
+                let valid = if chapter {
+                    flags & 2 != 0 && !(context == contexts::REVIEW_CONTENT && flags & 4 != 0)
+                } else if mention {
+                    flags & 4 == 0
+                } else {
+                    flags & 8 != 0
+                        && match context {
+                            contexts::REVIEW_DEFINITION => true,
+                            contexts::REVIEW_HELP => flags & 4 == 0,
+                            contexts::REVIEW_CONTENT => flags & 6 == 0,
+                            _ => flags & 2 == 0,
+                        }
+                };
+                let chord = key(code.clone(), flags);
+                if valid
+                    && !entry
+                        .defaults
+                        .iter()
+                        .any(|b| b.chord == chord && b.contexts.contains(&context))
+                {
+                    entry.defaults.push(DefaultBinding {
+                        chord,
+                        contexts: vec![context],
+                    });
+                }
+            }
+        }
+    }
+    if let Some(entry) = entries
+        .iter_mut()
+        .find(|entry| entry.id == ids::SELECTION_COPY)
+    {
+        let editors = vec![
+            contexts::REVIEW_FILTER,
+            contexts::REVIEW_HELP,
+            contexts::REVIEW_CLONE,
+            contexts::REVIEW_MODELS,
+            contexts::WORKFLOW_CONTROLS,
+            contexts::WORKFLOW_COMPOSE,
+            contexts::WORKFLOW_MENTIONS,
+        ];
+        for flags in 9..16 {
+            entry.defaults.push(DefaultBinding {
+                chord: key(BindingKey::Character('c'), flags),
+                contexts: editors.clone(),
+            });
+        }
+    }
+    for entry in &mut entries {
+        if [ids::NAVIGATION_UP, ids::NAVIGATION_DOWN].contains(&entry.id) {
+            for flags in [1, 2, 3] {
+                entry.defaults.push(DefaultBinding {
+                    chord: key(
+                        if entry.id == ids::NAVIGATION_UP {
+                            BindingKey::Up
+                        } else {
+                            BindingKey::Down
+                        },
+                        flags,
+                    ),
+                    contexts: vec![contexts::REVIEW_HELP],
+                });
+            }
+        }
+        if entry.id == ids::APP_QUIT {
+            // App's Control predicate followed its Super editor-copy guard.
+            // Local setup consumed these modified events before App dispatch;
+            // the exact global Ctrl+C remains unchanged in those contexts.
+            let editors = [
+                contexts::REVIEW_FILTER,
+                contexts::REVIEW_HELP,
+                contexts::REVIEW_CLONE,
+                contexts::REVIEW_MODELS,
+                contexts::WORKFLOW_CONTROLS,
+                contexts::WORKFLOW_COMPOSE,
+                contexts::WORKFLOW_MENTIONS,
+            ];
+            for flags in [3, 5, 7, 9, 11, 13, 15] {
+                let contexts = entry
+                    .contexts
+                    .iter()
+                    .copied()
+                    .filter(|context| {
+                        (context.0.starts_with("Review") || context.0.starts_with("Workflow"))
+                            && ![contexts::REVIEW_LOCAL_ROOTS, contexts::REVIEW_LOCAL_SELECT]
+                                .contains(context)
+                            && !(flags & 8 != 0 && editors.contains(context))
+                    })
+                    .collect();
+                entry.defaults.push(DefaultBinding {
+                    chord: key(BindingKey::Character('c'), flags),
+                    contexts,
+                });
+            }
+        }
+    }
     entries
 }

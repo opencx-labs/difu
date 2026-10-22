@@ -55,6 +55,36 @@ pub fn settings() -> Vec<SettingSpec> {
     all().iter().map(ActionSpec::setting).collect()
 }
 
+/// Only these App states coexist with host helper controls. Editors and
+/// overlays consume input before the host, including embedded local setup.
+pub(crate) fn embedded_content(context: Context) -> bool {
+    [
+        contexts::REVIEW_HOME,
+        contexts::REVIEW_REPOSITORY,
+        contexts::REVIEW_NAVIGATION,
+        contexts::REVIEW_CONTENT,
+        contexts::REVIEW_OVERVIEW,
+        contexts::REVIEW_LOCAL_LIST,
+    ]
+    .contains(&context)
+}
+/// Shared authority for host precedence and collision checks. Main helpers
+/// delegate focus cycling to App; Right/Bottom first cycle through App's panes.
+pub(crate) fn embedded_host_action(action: ActionId, context: Context, side: bool) -> bool {
+    embedded_content(context)
+        && (matches!(
+            action,
+            ids::HELPER_PLACEMENT
+                | ids::HELPER_VISIBILITY
+                | ids::AGENTS_SIDEBAR
+                | ids::AGENTS_CHANGES
+                | ids::AGENTS_BACK
+        ) || (side
+            && matches!(
+                action,
+                ids::NAVIGATION_NEXT_FOCUS | ids::NAVIGATION_PREVIOUS_FOCUS
+            )))
+}
 pub struct Bindings<'a> {
     config: &'a Config,
 }
@@ -89,6 +119,111 @@ impl<'a> Bindings<'a> {
         // Release is owned only by the voice hold lifecycle, never by action dispatch.
         if event.kind == KeyEventKind::Release {
             return false;
+        }
+        // Reviews explicitly accepted Control plus terminal modifiers for these
+        // actions. Opaque modifiers cannot be captured; retain them only while
+        // the original binding is active.
+        if [
+            ids::REVIEW_LAYOUT,
+            ids::REVIEW_OPEN_LINK,
+            ids::LOCAL_SCAN,
+            ids::WORKFLOW_NEXT,
+            ids::REVIEW_SELECT_UP,
+            ids::REVIEW_SELECT_DOWN,
+            ids::REVIEW_SIDE_LEFT,
+            ids::REVIEW_SIDE_RIGHT,
+            ids::REVIEW_CHAPTER_PREVIOUS,
+            ids::REVIEW_CHAPTER_NEXT,
+            ids::WORKFLOW_MENTION_PREVIOUS,
+            ids::WORKFLOW_MENTION_NEXT,
+            ids::WORKFLOW_MENTION_ACCEPT,
+        ]
+        .contains(&action)
+            && !self
+                .config
+                .preferences
+                .keyboard
+                .bindings
+                .contains_key(action.0)
+            && event.modifiers.intersects(M::HYPER | M::META)
+        {
+            return self.matches(
+                action,
+                context,
+                KeyEvent {
+                    modifiers: event.modifiers - M::HYPER - M::META,
+                    ..event
+                },
+            );
+        }
+        if [ids::NAVIGATION_FAST_UP, ids::NAVIGATION_FAST_DOWN].contains(&action)
+            && context.0.starts_with("Review")
+            && !self
+                .config
+                .preferences
+                .keyboard
+                .bindings
+                .contains_key(action.0)
+            && event.modifiers.intersects(M::HYPER | M::META)
+        {
+            return self.matches(
+                action,
+                context,
+                KeyEvent {
+                    modifiers: event.modifiers - M::HYPER - M::META,
+                    ..event
+                },
+            );
+        }
+        if action == ids::SELECTION_COPY
+            && [
+                contexts::REVIEW_FILTER,
+                contexts::REVIEW_HELP,
+                contexts::REVIEW_CLONE,
+                contexts::REVIEW_MODELS,
+                contexts::WORKFLOW_CONTROLS,
+                contexts::WORKFLOW_COMPOSE,
+                contexts::WORKFLOW_MENTIONS,
+            ]
+            .contains(&context)
+            && !self
+                .config
+                .preferences
+                .keyboard
+                .bindings
+                .contains_key(action.0)
+            && event.modifiers.intersects(M::HYPER | M::META)
+        {
+            return self.matches(
+                action,
+                context,
+                KeyEvent {
+                    modifiers: event.modifiers - M::HYPER - M::META,
+                    ..event
+                },
+            );
+        }
+        if ((action == ids::APP_QUIT
+            && (context.0.starts_with("Review") || context.0.starts_with("Workflow"))
+            && ![contexts::REVIEW_LOCAL_ROOTS, contexts::REVIEW_LOCAL_SELECT].contains(&context))
+            || ([ids::NAVIGATION_UP, ids::NAVIGATION_DOWN].contains(&action)
+                && context == contexts::REVIEW_HELP))
+            && !self
+                .config
+                .preferences
+                .keyboard
+                .bindings
+                .contains_key(action.0)
+            && event.modifiers.intersects(M::HYPER | M::META)
+        {
+            return self.matches(
+                action,
+                context,
+                KeyEvent {
+                    modifiers: event.modifiers - M::HYPER - M::META,
+                    ..event
+                },
+            );
         }
         // The original question handler accepted every non-Shift Enter. Preserve
         // opaque terminal modifiers only for this default semantic action; they
@@ -228,6 +363,50 @@ impl<'a> Bindings<'a> {
         let mut errors = Vec::new();
         for (index, left) in all().iter().enumerate() {
             for right in all().iter().skip(index + 1) {
+                // Different named contexts still coexist inside a PR helper.
+                // Existing default precedence (notably Escape) is intentional;
+                // explicit custom assignments cannot introduce shadowed actions.
+                if self
+                    .config
+                    .preferences
+                    .keyboard
+                    .bindings
+                    .contains_key(left.id.0)
+                    || self
+                        .config
+                        .preferences
+                        .keyboard
+                        .bindings
+                        .contains_key(right.id.0)
+                {
+                    for (host, review) in [(left, right), (right, left)] {
+                        for context in review
+                            .contexts
+                            .iter()
+                            .copied()
+                            .filter(|c| embedded_content(*c))
+                        {
+                            if !embedded_host_action(host.id, context, true) {
+                                continue;
+                            }
+                            let host_keys = self.effective(host.id, contexts::AGENT_HELPER);
+                            if let Some(chord) = self
+                                .effective(review.id, context)
+                                .iter()
+                                .find(|c| host_keys.contains(c))
+                            {
+                                errors.push(format!(
+                                    "{} conflicts with {} on {} in embedded {}",
+                                    host.label,
+                                    review.label,
+                                    label(chord),
+                                    context.0
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
                 for context in left.contexts.iter().filter(|c| right.contexts.contains(c)) {
                     let right_keys = self.effective(right.id, *context);
                     if let Some(chord) = self

@@ -1079,3 +1079,41 @@ fn tester_opens_real_synthetic_question_with_draft_binding_without_sending() -> 
     assert!(!panel.draft.edited().is_empty());
     Ok(())
 }
+
+#[test]
+fn capture_rejects_embedded_coactive_actions_but_accepts_disjoint_filter() -> Result<()> {
+    use crate::shortcuts::{ids, key};
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    storage.update_config(|config| {
+        config.preferences.keyboard.bindings.insert(
+            ids::HELPER_PLACEMENT.0.into(),
+            key(BindingKey::Function(12), 0),
+        );
+    })?;
+    let bytes = std::fs::read(&storage.config)?;
+    let mut panel = Panel::new(&storage, None)?;
+    panel.shortcut_action(&SettingId::Shortcut(ids::REVIEW_HELP.0.into()));
+    panel.key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE), &storage);
+    assert!(panel.error.is_some());
+    assert_eq!(panel.capture, Some(ids::REVIEW_HELP));
+    assert!(panel.draft.edited().is_empty());
+    assert_eq!(std::fs::read(&storage.config)?, bytes);
+    panel.shortcut_action(&SettingId::Shortcut(ids::REVIEW_FILTER_ACCEPT.0.into()));
+    panel.key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE), &storage);
+    assert!(panel.error.is_none());
+    assert!(panel.capture.is_none());
+    assert_eq!(
+        panel
+            .draft
+            .config()
+            .preferences
+            .keyboard
+            .bindings
+            .get(ids::REVIEW_FILTER_ACCEPT.0)
+            .context("captured filter binding")?
+            .clone(),
+        key(BindingKey::Function(12), 0)
+    );
+    Ok(())
+}

@@ -1,3 +1,4 @@
+use crate::shortcuts::ids::*;
 #[path = "ui_diff_reading.rs"]
 mod diff_reading;
 use crate::{
@@ -109,6 +110,7 @@ fn file_header(
     width: usize,
     chapter: Option<usize>,
     review: &Review,
+    activate: &str,
 ) -> Vec<TextRow> {
     let hint = match chapter {
         Some(chapter)
@@ -118,19 +120,24 @@ fn file_header(
                 .completed
                 .contains(&(chapter, file.path.clone())) =>
         {
-            "Enter: reopen section"
+            "reopen section"
         }
-        Some(_) => "Enter: complete section",
+        Some(_) => "complete section",
         None if review.interaction.github.viewed.contains(&file.path)
             && review
                 .snapshot
                 .as_ref()
                 .is_some_and(|s| s.head == review.interaction.github.head) =>
         {
-            "Enter: mark unviewed"
+            "mark unviewed"
         }
         None if review.local.is_some() => "Local diff",
-        None => "Enter: mark viewed",
+        None => "mark viewed",
+    };
+    let hint = if hint == "Local diff" {
+        hint.to_owned()
+    } else {
+        format!("{activate}: {hint}")
     };
     wrapped_text(
         &format!(
@@ -835,12 +842,19 @@ fn hunk_rows(
     split: bool,
     presentation: (&crate::settings::Code, (usize, bool)),
     with_title: (bool, Option<usize>),
-    review: &Review,
+    context: (&Review, &App),
 ) -> Vec<TextRow> {
+    let (review, app) = context;
     let (preferences, horizontal) = presentation;
     let mut rows = Vec::new();
     if with_title.0 {
-        rows.extend(file_header(file, width, with_title.1, review));
+        rows.extend(file_header(
+            file,
+            width,
+            with_title.1,
+            review,
+            &app.hint(NAVIGATION_ACTIVATE),
+        ));
     }
     rows.push(text(format!(" {}", hunk.header), DIM));
     if let Some(button) = expansion_button(review, file, hunk, Direction::Above) {
@@ -853,7 +867,10 @@ fn hunk_rows(
         .and_then(|state| state.error.as_ref())
     {
         rows.extend(prose(
-            &format!("Could not read file boundaries: {error}. Press r to retry."),
+            &format!(
+                "Could not read file boundaries: {error}. Press {} to retry.",
+                app.hint(REVIEW_REFRESH)
+            ),
             width,
         ));
     }
@@ -952,7 +969,10 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
             append(&mut doc.rows, TextRow::default());
             append(
                 &mut doc.rows,
-                link("Enter · Open pull requests", Action::OpenRepository),
+                link(
+                    format!("{} · Open pull requests", app.hint(NAVIGATION_ACTIVATE)),
+                    Action::OpenRepository,
+                ),
             );
             append(
                 &mut doc.rows,
@@ -1127,7 +1147,13 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
                     if title {
                         headers.push((
                             right.len(),
-                            file_header(file, code_width, Some(chapter_index), review),
+                            file_header(
+                                file,
+                                code_width,
+                                Some(chapter_index),
+                                review,
+                                &app.hint(NAVIGATION_ACTIVATE),
+                            ),
                         ));
                     }
                     let collapsed = review
@@ -1142,9 +1168,15 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
                                 code_width,
                                 Some(chapter_index),
                                 review,
+                                &app.hint(NAVIGATION_ACTIVATE),
                             ));
-                            right
-                                .push(text("✓ Chapter section completed · Enter to reopen", GREEN));
+                            right.push(text(
+                                format!(
+                                    "✓ Chapter section completed · {} to reopen",
+                                    app.hint(NAVIGATION_ACTIVATE)
+                                ),
+                                GREEN,
+                            ));
                         }
                         continue;
                     }
@@ -1158,7 +1190,7 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
                             (app.horizontal, app.diff_config().wrap_diff),
                         ),
                         (title, Some(chapter_index)),
-                        review,
+                        (review, app),
                     ));
                 }
             }
@@ -1271,12 +1303,24 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
             let collapsed = review.interaction.github.viewed.contains(&file.path)
                 && review.interaction.github.head == snapshot.head;
             if collapsed {
-                for row in file_header(file, width.saturating_sub(2) as usize, None, review) {
+                for row in file_header(
+                    file,
+                    width.saturating_sub(2) as usize,
+                    None,
+                    review,
+                    &app.hint(NAVIGATION_ACTIVATE),
+                ) {
                     append(&mut doc.rows, row);
                 }
                 append(
                     &mut doc.rows,
-                    text("✓ Viewed on GitHub · Enter to reopen", GREEN),
+                    text(
+                        format!(
+                            "✓ Viewed on GitHub · {} to reopen",
+                            app.hint(NAVIGATION_ACTIVATE)
+                        ),
+                        GREEN,
+                    ),
                 );
             }
             for (i, hunk) in file.hunks.iter().enumerate().filter(|_| !collapsed) {
@@ -1290,7 +1334,7 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
                         (app.horizontal, app.diff_config().wrap_diff),
                     ),
                     (i == 0, None),
-                    review,
+                    (review, app),
                 ) {
                     append(&mut doc.rows, row);
                 }
@@ -1298,7 +1342,13 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
             doc.files.push(FileSection {
                 start,
                 end: doc.rows.len(),
-                header: file_header(file, width.saturating_sub(2) as usize, None, review),
+                header: file_header(
+                    file,
+                    width.saturating_sub(2) as usize,
+                    None,
+                    review,
+                    &app.hint(NAVIGATION_ACTIVATE),
+                ),
             });
         }
     }
@@ -1558,17 +1608,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let tabs = if app.home {
         vec![
             (
-                "1 My PRs",
+                format!("{} My PRs", app.hint(REVIEW_TAB_1)),
                 app.inbox_tab == InboxTab::MyPrs,
                 Action::SetInbox(InboxTab::MyPrs),
             ),
             (
-                "2 Repositories",
+                format!("{} Repositories", app.hint(REVIEW_TAB_2)),
                 app.inbox_tab == InboxTab::Repositories,
                 Action::SetInbox(InboxTab::Repositories),
             ),
             (
-                "3 Diffs",
+                format!("{} Diffs", app.hint(REVIEW_TAB_3)),
                 app.inbox_tab == InboxTab::Diffs,
                 Action::SetInbox(InboxTab::Diffs),
             ),
@@ -1577,20 +1627,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         vec![
             (
                 if app.render_area.is_some() {
-                    "1 Preview"
+                    format!("{} Preview", app.hint(REVIEW_TAB_1))
                 } else {
-                    "1 Overview"
+                    format!("{} Overview", app.hint(REVIEW_TAB_1))
                 },
                 app.view == View::Overview,
                 Action::SetView(View::Overview),
             ),
             (
-                "2 Diff",
+                format!("{} Diff", app.hint(REVIEW_TAB_2)),
                 app.view == View::Diff,
                 Action::SetView(View::Diff),
             ),
             (
-                "3 Guide",
+                format!("{} Guide", app.hint(REVIEW_TAB_3)),
                 app.view == View::Guide,
                 Action::SetView(View::Guide),
             ),
@@ -1600,8 +1650,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         if app.render_area.is_some() && matches!(action, Action::Back) {
             continue;
         }
-        if x + label.len() as u16 + 4 < area.right() {
-            x = button(frame, app, x, area.y + 3, label, selected, action);
+        if x + label.width() as u16 + 4 < area.right() {
+            x = button(frame, app, x, area.y + 3, &label, selected, action);
         }
     }
     let filters = app.home && !app.repository_directory() && area.height >= 14;
@@ -1922,19 +1972,27 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.document = Some(doc);
     let mut status = if app.repository_directory() {
         if let Some(error) = &app.repositories_error {
-            format!("Could not refresh repositories: {} · r retry", clean(error))
+            format!(
+                "Could not refresh repositories: {} · {} retry",
+                clean(error),
+                app.hint(REVIEW_REFRESH)
+            )
         } else if app.repositories_loading {
             "Showing cached repositories · refreshing…".into()
         } else {
             format!(
-                "{} repositories · * pin/unpin",
-                app.repository_options.len()
+                "{} repositories · {} pin/unpin",
+                app.repository_options.len(),
+                app.hint(REVIEW_PIN_REPOSITORY)
             )
         }
     } else if app.home && app.inbox_loading && !app.inbox.is_empty() {
         "Showing cached PRs · Refreshing…".into()
     } else if app.home && app.inbox_error.is_some() && !app.inbox.is_empty() {
-        "Showing cached PRs · Refresh failed · r retry".into()
+        format!(
+            "Showing cached PRs · Refresh failed · {} retry",
+            app.hint(REVIEW_REFRESH)
+        )
     } else if let Some(review) = app.review() {
         if let Some(job) = &review.generation {
             format!(
@@ -1960,16 +2018,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             format!("[{bar}] {step}/5 · {elapsed}s · {}", clean(activity))
         } else if let Some(error) = &review.guide_error {
             format!(
-                "{}: {} · g retry",
+                "{}: {} · {} retry",
                 if review.preparation_failed {
                     "Snapshot"
                 } else {
                     "Guide"
                 },
-                clean(error).replace('\n', " ")
+                clean(error).replace('\n', " "),
+                app.hint(REVIEW_REGENERATE)
             )
         } else if review.newer.is_some() {
-            "● Remote PR updated · r to sync and refresh".into()
+            format!(
+                "● Remote PR updated · {} to sync and refresh",
+                app.hint(REVIEW_REFRESH)
+            )
         } else if let Some(model) = &review.guide_model {
             format!("Guide ready · {model}")
         } else {
@@ -2029,12 +2091,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let footer = if app.home {
         vec![
             (
-                "/ Actions",
+                format!("{} Actions", app.hint(REVIEW_CONTROLS)),
                 Action::Workflow(crate::workflow::WAction::Open),
             ),
-            ("? Help", Action::Help),
+            (format!("{} Help", app.hint(REVIEW_HELP)), Action::Help),
             (
-                "[ / ] State",
+                format!(
+                    "{}/{} State",
+                    app.hint(REVIEW_PREVIOUS_STATE),
+                    app.hint(REVIEW_NEXT_STATE)
+                ),
                 Action::SetState(match app.state() {
                     PrState::Open => PrState::Merged,
                     PrState::Merged => PrState::Closed,
@@ -2042,60 +2108,105 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     PrState::All => PrState::Open,
                 }),
             ),
-            ("f Filter", Action::Filter),
             (
-                "* Pin",
+                format!("{} Filter", app.hint(REVIEW_FILTER)),
+                Action::Filter,
+            ),
+            (
+                format!("{} Pin", app.hint(REVIEW_PIN_REPOSITORY)),
                 Action::PinRepository(app.repo_selected.clone().unwrap_or_default()),
             ),
-            ("Esc Repositories", Action::Back),
-            ("r Refresh", Action::Refresh),
-            ("Enter Open", Action::OpenPr),
-            ("Cmd+↑/↓ 10 lines", Action::FastScroll(10)),
+            (
+                format!("{} Repositories", app.hint(REVIEW_BACK)),
+                Action::Back,
+            ),
+            (
+                format!("{} Refresh", app.hint(REVIEW_REFRESH)),
+                Action::Refresh,
+            ),
+            (
+                format!("{} Open", app.hint(NAVIGATION_ACTIVATE)),
+                Action::OpenPr,
+            ),
+            (
+                format!(
+                    "{}/{} 10 lines",
+                    app.hint(NAVIGATION_FAST_UP),
+                    app.hint(NAVIGATION_FAST_DOWN)
+                ),
+                Action::FastScroll(10),
+            ),
         ]
     } else {
         vec![
             (
-                "/ Actions",
+                format!("{} Actions", app.hint(REVIEW_CONTROLS)),
                 Action::Workflow(crate::workflow::WAction::Open),
             ),
-            ("c / Cmd+C Copy", Action::Copy),
-            ("Cmd/Ctrl+click Definition", Action::Help),
-            ("Alt+↑/↓ Chapters", Action::Chapter(true)),
-            ("f Filter", Action::Filter),
+            (format!("{} Copy", app.hint(SELECTION_COPY)), Action::Copy),
+            ("Cmd/Ctrl+click Definition".into(), Action::Help),
             (
-                if app.diff_config().wrap_diff {
-                    "w Unwrap"
-                } else {
-                    "w Wrap"
-                },
+                format!(
+                    "{}/{} Chapters",
+                    app.hint(REVIEW_CHAPTER_PREVIOUS),
+                    app.hint(REVIEW_CHAPTER_NEXT)
+                ),
+                Action::Chapter(true),
+            ),
+            (
+                format!("{} Filter", app.hint(REVIEW_FILTER)),
+                Action::Filter,
+            ),
+            (
+                format!(
+                    "{} {}",
+                    app.hint(REVIEW_WRAP),
+                    if app.diff_config().wrap_diff {
+                        "Unwrap"
+                    } else {
+                        "Wrap"
+                    }
+                ),
                 Action::ToggleWrap,
             ),
-            ("Cmd+↑/↓ 10 lines", Action::FastScroll(10)),
-            ("? Help", Action::Help),
-            ("m Model", Action::Models),
-            ("r Refresh", Action::Refresh),
-            ("g Generate", Action::Regenerate),
-            ("x Cancel", Action::Cancel),
-            ("Ctrl+B Split", Action::ToggleLayout),
+            (
+                format!(
+                    "{}/{} 10 lines",
+                    app.hint(NAVIGATION_FAST_UP),
+                    app.hint(NAVIGATION_FAST_DOWN)
+                ),
+                Action::FastScroll(10),
+            ),
+            (format!("{} Help", app.hint(REVIEW_HELP)), Action::Help),
+            (format!("{} Model", app.hint(REVIEW_MODELS)), Action::Models),
+            (
+                format!("{} Refresh", app.hint(REVIEW_REFRESH)),
+                Action::Refresh,
+            ),
+            (
+                format!("{} Generate", app.hint(REVIEW_REGENERATE)),
+                Action::Regenerate,
+            ),
+            (
+                format!("{} Cancel", app.hint(REVIEW_CANCEL)),
+                Action::Cancel,
+            ),
+            (
+                format!("{} Split", app.hint(REVIEW_LAYOUT)),
+                Action::ToggleLayout,
+            ),
         ]
     };
     for (label, action) in footer {
-        if app.render_area.is_some() && matches!(action, Action::Back) {
-            continue;
-        }
-        if matches!(label, "c / Cmd+C Copy" | "Cmd/Ctrl+click Definition")
-            && app.view == View::Overview
-        {
-            continue;
-        }
-        if label == "Alt+↑/↓ Chapters" && app.view != View::Guide {
-            continue;
-        }
-        if (label == "[ / ] State" && app.repository_directory())
-            || (label == "* Pin" && !app.repository_directory())
-            || (label == "Esc Repositories"
+        if (app.render_area.is_some() && matches!(action, Action::Back))
+            || ((matches!(action, Action::Copy) || label == "Cmd/Ctrl+click Definition")
+                && app.view == View::Overview)
+            || (matches!(action, Action::Chapter(_)) && app.view != View::Guide)
+            || (matches!(action, Action::SetState(_)) && app.repository_directory())
+            || (matches!(action, Action::PinRepository(_)) && !app.repository_directory())
+            || (matches!(action, Action::Back)
                 && (app.inbox_tab != InboxTab::Repositories || app.repository.is_none()))
-            || (label == "f Filter" && app.filter_kind().is_none())
+            || (matches!(action, Action::Filter) && app.filter_kind().is_none())
         {
             continue;
         }
@@ -2116,7 +2227,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (_, _, View::Overview, _) => "Overview",
         _ => "Diff",
     };
-    let mut focus_line = vec![span(format!("Focus: {focused} · Tab to switch"), ACCENT)];
+    let mut focus_line = vec![span(
+        format!(
+            "Focus: {focused} · {} to switch",
+            app.hint(NAVIGATION_NEXT_FOCUS)
+        ),
+        ACCENT,
+    )];
     let notice_in_modal = matches!(
         &app.modal,
         Some(Modal::Workflow(wizard))
@@ -2146,7 +2263,7 @@ pub(crate) fn notice_color(kind: crate::app::NoticeKind) -> Color {
     }
 }
 
-fn inbox_rows(pr: &PrSummary, width: usize, selected: bool) -> Vec<TextRow> {
+fn inbox_rows(pr: &PrSummary, width: usize, selected: bool, refresh: &str) -> Vec<TextRow> {
     let width = width.max(1);
     let mut rows = vec![
         text(
@@ -2222,15 +2339,15 @@ fn inbox_rows(pr: &PrSummary, width: usize, selected: bool) -> Vec<TextRow> {
         }
         rows.push(line);
         if pr.stats_error {
-            rows.push(text("Stats stale · r retry", DIM));
+            rows.push(text(format!("Stats stale · {refresh} retry"), DIM));
         }
     } else {
         rows.extend(
             wrapped_text(
-                if pr.stats_error {
-                    "Stats unavailable · r retry"
+                &if pr.stats_error {
+                    format!("Stats unavailable · {refresh} retry")
                 } else {
-                    "Loading stats…"
+                    "Loading stats…".to_owned()
                 },
                 width,
             )
@@ -2384,15 +2501,14 @@ fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
     let selected = visible.iter().position(|i| *i == app.selected).unwrap_or(0);
     app.nav_scroll = app.nav_scroll.min(selected);
     let mut start = selected;
-    let mut needed = app
-        .inbox
-        .get(app.selected)
-        .map_or(0, |pr| inbox_rows(pr, width, true).len());
+    let mut needed = app.inbox.get(app.selected).map_or(0, |pr| {
+        inbox_rows(pr, width, true, &app.hint(REVIEW_REFRESH)).len()
+    });
     while start > app.nav_scroll {
         let Some(pr) = visible.get(start - 1).and_then(|i| app.inbox.get(*i)) else {
             break;
         };
-        let height = inbox_rows(pr, width, false).len() + 1;
+        let height = inbox_rows(pr, width, false, &app.hint(REVIEW_REFRESH)).len() + 1;
         if needed + height > available {
             break;
         }
@@ -2409,7 +2525,7 @@ fn draw_inbox(frame: &mut Frame, app: &mut App, rect: Rect) {
             break;
         };
         let selected = index == app.selected;
-        let rows = inbox_rows(pr, width, selected);
+        let rows = inbox_rows(pr, width, selected, &app.hint(REVIEW_REFRESH));
         let height = rows.len().min(usize::from(rect.bottom() - y)) as u16;
         let hit = Rect::new(rect.x, y, rect.width.saturating_sub(1), height);
         frame.render_widget(
@@ -2626,9 +2742,15 @@ fn draw_definition(frame: &mut Frame, app: &mut App) {
     if inner.height > 0 {
         let footer = Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1);
         frame.render_widget(
-            Paragraph::new(
-                "Esc Close   Cmd/Ctrl+click Definition   ↑/↓ Scroll   ←/→ Pan   PgUp/PgDn Page",
-            )
+            Paragraph::new(format!(
+                "Esc Close   Cmd/Ctrl+click Definition   {}/{} Scroll   {}/{} Pan   {}/{} Page",
+                app.hint(NAVIGATION_UP),
+                app.hint(NAVIGATION_DOWN),
+                app.hint(NAVIGATION_LEFT),
+                app.hint(NAVIGATION_RIGHT),
+                app.hint(NAVIGATION_PAGE_UP),
+                app.hint(NAVIGATION_PAGE_DOWN)
+            ))
             .style(Style::default().fg(ACCENT)),
             footer,
         );
@@ -2676,7 +2798,7 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
     if cursor_x < inner.right() && inner.height > 0 {
         frame.set_cursor_position((cursor_x, inner.y));
     }
-    let matches = crate::help::entries(&state.query.text());
+    let matches = crate::help::entries(&state.query.text(), &app.config);
     let mut rows = Vec::new();
     for (key, description) in &matches {
         rows.extend(prose(
@@ -2695,8 +2817,12 @@ fn draw_help(frame: &mut Frame, app: &mut App) {
     if inner.height > 1 {
         frame.render_widget(
             Paragraph::new(format!(
-                "{} matches · ↑↓ scroll · Ctrl+U clear · Esc close",
-                matches.len()
+                "{} matches · {}/{} scroll · Ctrl+U clear · Esc close",
+                matches.len(),
+                crate::shortcuts::Bindings::new(&app.config)
+                    .primary_hint_in(NAVIGATION_UP, crate::shortcuts::contexts::REVIEW_HELP),
+                crate::shortcuts::Bindings::new(&app.config)
+                    .primary_hint_in(NAVIGATION_DOWN, crate::shortcuts::contexts::REVIEW_HELP)
             ))
             .style(Style::default().fg(DIM)),
             Rect::new(inner.x, inner.y + 1, inner.width, 1),
@@ -2780,7 +2906,10 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
             });
             rows.push(text("", DIM));
             rows.extend(prose(
-                "Enter to open · Ctrl+U to clear · Esc to cancel",
+                &format!(
+                    "{} to open · Ctrl+U to clear · Esc to cancel",
+                    app.hint(NAVIGATION_ACTIVATE)
+                ),
                 inner.width as usize,
             ));
             rows
@@ -2805,7 +2934,15 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
                     spans,
                     ..Default::default()
                 },
-                text("↑↓ select · Enter apply · Esc close", DIM),
+                text(
+                    format!(
+                        "{}/{} select · {} apply · Esc close",
+                        app.hint(NAVIGATION_UP),
+                        app.hint(NAVIGATION_DOWN),
+                        app.hint(NAVIGATION_ACTIVATE)
+                    ),
+                    DIM,
+                ),
                 text("", DIM),
             ];
             if app.models_loading {
@@ -2850,7 +2987,7 @@ fn draw_modal(frame: &mut Frame, app: &mut App) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use anyhow::{Context, Result};
 
@@ -3222,8 +3359,22 @@ mod tests {
         assert_eq!(app.workflow.selection.as_ref().map(|a| a.start), Some(39));
         app.preview_diff_settings(Some(&preview));
         terminal.draw(|f| draw(f, &mut app))?;
+        app.config.preferences.keyboard.bindings.insert(
+            crate::shortcuts::ids::NAVIGATION_FIRST.0.into(),
+            crate::shortcuts::key(crate::settings::BindingKey::Function(12), 0),
+        );
+        let clamped = app.workflow.cursor;
         app.key_event(crossterm::event::KeyEvent::new(
             crossterm::event::KeyCode::Home,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(
+            app.workflow.cursor, clamped,
+            "removed Home keeps latent source intent"
+        );
+        assert!(app.diff_reading.is_some());
+        app.key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::F(12),
             crossterm::event::KeyModifiers::NONE,
         ));
         app.preview_diff_settings(None);
@@ -3305,7 +3456,7 @@ mod tests {
         Ok(())
     }
 
-    fn guide_app(directory: &std::path::Path) -> App {
+    pub(crate) fn guide_app(directory: &std::path::Path) -> App {
         use crate::{
             app::Review,
             codex::{Chapter, Guide},
@@ -4024,8 +4175,8 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect();
-        assert!(output.contains("Alt+↑/↓ Chapters"));
-        assert!(output.contains("Cmd+↑/↓ 10 lines"));
+        assert!(output.contains("Alt+Up/Alt+Down Chapters"));
+        assert!(output.contains("Super+Up/Super+Down 10 lines"));
         assert!(output.contains("Focus: Diff"));
         app.key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         let next_file = app
@@ -4751,8 +4902,14 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app))?;
         app.paste("COPY".into());
         terminal.draw(|frame| draw(frame, &mut app))?;
-        assert_eq!(crate::help::entries("COPY").len(), 1);
-        assert_eq!(crate::help::entries("Cmd+C").len(), 1);
+        for query in ["COPY", "Super+C"] {
+            let matches = crate::help::entries(query, &app.config);
+            let labels = matches
+                .iter()
+                .map(|(_, label)| label.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(labels, ["Copy selection or quit", "Copy selection"]);
+        }
         assert!(app.clipboard.is_none());
         app.key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
         terminal.draw(|frame| draw(frame, &mut app))?;

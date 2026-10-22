@@ -700,3 +700,60 @@ fn editing_reservations_reject_locked_save_without_writing_or_losing_draft() -> 
     }
     Ok(())
 }
+
+#[test]
+fn embedded_review_coactive_bindings_reject_cross_draft_and_normalized_collisions() -> Result<()> {
+    use crate::shortcuts::{Bindings, ids, key};
+    for (host_chord, review_chord) in [
+        (
+            key(BindingKey::Function(12), 0),
+            key(BindingKey::Function(12), 0),
+        ),
+        (
+            key(BindingKey::Character('Z'), 1),
+            key(BindingKey::Character('z'), 5),
+        ),
+    ] {
+        let directory = tempfile::tempdir()?;
+        let storage = store(&directory);
+        storage.update_config(|_| {})?;
+        let mut first = storage.settings_draft()?;
+        let mut second = storage.settings_draft()?;
+        first.set(
+            SettingId::Shortcut(ids::HELPER_PLACEMENT.0.into()),
+            SettingValue::Shortcut(Some(host_chord)),
+        )?;
+        second.set(
+            SettingId::Shortcut(ids::REVIEW_HELP.0.into()),
+            SettingValue::Shortcut(Some(review_chord)),
+        )?;
+        assert!(Bindings::new(first.config()).validate().is_ok());
+        assert!(Bindings::new(second.config()).validate().is_ok());
+        storage.save_settings_draft(&mut first)?;
+        let before = fs::read(&storage.config)?;
+        let result = storage.save_settings_draft(&mut second);
+        assert!(
+            result.is_err(),
+            "host and Review content are simultaneously available in embedded PR"
+        );
+        assert_eq!(fs::read(&storage.config)?, before);
+        assert_eq!(second.edited().len(), 1);
+    }
+    let mut config = Config::default();
+    for id in [
+        ids::HELPER_PLACEMENT,
+        ids::REVIEW_FILTER_ACCEPT,
+        ids::WORKFLOW_SUBMIT,
+    ] {
+        config
+            .preferences
+            .keyboard
+            .bindings
+            .insert(id.0.into(), key(BindingKey::Function(12), 0));
+    }
+    assert!(
+        Bindings::new(&config).validate().is_ok(),
+        "editing/modal consumers bypass host helper controls"
+    );
+    Ok(())
+}

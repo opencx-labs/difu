@@ -23,6 +23,8 @@ pub(crate) mod question_preview;
 mod questions;
 mod remote_control;
 mod reveal;
+#[cfg(test)]
+pub(crate) mod review_shortcut_tests;
 mod rules;
 mod selection;
 mod sends;

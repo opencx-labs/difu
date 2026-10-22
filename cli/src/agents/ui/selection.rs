@@ -257,6 +257,13 @@ impl Ui {
         }
     }
     pub fn copy_chat_selection(&mut self) -> bool {
+        if self.modal.is_none()
+            && self.panels.focused
+            && self.panels.visible()
+            && let Some(super::panels::View::PullRequest { app }) = &mut self.panels.view
+        {
+            return app.copy_selection();
+        }
         if let Some(text) = self.focused_editor().and_then(Editor::selected_text) {
             self.clipboard = Some(text);
             return true;

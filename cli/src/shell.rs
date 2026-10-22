@@ -233,10 +233,23 @@ impl Shell {
         let context = if self.palette.is_some() {
             contexts::PALETTE
         } else if self.agents_active {
-            self.agents.shortcut_context()
+            self.agents.input_context()
         } else {
-            contexts::REVIEW_CONTENT
+            self.reviews.shortcut_context()
         };
+        // Review editors/source selections own native Control+C before global
+        // actions, including embedded App forms and combined Control+Super+C.
+        if (context.0.starts_with("Review") || context.0.starts_with("Workflow"))
+            && key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && if self.agents_active {
+                self.agents.copy_chat_selection()
+            } else {
+                self.reviews.copy_selection()
+            }
+        {
+            return;
+        }
         let action = Bindings::new(&self.reviews.config).resolve(context, key);
         match action {
             Some(ids::SETTINGS_OPEN) => {
@@ -269,7 +282,9 @@ impl Shell {
                 return;
             }
             Some(ids::APP_QUIT) => {
-                if self.agents_active && self.agents.copy_chat_selection() {
+                if (self.agents_active && self.agents.copy_chat_selection())
+                    || (!self.agents_active && self.reviews.copy_selection())
+                {
                     return;
                 }
                 self.reviews.quit = true;
@@ -293,6 +308,8 @@ impl Shell {
         {
             if self.agents_active {
                 self.agents.copy_chat_selection();
+            } else {
+                self.reviews.copy_selection();
             }
             return;
         }

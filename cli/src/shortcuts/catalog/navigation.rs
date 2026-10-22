@@ -343,6 +343,7 @@ pub(super) fn entries() -> Vec<ActionSpec> {
                 contexts::REVIEW_CONTENT,
                 contexts::REVIEW_OVERVIEW,
                 contexts::WORKFLOW_COMPOSE,
+                contexts::WORKFLOW_MENTIONS,
                 contexts::WORKFLOW_CHOICE,
                 contexts::WORKFLOW_NEXT,
             ],

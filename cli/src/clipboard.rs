@@ -68,8 +68,11 @@ impl App {
             None => None,
         };
         let Some(mut anchor) = anchor else {
-            self.notice =
-                Notice::info("Choose a code line; Alt+Left/Right selects the old/new side");
+            self.notice = Notice::info(format!(
+                "Choose a code line; {}/{} selects the old/new side",
+                self.hint(crate::shortcuts::ids::REVIEW_SIDE_LEFT),
+                self.hint(crate::shortcuts::ids::REVIEW_SIDE_RIGHT)
+            ));
             return;
         };
         if let Some(start) = &self.workflow.selection

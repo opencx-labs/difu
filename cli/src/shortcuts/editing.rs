@@ -53,7 +53,17 @@ fn reserved(context: Context, chord: &KeyChord) -> bool {
         matches!(chord.key, BindingKey::Character(_)) && !modifiers.control && !modifiers.super_key;
     // These native filters/repository fields explicitly clear on Control+U
     // with extra modifiers, rather than using Editor's exact Control alias.
-    if [AGENT_COMMANDS, AGENT_MENU, AGENT_HELP, AGENT_REPOSITORY].contains(&context)
+    if [
+        AGENT_COMMANDS,
+        AGENT_MENU,
+        AGENT_HELP,
+        AGENT_REPOSITORY,
+        REVIEW_FILTER,
+        REVIEW_HELP,
+        REVIEW_CLONE,
+        REVIEW_MODELS,
+    ]
+    .contains(&context)
         && chord.key == BindingKey::Character('u')
         && modifiers.control
     {

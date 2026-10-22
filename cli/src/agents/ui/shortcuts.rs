@@ -3,6 +3,19 @@ use super::*;
 use crate::shortcuts::{ActionId, Bindings, Context, contexts::*};
 
 impl Ui {
+    /// Shell globals follow the actual embedded editor, while panel_key retains
+    /// its separately validated host helper precedence for nonmodal content.
+    pub(crate) fn input_context(&self) -> crate::shortcuts::Context {
+        if self.modal.is_none()
+            && self.panels.focused
+            && self.panels.visible()
+            && let Some(super::panels::View::PullRequest { app }) = &self.panels.view
+        {
+            return app.shortcut_context();
+        }
+        self.shortcut_context()
+    }
+
     pub(crate) fn shortcut_context(&self) -> Context {
         if self.inline_question() {
             return if self.question_note_focused {

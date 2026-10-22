@@ -372,13 +372,23 @@ impl Ui {
         }
         if self.panels.focused
             && let Some(View::PullRequest { app }) = &mut self.panels.view
-            && (app.modal.is_some() || app.filters.focused.is_some())
+            && !crate::shortcuts::embedded_content(app.shortcut_context())
         {
             app.key_event(key);
             return true;
         }
         use crate::shortcuts::ids::*;
-        let shortcut = self.shortcut(key);
+        let shortcut = self.shortcut(key).filter(|action| {
+            if let Some(View::PullRequest { app }) = &self.panels.view {
+                crate::shortcuts::embedded_host_action(
+                    *action,
+                    app.shortcut_context(),
+                    self.panels.right,
+                )
+            } else {
+                true
+            }
+        });
         if shortcut == Some(HELPER_PLACEMENT) && self.panels.visible() {
             self.move_helper();
             return true;
@@ -413,7 +423,9 @@ impl Ui {
                 && ((!backwards && app.focus == crate::app::Focus::Navigation)
                     || (backwards && app.focus == crate::app::Focus::Content))
             {
-                app.key_event(key);
+                if let Some(action) = shortcut {
+                    app.shortcut_action(action);
+                }
                 return true;
             }
             self.cycle_focus(shortcut == Some(NAVIGATION_PREVIOUS_FOCUS));
