@@ -321,7 +321,11 @@ pub fn get(config: &Config, id: &SettingId) -> SettingValue {
             SettingValue::Choice(config.preferences.code.whitespace.key().into())
         }
         SettingId::VoiceEnabled => SettingValue::Bool(config.voice_enabled),
-        SettingId::SendKey => SettingValue::Choice(config.preferences.input.send_key.key().into()),
+        SettingId::SendKey => SettingValue::Choice(
+            crate::shortcuts::send_preset(config)
+                .map_or("custom", SendKey::key)
+                .into(),
+        ),
         SettingId::RunningInput => {
             SettingValue::Choice(config.preferences.input.running.key().into())
         }
@@ -401,7 +405,9 @@ fn notification_preset(config: &Config) -> &'static str {
 }
 /// A raw provider snapshot distinguishes explicit provider selection from legacy model inference.
 pub(crate) fn snapshot(config: &Config, id: &SettingId) -> SettingValue {
-    if *id == SettingId::Provider {
+    if *id == SettingId::SendKey {
+        SettingValue::Choice(config.preferences.input.send_key.key().into())
+    } else if *id == SettingId::Provider {
         SettingValue::Text(config.agent_defaults.provider.map(|p| p.key().into()))
     } else {
         get(config, id)
@@ -795,10 +801,10 @@ pub fn registry() -> Vec<SettingSpec> {
             id: SettingId::SendKey,
             category: Category::Input,
             label: "Send message with",
-            description: "Applies to this preference when saved.",
+            description: "Enter preset: Enter sends, Shift+Enter inserts a newline, Ctrl+Enter queues. Ctrl+Enter preset: Ctrl+Enter sends, Enter inserts a newline, Alt+Enter queues. Selecting a preset replaces all three custom bindings together.",
             aliases: &[],
             kind: SettingKind::Choice,
-            choices: vec!["enter", "ctrl_enter"],
+            choices: vec!["enter", "ctrl_enter", "custom"],
             default: get(&defaults, &SettingId::SendKey),
             effect: Effect::ImmediateOnSave,
             preview: Preview::Input,
@@ -1095,7 +1101,7 @@ pub fn registry() -> Vec<SettingSpec> {
             id: SettingId::ShortcutReset,
             category: Category::Keyboard,
             label: "Reset shortcuts in draft",
-            description: "Reset binding overrides in the current draft; Save is still required.",
+            description: "Reset known shortcuts, the Enter send preset and selection override in the draft. Future action overrides are preserved. Save is still required.",
             aliases: &[],
             kind: SettingKind::DraftAction,
             choices: vec![],
@@ -1116,16 +1122,15 @@ pub fn registry() -> Vec<SettingSpec> {
             preview: Preview::None,
         },
     ];
-    let mut question = SettingSpec::shortcut("question.open", "Open question composer");
-    question.aliases = &["change question key", "question shortcut", "alt up"];
-    question.description = "Default Alt+Up. A selection key requires explicitly enabling composer text-selection override.";
-    entries.push(question);
+    entries.extend(crate::shortcuts::settings());
     entries
 }
 
 pub fn spec(id: &SettingId) -> Option<SettingSpec> {
     if let SettingId::Shortcut(action) = id {
-        return Some(SettingSpec::shortcut(action.clone(), "Action shortcut"));
+        return crate::shortcuts::find(action)
+            .and_then(crate::shortcuts::spec)
+            .map(crate::shortcuts::ActionSpec::setting);
     }
     registry().into_iter().find(|entry| entry.id == *id)
 }
@@ -1307,8 +1312,19 @@ pub fn set(config: &mut Config, id: &SettingId, value: SettingValue) -> Result<(
         }
         (SettingId::VoiceEnabled, SettingValue::Bool(value)) => config.voice_enabled = value,
         (SettingId::SendKey, SettingValue::Choice(value)) => {
-            config.preferences.input.send_key =
-                SendKey::parse(&value).ok_or_else(|| anyhow::anyhow!("Invalid choice"))?
+            let preset = SendKey::parse(&value).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Choose an Enter or Ctrl+Enter preset; Custom describes individual bindings"
+                )
+            })?;
+            config.preferences.input.send_key = preset;
+            for (id, chord) in crate::shortcuts::send_companions(preset) {
+                config
+                    .preferences
+                    .keyboard
+                    .bindings
+                    .insert(id.0.into(), chord);
+            }
         }
         (SettingId::RunningInput, SettingValue::Choice(value)) => {
             config.preferences.input.running =

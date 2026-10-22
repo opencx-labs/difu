@@ -289,23 +289,26 @@ fn provider_choice_hook_cycles_both_ways_including_automatic() -> Result<()> {
     Ok(())
 }
 #[test]
-fn keyboard_section_reset_clears_overrides_even_before_full_registry_arrives() -> Result<()> {
+fn keyboard_section_reset_preserves_unknown_future_overrides() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let storage = storage(&dir);
+    storage.update_config(|c| {
+        c.preferences
+            .keyboard
+            .bindings
+            .insert("future.action".into(), KeyChord::character('x'));
+    })?;
     let mut panel = Panel::new(&storage, Some(Category::Keyboard))?;
-    panel.draft.set(
-        SettingId::Shortcut("future.action".into()),
-        SettingValue::Shortcut(Some(KeyChord::character('x'))),
-    )?;
     panel.reset_section();
-    assert!(
+    assert_eq!(
         panel
             .draft
             .config()
             .preferences
             .keyboard
             .bindings
-            .is_empty()
+            .get("future.action"),
+        Some(&KeyChord::character('x'))
     );
     assert!(panel.draft.edited().is_empty());
     Ok(())
@@ -494,4 +497,426 @@ fn diff_preview_uses_context_gutters_wrap_and_selected_whitespace() {
     let short = draw::diff_preview(&config, 18).len();
     config.wrap_diff = true;
     assert!(draw::diff_preview(&config, 18).len() > short);
+}
+
+#[test]
+fn settings_navigation_uses_committed_custom_keys_until_save() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    storage.update_config(|config| {
+        config.preferences.keyboard.bindings.insert(
+            "settings.down".into(),
+            crate::shortcuts::key(BindingKey::Function(8), 0),
+        );
+    })?;
+    let mut panel = Panel::new(&storage, Some(Category::Motion))?;
+    panel.search_focused = false;
+    panel.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &storage);
+    assert_eq!(panel.selected, 0, "old key must not navigate");
+    panel.key(KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE), &storage);
+    assert_eq!(panel.selected, 1);
+    panel.draft.set(
+        SettingId::Shortcut("settings.down".into()),
+        SettingValue::Shortcut(Some(crate::shortcuts::key(BindingKey::Function(9), 0))),
+    )?;
+    panel.key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE), &storage);
+    assert_eq!(
+        panel.selected, 1,
+        "draft bindings cannot control the editor"
+    );
+    panel.key(KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE), &storage);
+    assert_eq!(panel.selected, 2);
+    panel.key(
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        &storage,
+    );
+    panel.key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE), &storage);
+    assert_eq!(panel.selected, 3);
+    Ok(())
+}
+
+#[test]
+fn every_settings_action_has_default_and_remapped_observable_effects() -> Result<()> {
+    use crate::shortcuts::{ids, key};
+    let cases = [
+        (
+            ids::SETTINGS_SAVE,
+            KeyCode::Char('s'),
+            KeyModifiers::CONTROL,
+        ),
+        (
+            ids::SETTINGS_DISCARD,
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+        ),
+        (
+            ids::SETTINGS_RESET_SECTION,
+            KeyCode::Char('r'),
+            KeyModifiers::CONTROL,
+        ),
+        (
+            ids::SETTINGS_EXPORT,
+            KeyCode::Char('e'),
+            KeyModifiers::CONTROL,
+        ),
+        (
+            ids::SETTINGS_MODIFIED,
+            KeyCode::Char('m'),
+            KeyModifiers::CONTROL,
+        ),
+        (
+            ids::SETTINGS_REPLAY,
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL,
+        ),
+        (
+            ids::SETTINGS_TEST,
+            KeyCode::Char('t'),
+            KeyModifiers::CONTROL,
+        ),
+        (
+            ids::SETTINGS_SEARCH,
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL,
+        ),
+        (
+            ids::SETTINGS_DETAILS,
+            KeyCode::Char('i'),
+            KeyModifiers::CONTROL,
+        ),
+        (
+            ids::SETTINGS_DETAILS_DOWN,
+            KeyCode::Down,
+            KeyModifiers::CONTROL,
+        ),
+        (ids::SETTINGS_DETAILS_UP, KeyCode::Up, KeyModifiers::CONTROL),
+        (ids::SETTINGS_FOCUS, KeyCode::Tab, KeyModifiers::NONE),
+        (
+            ids::SETTINGS_PREVIOUS_SECTION,
+            KeyCode::PageUp,
+            KeyModifiers::NONE,
+        ),
+        (
+            ids::SETTINGS_NEXT_SECTION,
+            KeyCode::PageDown,
+            KeyModifiers::NONE,
+        ),
+        (ids::SETTINGS_UP, KeyCode::Up, KeyModifiers::NONE),
+        (ids::SETTINGS_DOWN, KeyCode::Down, KeyModifiers::NONE),
+        (ids::SETTINGS_ACTIVATE, KeyCode::Enter, KeyModifiers::NONE),
+        (
+            ids::SETTINGS_PREVIOUS_VALUE,
+            KeyCode::Left,
+            KeyModifiers::NONE,
+        ),
+        (
+            ids::SETTINGS_SEARCH_SLASH,
+            KeyCode::Char('/'),
+            KeyModifiers::NONE,
+        ),
+        (
+            ids::SETTINGS_EDIT_ACCEPT,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ),
+        (
+            ids::SETTINGS_DISCARD_CLOSE,
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ),
+        (
+            ids::SETTINGS_RESET_BINDING,
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        ),
+    ];
+    for (action, code, modifiers) in cases {
+        for custom in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let storage = storage(&dir);
+            storage.update_config(|c| {
+                if custom {
+                    c.preferences
+                        .keyboard
+                        .bindings
+                        .insert(action.0.into(), key(BindingKey::Function(6), 0));
+                }
+            })?;
+            let mut panel = Panel::new(&storage, Some(Category::Motion))?;
+            panel.search_focused = false;
+            panel.replay = Instant::now() - std::time::Duration::from_secs(1);
+            let replay = panel.replay;
+            panel.details_scroll = 2;
+            match action {
+                ids::SETTINGS_SAVE | ids::SETTINGS_DISCARD | ids::SETTINGS_DISCARD_CLOSE => panel
+                    .draft
+                    .set(SettingId::WrapDiff, SettingValue::Bool(true))?,
+                ids::SETTINGS_RESET_SECTION => panel
+                    .draft
+                    .set(SettingId::ReplySpeed, SettingValue::Number(7))?,
+                ids::SETTINGS_UP => panel.selected = 1,
+                ids::SETTINGS_TEST | ids::SETTINGS_RESET_BINDING => {
+                    panel.query = "change question key".into();
+                    if action == ids::SETTINGS_RESET_BINDING {
+                        panel.draft.set(
+                            SettingId::Shortcut("question.open".into()),
+                            SettingValue::Shortcut(Some(key(BindingKey::Function(12), 0))),
+                        )?;
+                    }
+                }
+                ids::SETTINGS_EDIT_ACCEPT => {
+                    panel.query = "Agent reply speed".into();
+                    panel.selected = 0;
+                    panel.edit = Some("42".into());
+                }
+                _ => {}
+            }
+            if action == ids::SETTINGS_EDIT_ACCEPT {
+                panel.query.clear();
+                panel.selected = panel
+                    .rows()
+                    .iter()
+                    .position(|s| s.id == SettingId::ReplySpeed)
+                    .context("reply speed row")?;
+            }
+            if action == ids::SETTINGS_DISCARD_CLOSE {
+                panel.confirm_discard = true;
+            }
+            let outcome = panel.key(
+                if custom {
+                    KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)
+                } else {
+                    KeyEvent::new(code, modifiers)
+                },
+                &storage,
+            );
+            match action {
+                ids::SETTINGS_SAVE => {
+                    assert!(outcome.saved.is_some() && storage.load_config()?.wrap_diff)
+                }
+                ids::SETTINGS_DISCARD => {
+                    assert!(!panel.draft.config().wrap_diff && panel.draft.edited().is_empty())
+                }
+                ids::SETTINGS_RESET_SECTION => {
+                    assert_eq!(panel.draft.config().tweaks.agent_reply_cps, 200)
+                }
+                ids::SETTINGS_EXPORT => {
+                    assert!(panel.export_path.as_ref().is_some_and(|p| p.is_file()))
+                }
+                ids::SETTINGS_MODIFIED => assert!(panel.modified_only),
+                ids::SETTINGS_REPLAY => assert!(panel.replay > replay),
+                ids::SETTINGS_TEST => assert!(panel.testing),
+                ids::SETTINGS_SEARCH | ids::SETTINGS_SEARCH_SLASH | ids::SETTINGS_FOCUS => {
+                    assert!(panel.search_focused)
+                }
+                ids::SETTINGS_DETAILS => assert!(panel.details_expanded),
+                ids::SETTINGS_DETAILS_DOWN => assert_eq!(panel.details_scroll, 3),
+                ids::SETTINGS_DETAILS_UP => assert_eq!(panel.details_scroll, 1),
+                ids::SETTINGS_PREVIOUS_SECTION => assert_eq!(panel.category, Category::Appearance),
+                ids::SETTINGS_NEXT_SECTION => assert_eq!(panel.category, Category::Conversation),
+                ids::SETTINGS_UP => assert_eq!(panel.selected, 0),
+                ids::SETTINGS_DOWN => assert_eq!(panel.selected, 1),
+                ids::SETTINGS_ACTIVATE => assert_eq!(
+                    panel.draft.config().preferences.motion.level,
+                    Motion::Reduced
+                ),
+                ids::SETTINGS_PREVIOUS_VALUE => {
+                    assert_eq!(panel.draft.config().preferences.motion.level, Motion::Off)
+                }
+                ids::SETTINGS_EDIT_ACCEPT => {
+                    assert_eq!(panel.draft.config().tweaks.agent_reply_cps, 42)
+                }
+                ids::SETTINGS_DISCARD_CLOSE => {
+                    assert!(outcome.close && !panel.draft.config().wrap_diff)
+                }
+                ids::SETTINGS_RESET_BINDING => assert!(
+                    !panel
+                        .draft
+                        .config()
+                        .preferences
+                        .keyboard
+                        .bindings
+                        .contains_key("question.open")
+                ),
+                _ => anyhow::bail!("unexpected Settings action"),
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn input_and_keyboard_reset_keep_their_documented_scope() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    storage.update_config(|c| {
+        c.preferences.input.send_key = SendKey::CtrlEnter;
+        c.preferences.keyboard.bindings.insert(
+            "question.open".into(),
+            crate::shortcuts::key(BindingKey::Function(8), 0),
+        );
+        c.preferences
+            .keyboard
+            .bindings
+            .insert("future.action".into(), KeyChord::character('x'));
+    })?;
+    let mut panel = Panel::new(&storage, Some(Category::Input))?;
+    panel.reset_section();
+    assert_eq!(
+        crate::shortcuts::Bindings::new(panel.draft.config()).hint(crate::shortcuts::ids::SEND),
+        "Enter"
+    );
+    assert_eq!(panel.draft.config().preferences.keyboard.bindings.len(), 2);
+    assert!(
+        panel
+            .draft
+            .config()
+            .preferences
+            .keyboard
+            .bindings
+            .contains_key("question.open")
+    );
+    panel.draft.set(
+        SettingId::SendKey,
+        SettingValue::Choice("ctrl_enter".into()),
+    )?;
+    panel.category = Category::Keyboard;
+    panel.reset_section();
+    assert_eq!(
+        crate::shortcuts::Bindings::new(panel.draft.config()).hint(crate::shortcuts::ids::SEND),
+        "Enter"
+    );
+    assert_eq!(panel.draft.config().preferences.keyboard.bindings.len(), 1);
+    assert!(
+        panel
+            .draft
+            .config()
+            .preferences
+            .keyboard
+            .bindings
+            .contains_key("future.action")
+    );
+    assert_eq!(
+        storage.load_config()?.preferences.input.send_key,
+        SendKey::CtrlEnter,
+        "reset is draft-only"
+    );
+    panel.save(&storage).context("save reset")?;
+    assert_eq!(
+        storage.load_config()?.preferences.input.send_key,
+        SendKey::Enter
+    );
+    Ok(())
+}
+
+#[test]
+fn shortcut_controls_and_effective_send_labels_use_the_real_draft() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, Some(Category::Keyboard))?;
+    assert!(panel.shortcut_action(&SettingId::ShortcutCapture));
+    assert_eq!(panel.capture, Some(crate::shortcuts::ids::QUESTION_OPEN));
+    panel.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &storage);
+    panel.draft.set(
+        SettingId::Shortcut("question.open".into()),
+        SettingValue::Shortcut(Some(crate::shortcuts::key(BindingKey::Function(8), 0))),
+    )?;
+    panel.draft.set(
+        SettingId::Shortcut("settings.open".into()),
+        SettingValue::Shortcut(Some(crate::shortcuts::key(BindingKey::Function(8), 0))),
+    )?;
+    assert!(panel.shortcut_action(&SettingId::ShortcutConflicts));
+    assert!(
+        panel
+            .error
+            .as_ref()
+            .is_some_and(|s| s.contains("conflicts"))
+    );
+    assert!(panel.shortcut_action(&SettingId::ShortcutReset));
+    assert!(
+        panel
+            .draft
+            .config()
+            .preferences
+            .keyboard
+            .bindings
+            .is_empty()
+    );
+    panel.shortcut_action(&SettingId::ShortcutConflicts);
+    assert!(panel.error.is_none());
+    panel.draft.set(
+        SettingId::SendKey,
+        SettingValue::Choice("ctrl_enter".into()),
+    )?;
+    panel.draft.set(
+        SettingId::Shortcut("composer.send".into()),
+        SettingValue::Shortcut(Some(crate::shortcuts::key(BindingKey::Function(9), 0))),
+    )?;
+    panel.query = "Send message with".into();
+    panel.selected = 0;
+    panel.details_expanded = true;
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(130, 60))?;
+    terminal.draw(|f| panel.draw(f))?;
+    let screen = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(screen.contains("Custom"));
+    assert!(screen.contains("Send: F9 · Newline: Enter · Explicit queue: Alt+Enter"));
+    assert!(
+        panel
+            .draft
+            .edited()
+            .contains(&SettingId::Shortcut("composer.send".into()))
+    );
+    Ok(())
+}
+
+#[test]
+fn remapped_panel_hints_show_committed_keys_and_capture_ignores_paste_repeat_release() -> Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    storage.update_config(|c| {
+        c.preferences.keyboard.bindings.insert(
+            "settings.save".into(),
+            crate::shortcuts::key(BindingKey::Function(6), 0),
+        );
+    })?;
+    let mut panel = Panel::new(&storage, Some(Category::Keyboard))?;
+    assert!(narrow_screen(&mut panel)?.contains("F6 Save"));
+    panel.draft.set(
+        SettingId::Shortcut("settings.save".into()),
+        SettingValue::Shortcut(Some(crate::shortcuts::key(BindingKey::Function(7), 0))),
+    )?;
+    assert!(narrow_screen(&mut panel)?.contains("F6 Save"));
+    panel.shortcut_action(&SettingId::Shortcut("question.open".into()));
+    let query = panel.query.clone();
+    panel.paste("Never a key binding");
+    for kind in [
+        crossterm::event::KeyEventKind::Repeat,
+        crossterm::event::KeyEventKind::Release,
+    ] {
+        panel.key(
+            KeyEvent::new_with_kind(KeyCode::F(8), KeyModifiers::NONE, kind),
+            &storage,
+        );
+    }
+    assert_eq!(panel.query, query);
+    assert!(
+        !panel
+            .draft
+            .config()
+            .preferences
+            .keyboard
+            .bindings
+            .contains_key("question.open")
+    );
+    panel.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &storage);
+    panel.key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE), &storage);
+    assert!(narrow_screen(&mut panel)?.contains("F7 Save"));
+    Ok(())
 }

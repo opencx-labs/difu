@@ -36,46 +36,20 @@ pub(super) fn label(value: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
-fn display(value: SettingValue, id: &SettingId) -> String {
+fn display(value: SettingValue, id: &SettingId, config: &Config) -> String {
     match value {
         SettingValue::Bool(value) => if value { "On" } else { "Off" }.into(),
         SettingValue::Number(value) => value.to_string(),
         SettingValue::Choice(value) => label(&value),
         SettingValue::Text(value) => value.unwrap_or_else(|| "Automatic".into()),
-        SettingValue::Shortcut(value) => {
-            value
-                .map(|value| chord_label(&value))
-                .unwrap_or_else(|| match id {
-                    SettingId::Shortcut(action) if action == "question.open" => {
-                        "Alt+↑ (default)".into()
-                    }
-                    SettingId::Shortcut(action) if action == "settings.open" => {
-                        "Ctrl+, (default)".into()
-                    }
-                    _ => "Default".into(),
-                })
-        }
+        SettingValue::Shortcut(_) => match id {
+            SettingId::Shortcut(name) => crate::shortcuts::find(name)
+                .map(|action| crate::shortcuts::Bindings::new(config).hint(action))
+                .unwrap_or_else(|| "Unknown stored action".into()),
+            _ => "Default".into(),
+        },
         SettingValue::Action => "Open →".into(),
     }
-}
-fn chord_label(chord: &KeyChord) -> String {
-    let mut parts = Vec::new();
-    for (on, name) in [
-        (chord.modifiers.control, "Ctrl"),
-        (chord.modifiers.alt, "Alt"),
-        (chord.modifiers.shift, "Shift"),
-        (chord.modifiers.super_key, "Super"),
-    ] {
-        if on {
-            parts.push(name.to_owned());
-        }
-    }
-    parts.push(match chord.key {
-        BindingKey::Character(ch) => ch.to_string(),
-        BindingKey::Function(n) => format!("F{n}"),
-        ref key => format!("{key:?}"),
-    });
-    parts.join("+")
 }
 fn block(title: String) -> Block<'static> {
     Block::default()
@@ -103,7 +77,7 @@ impl Panel {
             Constraint::Length(2),
             Constraint::Min(0),
             Constraint::Length(2),
-            Constraint::Length(if full.width < 65 { 4 } else { 3 }),
+            Constraint::Length(4),
         ])
         .areas(inside);
         frame.render_widget(
@@ -192,9 +166,11 @@ impl Panel {
                         self.edit
                             .as_ref()
                             .map(|text| format!("{text}▏"))
-                            .unwrap_or_else(|| display(self.draft.value(&spec.id), &spec.id))
+                            .unwrap_or_else(|| {
+                                display(self.draft.value(&spec.id), &spec.id, self.draft.config())
+                            })
                     } else {
-                        display(self.draft.value(&spec.id), &spec.id)
+                        display(self.draft.value(&spec.id), &spec.id, self.draft.config())
                     };
                     let style = if selected {
                         Style::default().fg(INK).bg(ACCENT)
@@ -230,15 +206,22 @@ impl Panel {
                 .collect()
         };
         frame.render_widget(
-            Paragraph::new(lines).block(block(format!(" {} · PgUp/PgDn ", self.category.label()))),
+            Paragraph::new(lines).block(block(format!(
+                " {} · {}/{} ",
+                self.category.label(),
+                self.binding_hint(crate::shortcuts::ids::SETTINGS_PREVIOUS_SECTION),
+                self.binding_hint(crate::shortcuts::ids::SETTINGS_NEXT_SECTION)
+            ))),
             list,
         );
         if let Some(spec) = rows.get(self.selected) {
             self.draw_details(frame, details, spec);
         }
         let message = if self.confirm_discard {
-            "Unsaved preferences. Enter/D: discard and close · any other key: keep editing"
-                .to_owned()
+            format!(
+                "Unsaved preferences. {}: discard and close · any other key: keep editing",
+                self.binding_hint(crate::shortcuts::ids::SETTINGS_DISCARD_CLOSE)
+            )
         } else {
             self.error.clone().or_else(|| self.notice.clone()).unwrap_or_else(|| "Visual previews are local. Save applies preferences; connection actions apply separately.".into())
         };
@@ -254,11 +237,26 @@ impl Panel {
                 .wrap(Wrap { trim: false }),
             status,
         );
-        let help = if full.width < 65 {
-            "^S Save ^D Discard ^R Reset\n^E Export ^M Modified ^P Replay\n^T Test ^I Details ^↑/↓ Scroll\nTab Focus PgUp/Dn Sections Esc Close"
-        } else {
-            "Ctrl+S Save · Ctrl+D Discard · Ctrl+R Reset · Ctrl+E Export\nCtrl+M Modified · Ctrl+P Replay · Ctrl+T Test · Ctrl+I Details\nCtrl+↑/↓ Scroll · Tab Focus · PgUp/Dn Sections · Esc Close"
+        use crate::shortcuts::ids;
+        let hint = |id| {
+            let value = self
+                .binding_hint(id)
+                .split(" / ")
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            if full.width < 65 {
+                value
+                    .replace("Ctrl+", "^")
+                    .replace("PageUp", "PgUp")
+                    .replace("PageDown", "PgDn")
+                    .replace("^Up", "^↑")
+                    .replace("^Down", "^↓")
+            } else {
+                value
+            }
         };
+        let help=format!("{} Save {} Discard {} Reset\n{} Export {} Modified {} Replay\n{} Test {} Details {}/{} Scroll\n{} Focus {}/{} Sections Esc Close",hint(ids::SETTINGS_SAVE),hint(ids::SETTINGS_DISCARD),hint(ids::SETTINGS_RESET_SECTION),hint(ids::SETTINGS_EXPORT),hint(ids::SETTINGS_MODIFIED),hint(ids::SETTINGS_REPLAY),hint(ids::SETTINGS_TEST),hint(ids::SETTINGS_DETAILS),hint(ids::SETTINGS_DETAILS_UP),hint(ids::SETTINGS_DETAILS_DOWN),hint(ids::SETTINGS_FOCUS),hint(ids::SETTINGS_PREVIOUS_SECTION),hint(ids::SETTINGS_NEXT_SECTION)).replace("PgUp/PgDn","PgUp/Dn");
         frame.render_widget(
             Paragraph::new(help)
                 .style(Style::default().fg(DIM))
@@ -274,7 +272,10 @@ impl Panel {
             .as_ref()
             .map(|text| format!("Editing: {text}▏"))
             .unwrap_or_else(|| {
-                format!("Current: {}", display(self.draft.value(&spec.id), &spec.id))
+                format!(
+                    "Current: {}",
+                    display(self.draft.value(&spec.id), &spec.id, self.draft.config())
+                )
             });
         let mut details = vec![
             Line::styled(value, Style::default().fg(ACCENT)),
@@ -282,7 +283,13 @@ impl Panel {
             Line::from(spec.effect.label()),
             Line::from(spec.description),
             Line::default(),
-            Line::styled("Sample · Ctrl+P Replay", Style::default().fg(DIM)),
+            Line::styled(
+                format!(
+                    "Sample · {} Replay",
+                    self.binding_hint(crate::shortcuts::ids::SETTINGS_REPLAY)
+                ),
+                Style::default().fg(DIM),
+            ),
         ];
         let visual = self.preview_config().clone();
         let lines = match spec.preview {
@@ -298,11 +305,35 @@ impl Panel {
                 .preview
                 .render(&visual, inner.width, self.replay, false),
 
-            Preview::Shortcut => vec![
-                Line::from("Safe binding editor and tester"),
-                Line::from("Enter opens keyboard integration."),
-                Line::from("No session action runs in this preview."),
-            ],
+            Preview::Shortcut => {
+                let mut lines = vec![
+                    Line::from(format!(
+                        "{} captures this key; {} tests draft bindings safely.",
+                        self.binding_hint(crate::shortcuts::ids::SETTINGS_ACTIVATE),
+                        self.binding_hint(crate::shortcuts::ids::SETTINGS_TEST)
+                    )),
+                    Line::from(format!(
+                        "{} resets the selected binding. Esc cancels capture/test.",
+                        self.binding_hint(crate::shortcuts::ids::SETTINGS_RESET_BINDING)
+                    )),
+                ];
+                if let SettingId::Shortcut(name) = &spec.id
+                    && let Some(action) =
+                        crate::shortcuts::find(name).and_then(crate::shortcuts::spec)
+                {
+                    lines.push(Line::from(format!(
+                        "Contexts: {}",
+                        action
+                            .contexts
+                            .iter()
+                            .map(|c| c.0)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
+                lines.push(Line::from("Shift+Left overrides composer text selection only with explicit consent. No session action runs in this preview."));
+                lines
+            }
             Preview::Notification => vec![
                 Line::from(Span::styled(
                     "✓ Example session finished",
@@ -311,11 +342,23 @@ impl Panel {
                 Line::from("Synthetic status; no notification is sent."),
             ],
             Preview::None => vec![
-                Line::from("Enter edits or opens the selected control."),
+                Line::from(format!(
+                    "{} edits or opens the selected control.",
+                    self.binding_hint(crate::shortcuts::ids::SETTINGS_ACTIVATE)
+                )),
                 Line::from("Connection and rules actions apply separately."),
             ],
         };
         details.extend(lines);
+        if spec.id == SettingId::SendKey {
+            let bindings = crate::shortcuts::Bindings::new(self.draft.config());
+            details.push(Line::from(format!(
+                "Send: {} · Newline: {} · Explicit queue: {}",
+                bindings.hint(crate::shortcuts::ids::SEND),
+                bindings.hint(crate::shortcuts::ids::NEWLINE),
+                bindings.hint(crate::shortcuts::ids::QUEUE)
+            )));
+        }
         frame.render_widget(
             Paragraph::new(details)
                 .style(Style::default().bg(PANEL))

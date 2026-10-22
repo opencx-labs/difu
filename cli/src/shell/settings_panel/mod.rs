@@ -8,7 +8,10 @@ use std::{path::PathBuf, time::Instant};
 mod draw;
 mod integration;
 mod key;
-pub(crate) use integration::{command_category, is_open_shortcut};
+mod shortcuts;
+pub(crate) use integration::command_category;
+#[cfg(test)]
+pub(crate) use integration::is_open_shortcut;
 #[cfg(test)]
 mod tests;
 
@@ -22,6 +25,10 @@ pub(crate) struct Outcome {
 }
 pub(crate) struct Panel {
     pub draft: SettingsDraft,
+    committed: Config,
+    capture: Option<crate::shortcuts::ActionId>,
+    testing: bool,
+    last_shortcut: Option<crate::shortcuts::ActionId>,
     pub category: Category,
     pub query: String,
     pub modified_only: bool,
@@ -46,6 +53,10 @@ impl Panel {
     pub fn new(storage: &Storage, category: Option<Category>) -> anyhow::Result<Self> {
         let mut panel = Self {
             draft: storage.settings_draft()?,
+            committed: storage.load_config()?,
+            capture: None,
+            testing: false,
+            last_shortcut: None,
             category: category.unwrap_or(Category::Appearance),
             query: String::new(),
             modified_only: false,
@@ -64,10 +75,7 @@ impl Panel {
             extra_specs: Vec::new(),
             dynamic_choices: Default::default(),
         };
-        panel.set_shortcuts(vec![SettingSpec::shortcut(
-            "settings.open",
-            "Open Settings",
-        )]);
+        panel.set_shortcuts(crate::shortcuts::settings());
         Ok(panel)
     }
     pub fn rows(&self) -> Vec<SettingSpec> {
@@ -117,6 +125,7 @@ impl Panel {
     pub fn save(&mut self, storage: &Storage) -> Option<Config> {
         match storage.save_settings_draft(&mut self.draft) {
             Ok(config) => {
+                self.committed = config.clone();
                 self.error = None;
                 self.notice = Some("Preferences saved".into());
                 Some(config)
@@ -130,6 +139,7 @@ impl Panel {
     pub fn discard(&mut self, storage: &Storage) -> Option<Config> {
         match storage.refresh_settings() {
             Ok(config) => {
+                self.committed = config.clone();
                 self.draft.discard(config.clone());
                 self.error = None;
                 self.notice = Some("Draft discarded; latest saved preferences loaded".into());
@@ -143,19 +153,10 @@ impl Panel {
         }
     }
     pub fn reset_section(&mut self) {
-        if self.category == Category::Keyboard {
-            let ids = self
-                .draft
-                .config()
-                .preferences
-                .keyboard
-                .bindings
-                .keys()
-                .cloned()
-                .collect::<Vec<_>>();
-            for id in ids {
-                self.apply(SettingId::Shortcut(id), SettingValue::Shortcut(None));
-            }
+        if self.category == Category::Keyboard
+            && let Err(error) = self.draft.reset_shortcuts()
+        {
+            self.error = Some(format!("{error:#}"));
         }
         for spec in registry()
             .into_iter()
@@ -183,6 +184,9 @@ impl Panel {
         Ok(())
     }
     pub fn paste(&mut self, text: &str) {
+        if self.capture.is_some() || self.testing {
+            return;
+        }
         let text = text.replace(['\n', '\r', '\t'], " ");
         if let Some(edit) = &mut self.edit {
             edit.push_str(&text);
@@ -211,6 +215,7 @@ impl Panel {
 impl Panel {
     /// Overlay only locally edited visual fields; keep the save/conflict baseline untouched.
     pub fn refresh_preview(&mut self, committed: &Config) {
+        self.committed = committed.clone();
         let mut visual = committed.clone();
         for id in self.draft.edited() {
             if spec(id).is_some_and(|spec| {
@@ -223,7 +228,8 @@ impl Panel {
                         | Preview::Diff
                         | Preview::Input
                 )
-            }) && let Err(error) = set(&mut visual, id, self.draft.value(id))
+            }) && *id != SettingId::SendKey
+                && let Err(error) = set(&mut visual, id, self.draft.value(id))
             {
                 self.error = Some(format!("Could not preview Settings: {error:#}"));
             }

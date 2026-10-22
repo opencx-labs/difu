@@ -61,9 +61,23 @@ impl Panel {
     }
     pub fn key(&mut self, key: KeyEvent, storage: &Storage) -> Outcome {
         let mut outcome = Outcome::default();
+        if self.shortcut_key(key) {
+            return outcome;
+        }
+        use crate::shortcuts::{Bindings, contexts, ids};
+        let context = if self.confirm_discard {
+            contexts::SETTINGS_CONFIRM
+        } else if self.edit.is_some() {
+            contexts::SETTINGS_EDIT
+        } else if self.search_focused {
+            contexts::SETTINGS_SEARCH
+        } else {
+            contexts::SETTINGS
+        };
+        let action = Bindings::new(&self.committed).resolve(context, key);
         if self.confirm_discard {
-            match key.code {
-                KeyCode::Char('d') | KeyCode::Enter => {
+            match action {
+                Some(ids::SETTINGS_DISCARD_CLOSE) => {
                     outcome.saved = self.discard(storage);
                     outcome.close = self.error.is_none();
                 }
@@ -74,7 +88,7 @@ impl Panel {
         if self.edit.is_some() {
             match key.code {
                 KeyCode::Esc => self.edit = None,
-                KeyCode::Enter => {
+                _ if action == Some(ids::SETTINGS_EDIT_ACCEPT) => {
                     if let Some(spec) = self.rows().get(self.selected).cloned() {
                         let text = self.edit.clone().unwrap_or_default();
                         let value = if matches!(spec.kind, SettingKind::Number { .. }) {
@@ -115,71 +129,84 @@ impl Panel {
             }
             return outcome;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('s') => outcome.saved = self.save(storage),
-                KeyCode::Char('d') => outcome.saved = self.discard(storage),
-                KeyCode::Char('r') => self.reset_section(),
-                KeyCode::Char('e') => {
-                    if let Err(error) = self.export(storage) {
-                        self.error = Some(format!("{error:#}"));
-                    }
+        match action {
+            Some(ids::SETTINGS_SAVE) => outcome.saved = self.save(storage),
+            Some(ids::SETTINGS_DISCARD) => outcome.saved = self.discard(storage),
+            Some(ids::SETTINGS_RESET_SECTION) => self.reset_section(),
+            Some(ids::SETTINGS_EXPORT) => {
+                if let Err(error) = self.export(storage) {
+                    self.error = Some(format!("{error:#}"));
                 }
-                KeyCode::Char('m') => {
-                    self.modified_only = !self.modified_only;
-                    self.selected = 0;
-                }
-                KeyCode::Char('p') => self.replay = Instant::now(),
-                KeyCode::Char('t') => {
-                    outcome.preview_test = self
-                        .rows()
-                        .get(self.selected)
-                        .map(|spec| spec.preview)
-                        .filter(|preview| {
-                            matches!(preview, Preview::Notification | Preview::Shortcut)
-                        })
-                }
-                KeyCode::Char('f') => self.search_focused = true,
-                KeyCode::Char('i') => self.details_expanded = !self.details_expanded,
-                KeyCode::Down => self.details_scroll = self.details_scroll.saturating_add(1),
-                KeyCode::Up => self.details_scroll = self.details_scroll.saturating_sub(1),
-                _ => {}
             }
-            return outcome;
-        }
-        match key.code {
-            KeyCode::Esc => {
+            Some(ids::SETTINGS_MODIFIED) => {
+                self.modified_only = !self.modified_only;
+                self.selected = 0;
+            }
+            Some(ids::SETTINGS_REPLAY) => self.replay = Instant::now(),
+            Some(ids::SETTINGS_TEST) => {
+                let preview = self.rows().get(self.selected).map(|s| s.preview);
+                if preview == Some(Preview::Shortcut) {
+                    self.start_shortcut_test();
+                } else {
+                    outcome.preview_test = preview.filter(|p| *p == Preview::Notification);
+                }
+            }
+            Some(ids::SETTINGS_SEARCH | ids::SETTINGS_SEARCH_SLASH) => self.search_focused = true,
+            Some(ids::SETTINGS_DETAILS) => self.details_expanded = !self.details_expanded,
+            Some(ids::SETTINGS_DETAILS_DOWN) => {
+                self.details_scroll = self.details_scroll.saturating_add(1)
+            }
+            Some(ids::SETTINGS_DETAILS_UP) => {
+                self.details_scroll = self.details_scroll.saturating_sub(1)
+            }
+            Some(ids::SETTINGS_FOCUS) => self.search_focused = !self.search_focused,
+            Some(ids::SETTINGS_PREVIOUS_SECTION) => self.change_category(-1),
+            Some(ids::SETTINGS_NEXT_SECTION) => self.change_category(1),
+            Some(ids::SETTINGS_UP) => {
+                self.search_focused = false;
+                self.selected = self.selected.saturating_sub(1);
+            }
+            Some(ids::SETTINGS_DOWN) => {
+                self.search_focused = false;
+                self.selected = (self.selected + 1).min(self.rows().len().saturating_sub(1));
+            }
+            Some(ids::SETTINGS_ACTIVATE | ids::SETTINGS_PREVIOUS_VALUE) => {
+                if let Some(id) = self.activate(action == Some(ids::SETTINGS_PREVIOUS_VALUE))
+                    && !self.shortcut_action(&id)
+                {
+                    outcome.action = Some(id);
+                }
+            }
+            Some(ids::SETTINGS_RESET_BINDING) => {
+                if let Some(id @ SettingId::Shortcut(_)) =
+                    self.rows().get(self.selected).map(|s| s.id.clone())
+                {
+                    self.apply(id, SettingValue::Shortcut(None));
+                    self.notice = Some("Selected shortcut reset in draft".into());
+                }
+            }
+            _ if key.code == KeyCode::Esc => {
                 if self.draft.edited().is_empty() {
                     outcome.close = true;
                 } else {
                     self.confirm_discard = true;
                 }
             }
-            KeyCode::Tab | KeyCode::BackTab => self.search_focused = !self.search_focused,
-            KeyCode::PageUp => self.change_category(-1),
-            KeyCode::PageDown => self.change_category(1),
-            KeyCode::Up => {
-                self.search_focused = false;
-                self.selected = self.selected.saturating_sub(1);
-            }
-            KeyCode::Down => {
-                self.search_focused = false;
-                self.selected = (self.selected + 1).min(self.rows().len().saturating_sub(1));
-            }
-            KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
-                if !self.search_focused =>
-            {
-                outcome.action = self.activate(key.code == KeyCode::Left)
-            }
-            KeyCode::Backspace if self.search_focused => {
-                self.query.pop();
-                self.selected = 0;
-            }
-            KeyCode::Char(ch) if self.search_focused => {
-                self.query.push(ch);
-                self.selected = 0;
-            }
-            KeyCode::Char('/') => self.search_focused = true,
+            _ if self.search_focused => match key.code {
+                KeyCode::Backspace => {
+                    self.query.pop();
+                    self.selected = 0;
+                }
+                KeyCode::Char(ch)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    self.query.push(ch);
+                    self.selected = 0;
+                }
+                _ => {}
+            },
             _ => {}
         }
         outcome

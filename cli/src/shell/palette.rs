@@ -662,34 +662,34 @@ impl Shell {
         });
     }
     pub(super) fn palette_key(&mut self, key: KeyEvent) {
+        use crate::shortcuts::{Bindings, contexts, ids};
+        let action = Bindings::new(&self.reviews.config).resolve(contexts::PALETTE, key);
         let items = self.palette_items();
         let Some(palette) = &mut self.palette else {
             return;
         };
-        match key.code {
-            KeyCode::Esc => self.palette = None,
-            KeyCode::Enter => {
+        if key.code == KeyCode::Esc {
+            self.palette = None;
+            return;
+        }
+        match action {
+            Some(ids::PALETTE_ACTIVATE) => {
                 let selected = palette.selected;
                 self.activate_palette(selected);
             }
-            KeyCode::Up => palette.selected = palette.selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Tab => {
+            Some(ids::PALETTE_UP) => palette.selected = palette.selected.saturating_sub(1),
+            Some(ids::PALETTE_DOWN) => {
                 palette.selected = (palette.selected + 1).min(items.len().saturating_sub(1))
             }
-            KeyCode::BackTab => palette.selected = palette.selected.saturating_sub(1),
-            KeyCode::PageDown => {
+            Some(ids::PALETTE_PAGE_UP) => {
+                palette.selected = palette.selected.saturating_sub(palette.viewport)
+            }
+            Some(ids::PALETTE_PAGE_DOWN) => {
                 palette.selected =
                     (palette.selected + palette.viewport).min(items.len().saturating_sub(1))
             }
-            KeyCode::PageUp => palette.selected = palette.selected.saturating_sub(palette.viewport),
-            KeyCode::Char('c')
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::SUPER | KeyModifiers::CONTROL) =>
-            {
-                self.agents.clipboard = palette.query.selected_text();
-            }
-            KeyCode::Char('p') if key.modifiers == KeyModifiers::SUPER => {
+            Some(ids::PALETTE_COPY) => self.agents.clipboard = palette.query.selected_text(),
+            Some(ids::PALETTE_PIN) => {
                 if let Some(Item {
                     action: Action::Session(id),
                     ..
@@ -826,7 +826,11 @@ impl Shell {
         frame.render_widget(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Command palette · ⌘K ")
+                .title(format!(
+                    " Command palette · {} ",
+                    crate::shortcuts::Bindings::new(&self.reviews.config)
+                        .hint(crate::shortcuts::ids::PALETTE_OPEN)
+                ))
                 .style(Style::default().bg(INK).fg(TEXT))
                 .border_style(Style::default().fg(ACCENT)),
             rect,
@@ -938,8 +942,16 @@ impl Shell {
             "Searching GitHub…".into()
         } else {
             format!(
-                "{} results · ↑↓ Navigate · Enter Open · ⌘P Pin session · Esc Close",
-                items.len()
+                "{} results · {} / {} Navigate · {} Open · {} Pin · Esc Close",
+                items.len(),
+                crate::shortcuts::Bindings::new(&self.reviews.config)
+                    .hint(crate::shortcuts::ids::PALETTE_UP),
+                crate::shortcuts::Bindings::new(&self.reviews.config)
+                    .hint(crate::shortcuts::ids::PALETTE_DOWN),
+                crate::shortcuts::Bindings::new(&self.reviews.config)
+                    .hint(crate::shortcuts::ids::PALETTE_ACTIVATE),
+                crate::shortcuts::Bindings::new(&self.reviews.config)
+                    .hint(crate::shortcuts::ids::PALETTE_PIN)
             )
         };
         frame.render_widget(
@@ -1415,6 +1427,93 @@ mod tests {
         shell.activate_palette(index);
         assert!(shell.settings.is_some());
         assert!(!shell.agents_active);
+        Ok(())
+    }
+    #[test]
+    fn palette_defaults_and_remaps_drive_navigation_activation_copy_and_pin() -> Result<()> {
+        use crate::settings::BindingKey;
+        use crate::shortcuts::{ids, key};
+        let cases = [
+            (ids::PALETTE_UP, KeyCode::Up, KeyModifiers::NONE),
+            (ids::PALETTE_DOWN, KeyCode::Down, KeyModifiers::NONE),
+            (ids::PALETTE_PAGE_UP, KeyCode::PageUp, KeyModifiers::NONE),
+            (
+                ids::PALETTE_PAGE_DOWN,
+                KeyCode::PageDown,
+                KeyModifiers::NONE,
+            ),
+            (ids::PALETTE_ACTIVATE, KeyCode::Enter, KeyModifiers::NONE),
+            (ids::PALETTE_COPY, KeyCode::Char('c'), KeyModifiers::SUPER),
+            (ids::PALETTE_PIN, KeyCode::Char('p'), KeyModifiers::SUPER),
+        ];
+        for (action, code, modifiers) in cases {
+            for custom in [false, true] {
+                let dir = tempfile::tempdir()?;
+                let mut shell = fixture(Storage {
+                    config: dir.path().join("config.json"),
+                    cache: dir.path().into(),
+                })?;
+                if action == ids::PALETTE_ACTIVATE {
+                    query(&mut shell, "/settings");
+                } else if action == ids::PALETTE_PIN {
+                    query(&mut shell, "Invoice fixes");
+                } else if action == ids::PALETTE_COPY {
+                    query(&mut shell, "literal copy");
+                    if let Some(p) = &mut shell.palette {
+                        p.query.anchor = Some(0);
+                    }
+                } else {
+                    query(&mut shell, "/");
+                    assert!(shell.palette_items().len() > 4);
+                    if let Some(p) = &mut shell.palette {
+                        p.selected = 2;
+                        p.viewport = 2;
+                    }
+                }
+                if custom {
+                    shell
+                        .reviews
+                        .config
+                        .preferences
+                        .keyboard
+                        .bindings
+                        .insert(action.0.into(), key(BindingKey::Function(10), 0));
+                }
+                shell.key(if custom {
+                    KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE)
+                } else {
+                    KeyEvent::new(code, modifiers)
+                });
+                match action {
+                    ids::PALETTE_UP => {
+                        assert_eq!(shell.palette.as_ref().map(|p| p.selected), Some(1))
+                    }
+                    ids::PALETTE_DOWN => {
+                        assert_eq!(shell.palette.as_ref().map(|p| p.selected), Some(3))
+                    }
+                    ids::PALETTE_PAGE_UP => {
+                        assert_eq!(shell.palette.as_ref().map(|p| p.selected), Some(0))
+                    }
+                    ids::PALETTE_PAGE_DOWN => {
+                        assert_eq!(shell.palette.as_ref().map(|p| p.selected), Some(4))
+                    }
+                    ids::PALETTE_ACTIVATE => assert!(shell.settings.is_some()),
+                    ids::PALETTE_COPY => {
+                        assert_eq!(shell.agents.clipboard.as_deref(), Some("literal copy"))
+                    }
+                    ids::PALETTE_PIN => assert!(
+                        shell
+                            .reviews
+                            .storage
+                            .load_config()?
+                            .pinned_sessions
+                            .iter()
+                            .any(|id| id == "one")
+                    ),
+                    _ => anyhow::bail!("unexpected palette action"),
+                }
+            }
+        }
         Ok(())
     }
 }

@@ -426,3 +426,223 @@ fn no_op_save_keeps_legacy_document_bytes_and_rejects_malformed_without_writing(
     assert!(!missing.config.exists());
     Ok(())
 }
+
+#[test]
+fn question_metadata_lookup_matches_intent_search() -> Result<()> {
+    let found = search("change question key")
+        .into_iter()
+        .next()
+        .context("question search result")?;
+    let looked_up = spec(&found.id).context("question metadata")?;
+    assert_eq!(looked_up.label, "Open question composer");
+    assert!(looked_up.aliases.contains(&"change question key"));
+    Ok(())
+}
+
+#[test]
+fn concurrent_distinct_action_remaps_reject_the_final_context_collision() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let storage = store(&directory);
+    storage.update_config(|_| {})?;
+    let mut first = storage.settings_draft()?;
+    let mut second = storage.settings_draft()?;
+    let chord = KeyChord {
+        key: BindingKey::Function(12),
+        modifiers: Default::default(),
+    };
+    first.set(
+        SettingId::Shortcut("settings.open".into()),
+        SettingValue::Shortcut(Some(chord.clone())),
+    )?;
+    second.set(
+        SettingId::Shortcut("question.open".into()),
+        SettingValue::Shortcut(Some(chord)),
+    )?;
+    storage.save_settings_draft(&mut first)?;
+    let before = fs::read(&storage.config)?;
+    let result = storage.save_settings_draft(&mut second);
+    assert!(
+        result.is_err(),
+        "different edited fields still conflict when their effective contexts overlap"
+    );
+    assert_eq!(fs::read(&storage.config)?, before);
+    assert_eq!(second.edited().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn send_preset_atomically_replaces_custom_companions_and_reports_custom_afterwards() -> Result<()> {
+    let mut draft = SettingsDraft::new(Config::default());
+    for (action, key) in [
+        ("composer.send", 'a'),
+        ("composer.newline", 'b'),
+        ("composer.queue", 'c'),
+    ] {
+        draft.set(
+            SettingId::Shortcut(action.into()),
+            SettingValue::Shortcut(Some(KeyChord::character(key))),
+        )?;
+    }
+    draft.set(
+        SettingId::SendKey,
+        SettingValue::Choice("ctrl_enter".into()),
+    )?;
+    for (action, control, alt) in [
+        ("composer.send", true, false),
+        ("composer.newline", false, false),
+        ("composer.queue", false, true),
+    ] {
+        assert_eq!(
+            draft.config().preferences.keyboard.bindings.get(action),
+            Some(&KeyChord {
+                key: BindingKey::Enter,
+                modifiers: KeyModifiers {
+                    control,
+                    alt,
+                    ..Default::default()
+                },
+            })
+        );
+        assert!(draft.edited().contains(&SettingId::Shortcut(action.into())));
+    }
+    draft.set(
+        SettingId::Shortcut("composer.send".into()),
+        SettingValue::Shortcut(Some(KeyChord {
+            key: BindingKey::Function(9),
+            modifiers: Default::default(),
+        })),
+    )?;
+    assert_eq!(
+        draft.value(&SettingId::SendKey),
+        SettingValue::Choice("custom".into())
+    );
+    Ok(())
+}
+
+#[test]
+fn keyboard_reset_restores_enter_preset_and_preserves_unknown_future_actions() -> Result<()> {
+    let mut config = Config::default();
+    config.preferences.input.send_key = SendKey::CtrlEnter;
+    config
+        .preferences
+        .keyboard
+        .bindings
+        .insert("future.action".into(), KeyChord::character('z'));
+    let mut draft = SettingsDraft::new(config);
+    draft.set(
+        SettingId::Shortcut("question.open".into()),
+        SettingValue::Shortcut(Some(KeyChord {
+            key: BindingKey::Function(8),
+            modifiers: Default::default(),
+        })),
+    )?;
+    draft.reset_all()?;
+    assert_eq!(draft.config().preferences.input.send_key, SendKey::Enter);
+    assert_eq!(
+        draft
+            .config()
+            .preferences
+            .keyboard
+            .bindings
+            .get("future.action"),
+        Some(&KeyChord::character('z'))
+    );
+    assert_eq!(
+        crate::shortcuts::Bindings::new(draft.config()).hint(crate::shortcuts::ids::SEND),
+        "Enter"
+    );
+    Ok(())
+}
+
+#[test]
+fn preset_selection_checks_all_companions_even_when_the_selected_preset_was_unchanged() -> Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let storage = store(&dir);
+    let mut original = storage.settings_draft()?;
+    original.set(
+        SettingId::SendKey,
+        SettingValue::Choice("ctrl_enter".into()),
+    )?;
+    storage.save_settings_draft(&mut original)?;
+    let mut preset = storage.settings_draft()?;
+    let mut other = storage.settings_draft()?;
+    preset.set(
+        SettingId::SendKey,
+        SettingValue::Choice("ctrl_enter".into()),
+    )?;
+    other.set(
+        SettingId::Shortcut("composer.send".into()),
+        SettingValue::Shortcut(Some(KeyChord {
+            key: BindingKey::Function(9),
+            modifiers: Default::default(),
+        })),
+    )?;
+    storage.save_settings_draft(&mut other)?;
+    let bytes = fs::read(&storage.config)?;
+    assert!(
+        storage.save_settings_draft(&mut preset).is_err(),
+        "explicitly reselecting a bundle must guard its unchanged companion fields"
+    );
+    assert_eq!(fs::read(&storage.config)?, bytes);
+    Ok(())
+}
+
+#[test]
+fn custom_send_display_does_not_create_preset_edits_or_overwrite_concurrent_fields() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = store(&dir);
+    let mut first = storage.settings_draft()?;
+    let mut other = storage.settings_draft()?;
+    first.set(
+        SettingId::Shortcut("composer.send".into()),
+        SettingValue::Shortcut(Some(KeyChord {
+            key: BindingKey::Function(9),
+            modifiers: Default::default(),
+        })),
+    )?;
+    assert_eq!(
+        first.value(&SettingId::SendKey),
+        SettingValue::Choice("custom".into())
+    );
+    assert!(!first.edited().contains(&SettingId::SendKey));
+    other.set(SettingId::WrapDiff, SettingValue::Bool(true))?;
+    storage.save_settings_draft(&mut other)?;
+    let saved = storage.save_settings_draft(&mut first)?;
+    assert!(saved.wrap_diff);
+    assert_eq!(saved.preferences.input.send_key, SendKey::Enter);
+    assert_eq!(saved.preferences.keyboard.bindings.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn unknown_action_overrides_are_preserved_but_not_editable_controls() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = store(&dir);
+    fs::write(
+        &storage.config,
+        r#"{"preferences":{"keyboard":{"bindings":{"future.action":{"key":"Escape","modifiers":{}}}}}}"#,
+    )?;
+    let mut draft = storage.settings_draft()?;
+    assert!(spec(&SettingId::Shortcut("future.action".into())).is_none());
+    assert!(
+        draft
+            .set(
+                SettingId::Shortcut("future.action".into()),
+                SettingValue::Shortcut(Some(KeyChord::character('z')))
+            )
+            .is_err()
+    );
+    draft.set(SettingId::WrapDiff, SettingValue::Bool(true))?;
+    storage.save_settings_draft(&mut draft)?;
+    let saved = storage.load_config()?;
+    assert!(saved.wrap_diff);
+    assert!(
+        saved
+            .preferences
+            .keyboard
+            .bindings
+            .contains_key("future.action")
+    );
+    Ok(())
+}

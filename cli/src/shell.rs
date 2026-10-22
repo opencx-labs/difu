@@ -17,11 +17,12 @@ use ratatui::{Frame, layout::Rect, style::Style, widgets::Paragraph};
 use std::io::Write;
 use unicode_width::UnicodeWidthStr;
 
-const TAB_LABELS: [&str; 2] = [" Agents (⌥+1) ", " Reviews (⌥+2) "];
 const TAB_MARGIN: u16 = 1;
 mod palette;
 mod preferences;
 pub(crate) mod settings_panel;
+#[cfg(test)]
+mod shortcut_tests;
 
 pub struct Shell {
     pub reviews: App,
@@ -174,6 +175,19 @@ impl Shell {
             self.switch(false);
         }
     }
+    fn tab_labels(&self) -> [String; 2] {
+        let bindings = crate::shortcuts::Bindings::new(&self.reviews.config);
+        [
+            format!(
+                " Agents ({}) ",
+                bindings.hint(crate::shortcuts::ids::SHELL_AGENTS)
+            ),
+            format!(
+                " Reviews ({}) ",
+                bindings.hint(crate::shortcuts::ids::SHELL_REVIEWS)
+            ),
+        ]
+    }
     pub fn key(&mut self, key: KeyEvent) {
         self.reconcile_settings_action();
         if key.kind == KeyEventKind::Release {
@@ -215,46 +229,73 @@ impl Shell {
             }
             return;
         }
-        if settings_panel::is_open_shortcut(&self.reviews.config, key) {
-            self.open_settings(None);
-            return;
-        }
-        if key.code == KeyCode::Char('k') && key.modifiers == KeyModifiers::SUPER {
-            if self.palette.is_some() {
-                self.palette = None;
-            } else {
-                self.agents.cancel_voice();
-                self.agents.prepare_palette();
-                self.palette = Some(palette::Palette::new(self.reviews.storage.clone()));
+        use crate::shortcuts::{Bindings, contexts, ids};
+        let context = if self.palette.is_some() {
+            contexts::PALETTE
+        } else if self.agents_active && self.agents.browser_input() {
+            contexts::AGENT_BROWSER
+        } else if self.agents_active {
+            contexts::AGENT_COMPOSER
+        } else {
+            contexts::REVIEW_CONTENT
+        };
+        let action = Bindings::new(&self.reviews.config).resolve(context, key);
+        match action {
+            Some(ids::SETTINGS_OPEN) => {
+                self.open_settings(None);
+                return;
             }
-            return;
+            Some(ids::PALETTE_OPEN) => {
+                if self.palette.is_some() {
+                    self.palette = None;
+                } else {
+                    self.agents.cancel_voice();
+                    self.agents.prepare_palette();
+                    self.palette = Some(palette::Palette::new(self.reviews.storage.clone()));
+                }
+                return;
+            }
+            _ => {}
         }
         if self.palette.is_some() {
             self.palette_key(key);
             return;
         }
-        if key.modifiers == KeyModifiers::ALT {
-            match key.code {
-                KeyCode::Char('1') => {
-                    self.switch(true);
-                    return;
-                }
-                KeyCode::Char('2') => {
-                    self.switch(false);
-                    return;
-                }
-                _ => {}
+        match action {
+            Some(ids::SHELL_AGENTS) => {
+                self.switch(true);
+                return;
             }
+            Some(ids::SHELL_REVIEWS) => {
+                self.switch(false);
+                return;
+            }
+            Some(ids::APP_QUIT) => {
+                if self.agents_active && self.agents.copy_chat_selection() {
+                    return;
+                }
+                self.reviews.quit = true;
+                return;
+            }
+            _ => {}
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            if self.agents_active && self.agents.browser_input() {
-                self.agents.key(key);
-                return;
+        // Keep Ctrl+C's copy precedence even when exit is moved elsewhere; do not
+        // let a legacy view handler turn the removed global default into exit.
+        if key.code == KeyCode::Char('c')
+            && key.modifiers == KeyModifiers::CONTROL
+            && context != contexts::AGENT_BROWSER
+            && self
+                .reviews
+                .config
+                .preferences
+                .keyboard
+                .bindings
+                .contains_key(ids::APP_QUIT.0)
+            && action.is_none()
+        {
+            if self.agents_active {
+                self.agents.copy_chat_selection();
             }
-            if self.agents_active && self.agents.copy_chat_selection() {
-                return;
-            }
-            self.reviews.quit = true;
             return;
         }
         if self.agents_active {
@@ -286,7 +327,7 @@ impl Shell {
         }
         if mouse.row == 0 && mouse.kind == MouseEventKind::Down(MouseButton::Left) {
             let mut x = TAB_MARGIN;
-            for (index, label) in TAB_LABELS.iter().enumerate() {
+            for (index, label) in self.tab_labels().iter().enumerate() {
                 let end = x + label.width() as u16;
                 if (x..end).contains(&mouse.column) {
                     self.switch(index == 0);
@@ -347,11 +388,11 @@ impl Shell {
             crate::ui::draw(frame, &mut self.reviews);
         }
         let mut x = TAB_MARGIN;
-        for (index, label) in TAB_LABELS.iter().enumerate() {
+        for (index, label) in self.tab_labels().iter().enumerate() {
             let width = label.width() as u16;
             let active = self.agents_active == (index == 0);
             frame.render_widget(
-                Paragraph::new(*label).style(if active {
+                Paragraph::new(label.as_str()).style(if active {
                     Style::default().bg(ACCENT).fg(crate::ui::INK)
                 } else {
                     Style::default().fg(DIM).bg(BG)
@@ -419,7 +460,7 @@ mod tests {
         shell.key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT));
         assert!(storage.load_config()?.last_tab_agents);
         let reviews_start =
-            TAB_MARGIN + TAB_LABELS.first().copied().unwrap_or_default().width() as u16;
+            TAB_MARGIN + shell.tab_labels().first().map_or(0, |label| label.width()) as u16;
         shell.mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: reviews_start,

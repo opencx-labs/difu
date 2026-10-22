@@ -66,6 +66,9 @@ fn terminal_meta_child() -> Result<()> {
         "alt-up" => (KeyCode::Up, KeyModifiers::ALT),
         "alt-down" => (KeyCode::Down, KeyModifiers::ALT),
         "up" => (KeyCode::Up, KeyModifiers::NONE),
+        "shift-left" => (KeyCode::Left, KeyModifiers::SHIFT),
+        "ctrl-enter" => (KeyCode::Enter, KeyModifiers::CONTROL),
+        "backtab" => (KeyCode::BackTab, KeyModifiers::SHIFT),
         "esc" | "esc-then-up" => (KeyCode::Esc, KeyModifiers::NONE),
         _ => anyhow::bail!("Unknown expected key"),
     };

@@ -57,6 +57,9 @@ def exercise(name, chunks, expected, root):
 
 
 cases = [
+    ('shift-left-csi', [b'\x1b[1;2D'], 'shift-left'),
+    ('ctrl-enter-csi-u', [b'\x1b[13;5u'], 'ctrl-enter'),
+    ('shift-tab-csi', [b'\x1b[Z'], 'backtab'),
     ('meta-csi-up', [b'\x1b\x1b[A'], 'alt-up'),
     ('meta-ss3-up', [b'\x1b\x1bOA'], 'alt-up'),
     ('meta-csi-down', [b'\x1b\x1b[B'], 'alt-down'),

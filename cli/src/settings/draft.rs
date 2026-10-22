@@ -9,6 +9,7 @@ pub struct SettingsDraft {
     baseline: Config,
     config: Config,
     edited: BTreeSet<SettingId>,
+    guarded: BTreeSet<SettingId>,
 }
 impl SettingsDraft {
     pub fn new(config: Config) -> Self {
@@ -16,6 +17,7 @@ impl SettingsDraft {
             baseline: config.clone(),
             config,
             edited: BTreeSet::new(),
+            guarded: BTreeSet::new(),
         }
     }
     /// Immutable preview snapshot. Mutations must use validated registry adapters.
@@ -30,13 +32,40 @@ impl SettingsDraft {
     }
     pub fn set(&mut self, id: SettingId, value: SettingValue) -> Result<()> {
         set(&mut self.config, &id, value)?;
+        if id == SettingId::SendKey {
+            self.guarded.insert(SettingId::SendKey);
+            self.guarded.extend(
+                crate::shortcuts::send_companions(self.config.preferences.input.send_key)
+                    .into_iter()
+                    .map(|(action, _)| SettingId::Shortcut(action.0.into())),
+            );
+        }
         self.recompute_edits();
         Ok(())
     }
     /// Reset only this draft, using the registry's default. Shortcut None removes its override.
     pub fn reset(&mut self, id: &SettingId) -> Result<()> {
         let spec = super::spec(id).ok_or_else(|| anyhow::anyhow!("Unknown setting"))?;
-        self.set(id.clone(), spec.default)
+        self.set(id.clone(), spec.default)?;
+        if *id == SettingId::SendKey {
+            for (action, _) in crate::shortcuts::send_companions(super::SendKey::Enter) {
+                self.config.preferences.keyboard.bindings.remove(action.0);
+            }
+            self.recompute_edits();
+        }
+        Ok(())
+    }
+    /// Full keyboard reset includes the send preset; unknown newer action IDs stay opaque.
+    pub fn reset_shortcuts(&mut self) -> Result<()> {
+        self.reset(&SettingId::SendKey)?;
+        self.reset(&SettingId::QuestionOverridesSelection)?;
+        for action in crate::shortcuts::all() {
+            self.set(
+                SettingId::Shortcut(action.id.0.into()),
+                SettingValue::Shortcut(None),
+            )?;
+        }
+        Ok(())
     }
     pub fn reset_all(&mut self) -> Result<()> {
         let shortcuts: Vec<_> = self
@@ -50,7 +79,10 @@ impl SettingsDraft {
         for spec in registry().into_iter().filter(|spec| spec.is_stored_field()) {
             self.set(spec.id, spec.default)?;
         }
-        for action in shortcuts {
+        for action in shortcuts
+            .into_iter()
+            .filter(|id| crate::shortcuts::find(id).is_some())
+        {
             self.set(SettingId::Shortcut(action), SettingValue::Shortcut(None))?;
         }
         Ok(())
@@ -126,7 +158,7 @@ impl Storage {
     ) -> std::result::Result<Config, SaveError> {
         let mut conflicts = Vec::new();
         let result = self.try_patch_config(|fresh| {
-            for id in &draft.edited {
+            for id in draft.edited.union(&draft.guarded) {
                 if super::registry::snapshot(fresh, id)
                     != super::registry::snapshot(&draft.baseline, id)
                 {
@@ -137,9 +169,16 @@ impl Storage {
                 conflicts.is_empty(),
                 "Settings changed while this draft was open"
             );
+            // The draft already applied preset companions. Save individual raw leaves;
+            // re-applying a preset here would overwrite a newer custom companion.
             for id in &draft.edited {
-                set(fresh, id, get(&draft.config, id))?;
+                if *id == SettingId::SendKey {
+                    fresh.preferences.input.send_key = draft.config.preferences.input.send_key;
+                } else {
+                    set(fresh, id, get(&draft.config, id))?;
+                }
             }
+            crate::shortcuts::Bindings::new(fresh).validate()?;
             Ok(())
         });
         match result {
