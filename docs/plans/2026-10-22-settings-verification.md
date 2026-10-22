@@ -220,7 +220,7 @@ user. A RAM-filesystem comparison did not fix the issue and was discarded.
 The original attempts remain in task-local logs; only completed final command
 results count as passing evidence.
 
-[All 189 shortcut actions](2026-10-22-settings-action-coverage.md) and
+[All 190 shortcut actions](2026-10-22-settings-action-coverage.md) and
 [the ordered decision ledger](2026-10-22-settings-decisions.md) are retained.
 
 
@@ -238,3 +238,33 @@ were superseded by the final source and rebuilt archives reported above.
 
 Focused RED/GREEN logs:
 `/tmp/difu-settings-interrupted-read-{red,green}.log`.
+
+
+## Local testing follow-up: navigation and Motion previews
+
+The user-tested Tab navigation now cycles Search, Sections and Settings, with
+Shift+Tab reversing the order. The user then reported that individual Motion
+previews did not react and that the shortcut footer was hard to read.
+
+Regression tests reproduced expired preview clocks, missing restart after an
+edit, and unrelated effects masking a disabled control. Selecting a new control
+or changing motion values now restarts its sample; sent messages, replies and
+timing controls use focused scenes through the production effect renderers.
+Replay reveals the sample again. Zero durations and disabled dependencies show
+an explanation without changing the saved settings. The footer uses styled,
+spaced commands, wraps whole shortcuts and displays Replay or Test contextually.
+
+Native Apple Silicon verification after these follow-ups:
+- Formatting and strict all-target Clippy passed.
+- `cargo test --locked`: **874 passed, zero failed, five existing tests ignored**.
+- All nine Motion controls progress, finish and replay; zero durations, toggles,
+  reply speed and delay caps have regression coverage.
+- The real PTY lifecycle test covers Tab, Shift+Tab, arrows, search and Replay.
+- Footer visibility passes at 38, 80, 130 and 220 columns; terminal-buffer renders
+  were also reviewed locally. No screenshot assets are included in the repository.
+- The release build passed and `/private/tmp/difu-settings-preview/difu --version`
+  returned `difu 0.26.0`; its existing notification helper is packaged beside it.
+
+The earlier four-platform archive results above describe the original feature
+build. These follow-ups were rebuilt and tested on native Apple Silicon only.
+Logs: `/private/tmp/difu-motion-{red,green,settings,clippy,full-tests,build}.log`.

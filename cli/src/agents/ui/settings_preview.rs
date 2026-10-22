@@ -7,6 +7,8 @@ pub(crate) struct SettingsPreview {
     replay: Instant,
     playing: bool,
     control_animating: bool,
+    frame_time: Instant,
+    control: Option<crate::settings::SettingId>,
 }
 impl SettingsPreview {
     pub fn new(replay: Instant) -> Self {
@@ -33,6 +35,8 @@ impl SettingsPreview {
             replay,
             playing: false,
             control_animating: false,
+            frame_time: replay,
+            control: None,
         }
     }
     /// Replay a control-specific scene with the same effect renderer as the live UI.
@@ -54,6 +58,12 @@ impl SettingsPreview {
         now: Instant,
     ) -> Vec<Line<'static>> {
         use crate::settings::{Category, SettingId};
+        self.frame_time = now;
+        if self.control.as_ref() != Some(id) {
+            self.position = Position::default();
+            self.playing = false;
+            self.control = Some(id.clone());
+        }
         if *id == SettingId::AutoScroll {
             return self.scroll_scene(config, width);
         }
@@ -71,7 +81,26 @@ impl SettingsPreview {
         ) {
             let animate = crate::settings::spec(id)
                 .is_some_and(|spec| spec.preview == crate::settings::Preview::Animation);
-            return self.render(config, width, replay, animate);
+            let mut session = self.session.clone();
+            match id {
+                SettingId::ReplyToolEffect => session.entries.retain(|entry| {
+                    matches!(entry.kind.as_str(), "commandExecution" | "agentMessage")
+                }),
+                SettingId::ReplySpeed | SettingId::MaxAnimationDelay => {
+                    session.entries.retain(|entry| entry.kind == "agentMessage")
+                }
+                SettingId::SentMessageEffect | SettingId::SentDuration => {
+                    session.entries.retain(|entry| entry.kind == "userMessage")
+                }
+                _ => {}
+            }
+            let mut scene = config.clone();
+            if matches!(id, SettingId::SentMessageEffect | SettingId::SentDuration) {
+                // The sent-message example must not fall back to the generic
+                // chat-entry effect when its own effect is disabled.
+                scene.preferences.motion.reply_tool = false;
+            }
+            return self.render_session_at(&session, &scene, width, replay, animate, now);
         }
         // These scenes own only synthetic rows and effect state. They never touch
         // a live Ui, composer, service request or microphone.
@@ -276,7 +305,7 @@ impl SettingsPreview {
         rows
     }
     pub fn animating(&self) -> bool {
-        self.control_animating || self.position.animating()
+        self.control_animating || self.position.animating_at(self.frame_time)
     }
     /// Accept the complete draft so runtime preference adapters can be shared here.
     pub fn render(
@@ -286,14 +315,38 @@ impl SettingsPreview {
         replay: Instant,
         animate: bool,
     ) -> Vec<Line<'static>> {
+        self.render_session_at(
+            &self.session.clone(),
+            config,
+            width,
+            replay,
+            animate,
+            Instant::now(),
+        )
+    }
+    fn render_session_at(
+        &mut self,
+        session: &Session,
+        config: &Config,
+        width: u16,
+        replay: Instant,
+        animate: bool,
+        now: Instant,
+    ) -> Vec<Line<'static>> {
+        self.frame_time = now;
         self.control_animating = false;
-        if self.replay != replay || !animate || !self.playing {
+        let restart = self.replay != replay || !animate || !self.playing;
+        if restart {
             self.position = Position::default();
             self.replay = replay;
             if animate {
                 self.position.replies_seen = true;
                 self.position.known = Some(HashSet::new());
-                if let Some(entry) = self.session.entries.first() {
+                if let Some(entry) = session
+                    .entries
+                    .iter()
+                    .find(|entry| entry.kind == "userMessage")
+                {
                     let tweaks = config.preferences.motion.tweaks(config.tweaks);
                     self.position.sent = reveal::Typing::start(
                         &entry.text,
@@ -304,6 +357,21 @@ impl SettingsPreview {
             }
         }
         self.playing = animate;
+        // Seed at the replay instant so every control uses the same clock, even
+        // when its first visible frame arrives after the replay request.
+        if restart && animate && now > replay {
+            self.transcript_frame(session, config, width, animate, replay);
+        }
+        self.transcript_frame(session, config, width, animate, now)
+    }
+    fn transcript_frame(
+        &mut self,
+        session: &Session,
+        config: &Config,
+        width: u16,
+        animate: bool,
+        now: Instant,
+    ) -> Vec<Line<'static>> {
         if config
             .preferences
             .motion
@@ -318,8 +386,8 @@ impl SettingsPreview {
             self.position.expanded.insert("sample-tool".into());
         }
         let (mut lines, sections, _) = transcript::render_entries_with_preferences(
-            &self.session,
-            &self.session.entries,
+            session,
+            &session.entries,
             &self.position,
             width.max(1),
             false,
@@ -328,11 +396,10 @@ impl SettingsPreview {
         );
         if animate {
             let tweaks = config.preferences.motion.tweaks(config.tweaks);
-            let now = Instant::now();
             let total = lines.len();
             let turn = flap::chat(
                 &mut self.position,
-                &self.session,
+                session,
                 &sections,
                 0,
                 total,
@@ -343,7 +410,7 @@ impl SettingsPreview {
             );
             reveal::apply(
                 &mut self.position,
-                &self.session,
+                session,
                 &sections,
                 0,
                 total,
@@ -355,6 +422,52 @@ impl SettingsPreview {
             );
         }
         lines
+    }
+}
+
+/// Explain effective motion dependencies without changing the draft or its timings.
+pub(crate) fn motion_disabled(
+    config: &Config,
+    id: &crate::settings::SettingId,
+) -> Option<&'static str> {
+    use crate::settings::{Motion, SettingId};
+    let motion = &config.preferences.motion;
+    if motion.level != Motion::Full {
+        return Some("Motion is disabled by Animations. Choose Full to preview this effect.");
+    }
+    match id {
+        SettingId::ReplyToolEffect | SettingId::ReplySpeed | SettingId::MaxAnimationDelay => {
+            if !motion.reply_tool {
+                Some("Reply and tool effects are Off. Turn them On to preview this effect.")
+            } else if config.tweaks.agent_reply_cps == 0 {
+                Some("Reply speed is 0. Set it above 0 to preview this effect.")
+            } else {
+                None
+            }
+        }
+        SettingId::SentMessageEffect | SettingId::SentDuration | SettingId::InputClearDuration => {
+            if !motion.sent_message {
+                Some("Sent-message effect is Off. Turn it On to preview this effect.")
+            } else if *id == SettingId::InputClearDuration && config.tweaks.input_clear_ms == 0 {
+                Some("Input clearing duration is 0 ms. Set it above 0 to preview this effect.")
+            } else if *id != SettingId::InputClearDuration && config.tweaks.sent_message_ms == 0 {
+                Some("Sent-message duration is 0 ms. Set it above 0 to preview this effect.")
+            } else {
+                None
+            }
+        }
+        SettingId::SidebarEffect | SettingId::ScreenTransitionEffect => {
+            if *id == SettingId::SidebarEffect && !motion.sidebar {
+                Some("Sidebar effects are Off. Turn them On to preview this effect.")
+            } else if *id == SettingId::ScreenTransitionEffect && !motion.screen_transition {
+                Some("Screen transitions are Off. Turn them On to preview this effect.")
+            } else if config.tweaks.agent_reply_cps == 0 {
+                Some("Reply speed is 0. Set it above 0 to preview this effect.")
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -502,5 +615,143 @@ mod tests {
             }
         }
         assert_eq!(preview.render(&config, 60, start, false), original);
+    }
+    #[test]
+    fn motion_preview_toggles_do_not_replay_an_unrelated_effect() {
+        let start = Instant::now();
+        for id in [
+            SettingId::ReplyToolEffect,
+            SettingId::ReplySpeed,
+            SettingId::SentMessageEffect,
+            SettingId::SentDuration,
+        ] {
+            let mut config = Config::default();
+            match id {
+                SettingId::ReplyToolEffect => config.preferences.motion.reply_tool = false,
+                SettingId::ReplySpeed => config.tweaks.agent_reply_cps = 0,
+                SettingId::SentMessageEffect => config.preferences.motion.sent_message = false,
+                _ => config.tweaks.sent_message_ms = 0,
+            }
+            let mut preview = SettingsPreview::new(start);
+            let first = preview.render_control_at(&config, 60, start, &id, start);
+            assert!(
+                !preview.animating(),
+                "{id:?} must not animate another control's effect"
+            );
+            let last =
+                preview.render_control_at(&config, 60, start, &id, start + Duration::from_secs(5));
+            assert_eq!(first, last);
+        }
+    }
+
+    #[test]
+    fn motion_preview_reply_speed_and_cap_change_the_visible_progress() {
+        let start = Instant::now();
+        let mut slow = Config::default();
+        slow.tweaks.agent_reply_cps = 10;
+        slow.tweaks.max_animation_ms = 0;
+        let mut fast = slow.clone();
+        fast.tweaks.agent_reply_cps = 1000;
+        let mut capped = slow.clone();
+        capped.tweaks.max_animation_ms = 100;
+        for (id, config) in [
+            (SettingId::ReplySpeed, fast),
+            (SettingId::MaxAnimationDelay, capped),
+        ] {
+            let mut slow_preview = SettingsPreview::new(start);
+            let mut fast_preview = SettingsPreview::new(start);
+            slow_preview.render_control_at(&slow, 60, start, &id, start);
+            fast_preview.render_control_at(&config, 60, start, &id, start);
+            let slow_rows = slow_preview.render_control_at(
+                &slow,
+                60,
+                start,
+                &id,
+                start + Duration::from_secs(1),
+            );
+            let fast_rows = fast_preview.render_control_at(
+                &config,
+                60,
+                start,
+                &id,
+                start + Duration::from_secs(1),
+            );
+            assert!(!text(&slow_rows).contains("saving."));
+            assert!(
+                text(&fast_rows).contains("saving."),
+                "{id:?}: faster timing must visibly finish earlier: {}",
+                text(&fast_rows)
+            );
+        }
+    }
+    #[test]
+    fn motion_preview_every_control_progresses_settles_and_replays() {
+        let start = Instant::now();
+        let config = Config::default();
+        for id in [
+            SettingId::Motion,
+            SettingId::ReplyToolEffect,
+            SettingId::SentMessageEffect,
+            SettingId::SidebarEffect,
+            SettingId::ScreenTransitionEffect,
+            SettingId::ReplySpeed,
+            SettingId::SentDuration,
+            SettingId::InputClearDuration,
+            SettingId::MaxAnimationDelay,
+        ] {
+            let mut preview = SettingsPreview::new(start);
+            let first = preview.render_control_at(&config, 60, start, &id, start);
+            assert!(
+                preview.animating(),
+                "{id:?}: first frame must schedule repainting"
+            );
+            let later = preview.render_control_at(
+                &config,
+                60,
+                start,
+                &id,
+                start + Duration::from_millis(200),
+            );
+            assert_ne!(first, later, "{id:?}: pixels must change during playback");
+            let settled =
+                preview.render_control_at(&config, 60, start, &id, start + Duration::from_secs(5));
+            assert!(!preview.animating(), "{id:?}: playback must finish");
+            assert_ne!(first, settled);
+            let replay = start + Duration::from_secs(6);
+            assert_eq!(
+                preview.render_control_at(&config, 60, replay, &id, replay),
+                first
+            );
+            assert!(preview.animating(), "{id:?}: replay must restart");
+        }
+    }
+
+    #[test]
+    fn motion_preview_sent_duration_obeys_the_cap_and_zero() {
+        let start = Instant::now();
+        for (duration, cap, active) in [
+            (0, 0, false),
+            (100, 0, false),
+            (1000, 0, true),
+            (1000, 100, false),
+        ] {
+            let mut config = Config::default();
+            config.tweaks.sent_message_ms = duration;
+            config.tweaks.max_animation_ms = cap;
+            let mut preview = SettingsPreview::new(start);
+            preview.render_control_at(&config, 60, start, &SettingId::SentDuration, start);
+            preview.render_control_at(
+                &config,
+                60,
+                start,
+                &SettingId::SentDuration,
+                start + Duration::from_millis(500),
+            );
+            assert_eq!(
+                preview.animating(),
+                active,
+                "duration {duration}, cap {cap}"
+            );
+        }
     }
 }

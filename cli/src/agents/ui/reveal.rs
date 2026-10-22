@@ -101,7 +101,9 @@ impl Typing {
 
 impl Position {
     pub(super) fn animating(&self) -> bool {
-        let now = Instant::now();
+        self.animating_at(Instant::now())
+    }
+    pub(super) fn animating_at(&self, now: Instant) -> bool {
         self.sent.is_some()
             || self.clearing.is_some()
             || !self.voice_flaps.is_empty()

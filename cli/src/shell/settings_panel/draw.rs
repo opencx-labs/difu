@@ -73,19 +73,33 @@ impl Panel {
             full,
         );
         let inside = full.inner(ratatui::layout::Margin::new(1, 1));
+        let footer_lines = self.footer_lines(inside.width);
+        let footer_height = u16::try_from(footer_lines.len()).unwrap_or(u16::MAX);
         let [search, body, status, footer] = Layout::vertical([
             Constraint::Length(2),
             Constraint::Min(0),
-            Constraint::Length(2),
-            Constraint::Length(4),
+            Constraint::Length(if self.error.is_some() || self.confirm_discard {
+                2
+            } else {
+                1
+            }),
+            Constraint::Length(footer_height),
         ])
         .areas(inside);
         frame.render_widget(
             Paragraph::new(format!(
                 "{} Search: {}{} · {}",
-                if self.search_focused { "›" } else { " " },
+                if self.focus == Focus::Search {
+                    "›"
+                } else {
+                    " "
+                },
                 self.query,
-                if self.search_focused { "▏" } else { "" },
+                if self.focus == Focus::Search {
+                    "▏"
+                } else {
+                    ""
+                },
                 if self.modified_only {
                     "Modified only"
                 } else {
@@ -107,31 +121,7 @@ impl Panel {
                 Constraint::Min(24),
             ])
             .areas(body);
-            let rows = Category::ALL
-                .iter()
-                .map(|category| {
-                    Line::styled(
-                        format!(
-                            "{} {}",
-                            if self.category == *category {
-                                "›"
-                            } else {
-                                " "
-                            },
-                            category.label()
-                        ),
-                        Style::default().fg(if self.category == *category {
-                            ACCENT
-                        } else {
-                            DIM
-                        }),
-                    )
-                })
-                .collect::<Vec<_>>();
-            frame.render_widget(
-                Paragraph::new(rows).block(block(" Sections ".into())),
-                categories,
-            );
+            self.draw_sections(frame, categories);
             (list, details)
         } else if medium {
             let [list, details] =
@@ -172,7 +162,7 @@ impl Panel {
                     } else {
                         display(self.draft.value(&spec.id), &spec.id, self.draft.config())
                     };
-                    let style = if selected {
+                    let style = if selected && self.focus == Focus::Settings {
                         Style::default().fg(INK).bg(ACCENT)
                     } else {
                         Style::default().fg(TEXT)
@@ -205,16 +195,36 @@ impl Panel {
                 })
                 .collect()
         };
-        frame.render_widget(
-            Paragraph::new(lines).block(block(format!(
-                " {} · {}/{} ",
-                self.category.label(),
-                self.binding_hint(crate::shortcuts::ids::SETTINGS_PREVIOUS_SECTION),
-                self.binding_hint(crate::shortcuts::ids::SETTINGS_NEXT_SECTION)
-            ))),
-            list,
-        );
+        if !wide && self.focus == Focus::Sections {
+            self.draw_sections(frame, list);
+        } else {
+            frame.render_widget(
+                Paragraph::new(lines).block(
+                    block(format!(" {} · Settings ", self.category.label())).border_style(
+                        Style::default().fg(if self.focus == Focus::Settings {
+                            ACCENT
+                        } else {
+                            BORDER
+                        }),
+                    ),
+                ),
+                list,
+            );
+        }
         if let Some(spec) = rows.get(self.selected) {
+            if self.preview_selection.as_ref() != Some(&spec.id) {
+                self.preview_selection = Some(spec.id.clone());
+                self.replay = Instant::now();
+                self.details_scroll = 0;
+            }
+            if spec.preview == Preview::Animation {
+                let config = self.preview_config();
+                let motion = (config.preferences.motion.clone(), config.tweaks);
+                if self.preview_motion.as_ref() != Some(&motion) {
+                    self.preview_motion = Some(motion);
+                    self.replay = Instant::now();
+                }
+            }
             self.draw_details(frame, details, spec);
         }
         let message = if self.confirm_discard {
@@ -237,36 +247,55 @@ impl Panel {
                 .wrap(Wrap { trim: false }),
             status,
         );
-        use crate::shortcuts::ids;
-        let hint = |id| {
-            let value = self
-                .binding_hint(id)
-                .split(" / ")
-                .next()
-                .unwrap_or_default()
-                .to_owned();
-            if full.width < 65 {
-                value
-                    .replace("Ctrl+", "^")
-                    .replace("PageUp", "PgUp")
-                    .replace("PageDown", "PgDn")
-                    .replace("^Up", "^↑")
-                    .replace("^Down", "^↓")
-            } else {
-                value
-            }
-        };
-        let help=format!("{} Save {} Discard {} Reset\n{} Export {} Modified {} Replay\n{} Test {} Details {}/{} Scroll\n{} Focus {}/{} Sections Esc Close",hint(ids::SETTINGS_SAVE),hint(ids::SETTINGS_DISCARD),hint(ids::SETTINGS_RESET_SECTION),hint(ids::SETTINGS_EXPORT),hint(ids::SETTINGS_MODIFIED),hint(ids::SETTINGS_REPLAY),hint(ids::SETTINGS_TEST),hint(ids::SETTINGS_DETAILS),hint(ids::SETTINGS_DETAILS_UP),hint(ids::SETTINGS_DETAILS_DOWN),hint(ids::SETTINGS_FOCUS),hint(ids::SETTINGS_PREVIOUS_SECTION),hint(ids::SETTINGS_NEXT_SECTION)).replace("PgUp/PgDn","PgUp/Dn");
-        frame.render_widget(
-            Paragraph::new(help)
-                .style(Style::default().fg(DIM))
-                .wrap(Wrap { trim: false }),
-            footer,
-        );
+        frame.render_widget(Paragraph::new(footer_lines), footer);
         self.expire_notification_test(Instant::now());
         if let Some((message, error, _)) = &self.notification_test {
             crate::agents::ui::toast::draw(frame, full, message, *error);
         }
+    }
+    fn draw_sections(&self, frame: &mut Frame, area: Rect) {
+        let focused = self.focus == Focus::Sections;
+        let selected = Category::ALL
+            .iter()
+            .position(|category| *category == self.category)
+            .unwrap_or(0);
+        let visible = usize::from(area.height.saturating_sub(2));
+        let start = selected.saturating_sub(visible.saturating_sub(1));
+        let rows = Category::ALL
+            .iter()
+            .skip(start)
+            .take(visible)
+            .map(|category| {
+                let active = *category == self.category;
+                Line::styled(
+                    format!("{} {}", if active { "›" } else { " " }, category.label()),
+                    if active && focused {
+                        Style::default().fg(INK).bg(ACCENT)
+                    } else {
+                        Style::default().fg(if active { ACCENT } else { DIM })
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let title = if focused {
+            format!(
+                " Sections · {}/{} ",
+                self.binding_hint(crate::shortcuts::ids::SETTINGS_UP),
+                self.binding_hint(crate::shortcuts::ids::SETTINGS_DOWN)
+            )
+        } else {
+            " Sections ".into()
+        };
+        frame.render_widget(
+            Paragraph::new(rows).block(
+                block(title).border_style(Style::default().fg(if focused {
+                    ACCENT
+                } else {
+                    BORDER
+                })),
+            ),
+            area,
+        );
     }
     fn draw_details(&mut self, frame: &mut Frame, area: Rect, spec: &SettingSpec) {
         frame.render_widget(block(" Details & preview ".into()), area);
@@ -288,10 +317,18 @@ impl Panel {
             Line::from(spec.description),
             Line::default(),
             Line::styled(
-                format!(
-                    "Sample · {} Replay",
-                    self.binding_hint(crate::shortcuts::ids::SETTINGS_REPLAY)
-                ),
+                match spec.preview {
+                    Preview::Animation => format!(
+                        "Live sample · {} Replay",
+                        self.binding_hint(crate::shortcuts::ids::SETTINGS_REPLAY)
+                    ),
+                    Preview::Shortcut | Preview::Notification => format!(
+                        "Try it · {} Test",
+                        self.binding_hint(crate::shortcuts::ids::SETTINGS_TEST)
+                    ),
+                    Preview::None => "About this setting".into(),
+                    _ => "Preview · updates as you edit".into(),
+                },
                 Style::default().fg(DIM),
             ),
         ];
@@ -302,6 +339,39 @@ impl Panel {
         );
         let mut notification_sample = None;
         let visual = self.preview_config().clone();
+        if spec.preview == Preview::Animation {
+            if let Some(reason) =
+                crate::agents::ui::settings_preview::motion_disabled(&visual, &spec.id)
+            {
+                details.push(Line::styled(reason, Style::default().fg(ACCENT)));
+                details.push(Line::default());
+            }
+            let timing = match spec.id {
+                SettingId::SentMessageEffect | SettingId::SentDuration => Some(format!(
+                    "Sent message: {} ms · effective {} ms",
+                    visual.tweaks.sent_message_ms,
+                    visual.tweaks.capped(visual.tweaks.sent_message_ms)
+                )),
+                SettingId::InputClearDuration => Some(format!(
+                    "Input clearing: {} ms · effective {} ms",
+                    visual.tweaks.input_clear_ms,
+                    visual.tweaks.capped(visual.tweaks.input_clear_ms)
+                )),
+                SettingId::ReplySpeed | SettingId::MaxAnimationDelay => Some(format!(
+                    "Reply: {} characters/s · {}",
+                    visual.tweaks.agent_reply_cps,
+                    if visual.tweaks.max_animation_ms == 0 {
+                        "no delay cap".into()
+                    } else {
+                        format!("{} ms delay cap", visual.tweaks.max_animation_ms)
+                    }
+                )),
+                _ => None,
+            };
+            if let Some(timing) = timing {
+                details.push(Line::styled(timing, Style::default().fg(DIM)));
+            }
+        }
         let lines = match spec.preview {
             Preview::Diff => diff_preview(&visual, inner.width),
             Preview::Animation => {

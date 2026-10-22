@@ -12,8 +12,9 @@ import termios
 import time
 
 inputs = [b"\x1b[44;5u", b"\x1b[24~", b"\x1b[200~stop flashing\x1b[201~",
-          b"\t", b"\r", b"\x10", b"\x13", b"\r", b"\x04", b"\x1b",
-          b"\x1b[44;5u", b"\x1b[24~", b"\x1b"]
+          b"\t", b"\x1b[B", b"\t", b"\r", b"\x10", b"\x13", b"\r", b"\x04",
+          b"\x1b[Z", b"\x1b[A", b"\x1b[Z", b"\x1b[200~stop flashing\x1b[201~", b"\r",
+          b"\x1b", b"\x1b[44;5u", b"\x1b[24~", b"\x1b"]
 for width, height in [(42, 20), (140, 42)]:
     with tempfile.TemporaryDirectory(prefix="difu-settings-pty-") as directory:
         root = Path(directory)

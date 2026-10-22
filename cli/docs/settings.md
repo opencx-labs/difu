@@ -6,10 +6,15 @@ active session, composer draft, selection and reading position stay intact.
 
 ## Browse, preview and save
 
-Type in Search; **Tab** switches between search and the rows. **PageUp/PageDown**
-changes section, **Up/Down** selects a setting, **Enter/Right** edits or advances
-it, and **Left** selects the previous value. Details expand with **Ctrl+I** and
-scroll with **Ctrl+Up/Down**, including in a narrow terminal. The displayed keys
+**Tab** cycles through Search → Sections → Settings; **Shift+Tab** goes back.
+**Up/Down** changes the section when Sections is focused, or selects a setting
+when Settings is focused. **Ctrl+F** jumps to Search. Search text only changes
+while that field is focused. **Enter** or **Down** from Search focuses the
+results without changing a value. **Enter/Right** from Sections focuses its
+settings; press again to edit or advance a value. **Left** selects the previous
+value while Settings is focused. **PageUp/PageDown** remain section shortcuts.
+Details expand with **Ctrl+I** and scroll with **Ctrl+Up/Down**, including in a
+narrow terminal. The displayed keys
 follow your saved custom bindings.
 
 Search understands intent: **stop flashing** finds Animations; **change question
@@ -26,7 +31,11 @@ a sample when available, and one of these effect labels:
 shows modified settings. **Ctrl+R** resets the current section in the draft;
 Save is still required. Settings navigation uses committed shortcuts until Save.
 Appearance and motion preview locally while editing; Discard restores saved
-values. **Ctrl+P** replays the sample. **Ctrl+T** tests the selected shortcut or
+values. Motion samples restart when you select a control or change its value.
+**Ctrl+P** replays the selected effect and brings its sample back into view.
+Disabled effects explain which toggle or zero duration is preventing playback;
+nonzero durations also show the effective timing after the animation cap.
+**Ctrl+T** tests the selected shortcut or
 notification. Shortcut tests never send messages, approve tools, interrupt work,
 or start the microphone. Notification tests explicitly use the current draft.
 

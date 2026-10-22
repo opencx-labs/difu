@@ -55,7 +55,7 @@ fn settings_terminal_child() -> Result<()> {
         terminal.draw(|frame| shell.draw(frame))?;
         fs::write(root.join("phase"), "0")?;
         let mut replay = None;
-        for step in 0..13 {
+        for step in 0..20 {
             loop {
                 ensure!(
                     event::poll(Duration::from_secs(5))?,
@@ -68,7 +68,7 @@ fn settings_terminal_child() -> Result<()> {
                 }
                 break;
             }
-            let should_open = matches!(step, 1..=8 | 11);
+            let should_open = matches!(step, 1..=15 | 18);
             ensure!(
                 shell.settings.is_some() == should_open,
                 "Settings visibility at {step}"
@@ -82,30 +82,43 @@ fn settings_terminal_child() -> Result<()> {
                             super::SettingId::Motion
                         );
                     }
-                    4 | 6 | 8 | 11 => assert_eq!(
+                    6 | 8 | 10..=15 | 18 => assert_eq!(
                         panel.draft.config().preferences.motion.level,
                         Motion::Reduced
                     ),
-                    7 => assert_eq!(panel.draft.config().preferences.motion.level, Motion::Off),
+                    9 => assert_eq!(panel.draft.config().preferences.motion.level, Motion::Off),
+                    _ => {}
+                }
+                match step {
+                    3 | 4 | 11 | 12 => assert_eq!(panel.focus, super::Focus::Sections),
+                    5 | 15 => assert_eq!(panel.focus, super::Focus::Settings),
+                    13 | 14 => assert_eq!(panel.focus, super::Focus::Search),
                     _ => {}
                 }
                 if step == 4 {
+                    assert_eq!(panel.category, super::Category::Motion);
+                    assert!(panel.query.is_empty());
+                }
+                if step == 12 {
+                    assert_eq!(panel.category, super::Category::Appearance);
+                }
+                if step == 6 {
                     replay = Some(panel.replay);
                     assert!(!panel.draft.edited().is_empty());
                 }
-                if step == 5 {
+                if step == 7 {
                     ensure!(
                         panel.replay > replay.context("previous replay")?,
                         "Preview was not replayed"
                     );
                 }
-                if matches!(step, 6 | 8 | 11) {
+                if matches!(step, 8 | 10..=15 | 18) {
                     assert!(panel.draft.edited().is_empty());
                 }
             }
             assert_eq!(
                 storage.load_config()?.preferences.motion.level,
-                if step >= 6 {
+                if step >= 8 {
                     Motion::Reduced
                 } else {
                     Motion::Full

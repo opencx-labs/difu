@@ -69,7 +69,7 @@ impl Panel {
             contexts::SETTINGS_CONFIRM
         } else if self.edit.is_some() {
             contexts::SETTINGS_EDIT
-        } else if self.search_focused {
+        } else if self.focus == Focus::Search {
             contexts::SETTINGS_SEARCH
         } else {
             contexts::SETTINGS
@@ -146,7 +146,27 @@ impl Panel {
                 self.modified_only = !self.modified_only;
                 self.selected = 0;
             }
-            Some(ids::SETTINGS_REPLAY) => self.replay = Instant::now(),
+            Some(ids::SETTINGS_REPLAY) => {
+                self.replay = Instant::now();
+                self.details_scroll = 0;
+                if let Some(spec) = self.rows().get(self.selected) {
+                    self.notice = Some(if spec.preview == Preview::Animation {
+                        crate::agents::ui::settings_preview::motion_disabled(
+                            self.preview_config(),
+                            &spec.id,
+                        )
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Replaying {}", spec.label))
+                    } else if matches!(spec.preview, Preview::Shortcut | Preview::Notification) {
+                        format!(
+                            "Use {} Test to try this setting",
+                            self.binding_hint(ids::SETTINGS_TEST)
+                        )
+                    } else {
+                        "This preview updates as you edit; there is no animation to replay.".into()
+                    });
+                }
+            }
             Some(ids::SETTINGS_TEST) => {
                 let preview = self.rows().get(self.selected).map(|s| s.preview);
                 if preview == Some(Preview::Shortcut) {
@@ -155,7 +175,9 @@ impl Panel {
                     outcome.preview_test = preview.filter(|p| *p == Preview::Notification);
                 }
             }
-            Some(ids::SETTINGS_SEARCH | ids::SETTINGS_SEARCH_SLASH) => self.search_focused = true,
+            Some(ids::SETTINGS_SEARCH | ids::SETTINGS_SEARCH_SLASH) => {
+                self.focus = Focus::Search;
+            }
             Some(ids::SETTINGS_DETAILS) => self.details_expanded = !self.details_expanded,
             Some(ids::SETTINGS_DETAILS_DOWN) => {
                 self.details_scroll = self.details_scroll.saturating_add(1)
@@ -163,25 +185,42 @@ impl Panel {
             Some(ids::SETTINGS_DETAILS_UP) => {
                 self.details_scroll = self.details_scroll.saturating_sub(1)
             }
-            Some(ids::SETTINGS_FOCUS) => self.search_focused = !self.search_focused,
+            Some(ids::SETTINGS_FOCUS) => self.focus_next(false),
+            Some(ids::SETTINGS_FOCUS_PREVIOUS) => self.focus_next(true),
             Some(ids::SETTINGS_PREVIOUS_SECTION) => self.change_category(-1),
             Some(ids::SETTINGS_NEXT_SECTION) => self.change_category(1),
-            Some(ids::SETTINGS_UP) => {
-                self.search_focused = false;
-                self.selected = self.selected.saturating_sub(1);
+            Some(ids::SETTINGS_UP | ids::SETTINGS_DOWN) => match self.focus {
+                Focus::Sections => self.change_category(if action == Some(ids::SETTINGS_UP) {
+                    -1
+                } else {
+                    1
+                }),
+                Focus::Search => {
+                    self.focus = Focus::Settings;
+                    self.details_expanded = false;
+                }
+                Focus::Settings => {
+                    self.selected = if action == Some(ids::SETTINGS_UP) {
+                        self.selected.saturating_sub(1)
+                    } else {
+                        (self.selected + 1).min(self.rows().len().saturating_sub(1))
+                    };
+                }
+            },
+            Some(ids::SETTINGS_ACTIVATE) if self.focus != Focus::Settings => {
+                self.focus = Focus::Settings;
+                self.details_expanded = false;
             }
-            Some(ids::SETTINGS_DOWN) => {
-                self.search_focused = false;
-                self.selected = (self.selected + 1).min(self.rows().len().saturating_sub(1));
-            }
-            Some(ids::SETTINGS_ACTIVATE | ids::SETTINGS_PREVIOUS_VALUE) => {
+            Some(ids::SETTINGS_ACTIVATE | ids::SETTINGS_PREVIOUS_VALUE)
+                if self.focus == Focus::Settings =>
+            {
                 if let Some(id) = self.activate(action == Some(ids::SETTINGS_PREVIOUS_VALUE))
                     && !self.shortcut_action(&id)
                 {
                     outcome.action = Some(id);
                 }
             }
-            Some(ids::SETTINGS_RESET_BINDING) => {
+            Some(ids::SETTINGS_RESET_BINDING) if self.focus == Focus::Settings => {
                 if let Some(id @ SettingId::Shortcut(_)) =
                     self.rows().get(self.selected).map(|s| s.id.clone())
                 {
@@ -196,7 +235,7 @@ impl Panel {
                     self.confirm_discard = true;
                 }
             }
-            _ if self.search_focused => match key.code {
+            _ if self.focus == Focus::Search => match key.code {
                 KeyCode::Backspace => {
                     self.query.pop();
                     self.selected = 0;

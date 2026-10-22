@@ -23,6 +23,7 @@ pub const SETTINGS_DETAILS: ActionId = ActionId("settings.details");
 pub const SETTINGS_DETAILS_DOWN: ActionId = ActionId("settings.details_down");
 pub const SETTINGS_DETAILS_UP: ActionId = ActionId("settings.details_up");
 pub const SETTINGS_FOCUS: ActionId = ActionId("settings.focus");
+pub const SETTINGS_FOCUS_PREVIOUS: ActionId = ActionId("settings.focus_previous");
 pub const SETTINGS_PREVIOUS_SECTION: ActionId = ActionId("settings.previous_section");
 pub const SETTINGS_NEXT_SECTION: ActionId = ActionId("settings.next_section");
 pub const SETTINGS_UP: ActionId = ActionId("settings.up");

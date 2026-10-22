@@ -117,6 +117,7 @@ fn narrow_panel_keeps_search_selection_details_and_actions_reachable() -> Result
     assert!(content.contains("Settings"));
     assert!(content.contains("^S Save"));
     panel.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &storage);
+    panel.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &storage);
     panel.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &storage);
     assert!(!panel.draft.edited().is_empty());
     terminal.draw(|frame| panel.draw(frame))?;
@@ -129,7 +130,7 @@ fn numeric_validation_keeps_draft_and_editor_until_a_valid_value_is_entered() ->
     let storage = storage(&dir);
     let mut panel = Panel::new(&storage, Some(Category::Motion))?;
     panel.query = "Reply speed".into();
-    panel.search_focused = false;
+    panel.focus = Focus::Settings;
     panel.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &storage);
     panel.edit = Some("not a number".into());
     panel.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &storage);
@@ -265,7 +266,7 @@ fn provider_choice_hook_cycles_both_ways_including_automatic() -> Result<()> {
     let storage = storage(&dir);
     let mut panel = Panel::new(&storage, Some(Category::AgentDefaults))?;
     panel.query = "Default model".into();
-    panel.search_focused = false;
+    panel.focus = Focus::Settings;
     panel.set_dynamic_choices(
         SettingId::DefaultModel,
         vec!["first".into(), "second".into()],
@@ -376,7 +377,7 @@ fn narrow_footer_keeps_details_scroll_and_navigation_instructions_visible() -> R
     let dir = tempfile::tempdir()?;
     let mut panel = Panel::new(&storage(&dir), None)?;
     let screen = narrow_screen(&mut panel)?;
-    for hint in ["Details", "Scroll", "PgUp/Dn", "Tab Focus", "Esc"] {
+    for hint in ["Details", "Scroll", "^F Search", "Tab Focus", "Esc"] {
         assert!(screen.contains(hint), "missing visible instruction: {hint}");
     }
     Ok(())
@@ -510,7 +511,7 @@ fn settings_navigation_uses_committed_custom_keys_until_save() -> Result<()> {
         );
     })?;
     let mut panel = Panel::new(&storage, Some(Category::Motion))?;
-    panel.search_focused = false;
+    panel.focus = Focus::Settings;
     panel.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &storage);
     assert_eq!(panel.selected, 0, "old key must not navigate");
     panel.key(KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE), &storage);
@@ -592,6 +593,11 @@ fn every_settings_action_has_default_and_remapped_observable_effects() -> Result
         (ids::SETTINGS_DETAILS_UP, KeyCode::Up, KeyModifiers::CONTROL),
         (ids::SETTINGS_FOCUS, KeyCode::Tab, KeyModifiers::NONE),
         (
+            ids::SETTINGS_FOCUS_PREVIOUS,
+            KeyCode::BackTab,
+            KeyModifiers::NONE,
+        ),
+        (
             ids::SETTINGS_PREVIOUS_SECTION,
             KeyCode::PageUp,
             KeyModifiers::NONE,
@@ -643,7 +649,7 @@ fn every_settings_action_has_default_and_remapped_observable_effects() -> Result
                 }
             })?;
             let mut panel = Panel::new(&storage, Some(Category::Motion))?;
-            panel.search_focused = false;
+            panel.focus = Focus::Settings;
             panel.replay = Instant::now() - std::time::Duration::from_secs(1);
             let replay = panel.replay;
             panel.details_scroll = 2;
@@ -707,8 +713,9 @@ fn every_settings_action_has_default_and_remapped_observable_effects() -> Result
                 ids::SETTINGS_REPLAY => assert!(panel.replay > replay),
                 ids::SETTINGS_TEST => assert!(panel.testing),
                 ids::SETTINGS_SEARCH | ids::SETTINGS_SEARCH_SLASH | ids::SETTINGS_FOCUS => {
-                    assert!(panel.search_focused)
+                    assert_eq!(panel.focus, Focus::Search)
                 }
+                ids::SETTINGS_FOCUS_PREVIOUS => assert_eq!(panel.focus, Focus::Sections),
                 ids::SETTINGS_DETAILS => assert!(panel.details_expanded),
                 ids::SETTINGS_DETAILS_DOWN => assert_eq!(panel.details_scroll, 3),
                 ids::SETTINGS_DETAILS_UP => assert_eq!(panel.details_scroll, 1),
@@ -944,7 +951,7 @@ fn editing_reservations_keep_search_typing_and_capture_isolation() -> Result<()>
         })?;
         let bytes = std::fs::read(&storage.config)?;
         let mut panel = Panel::new(&storage, None)?;
-        panel.search_focused = true;
+        panel.focus = Focus::Search;
         panel.query = before.into();
         panel
             .draft
@@ -1328,6 +1335,7 @@ fn explicit_sign_in_handoff_keeps_unsaved_draft_and_separate_status_actions() ->
         .set(SettingId::ReplySpeed, SettingValue::Number(17))?;
     assert!(shell.take_sign_in().is_none());
     shell.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    shell.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     for (id, provider) in [
         (
             SettingId::CodexSignIn,
@@ -1518,5 +1526,243 @@ fn repository_edit_cannot_save_a_known_unavailable_retained_starting_mode() -> R
         .draft
         .set(SettingId::StartingMode, SettingValue::Text(None))?;
     assert!(panel.save(&storage).is_some());
+    Ok(())
+}
+
+#[test]
+fn tab_navigation_routes_arrows_to_sections_then_settings() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, None)?;
+    panel.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &storage);
+    panel.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &storage);
+    assert_eq!(panel.category, Category::Motion);
+    assert_eq!(panel.selected, 0);
+    panel.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &storage);
+    assert_eq!(panel.category, Category::Appearance);
+    panel.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &storage);
+    panel.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &storage);
+    assert_eq!(panel.category, Category::Appearance);
+    assert_eq!(panel.selected, 1);
+    panel.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &storage);
+    assert_eq!(panel.selected, 0);
+    panel.paste("ignored outside search");
+    assert!(panel.query.is_empty());
+    panel.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &storage);
+    panel.paste("stop flashing");
+    assert_eq!(panel.query, "stop flashing");
+    assert!(panel.draft.edited().is_empty());
+    assert!(!storage.config.exists());
+    Ok(())
+}
+
+#[test]
+fn tab_navigation_shift_tab_reverses_for_terminal_key_encodings() -> Result<()> {
+    for event in [
+        KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let storage = storage(&dir);
+        let mut panel = Panel::new(&storage, None)?;
+        panel.key(event, &storage);
+        panel.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &storage);
+        assert_eq!(panel.selected, 1);
+        panel.key(event, &storage);
+        panel.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &storage);
+        assert_eq!(panel.category, Category::Motion);
+        panel.key(event, &storage);
+        panel.paste("stop flashing");
+        assert_eq!(panel.query, "stop flashing");
+        assert!(panel.draft.edited().is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn tab_navigation_search_enter_focuses_results_without_changing_a_value() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, None)?;
+    panel.paste("stop flashing");
+    panel.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &storage);
+    panel.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &storage);
+    assert_eq!(
+        panel.draft.config().preferences.motion.level,
+        Motion::Reduced
+    );
+    panel.key(
+        KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        &storage,
+    );
+    panel.key(
+        KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        &storage,
+    );
+    assert_eq!(panel.query, "stop flashin");
+    panel.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &storage);
+    panel.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &storage);
+    assert_eq!(panel.category, Category::Motion);
+    assert!(panel.query.is_empty());
+    assert_eq!(
+        panel.draft.config().preferences.motion.level,
+        Motion::Reduced
+    );
+    Ok(())
+}
+
+#[test]
+fn tab_navigation_section_enter_only_moves_focus_and_narrow_sections_stay_visible() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, None)?;
+    panel.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &storage);
+    for _ in 0..9 {
+        panel.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &storage);
+    }
+    assert_eq!(panel.category, Category::Connections);
+    assert!(narrow_screen(&mut panel)?.contains("Connections"));
+    panel.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &storage);
+    assert_eq!(panel.category, Category::Appearance);
+    panel.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &storage);
+    assert!(panel.draft.edited().is_empty());
+    panel.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &storage);
+    assert_eq!(panel.selected, 1);
+    assert_eq!(panel.category, Category::Appearance);
+    Ok(())
+}
+
+#[test]
+fn motion_preview_restarts_when_selected_after_the_panel_has_been_idle() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(130, 40))?;
+    for id in [
+        SettingId::ReplyToolEffect,
+        SettingId::SentMessageEffect,
+        SettingId::SidebarEffect,
+        SettingId::ScreenTransitionEffect,
+        SettingId::ReplySpeed,
+        SettingId::SentDuration,
+        SettingId::InputClearDuration,
+        SettingId::MaxAnimationDelay,
+    ] {
+        let mut panel = Panel::new(&storage, Some(Category::Motion))?;
+        panel.focus = Focus::Settings;
+        terminal.draw(|f| panel.draw(f))?;
+        panel.replay = Instant::now() - std::time::Duration::from_secs(10);
+        let previous = panel.replay;
+        panel.selected = panel
+            .rows()
+            .iter()
+            .position(|s| s.id == id)
+            .context("motion row")?;
+        terminal.draw(|f| panel.draw(f))?;
+        assert!(panel.replay > previous, "{id:?} must start when selected");
+        assert!(panel.animating(), "{id:?} must request visible frames");
+        assert!(!storage.config.exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn motion_preview_restarts_after_edit_and_replay_reveals_the_sample() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, Some(Category::Motion))?;
+    panel.focus = Focus::Settings;
+    panel.query = "Sidebar effects".into();
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(130, 40))?;
+    terminal.draw(|f| panel.draw(f))?;
+    panel.replay = Instant::now() - std::time::Duration::from_secs(10);
+    panel.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &storage);
+    terminal.draw(|f| panel.draw(f))?;
+    assert!(!panel.animating());
+    panel.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &storage);
+    terminal.draw(|f| panel.draw(f))?;
+    assert!(panel.animating(), "re-enabling an effect must replay it");
+    panel.details_scroll = 50;
+    panel.key(
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        &storage,
+    );
+    terminal.draw(|f| panel.draw(f))?;
+    assert_eq!(
+        panel.details_scroll, 0,
+        "Replay must bring the sample back into view"
+    );
+    assert!(panel.animating());
+    assert!(!storage.config.exists());
+    Ok(())
+}
+
+#[test]
+fn motion_preview_zero_durations_explain_why_replay_is_disabled() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(130, 40))?;
+    for (label, timing) in [
+        ("Sent-message effect", SettingId::SentDuration),
+        ("Sent-message duration", SettingId::SentDuration),
+        ("Input clearing duration", SettingId::InputClearDuration),
+    ] {
+        let mut panel = Panel::new(&storage, Some(Category::Motion))?;
+        panel.query = label.into();
+        panel.draft.set(timing, SettingValue::Number(0))?;
+        panel.key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &storage,
+        );
+        terminal.draw(|f| panel.draw(f))?;
+        assert!(
+            !panel.animating(),
+            "{label}: unrelated effects must not play"
+        );
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(
+            screen.contains("0 ms"),
+            "{label}: explain the disabled timing"
+        );
+        assert!(
+            screen.contains("above 0"),
+            "{label}: explain how to enable it"
+        );
+        assert!(!storage.config.exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn footer_keeps_actions_visible_across_terminal_sizes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    for width in [38, 80, 130, 220] {
+        let mut panel = Panel::new(&storage(&dir), Some(Category::Motion))?;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 24))?;
+        terminal.draw(|f| panel.draw(f))?;
+
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        for label in [
+            "Save", "Discard", "Replay", "Details", "Close", "Focus", "Search", "Reset", "Export",
+            "Modified", "Scroll",
+        ] {
+            assert!(
+                screen.contains(label),
+                "{width} columns: {label} must stay visible"
+            );
+        }
+    }
     Ok(())
 }

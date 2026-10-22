@@ -7,6 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::{path::PathBuf, time::Instant};
 mod connections;
 mod draw;
+mod footer;
 mod integration;
 mod key;
 mod shortcuts;
@@ -27,6 +28,13 @@ pub(crate) struct Outcome {
     pub action: Option<SettingId>,
     pub preview_test: Option<Preview>,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Focus {
+    Search,
+    Sections,
+    Settings,
+}
+
 pub(crate) struct Panel {
     connections: connections::State,
     pub draft: SettingsDraft,
@@ -48,9 +56,11 @@ pub(crate) struct Panel {
     pub replay: Instant,
     preview: crate::agents::ui::settings_preview::SettingsPreview,
     visual_config: Option<Config>,
+    preview_selection: Option<SettingId>,
+    preview_motion: Option<(MotionPreferences, crate::storage::Tweaks)>,
     pub(super) details_expanded: bool,
     pub(super) details_scroll: u16,
-    search_focused: bool,
+    focus: Focus,
     edit: Option<String>,
     /// Full action registry metadata can be supplied by the keyboard integration.
     extra_specs: Vec<SettingSpec>,
@@ -93,9 +103,11 @@ impl Panel {
             details_scroll: 0,
             export_path: None,
             replay: Instant::now(),
-            search_focused: true,
+            focus: Focus::Search,
             preview: crate::agents::ui::settings_preview::SettingsPreview::new(Instant::now()),
             visual_config: None,
+            preview_selection: None,
+            preview_motion: None,
             edit: None,
             extra_specs: Vec::new(),
             dynamic_choices: Default::default(),
@@ -228,10 +240,18 @@ impl Panel {
         let text = text.replace(['\n', '\r', '\t'], " ");
         if let Some(edit) = &mut self.edit {
             edit.push_str(&text);
-        } else if self.search_focused {
+        } else if self.focus == Focus::Search {
             self.query.push_str(&text);
             self.selected = 0;
         }
+    }
+    fn focus_next(&mut self, backwards: bool) {
+        self.focus = match (self.focus, backwards) {
+            (Focus::Search, false) | (Focus::Settings, true) => Focus::Sections,
+            (Focus::Sections, false) | (Focus::Search, true) => Focus::Settings,
+            (Focus::Settings, false) | (Focus::Sections, true) => Focus::Search,
+        };
+        self.details_expanded = false;
     }
     fn change_category(&mut self, delta: isize) {
         let index = Category::ALL
@@ -245,7 +265,9 @@ impl Panel {
         self.selected = 0;
         self.details_scroll = 0;
         self.query.clear();
-        self.search_focused = false;
+        if self.focus == Focus::Search {
+            self.focus = Focus::Settings;
+        }
         self.edit = None;
     }
 }

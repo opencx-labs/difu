@@ -1,6 +1,6 @@
 # Settings shortcut coverage
 
-The production registry contains **189 action IDs across 93 contexts**. This table
+The production registry contains **190 action IDs across 93 contexts**. This table
 maps every editable action to enabled tests that exercise its actual dispatch.
 The registry itself records exact context membership; tests cover default keys,
 saved replacements, removed aliases, reset/discard, editing ownership, effective
@@ -38,7 +38,8 @@ approval-text action were removed; future unknown stored IDs remain opaque.
 | `settings.details` | Ctrl+I | `every_settings_action_has_default_and_remapped_observable_effects`; `settings_navigation_uses_committed_custom_keys_until_save` |
 | `settings.details_down` | Ctrl+Down | `every_settings_action_has_default_and_remapped_observable_effects`; `settings_navigation_uses_committed_custom_keys_until_save` |
 | `settings.details_up` | Ctrl+Up | `every_settings_action_has_default_and_remapped_observable_effects`; `settings_navigation_uses_committed_custom_keys_until_save` |
-| `settings.focus` | Tab / Shift+Tab | `every_settings_action_has_default_and_remapped_observable_effects`; `settings_navigation_uses_committed_custom_keys_until_save` |
+| `settings.focus` | Tab | `every_settings_action_has_default_and_remapped_observable_effects`; `settings_navigation_uses_committed_custom_keys_until_save`; `tab_navigation_routes_arrows_to_sections_then_settings` |
+| `settings.focus_previous` | Shift+Tab | `every_settings_action_has_default_and_remapped_observable_effects`; `tab_navigation_shift_tab_reverses_for_terminal_key_encodings`; `settings_terminal_lifecycle_uses_real_pty` |
 | `settings.previous_section` | PageUp | `every_settings_action_has_default_and_remapped_observable_effects`; `settings_navigation_uses_committed_custom_keys_until_save` |
 | `settings.next_section` | PageDown | `every_settings_action_has_default_and_remapped_observable_effects`; `settings_navigation_uses_committed_custom_keys_until_save` |
 | `settings.up` | Up | `every_settings_action_has_default_and_remapped_observable_effects`; `settings_navigation_uses_committed_custom_keys_until_save` |

@@ -510,9 +510,15 @@ pub(super) fn entries() -> Vec<ActionSpec> {
         ),
         entry(
             ids::SETTINGS_FOCUS,
-            "Switch preference search focus",
+            "Focus next settings area",
             &[contexts::SETTINGS, contexts::SETTINGS_SEARCH],
-            &[key(BindingKey::Tab, 0), key(BindingKey::Tab, 4)],
+            &[key(BindingKey::Tab, 0)],
+        ),
+        entry(
+            ids::SETTINGS_FOCUS_PREVIOUS,
+            "Focus previous settings area",
+            &[contexts::SETTINGS, contexts::SETTINGS_SEARCH],
+            &[key(BindingKey::Tab, 4)],
         ),
         entry(
             ids::SETTINGS_PREVIOUS_SECTION,
@@ -528,20 +534,20 @@ pub(super) fn entries() -> Vec<ActionSpec> {
         ),
         entry(
             ids::SETTINGS_UP,
-            "Previous setting",
+            "Previous setting or section",
             &[contexts::SETTINGS, contexts::SETTINGS_SEARCH],
             &[key(BindingKey::Up, 0)],
         ),
         entry(
             ids::SETTINGS_DOWN,
-            "Next setting",
+            "Next setting or section",
             &[contexts::SETTINGS, contexts::SETTINGS_SEARCH],
             &[key(BindingKey::Down, 0)],
         ),
         entry(
             ids::SETTINGS_ACTIVATE,
-            "Edit selected setting",
-            &[contexts::SETTINGS],
+            "Enter settings or edit selected setting",
+            &[contexts::SETTINGS, contexts::SETTINGS_SEARCH],
             &[
                 key(BindingKey::Right, 0),
                 key(BindingKey::Enter, 0),
