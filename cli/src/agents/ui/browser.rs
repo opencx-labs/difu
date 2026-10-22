@@ -811,3 +811,53 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+pub(crate) mod shortcut_fixture {
+    use super::super::{Ui, panels};
+    use super::*;
+
+    pub(crate) fn install_browser(ui: &mut Ui) -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let listener = UnixListener::bind(directory.path().join("embed.sock"))?;
+        listener.set_nonblocking(true)?;
+        let browser = Browser {
+            child: ChildGroup::spawn(&mut Command::new("true"))?,
+            engine: None,
+            _directory: directory,
+            listener,
+            stream: None,
+            initialized: true,
+            input: Vec::new(),
+            output: Vec::new(),
+            area: Rect::default(),
+            cell: [8, 16],
+            image: 0,
+            grid: None,
+            error: None,
+            focused: true,
+            visible: true,
+        };
+        ui.panels.view = Some(panels::View::Artifact {
+            path: "/synthetic/shortcut.html".into(),
+            title: "Sample".into(),
+            browser: Some(Box::new(browser)),
+            error: None,
+        });
+        ui.panels.focused = true;
+        Ok(())
+    }
+    pub(crate) fn browser_keys(ui: &Ui) -> Result<Vec<Value>> {
+        let Some(panels::View::Artifact {
+            browser: Some(browser),
+            ..
+        }) = &ui.panels.view
+        else {
+            anyhow::bail!("browser missing");
+        };
+        String::from_utf8_lossy(&browser.output)
+            .lines()
+            .map(|line| serde_json::from_str(line).map_err(Into::into))
+            .collect()
+    }
+}

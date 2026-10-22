@@ -16,6 +16,7 @@ impl Panel {
                 self.capture = Some(action);
                 self.last_shortcut = Some(action);
                 self.testing = false;
+                self.question_test = None;
                 self.error = None;
                 self.notice = Some(format!(
                     "Press a new key for {}. Esc cancels. Ctrl+Enter requires a terminal that reports it distinctly (CSI-u). Shift+Left requires the text-selection override.",
@@ -48,6 +49,9 @@ impl Panel {
     pub(super) fn start_shortcut_test(&mut self) {
         self.capture = None;
         self.testing = true;
+        self.question_test = Some(crate::agents::ui::question_preview::QuestionPreview::new(
+            self.draft.config(),
+        ));
         self.error = None;
         self.notice=Some("Safe draft binding test: press any key. Matches are reported only; no action runs. Esc leaves the test.".into());
     }
@@ -57,6 +61,9 @@ impl Panel {
         }
         if event.kind != KeyEventKind::Press {
             return true;
+        }
+        if let Some(preview) = &mut self.question_test {
+            preview.key(event);
         }
         if event.code == KeyCode::Esc {
             self.capture = None;
@@ -88,6 +95,7 @@ impl Panel {
                         s.label,
                         s.contexts
                             .iter()
+                            .filter(|c| bindings.matches(s.id, **c, event))
                             .map(|c| c.0)
                             .collect::<Vec<_>>()
                             .join(", ")

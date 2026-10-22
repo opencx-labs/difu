@@ -121,5 +121,45 @@ pub(super) fn build() -> Vec<ActionSpec> {
             contexts: vec![contexts::AGENT_SLACK, contexts::AGENT_TWEAKS],
         });
     }
+    // Coding transcripts forward ordinary typing to the composer. Their modified
+    // and navigation defaults remain available, while list-only character aliases
+    // cannot bypass that input ownership (the command slash is composer-owned).
+    for entry in &mut entries {
+        if entry.contexts.contains(&contexts::AGENT_CONVERSATION)
+            && ![
+                ids::SESSION_NEW,
+                ids::SESSION_REFRESH,
+                ids::AGENTS_HELP,
+                ids::CONVERSATION_COMPOSE,
+            ]
+            .contains(&entry.id)
+        {
+            entry.contexts.push(contexts::AGENT_CONVERSATION_INPUT);
+            for binding in &mut entry.defaults {
+                let modifiers = &binding.chord.modifiers;
+                let typing = matches!(binding.chord.key, BindingKey::Character(_))
+                    && !modifiers.control
+                    && !modifiers.alt
+                    && !modifiers.super_key;
+                if binding.contexts.contains(&contexts::AGENT_CONVERSATION)
+                    && (!typing || entry.id == ids::AGENTS_COMMANDS)
+                {
+                    binding.contexts.push(contexts::AGENT_CONVERSATION_INPUT);
+                }
+            }
+        }
+    }
+    // Queue buttons have no Editor; globals must use that exact context rather
+    // than suppressing valid list/button bindings as though text were focused.
+    for entry in &mut entries {
+        if entry.contexts.contains(&contexts::AGENT_QUEUE_EDITOR) {
+            entry.contexts.push(contexts::AGENT_QUEUE_BUTTON);
+            for binding in &mut entry.defaults {
+                if binding.contexts.contains(&contexts::AGENT_QUEUE_EDITOR) {
+                    binding.contexts.push(contexts::AGENT_QUEUE_BUTTON);
+                }
+            }
+        }
+    }
     entries
 }

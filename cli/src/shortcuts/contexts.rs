@@ -2,6 +2,7 @@ use super::Context;
 pub const AGENT_LIST: Context = Context("AgentList");
 pub const AGENT_COMPOSER: Context = Context("AgentComposer");
 pub const AGENT_COMPOSER_PANES: Context = Context("AgentComposerPanes");
+pub const AGENT_CONVERSATION_INPUT: Context = Context("AgentConversationInput");
 pub const AGENT_CONVERSATION: Context = Context("AgentConversation");
 pub const AGENT_CHANGES: Context = Context("AgentChanges");
 pub const AGENT_CHANGE_TREE: Context = Context("AgentChangeTree");
@@ -15,6 +16,7 @@ pub const AGENT_APPROVAL: Context = Context("AgentApproval");
 pub const AGENT_APPROVAL_TEXT: Context = Context("AgentApprovalText");
 pub const AGENT_PENDING: Context = Context("AgentPending");
 pub const AGENT_QUEUE: Context = Context("AgentQueue");
+pub const AGENT_QUEUE_BUTTON: Context = Context("AgentQueueButton");
 pub const AGENT_QUEUE_EDITOR: Context = Context("AgentQueueEditor");
 pub const AGENT_PLAN: Context = Context("AgentPlan");
 pub const AGENT_PLAN_FEEDBACK: Context = Context("AgentPlanFeedback");
@@ -83,6 +85,7 @@ pub const ALL: &[Context] = &[
     AGENT_COMPOSER,
     AGENT_COMPOSER_PANES,
     AGENT_CONVERSATION,
+    AGENT_CONVERSATION_INPUT,
     AGENT_CHANGES,
     AGENT_CHANGE_TREE,
     AGENT_RESOURCES,
@@ -96,6 +99,7 @@ pub const ALL: &[Context] = &[
     AGENT_PENDING,
     AGENT_QUEUE,
     AGENT_QUEUE_EDITOR,
+    AGENT_QUEUE_BUTTON,
     AGENT_PLAN,
     AGENT_PLAN_FEEDBACK,
     AGENT_COMMANDS,

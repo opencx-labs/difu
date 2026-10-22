@@ -286,3 +286,226 @@ fn editing_reservations_preserve_actual_composer_input_from_invalid_stored_globa
     }
     Ok(())
 }
+
+#[test]
+fn agent_globals_use_actual_list_and_modal_editor_contexts() -> Result<()> {
+    use crate::agents::ui::{Focus, Modal};
+    let dir = tempfile::tempdir()?;
+    let storage = Storage {
+        config: dir.path().join("config.json"),
+        cache: dir.path().into(),
+    };
+    let mut config = Config::default();
+    config.preferences.keyboard.bindings.insert(
+        ids::SETTINGS_OPEN.0.into(),
+        key(BindingKey::Character('z'), 0),
+    );
+    let mut shell = Shell::new(storage, config, None);
+    shell.agents_active = true;
+    shell.agents.focus = Focus::List;
+    shell.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+    assert!(
+        shell.settings.is_some(),
+        "list may use a printable custom global"
+    );
+    shell.settings = None;
+    shell.agents.modal = Some(Modal::Rename(crate::editor::Editor::from("name")));
+    shell.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+    assert!(
+        shell.settings.is_none(),
+        "invalid persisted key must not steal rename input"
+    );
+    assert!(matches!(&shell.agents.modal, Some(Modal::Rename(e)) if e.text() == "namez"));
+    Ok(())
+}
+
+#[test]
+fn agent_globals_distinguish_queue_editor_from_its_buttons() -> Result<()> {
+    use crate::agents::{Prompt, ui::Modal};
+    let dir = tempfile::tempdir()?;
+    let storage = Storage {
+        config: dir.path().join("config.json"),
+        cache: dir.path().into(),
+    };
+    let mut config = Config::default();
+    config.preferences.keyboard.bindings.insert(
+        ids::SETTINGS_OPEN.0.into(),
+        key(BindingKey::Character('z'), 0),
+    );
+    let mut shell = Shell::new(storage, config, None);
+    shell.agents_active = true;
+    for focus in [0, 1, 2] {
+        shell.settings = None;
+        shell.agents.modal = Some(Modal::QueuedEdit {
+            index: 0,
+            expected: Prompt::Text("queued".into()),
+            editor: crate::editor::Editor::from("queued"),
+            focus,
+        });
+        shell.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(
+            shell.settings.is_some(),
+            focus != 0,
+            "actual queue field {focus}"
+        );
+        if focus == 0 {
+            assert!(
+                matches!(&shell.agents.modal, Some(Modal::QueuedEdit{editor,..}) if editor.text() == "queuedz")
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn settings_entry_and_cross_client_disable_drop_active_voice_without_losing_draft() -> Result<()> {
+    use crate::agents::ui::Focus;
+    let dir = tempfile::tempdir()?;
+    let storage = Storage {
+        config: dir.path().join("config.json"),
+        cache: dir.path().into(),
+    };
+    let config = Config {
+        voice_enabled: true,
+        ..Default::default()
+    };
+    storage.update_config(|saved| *saved = config.clone())?;
+    let mut shell = Shell::new(storage.clone(), config.clone(), None);
+    shell.agents.selected = Some("one".into());
+    shell.agents.drilled = true;
+    shell.agents.focus = Focus::Composer;
+    shell
+        .agents
+        .positions
+        .entry("one".into())
+        .or_default()
+        .draft = crate::editor::Editor::from("keep draft");
+    let tx = crate::agents::ui::active_dictation(&mut shell.agents)?;
+    shell.open_settings(None);
+    assert!(tx.send(crate::voice::Event::Listening).is_err());
+    assert_eq!(
+        shell
+            .agents
+            .positions
+            .get("one")
+            .ok_or_else(|| anyhow::anyhow!("position"))?
+            .draft
+            .text(),
+        "keep draft"
+    );
+    shell.settings = None;
+    let tx = crate::agents::ui::active_dictation(&mut shell.agents)?;
+    storage.update_config(|saved| saved.preferences.appearance.message_separators = true)?;
+    shell.settings_refreshed = None;
+    shell.refresh_settings();
+    tx.send(crate::voice::Event::Listening)?;
+    storage.update_config(|saved| saved.voice_enabled = false)?;
+    shell.settings_refreshed = None;
+    shell.refresh_settings();
+    assert!(tx.send(crate::voice::Event::Listening).is_err());
+    assert_eq!(
+        shell
+            .agents
+            .positions
+            .get("one")
+            .ok_or_else(|| anyhow::anyhow!("position"))?
+            .draft
+            .text(),
+        "keep draft"
+    );
+    Ok(())
+}
+
+#[test]
+fn invalid_persisted_global_cannot_steal_typing_from_a_coding_transcript() -> Result<()> {
+    use crate::agents::{Job, Launch, Session, ui::Focus};
+    let dir = tempfile::tempdir()?;
+    let storage = Storage {
+        config: dir.path().join("config.json"),
+        cache: dir.path().into(),
+    };
+    let mut config = Config::default();
+    config.preferences.keyboard.bindings.insert(
+        ids::SETTINGS_OPEN.0.into(),
+        key(BindingKey::Character('z'), 0),
+    );
+    let mut shell = Shell::new(storage, config, None);
+    shell.agents_active = true;
+    shell.agents.selected = Some("one".into());
+    shell.agents.sessions.insert(
+        "one".into(),
+        Session::new(
+            "one".into(),
+            Job::Coding(Launch {
+                repository: dir.path().into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: "task".into(),
+                model: None,
+                effort: None,
+            }),
+        ),
+    );
+    shell.agents.drilled = true;
+    shell.agents.focus = Focus::Conversation;
+    shell.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+    assert!(shell.settings.is_none());
+    assert_eq!(shell.agents.focus, Focus::Composer);
+    assert_eq!(
+        shell
+            .agents
+            .positions
+            .get("one")
+            .ok_or_else(|| anyhow::anyhow!("draft"))?
+            .draft
+            .text(),
+        "z"
+    );
+    Ok(())
+}
+
+#[test]
+fn embedded_browser_receives_raw_ctrl_c_instead_of_copy_or_quit() -> Result<()> {
+    for custom in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let mut config = Config::default();
+        if custom {
+            config
+                .preferences
+                .keyboard
+                .bindings
+                .insert(ids::APP_QUIT.0.into(), key(BindingKey::Function(11), 0));
+        }
+        let mut shell = Shell::new(storage, config, None);
+        shell.agents.selected = Some("sample".into());
+        shell.agents.drilled = true;
+        let draft = &mut shell
+            .agents
+            .positions
+            .entry("sample".into())
+            .or_default()
+            .draft;
+        *draft = crate::editor::Editor::from("selected draft");
+        draft.anchor = Some(0);
+        crate::agents::ui::install_browser(&mut shell.agents)?;
+        assert_eq!(
+            shell.agents.shortcut_context(),
+            crate::shortcuts::contexts::AGENT_BROWSER
+        );
+        shell.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(!shell.reviews.quit);
+        assert!(shell.agents.clipboard.is_none());
+        assert_eq!(
+            crate::agents::ui::browser_keys(&shell.agents)?,
+            vec![serde_json::json!({
+                "type":"key", "key":"c", "kind":"press",
+                "mods":{"shift":false,"alt":false,"ctrl":true,"super":false}
+            })]
+        );
+    }
+    Ok(())
+}

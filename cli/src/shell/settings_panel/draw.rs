@@ -332,6 +332,9 @@ impl Panel {
                     )));
                 }
                 lines.push(Line::from("Shift+Left overrides composer text selection only with explicit consent. No session action runs in this preview."));
+                if let Some(preview) = &mut self.question_test {
+                    lines.extend(preview.render(inner.width));
+                }
                 lines
             }
             Preview::Notification => vec![

@@ -5,7 +5,12 @@ pub(super) struct History {
 }
 impl Ui {
     pub(super) fn history_key(&mut self, key: KeyEvent) -> bool {
-        if !key.modifiers.is_empty() || !matches!(key.code, KeyCode::Up | KeyCode::Down) {
+        use crate::shortcuts::ids::{COMPOSER_HISTORY_NEXT, COMPOSER_HISTORY_PREVIOUS};
+        let action = self.shortcut(key);
+        if !matches!(
+            action,
+            Some(COMPOSER_HISTORY_PREVIOUS | COMPOSER_HISTORY_NEXT)
+        ) {
             return false;
         }
         let Some(id) = self.selected.as_ref() else {
@@ -15,7 +20,7 @@ impl Ui {
             return false;
         };
         if position.history.is_none() {
-            if key.code != KeyCode::Up || !position.draft.chars.is_empty() {
+            if action != Some(COMPOSER_HISTORY_PREVIOUS) || !position.draft.chars.is_empty() {
                 return false;
             }
             let mut drafts = self
@@ -42,7 +47,7 @@ impl Ui {
         if let Some(draft) = history.drafts.get_mut(history.index) {
             *draft = position.draft.clone();
         }
-        history.index = if key.code == KeyCode::Up {
+        history.index = if action == Some(COMPOSER_HISTORY_PREVIOUS) {
             history.index.saturating_sub(1)
         } else {
             history

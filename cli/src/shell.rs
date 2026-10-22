@@ -235,7 +235,7 @@ impl Shell {
         } else if self.agents_active && self.agents.browser_input() {
             contexts::AGENT_BROWSER
         } else if self.agents_active {
-            contexts::AGENT_COMPOSER
+            self.agents.shortcut_context()
         } else {
             contexts::REVIEW_CONTENT
         };

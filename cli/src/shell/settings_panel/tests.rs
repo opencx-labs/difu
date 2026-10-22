@@ -1006,3 +1006,76 @@ fn editing_reservations_preserve_settings_field_alt_character_input() -> Result<
     assert!(panel.draft.edited().is_empty());
     Ok(())
 }
+
+#[test]
+fn tester_reports_only_contexts_matching_the_pressed_alias() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut panel = Panel::new(&storage(&dir), Some(Category::Keyboard))?;
+    panel.start_shortcut_test();
+    for (key, label, present, absent) in [
+        ('k', "Move up", "AgentPermissions, AgentMcp", "AgentList"),
+        (' ', "Previous page", "ReviewHome", "AgentList"),
+        ('c', "Copy selection", "AgentChanges", "AgentComposer"),
+    ] {
+        panel.shortcut_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE));
+        let notice = panel.notice.as_deref().context("notice")?;
+        // Space's action is Next page, not Previous page.
+        let label = if key == ' ' { "Next page" } else { label };
+        let matched = notice
+            .split("; ")
+            .find(|entry| entry.contains(label))
+            .context("action result")?;
+        assert!(matched.contains(present), "{matched}");
+        assert!(!matched.contains(absent), "{matched}");
+    }
+    Ok(())
+}
+
+#[test]
+fn tester_opens_real_synthetic_question_with_draft_binding_without_sending() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    let mut panel = Panel::new(&storage, Some(Category::Keyboard))?;
+    panel.query = "change question key".into();
+    panel.draft.set(
+        SettingId::Shortcut("question.open".into()),
+        SettingValue::Shortcut(Some(crate::shortcuts::key(BindingKey::Function(8), 0))),
+    )?;
+    panel.start_shortcut_test();
+    panel.shortcut_key(KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE));
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 55))?;
+    terminal.draw(|frame| panel.draw(frame))?;
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(
+        text.contains("Which sample scope should be used?"),
+        "{text}"
+    );
+    for event in [
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL),
+        KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+    ] {
+        panel.shortcut_key(event);
+    }
+    terminal.draw(|frame| panel.draw(frame))?;
+    let text = terminal
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(
+        text.contains("Which sample scope should be used?"),
+        "{text}"
+    );
+    assert!(!storage.config.exists());
+    assert!(!panel.draft.edited().is_empty());
+    Ok(())
+}

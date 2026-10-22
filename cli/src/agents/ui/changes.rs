@@ -715,7 +715,16 @@ impl Ui {
                     format!(
                         "PR {}{}",
                         key.id(),
-                        if multiple { " · [ / ] switch PR" } else { "" }
+                        if multiple {
+                            let bindings = crate::shortcuts::Bindings::new(&self.shortcut_config);
+                            format!(
+                                " · {} / {} switch PR",
+                                bindings.hint(crate::shortcuts::ids::CHANGES_PREVIOUS_PR),
+                                bindings.hint(crate::shortcuts::ids::CHANGES_NEXT_PR)
+                            )
+                        } else {
+                            String::new()
+                        }
                     )
                 },
             ),
@@ -1347,5 +1356,79 @@ mod tests {
                 .iter()
                 .any(|file| file.patch.contains("rename from"))
         );
+    }
+}
+
+#[cfg(test)]
+mod shortcut_tests {
+    use super::*;
+    use crate::{
+        settings::BindingKey,
+        shortcuts::{ids, key},
+    };
+    use anyhow::{Context, Result};
+    #[test]
+    fn remapped_navigation_replaces_clamped_source_intent_while_copy_retains_it() -> Result<()> {
+        for action in [
+            ids::NAVIGATION_FIRST,
+            ids::NAVIGATION_UP,
+            ids::SELECTION_COPY,
+        ] {
+            let (mut ui, _dir, mut config) = super::super::shortcut_tests::fixture(None)?;
+            config
+                .preferences
+                .keyboard
+                .bindings
+                .insert(action.0.into(), key(BindingKey::Function(12), 0));
+            ui.apply_settings(&config);
+            ui.focus = Focus::Changes;
+            ui.changes_visible = true;
+            let source = "long context ".repeat(30);
+            let mut document = Document::from(format!(
+                "diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n@@ -1,3 +1,3 @@\n {source}\n-old\n+new\n after\n"
+            ));
+            let position = ui.positions.get_mut("one").context("position")?;
+            let mut code = crate::settings::Code::default();
+            let rows = document.reflow(position, 50, true, true, &code);
+            let first = rows
+                .iter()
+                .position(|r| {
+                    r.source
+                        .as_ref()
+                        .is_some_and(|(_, s)| s.starts_with("long context"))
+                })
+                .context("context")?;
+            position.changes = first + 4;
+            position.selection = Some(first);
+            let initial = position.changes;
+            document.reflow(position, 50, true, true, &code);
+            code.context_lines = 0;
+            let rows = document.reflow(position, 50, false, false, &code);
+            assert!(position.changes < initial);
+            ui.change_lines = rows.len();
+            ui.change_rows = rows;
+            ui.changes.insert("one".into(), document);
+            ui.key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+            let document = ui.changes.get_mut("one").context("document")?;
+            if action == ids::SELECTION_COPY {
+                assert_eq!(ui.clipboard.as_deref(), Some(source.as_str()));
+                assert!(document.reading.is_some());
+            } else {
+                assert!(
+                    document.reading.is_none(),
+                    "semantic navigation must discard old reading intent"
+                );
+            }
+            code.context_lines = 3;
+            let position = ui.positions.get_mut("one").context("position")?;
+            document.reflow(position, 50, true, true, &code);
+            if action == ids::SELECTION_COPY {
+                assert_eq!(position.changes, initial);
+                assert_eq!(position.selection, Some(first));
+            } else {
+                assert_ne!(position.changes, initial);
+            }
+        }
+        Ok(())
     }
 }

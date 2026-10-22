@@ -4,6 +4,15 @@ use super::*;
 impl Ui {
     /// Apply committed preference fields without replacing session, composer or viewport state.
     pub(crate) fn apply_settings(&mut self, config: &Config) {
+        use crate::shortcuts::{Bindings, contexts, ids};
+        if !config.voice_enabled
+            || Bindings::new(&self.shortcut_config)
+                .effective(ids::VOICE_HOLD, contexts::AGENT_COMPOSER)
+                != Bindings::new(config).effective(ids::VOICE_HOLD, contexts::AGENT_COMPOSER)
+        {
+            self.cancel_voice();
+        }
+        self.shortcut_config = config.clone();
         self.preferences = config.preferences.clone();
         self.pinned_sessions = config.pinned_sessions.clone();
         self.session_order = config.session_order.clone();

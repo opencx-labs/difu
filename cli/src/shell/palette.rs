@@ -489,7 +489,7 @@ impl Shell {
         }
         for (index, label) in self.agents.menu_entries().into_iter().enumerate() {
             items.push(Item {
-                title: label.into(),
+                title: label.clone(),
                 detail: self
                     .agents
                     .selected

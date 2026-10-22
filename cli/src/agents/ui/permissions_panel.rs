@@ -150,7 +150,7 @@ fn readable_error(error: &str) -> String {
         format!("{first} · r retry")
     }
 }
-pub(super) fn composer_status(session: &Session) -> Line<'static> {
+pub(super) fn composer_status(session: &Session, binding: &str) -> Line<'static> {
     let state = &session.permission_state;
     let mut spans = vec![Span::styled(
         mode_label(state.mode.as_deref(), session.provider).to_owned(),
@@ -210,7 +210,7 @@ pub(super) fn composer_status(session: &Session) -> Line<'static> {
         ));
     }
     spans.push(Span::styled(
-        "  Shift+Tab · /permissions",
+        format!("  {binding} · /permissions"),
         Style::default().fg(DIM),
     ));
     Line::from(spans)
@@ -428,6 +428,20 @@ impl State {
             Err(error) => self.error = Some(error),
         }
         self.preserve_form = false;
+    }
+    pub(super) fn shortcut_context(&self) -> crate::shortcuts::Context {
+        use crate::shortcuts::contexts::*;
+        if let Some(form) = &self.form {
+            if form.delete {
+                AGENT_PERMISSION_DELETE
+            } else {
+                AGENT_PERMISSION_FORM
+            }
+        } else if self.searching {
+            AGENT_PERMISSION_SEARCH
+        } else {
+            AGENT_PERMISSIONS
+        }
     }
     pub(super) fn editor(&self) -> Option<&Editor> {
         self.form
@@ -1399,11 +1413,11 @@ mod tests {
         session.permission_state.reload_pending = true;
         session.status = Status::Failed;
         session.error = Some("Provider turn failed".into());
-        let failed = composer_status(&session).to_string();
+        let failed = composer_status(&session, "Shift+Tab").to_string();
         assert!(failed.starts_with("Manual · Turn failed"));
         assert!(!failed.contains("reconnect") && !failed.contains("switching"));
         session.status = Status::Interrupted;
-        let interrupted = composer_status(&session);
+        let interrupted = composer_status(&session, "Shift+Tab");
         assert!(interrupted.to_string().starts_with("Manual · Interrupted"));
         assert!(
             !interrupted.to_string().contains("reconnect")
@@ -1418,14 +1432,14 @@ mod tests {
         session.status = Status::Waiting;
         session.error = None;
         assert!(
-            composer_status(&session)
+            composer_status(&session, "Shift+Tab")
                 .to_string()
                 .contains("switching to Bypass…")
         );
         session.status = Status::Failed;
         session.error = Some("channel is empty and sending half is closed".into());
         assert!(
-            composer_status(&session)
+            composer_status(&session, "Shift+Tab")
                 .to_string()
                 .contains("reconnect needed")
         );
@@ -1481,7 +1495,7 @@ mod tests {
         session.permission_state.mode = Some("auto".into());
         session.permission_state.pending_mode = Some("bypassPermissions".into());
         session.permission_state.reload_pending = true;
-        let composer = composer_status(&session).to_string();
+        let composer = composer_status(&session, "Shift+Tab").to_string();
         assert!(composer.contains("Auto") && composer.contains("reconnect needed"));
         assert!(!composer.contains("switching") && !composer.contains("pending"));
         ui.sessions.insert("one".into(), session);

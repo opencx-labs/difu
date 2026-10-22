@@ -17,6 +17,7 @@ mod permissions_panel;
 mod plan_prompt;
 mod prompt;
 mod prs;
+pub(crate) mod question_preview;
 mod questions;
 mod remote_control;
 mod reveal;
@@ -25,6 +26,9 @@ mod selection;
 mod sends;
 mod settings;
 pub(crate) mod settings_preview;
+#[cfg(test)]
+mod shortcut_tests;
+mod shortcuts;
 mod sidebar;
 mod slack;
 mod themes;
@@ -33,6 +37,10 @@ mod transcript_window;
 mod tweaks;
 mod usage;
 mod voice;
+#[cfg(test)]
+pub(crate) use browser::shortcut_fixture::{browser_keys, install_browser};
+#[cfg(test)]
+pub(crate) use voice::tests::active_dictation;
 mod watch;
 use crate::{
     editor::Editor,
@@ -330,6 +338,7 @@ enum Task {
 
 pub struct Ui {
     pub(crate) preferences: crate::settings::Preferences,
+    shortcut_config: Config,
     pub(crate) settings_requested: Option<crate::settings::Category>,
     panels: panels::Panels,
     prs: prs::State,
@@ -418,6 +427,7 @@ impl Ui {
         let (sender, receiver) = mpsc::channel();
         Self {
             preferences: config.preferences.clone(),
+            shortcut_config: config.clone(),
             panels: panels::Panels::new(
                 config.preferences.layout.helper(config.agent_panel_right)
                     != crate::settings::HelperPlacement::Main,
@@ -1238,7 +1248,7 @@ impl Ui {
             true,
         );
     }
-    pub(crate) fn menu_entries(&self) -> Vec<&'static str> {
+    pub(crate) fn menu_entries(&self) -> Vec<String> {
         let archived = self
             .sessions
             .get(self.selected.as_deref().unwrap_or_default())
@@ -1280,7 +1290,29 @@ impl Ui {
         if self.plan_available() {
             entries.push("Review completed plan");
         }
+        use crate::shortcuts::{Bindings, ids::*};
+        let bindings = Bindings::new(&self.shortcut_config);
         entries
+            .into_iter()
+            .map(|label| {
+                let replacement = match label {
+                    "Change model / reasoning · Alt+M" => {
+                        Some(("Change model / reasoning", AGENTS_MODELS))
+                    }
+                    "Toggle agents list · Alt+[" => Some(("Toggle agents list", AGENTS_SIDEBAR)),
+                    "Toggle Changes · Alt+D" => Some(("Toggle Changes", AGENTS_CHANGES)),
+                    "Pending questions · Alt+↑" => Some(("Pending questions", QUESTION_OPEN)),
+                    "Permissions and mode · Shift+Tab" => {
+                        Some(("Permissions and mode", COMPOSER_PERMISSION_MODE))
+                    }
+                    _ => None,
+                };
+                replacement.map_or_else(
+                    || label.into(),
+                    |(label, id)| format!("{label} · {}", bindings.hint(id)),
+                )
+            })
+            .collect()
     }
     pub(crate) fn menu_action(&mut self, index: usize) {
         match index {
@@ -1603,8 +1635,9 @@ impl Ui {
             self.voice_key(key);
             return;
         }
+        use crate::shortcuts::ids::*;
         if self.focus == Focus::Changes
-            && matches!(key.code, KeyCode::Home | KeyCode::End)
+            && matches!(self.shortcut(key), Some(NAVIGATION_FIRST | NAVIGATION_LAST))
             && let Some(document) = self
                 .selected
                 .as_ref()
@@ -1627,20 +1660,13 @@ impl Ui {
         {
             self.typing_focus();
         }
-        if key.code == KeyCode::Char('c')
-            && key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        if ((key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL)
+            || self.shortcut(key) == Some(SELECTION_COPY))
             && self.copy_chat_selection()
         {
             return;
         }
-
-        if key.code == KeyCode::Char('c')
-            && key.modifiers.contains(KeyModifiers::SUPER)
-            && let Some(editor) = self.focused_editor()
-        {
-            self.clipboard = editor.selected_text();
+        if self.shortcut(key) == Some(SELECTION_COPY) && self.focused_editor().is_some() {
             return;
         }
         if matches!(self.modal, Some(Modal::Plan(_))) {
@@ -1653,16 +1679,16 @@ impl Ui {
         if self.voice_key(key) {
             return;
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('[') {
+        let shortcut = self.shortcut(key);
+        if shortcut == Some(AGENTS_SIDEBAR) {
             self.toggle_list();
             return;
         }
-        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('d') {
+        if shortcut == Some(AGENTS_CHANGES) {
             self.toggle_changes();
             return;
         }
-        if key.modifiers == KeyModifiers::ALT && key.code == KeyCode::Char('m') {
+        if shortcut == Some(AGENTS_MODELS) {
             if matches!(self.modal, Some(Modal::ModelPicker(_))) {
                 self.modal = None;
             } else {
@@ -1670,7 +1696,7 @@ impl Ui {
             }
             return;
         }
-        if key.code == KeyCode::Up && key.modifiers.contains(KeyModifiers::ALT) {
+        if self.shortcut(key) == Some(crate::shortcuts::ids::QUESTION_OPEN) {
             self.open_questions();
             return;
         }
@@ -1680,19 +1706,17 @@ impl Ui {
             return;
         }
         if self.focus == Focus::List
-            && key.modifiers == KeyModifiers::CONTROL
-            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+            && matches!(shortcut, Some(SESSION_REORDER_UP | SESSION_REORDER_DOWN))
         {
-            self.reorder_session(key.code == KeyCode::Down);
+            self.reorder_session(shortcut == Some(SESSION_REORDER_DOWN));
             return;
         }
         if self.drilled
-            && key.modifiers == KeyModifiers::SUPER
-            && matches!(key.code, KeyCode::Up | KeyCode::Down)
+            && matches!(shortcut, Some(CONVERSATION_PREVIOUS | CONVERSATION_NEXT))
             && matches!(self.focus, Focus::Composer | Focus::Conversation)
         {
             if self.focus == Focus::Composer {
-                if key.code == KeyCode::Up {
+                if shortcut == Some(CONVERSATION_PREVIOUS) {
                     self.focus = Focus::Conversation;
                     if let Some(p) = self
                         .selected
@@ -1711,23 +1735,26 @@ impl Ui {
                     }
                 }
             } else {
-                self.move_transcript(key.code == KeyCode::Down);
+                self.move_transcript(shortcut == Some(CONVERSATION_NEXT));
             }
             return;
         }
         if self.focus == Focus::List
-            && key.code == KeyCode::Enter
+            && shortcut == Some(NAVIGATION_ACTIVATE)
             && !self.orchestrator_list
             && self.selected.as_deref() == Some(super::orchestrator::ID)
         {
             self.open_orchestrator_list();
             return;
         }
-        if self.orchestrator_list && !self.drilled && key.code == KeyCode::Esc {
+        if self.orchestrator_list && !self.drilled && shortcut == Some(AGENTS_BACK) {
             self.close_orchestrator_list();
             return;
         }
-        if self.changes_visible && self.drilled && key.code == KeyCode::Esc {
+        if self.changes_visible
+            && self.drilled
+            && matches!(shortcut, Some(AGENTS_BACK | CONVERSATION_INTERRUPT))
+        {
             self.toggle_changes();
             return;
         }
@@ -1735,13 +1762,12 @@ impl Ui {
             && self.drilled
             && !self.panels.focused
             && matches!(self.focus, Focus::Changes | Focus::ChangeTree)
-            && key.modifiers.is_empty()
-            && matches!(key.code, KeyCode::Char('[' | ']'))
+            && matches!(shortcut, Some(CHANGES_PREVIOUS_PR | CHANGES_NEXT_PR))
         {
-            self.cycle_change_pr(key.code == KeyCode::Char(']'));
+            self.cycle_change_pr(shortcut == Some(CHANGES_NEXT_PR));
             return;
         }
-        if key.code == KeyCode::Esc
+        if shortcut == Some(CONVERSATION_INTERRUPT)
             && self.drilled
             && matches!(self.focus, Focus::Composer | Focus::Conversation)
             && let Some(session) = self.selected.as_ref().and_then(|id| self.sessions.get(id))
@@ -1761,32 +1787,39 @@ impl Ui {
                 return;
             }
         }
-        if matches!(key.code, KeyCode::Up | KeyCode::Down)
-            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SUPER)
-            && self.step_change_file(key.code == KeyCode::Down)
-        {
+        if matches!(
+            shortcut,
+            Some(NAVIGATION_UP | NAVIGATION_DOWN | NAVIGATION_FAST_UP | NAVIGATION_FAST_DOWN)
+        ) && self.step_change_file(matches!(
+            shortcut,
+            Some(NAVIGATION_DOWN | NAVIGATION_FAST_DOWN)
+        )) {
             return;
         }
         if self.focus == Focus::ChangeTree && self.changes_visible {
-            match key.code {
-                KeyCode::Enter => {
+            match shortcut {
+                Some(NAVIGATION_ACTIVATE) => {
                     self.focus = Focus::Changes;
                     return;
                 }
-                KeyCode::Left | KeyCode::Right => {
+                Some(NAVIGATION_LEFT | NAVIGATION_RIGHT) => {
                     if let Some(p) = self
                         .selected
                         .as_ref()
                         .and_then(|id| self.positions.get_mut(id))
                     {
-                        p.change_tree_horizontal = p
-                            .change_tree_horizontal
-                            .saturating_add_signed(if key.code == KeyCode::Left { -4 } else { 4 });
+                        p.change_tree_horizontal = p.change_tree_horizontal.saturating_add_signed(
+                            if shortcut == Some(NAVIGATION_LEFT) {
+                                -4
+                            } else {
+                                4
+                            },
+                        );
                     }
                     return;
                 }
-                KeyCode::Home | KeyCode::End => {
-                    self.move_change_tree(if key.code == KeyCode::Home {
+                Some(NAVIGATION_FIRST | NAVIGATION_LAST) => {
+                    self.move_change_tree(if shortcut == Some(NAVIGATION_FIRST) {
                         i32::MIN
                     } else {
                         i32::MAX
@@ -1797,8 +1830,7 @@ impl Ui {
             }
         }
         if self.focus == Focus::Composer && self.drilled {
-            if key.code == KeyCode::BackTab
-                && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)
+            if shortcut == Some(COMPOSER_PERMISSION_MODE)
                 && !self.changes_visible
                 && !self.panels.focused
                 && !self.question_panel()
@@ -1806,8 +1838,7 @@ impl Ui {
                 self.cycle_permission_mode();
                 return;
             }
-            if key.modifiers.is_empty()
-                && key.code == KeyCode::Right
+            if shortcut == Some(COMPOSER_SUGGESTION)
                 && let Some(suggestion) = self.composer_suggestion().map(str::to_owned)
                 && let Some(id) = self.selected.clone()
             {
@@ -1821,11 +1852,7 @@ impl Ui {
             if self.history_key(key) {
                 return;
             }
-            if key.code == KeyCode::Char('v')
-                && key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
-            {
+            if shortcut == Some(COMPOSER_ATTACH) {
                 if self
                     .selected
                     .as_ref()
@@ -1837,10 +1864,7 @@ impl Ui {
                 self.attach(None);
                 return;
             }
-            if matches!(key.code, KeyCode::Char('$' | '@'))
-                && !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+            if matches!(shortcut, Some(COMPOSER_SKILLS | COMPOSER_PATHS))
                 && self
                     .selected
                     .as_ref()
@@ -1853,15 +1877,15 @@ impl Ui {
                                 .is_some_and(|c| c.is_whitespace())
                     })
             {
-                if key.code == KeyCode::Char('@') {
+                if shortcut == Some(COMPOSER_PATHS) {
                     self.open_paths();
                 } else {
                     self.open_commands(true);
                 }
                 return;
             }
-            match key.code {
-                KeyCode::Char('/')
+            match shortcut {
+                Some(AGENTS_COMMANDS)
                     if self
                         .selected
                         .as_ref()
@@ -1870,14 +1894,21 @@ impl Ui {
                 {
                     self.open_commands(false)
                 }
-                KeyCode::Esc => {
+                Some(CONVERSATION_INTERRUPT) => {
                     self.drilled = false;
                     self.focus = Focus::List;
                 }
-                KeyCode::Tab | KeyCode::BackTab => self.cycle_focus(key.code == KeyCode::BackTab),
-                KeyCode::Enter if ctrl => self.send(true),
-                KeyCode::Enter if !key.modifiers.contains(KeyModifiers::SHIFT) => {
-                    self.send_primary()
+                Some(
+                    NAVIGATION_NEXT_FOCUS
+                    | NAVIGATION_NEXT_FOCUS_COMPOSER
+                    | NAVIGATION_PREVIOUS_FOCUS,
+                ) => self.cycle_focus(shortcut == Some(NAVIGATION_PREVIOUS_FOCUS)),
+                Some(COMPOSER_QUEUE) => self.send(true),
+                Some(COMPOSER_SEND) => self.send_primary(),
+                Some(COMPOSER_NEWLINE) => {
+                    if let Some(id) = self.selected.clone() {
+                        self.positions.entry(id).or_default().draft.insert("\n");
+                    }
                 }
                 _ => {
                     if let Some(id) = self.selected.clone() {
@@ -1887,26 +1918,26 @@ impl Ui {
             }
             return;
         }
-        match key.code {
-            KeyCode::Char('n') => self.launch(),
-            KeyCode::Char('/') if self.drilled && self.focus != Focus::List => {
+        match shortcut {
+            Some(SESSION_NEW) => self.launch(),
+            Some(AGENTS_COMMANDS) if self.drilled && self.focus != Focus::List => {
                 self.open_commands(false)
             }
-            KeyCode::Char('/') => {
+            Some(AGENTS_COMMANDS) => {
                 self.modal = Some(Modal::Menu {
                     query: Editor::default(),
                     selected: 0,
                 })
             }
-            KeyCode::Char('?') => self.modal = Some(Modal::Help(Default::default())),
-            KeyCode::Char('r') => {
+            Some(AGENTS_HELP) => self.modal = Some(Modal::Help(Default::default())),
+            Some(SESSION_REFRESH) => {
                 self.refreshed = None;
                 self.changes_at = None;
                 if let Some(id) = &self.selected {
                     self.prs.refresh(id);
                 }
             }
-            KeyCode::Enter
+            Some(NAVIGATION_ACTIVATE)
                 if self.drilled
                     && self.focus == Focus::Conversation
                     && self
@@ -1924,7 +1955,7 @@ impl Ui {
                     self.action(Action::ToggleEntry(entry));
                 }
             }
-            KeyCode::Enter if self.changes_visible && self.focus == Focus::List => {
+            Some(NAVIGATION_ACTIVATE) if self.changes_visible && self.focus == Focus::List => {
                 if self.selected.is_some() {
                     self.follow_latest();
                     self.drilled = true;
@@ -1932,13 +1963,13 @@ impl Ui {
                     self.changes_at = None;
                 }
             }
-            KeyCode::Char('i') | KeyCode::Enter if self.drilled => {
+            Some(CONVERSATION_COMPOSE | NAVIGATION_ACTIVATE) if self.drilled => {
                 if self.focus == Focus::List {
                     self.follow_latest();
                 }
                 self.focus = Focus::Composer;
             }
-            KeyCode::Enter => {
+            Some(NAVIGATION_ACTIVATE) => {
                 if self.selected.is_some() {
                     self.follow_latest();
                     self.drilled = true;
@@ -1946,19 +1977,34 @@ impl Ui {
                     self.changes_at = None;
                 }
             }
-            KeyCode::Esc => {
+            Some(AGENTS_BACK | CONVERSATION_INTERRUPT) => {
                 self.drilled = false;
                 self.focus = Focus::List;
             }
-            KeyCode::Tab | KeyCode::BackTab => self.cycle_focus(key.code == KeyCode::BackTab),
-            KeyCode::Up | KeyCode::Down if self.focus == Focus::Conversation => {
-                self.move_transcript(key.code == KeyCode::Down);
+            Some(NAVIGATION_NEXT_FOCUS | NAVIGATION_PREVIOUS_FOCUS) => {
+                self.cycle_focus(shortcut == Some(NAVIGATION_PREVIOUS_FOCUS))
             }
-            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown => {
-                let down = matches!(key.code, KeyCode::Down | KeyCode::PageDown);
-                let amount = if matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+            Some(NAVIGATION_UP | NAVIGATION_DOWN) if self.focus == Focus::Conversation => {
+                self.move_transcript(shortcut == Some(NAVIGATION_DOWN));
+            }
+            Some(
+                NAVIGATION_UP | NAVIGATION_DOWN | NAVIGATION_PAGE_UP | NAVIGATION_PAGE_DOWN
+                | NAVIGATION_FAST_UP | NAVIGATION_FAST_DOWN | CHANGES_SELECT_UP
+                | CHANGES_SELECT_DOWN,
+            ) => {
+                let down = matches!(
+                    shortcut,
+                    Some(
+                        NAVIGATION_DOWN
+                            | NAVIGATION_PAGE_DOWN
+                            | NAVIGATION_FAST_DOWN
+                            | CHANGES_SELECT_DOWN
+                    )
+                );
+                let amount = if matches!(shortcut, Some(NAVIGATION_PAGE_UP | NAVIGATION_PAGE_DOWN))
+                {
                     self.viewport.max(1)
-                } else if key.modifiers.contains(KeyModifiers::SUPER) {
+                } else if matches!(shortcut, Some(NAVIGATION_FAST_UP | NAVIGATION_FAST_DOWN)) {
                     10
                 } else {
                     1
@@ -1969,18 +2015,22 @@ impl Ui {
                     } else {
                         -(amount as i32)
                     },
-                    key.modifiers.contains(KeyModifiers::SHIFT),
+                    matches!(shortcut, Some(CHANGES_SELECT_UP | CHANGES_SELECT_DOWN)),
                 );
             }
-            KeyCode::Left | KeyCode::Right if self.focus == Focus::Changes => {
+            Some(NAVIGATION_LEFT | NAVIGATION_RIGHT) if self.focus == Focus::Changes => {
                 if let Some(id) = self.selected.clone() {
                     let p = self.positions.entry(id).or_default();
-                    p.horizontal = p
-                        .horizontal
-                        .saturating_add_signed(if key.code == KeyCode::Left { -4 } else { 4 });
+                    p.horizontal =
+                        p.horizontal
+                            .saturating_add_signed(if shortcut == Some(NAVIGATION_LEFT) {
+                                -4
+                            } else {
+                                4
+                            });
                 }
             }
-            KeyCode::End => {
+            Some(NAVIGATION_LAST) => {
                 self.text_selection.clear();
                 if let Some(id) = self.selected.clone() {
                     let p = self.positions.entry(id).or_default();
@@ -1995,7 +2045,7 @@ impl Ui {
                     }
                 }
             }
-            KeyCode::Home => {
+            Some(NAVIGATION_FIRST) => {
                 if let Some(id) = self.selected.clone() {
                     let p = self.positions.entry(id).or_default();
                     if self.focus == Focus::Changes {
@@ -2009,7 +2059,7 @@ impl Ui {
                     }
                 }
             }
-            KeyCode::Char('c') if self.focus == Focus::Changes => self.copy_change(),
+            Some(SELECTION_COPY) if self.focus == Focus::Changes => self.copy_change(),
             _ => {}
         }
     }
@@ -3735,7 +3785,11 @@ impl Ui {
                 || format!("{question_count} question(s)"),
                 |index| format!("{} of {question_count} questions", index + 1),
             );
-            let header = format!("{questions} · {approval_count} approval(s) · Alt+↑ Questions");
+            let header = format!(
+                "{questions} · {approval_count} approval(s) · {} Questions",
+                crate::shortcuts::Bindings::new(&self.shortcut_config)
+                    .hint(crate::shortcuts::ids::QUESTION_OPEN)
+            );
             self.button(
                 frame,
                 Rect::new(area.x, body.bottom() + activity_height, area.width, 1),
@@ -3803,7 +3857,11 @@ impl Ui {
             let status_y = composer.bottom().saturating_sub(1);
             if let Some(session) = self.sessions.get(&id) {
                 frame.render_widget(
-                    Paragraph::new(permissions_panel::composer_status(session)),
+                    Paragraph::new(permissions_panel::composer_status(
+                        session,
+                        &crate::shortcuts::Bindings::new(&self.shortcut_config)
+                            .hint(crate::shortcuts::ids::COMPOSER_PERMISSION_MODE),
+                    )),
                     Rect::new(
                         composer.x.saturating_add(1),
                         status_y,
@@ -3870,7 +3928,11 @@ impl Ui {
             self.button(
                 frame,
                 Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
-                "Enter · Open session",
+                &format!(
+                    "{} · Open session",
+                    crate::shortcuts::Bindings::new(&self.shortcut_config)
+                        .hint(crate::shortcuts::ids::NAVIGATION_ACTIVATE)
+                ),
                 Action::Open,
                 false,
             );
@@ -4153,7 +4215,7 @@ impl Ui {
                     &state.query,
                     true,
                 );
-                let help = agent_help(&state.query.text());
+                let help = agent_help(&state.query.text(), &self.shortcut_config);
                 let lines = help
                     .into_iter()
                     .flat_map(|(key, desc)| wrapped(&format!("{key:22} {desc}"), area.width))
@@ -4367,7 +4429,15 @@ impl Ui {
         }
     }
 }
-fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
+fn agent_help(query: &str, config: &Config) -> Vec<(String, &'static str)> {
+    use crate::shortcuts::{Bindings, ids::*};
+    let bindings = Bindings::new(config);
+    let hints = |ids: &[crate::shortcuts::ActionId]| {
+        ids.iter()
+            .map(|id| bindings.hint(*id))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    };
     let query = query.to_lowercase();
     [
         ("⌥+1 / ⌥+2", "Switch Agents / Reviews"),
@@ -4396,7 +4466,7 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
         ),
         (
             "Tab / Shift+Tab",
-            "Cycle visible panes; Shift+Tab in composer changes permission mode",
+            "Cycle visible panes; composer permission mode has its own shortcut",
         ),
         ("Drag · Ctrl+C / Cmd+C", "Select and copy conversation text"),
         (
@@ -4416,7 +4486,7 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
         ),
         (
             "Enter in composer",
-            "Send message; steer active turn immediately",
+            "Send message using the configured running-turn behavior",
         ),
         (
             "Ctrl+Enter",
@@ -4429,7 +4499,7 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
         ("Ctrl+]", "Skip the current question without answering"),
         (
             "n (question choice)",
-            "Add a note beneath the selected answer; Enter submits both",
+            "Add a note beneath the selected answer; submitting sends both",
         ),
         (
             "/ · $ · @",
@@ -4485,6 +4555,57 @@ fn agent_help(query: &str) -> Vec<(&'static str, &'static str)> {
         ),
     ]
     .into_iter()
+    .map(|(key, description)| {
+        let key = match key {
+            "⌥+1 / ⌥+2" => hints(&[SHELL_AGENTS, SHELL_REVIEWS]),
+            "n" => hints(&[SESSION_NEW]),
+            "↑ / ↓" if description.starts_with("Up in") => {
+                hints(&[COMPOSER_HISTORY_PREVIOUS, COMPOSER_HISTORY_NEXT])
+            }
+            "↑ / ↓" => hints(&[NAVIGATION_UP, NAVIGATION_DOWN]),
+            "Enter on a tool" => hints(&[NAVIGATION_ACTIVATE]),
+            "PageUp / PageDown / wheel" => format!(
+                "{} / wheel",
+                hints(&[NAVIGATION_PAGE_UP, NAVIGATION_PAGE_DOWN])
+            ),
+            "Enter / Esc" => hints(&[NAVIGATION_ACTIVATE, CONVERSATION_INTERRUPT]),
+            "Cmd+K" => hints(&[PALETTE_OPEN]),
+            "Ctrl+↑ / ↓ in sessions" => hints(&[SESSION_REORDER_UP, SESSION_REORDER_DOWN]),
+            "Tab / Shift+Tab" => hints(&[NAVIGATION_NEXT_FOCUS, NAVIGATION_PREVIOUS_FOCUS]),
+            "Drag · Ctrl+C / Cmd+C" => format!("Drag · Ctrl+C / {}", hints(&[SELECTION_COPY])),
+            "Ctrl+V / Cmd+V" => hints(&[COMPOSER_ATTACH]),
+            "Alt+[" => hints(&[AGENTS_SIDEBAR]),
+            "Alt+D" => hints(&[AGENTS_CHANGES]),
+            "Alt+M" => hints(&[AGENTS_MODELS]),
+            "Enter in composer" => hints(&[COMPOSER_SEND]),
+            "Ctrl+Enter" => format!("{} / Ctrl+Enter answers", hints(&[COMPOSER_QUEUE])),
+            "Alt+↑ / ↓" => hints(&[QUESTION_OPEN, QUESTION_PREVIOUS, QUESTION_NEXT]),
+            "Ctrl+]" => hints(&[QUESTION_SKIP]),
+            "n (question choice)" => hints(&[QUESTION_NOTE]),
+            "/ · $ · @" => hints(&[AGENTS_COMMANDS, COMPOSER_SKILLS, COMPOSER_PATHS]),
+            "Shift+Enter" => hints(&[COMPOSER_NEWLINE]),
+            "Shift+Tab (composer)" => hints(&[COMPOSER_PERMISSION_MODE]),
+            "Hold Space" => format!("Hold {}", hints(&[VOICE_HOLD])),
+            "Cmd+A / Cmd+C" => format!("Cmd+A / {}", hints(&[SELECTION_COPY])),
+            "i" => hints(&[CONVERSATION_COMPOSE]),
+            "/" => hints(&[AGENTS_COMMANDS]),
+            "r" => hints(&[SESSION_REFRESH]),
+            "← / →" => hints(&[NAVIGATION_LEFT, NAVIGATION_RIGHT]),
+            "Cmd+↑ / ↓" => hints(&[
+                CONVERSATION_PREVIOUS,
+                CONVERSATION_NEXT,
+                NAVIGATION_FAST_UP,
+                NAVIGATION_FAST_DOWN,
+            ]),
+            "Shift+↑ / ↓" => hints(&[CHANGES_SELECT_UP, CHANGES_SELECT_DOWN]),
+            "c / Cmd+C" => hints(&[SELECTION_COPY]),
+            "Home / End" => hints(&[NAVIGATION_FIRST, NAVIGATION_LAST]),
+            "?" => hints(&[AGENTS_HELP]),
+            "Ctrl+C" => format!("Ctrl+C copy / {} exit", hints(&[APP_QUIT])),
+            _ => key.into(),
+        };
+        (key, description)
+    })
     .filter(|(key, description)| {
         format!("{key} {description}")
             .to_lowercase()
@@ -8611,7 +8732,7 @@ mod tests {
         assert!(
             screen
                 .lines()
-                .any(|line| line.contains("1 of 3") && line.contains("Alt+↑ Questions"))
+                .any(|line| line.contains("1 of 3") && line.contains("Alt+Up Questions"))
         );
         let header_row = ui
             .hits

@@ -345,19 +345,19 @@ impl Ui {
         }
     }
     pub(super) fn question_key(&mut self, key: KeyEvent) -> bool {
+        use crate::shortcuts::ids::*;
+        let action = self.shortcut(key);
         if !self.inline_question() {
             return false;
         }
-        if key.modifiers.contains(KeyModifiers::ALT)
-            && matches!(key.code, KeyCode::Up | KeyCode::Down)
-        {
+        if matches!(action, Some(QUESTION_PREVIOUS | QUESTION_NEXT)) {
             let index = self.question_index().unwrap_or(0);
-            if key.code == KeyCode::Down && index == 0 {
+            if action == Some(QUESTION_NEXT) && index == 0 {
                 self.remember_answers();
                 self.modal = None;
                 self.focus = Focus::Composer;
             } else {
-                let next = if key.code == KeyCode::Up {
+                let next = if action == Some(QUESTION_PREVIOUS) {
                     (index + 1).min(self.question_slots().len().saturating_sub(1))
                 } else {
                     index - 1
@@ -366,7 +366,7 @@ impl Ui {
             }
             return true;
         }
-        if key.code == KeyCode::Char(']') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if action == Some(QUESTION_SKIP) {
             self.submit_question(true);
             return true;
         }
@@ -380,17 +380,17 @@ impl Ui {
             self.focus = Focus::Composer;
             return true;
         }
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        if matches!(action, Some(QUESTION_NEXT_FIELD | QUESTION_PREVIOUS_FIELD)) {
             let count = self.question_slots().len().max(1);
             let index = self.question_index().unwrap_or(0);
-            self.open_question(if key.code == KeyCode::Tab {
+            self.open_question(if action == Some(QUESTION_NEXT_FIELD) {
                 (index + 1) % count
             } else {
                 (index + count - 1) % count
             });
             return true;
         }
-        if key.code == KeyCode::Enter && !key.modifiers.contains(KeyModifiers::SHIFT) {
+        if action == Some(QUESTION_SUBMIT) {
             self.submit_question(false);
             return true;
         }
@@ -401,21 +401,15 @@ impl Ui {
             self.question_reveal = true;
             return true;
         }
-        if key.code == KeyCode::Char(' ')
-            && key.modifiers.is_empty()
-            && self.toggle_question_check()
-        {
+        if action == Some(QUESTION_TOGGLE) && self.toggle_question_check() {
             self.remember_answers();
             return true;
         }
-        if key.code == KeyCode::Char('n')
-            && key.modifiers.is_empty()
-            && self.question_note_key().is_some()
-        {
+        if action == Some(QUESTION_NOTE) && self.question_note_key().is_some() {
             self.open_question_note();
             return true;
         }
-        self.question_reveal = !matches!(key.code, KeyCode::PageUp | KeyCode::PageDown);
+        self.question_reveal = !matches!(action, Some(NAVIGATION_PAGE_UP | NAVIGATION_PAGE_DOWN));
         if let Some(Modal::Approval {
             pending,
             field,
@@ -433,11 +427,11 @@ impl Ui {
                 .and_then(|q| q.get("options"))
                 .and_then(Value::as_array)
                 .map_or(0, Vec::len);
-            match key.code {
-                KeyCode::Up if key.modifiers.is_empty() => *selected = selected.saturating_sub(1),
-                KeyCode::Down if key.modifiers.is_empty() => *selected = (*selected + 1).min(count),
-                KeyCode::PageUp => *scroll = scroll.saturating_sub(3),
-                KeyCode::PageDown => *scroll = scroll.saturating_add(3),
+            match action {
+                Some(NAVIGATION_UP) => *selected = selected.saturating_sub(1),
+                Some(NAVIGATION_DOWN) => *selected = (*selected + 1).min(count),
+                Some(NAVIGATION_PAGE_UP) => *scroll = scroll.saturating_sub(3),
+                Some(NAVIGATION_PAGE_DOWN) => *scroll = scroll.saturating_add(3),
                 _ => {
                     *selected = count;
                     if let Some(answer) = answers.get_mut(*field) {
@@ -894,20 +888,36 @@ impl Ui {
         *scroll
     }
     fn draw_question_bar(&mut self, frame: &mut Frame, area: Rect) {
+        use crate::shortcuts::{Bindings, ids::*};
+        let bindings = Bindings::new(&self.shortcut_config);
+        let hint = if self.question_send.is_some() {
+            "Sending answer…".into()
+        } else if self.question_note_focused {
+            format!(
+                "{} submit with note · Esc choices · {}/{} questions",
+                bindings.hint(QUESTION_SUBMIT),
+                bindings.hint(QUESTION_PREVIOUS),
+                bindings.hint(QUESTION_NEXT)
+            )
+        } else {
+            format!(
+                "{}{} add note · {} submit · {} skip · {} previous/input · {} next",
+                if self.multi_select_key().is_some() {
+                    format!("{} choose · ", bindings.hint(QUESTION_TOGGLE))
+                } else {
+                    String::new()
+                },
+                bindings.hint(QUESTION_NOTE),
+                bindings.hint(QUESTION_SUBMIT),
+                bindings.hint(QUESTION_SKIP),
+                bindings.hint(QUESTION_NEXT),
+                bindings.hint(QUESTION_PREVIOUS)
+            )
+        };
         self.button(
             frame,
             Rect::new(area.x, area.bottom().saturating_sub(1), area.width, 1),
-            if self.question_send.is_some() {
-                "Sending answer…"
-            } else {
-                if self.question_note_focused {
-                    "Enter submit with note · Esc choices · Alt+↑↓ questions"
-                } else if self.multi_select_key().is_some() {
-                    "Space choose · n add note · Enter submit · Ctrl+] skip · Alt+↓ previous/input · Alt+↑ next"
-                } else {
-                    "n add note · Enter submit · Ctrl+] skip · Alt+↓ previous/input · Alt+↑ next"
-                }
-            },
+            &hint,
             Action::SubmitQuestion(false),
             false,
         );

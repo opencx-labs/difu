@@ -43,6 +43,12 @@ fn reserved(context: Context, chord: &KeyChord) -> bool {
     let modifiers = &chord.modifiers;
     let printable =
         matches!(chord.key, BindingKey::Character(_)) && !modifiers.control && !modifiers.super_key;
+    // Coding transcripts forward only unmodified/Shift printable typing to the
+    // composer; navigation still belongs to the transcript, not an Editor.
+    if context == AGENT_CONVERSATION_INPUT {
+        return printable && !modifiers.alt;
+    }
+    // AGENT_QUEUE_BUTTON deliberately has no Editor: its former text field is unfocused.
     // Settings uses simple strings, not Editor: reserve exactly its insertion and
     // Backspace paths. Its field editor also accepts Alt characters.
     if context == SETTINGS_SEARCH || context == SETTINGS_EDIT {
