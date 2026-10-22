@@ -9,7 +9,9 @@ impl Shell {
         }
     }
     pub(super) fn test_notification(&mut self) {
-        let Some(panel) = &self.settings else { return };
+        let Some(panel) = &mut self.settings else {
+            return;
+        };
         let mut preferences = panel.draft.config().preferences.notifications.clone();
         use crate::{agents::notifications::Kind, settings::SettingId};
         let event = match panel.rows().get(panel.selected).map(|row| &row.id) {
@@ -21,10 +23,34 @@ impl Shell {
             Some(SettingId::ErrorNotification) => Some(Kind::Error),
             _ => Some(Kind::Completion),
         };
+        panel.notification_test = event
+            .filter(|kind| {
+                (preferences.quiet
+                    || preferences.delivery != crate::settings::NotificationDelivery::Desktop)
+                    && match kind {
+                        Kind::Completion => preferences.completion,
+                        Kind::Question => preferences.question_approval,
+                        Kind::Error => preferences.error,
+                    }
+            })
+            .map(|kind| {
+                (
+                    format!("Example · {}", kind.label()),
+                    kind == Kind::Error,
+                    std::time::Instant::now(),
+                )
+            });
         self.notification_action(Command::Test { preferences, event });
     }
     /// Call every event-loop iteration, including sustained input and motion-off frames.
     pub fn notification_tick(&mut self, focused: bool) {
+        if self
+            .settings
+            .as_mut()
+            .is_some_and(|panel| panel.expire_notification_test(std::time::Instant::now()))
+        {
+            crate::repaint::request();
+        }
         let viewed = if self.agents_active && self.settings.is_none() && self.palette.is_none() {
             self.agents.notification_viewed_session()
         } else {

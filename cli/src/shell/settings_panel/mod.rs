@@ -38,6 +38,7 @@ pub(crate) struct Panel {
     pub error: Option<String>,
     pub notice: Option<String>,
     pub notification_status: Option<crate::agents::notifications::Capabilities>,
+    pub(super) notification_test: Option<(String, bool, Instant)>,
     pub confirm_discard: bool,
     pub export_path: Option<PathBuf>,
     pub replay: Instant,
@@ -53,6 +54,19 @@ pub(crate) struct Panel {
     dynamic_choices: std::collections::BTreeMap<SettingId, Vec<String>>,
 }
 impl Panel {
+    pub(super) fn expire_notification_test(&mut self, now: Instant) -> bool {
+        if self
+            .notification_test
+            .as_ref()
+            .is_some_and(|(_, _, started)| {
+                now.saturating_duration_since(*started) >= crate::agents::ui::toast::LIFETIME
+            })
+        {
+            self.notification_test = None;
+            return true;
+        }
+        false
+    }
     pub fn new(storage: &Storage, category: Option<Category>) -> anyhow::Result<Self> {
         let mut panel = Self {
             draft: storage.settings_draft()?,
@@ -68,6 +82,7 @@ impl Panel {
             error: None,
             notice: None,
             notification_status: None,
+            notification_test: None,
             confirm_discard: false,
             details_expanded: false,
             details_scroll: 0,

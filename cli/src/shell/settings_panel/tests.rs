@@ -1158,3 +1158,91 @@ fn notification_preview_reflects_selected_event_disable_and_quiet_without_action
     assert!(!storage(&dir).config.exists());
     Ok(())
 }
+
+#[test]
+fn notification_samples_render_production_toast_borders_severity_and_wrapping() -> Result<()> {
+    use crate::ui::{BG, GREEN, RED};
+    let dir = tempfile::tempdir()?;
+    let mut panel = Panel::new(&storage(&dir), Some(Category::Notifications))?;
+    for width in [80, 140] {
+        for (id, color, text) in [
+            (
+                SettingId::CompletionNotification,
+                GREEN,
+                "Example · Turn completed",
+            ),
+            (
+                SettingId::ErrorNotification,
+                RED,
+                "Example · Session failed",
+            ),
+            (
+                SettingId::QuestionNotification,
+                GREEN,
+                "Example · Question or approval needed",
+            ),
+        ] {
+            panel.selected = panel
+                .rows()
+                .iter()
+                .position(|row| row.id == id)
+                .context("row")?;
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, 40))?;
+            terminal.draw(|frame| panel.draw(frame))?;
+            let buffer = terminal.backend().buffer();
+            let start = buffer
+                .content
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.symbol() == "┌" && c.fg == color)
+                .map(|(n, _)| n)
+                .context("production toast corner with severity color")?;
+            let x = start as u16 % width;
+            let y = start as u16 / width;
+            let right = (x + 1..width)
+                .find(|right| {
+                    buffer
+                        .cell((*right, y))
+                        .is_some_and(|c| c.symbol() == "┐" && c.fg == color)
+                })
+                .context("top right")?;
+            let bottom = (y + 1..40)
+                .find(|bottom| {
+                    buffer
+                        .cell((x, *bottom))
+                        .is_some_and(|c| c.symbol() == "└" && c.fg == color)
+                })
+                .context("bottom left")?;
+            let mut lines = Vec::new();
+            for row in y + 1..bottom {
+                let mut line = String::new();
+                for column in x + 1..right {
+                    let cell = buffer.cell((column, row)).context("sample cell")?;
+                    assert_eq!(cell.fg, color);
+                    assert_eq!(cell.bg, BG);
+                    line.push_str(cell.symbol());
+                }
+                lines.push(line.trim_end().to_owned());
+            }
+            assert_eq!(lines.join(" "), text);
+            assert_eq!(
+                bottom - y,
+                if width == 80 && id == SettingId::QuestionNotification {
+                    3
+                } else {
+                    2
+                }
+            );
+            assert_eq!(
+                buffer
+                    .cell((right, bottom))
+                    .context("bottom right")?
+                    .symbol(),
+                "┘"
+            );
+        }
+    }
+    assert!(!storage(&dir).config.exists());
+    Ok(())
+}

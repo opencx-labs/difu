@@ -38,6 +38,7 @@ mod shortcuts;
 mod sidebar;
 mod slack;
 mod themes;
+pub(crate) mod toast;
 pub(in crate::agents) mod transcript;
 mod transcript_window;
 mod tweaks;
@@ -431,7 +432,7 @@ pub struct Ui {
 impl Ui {
     pub(crate) fn notification_viewed_session(&self) -> Option<String> {
         if self.modal.is_some()
-            || self.changes_visible
+            || (self.drilled && self.changes_visible)
             || (self.panels.visible() && !self.panels.right)
         {
             None
@@ -3219,7 +3220,7 @@ impl Ui {
             (Some((text, error)), Some((previous, was_error, started)))
                 if text == previous && error == was_error =>
             {
-                if now.saturating_duration_since(*started) >= Duration::from_secs(5) {
+                if now.saturating_duration_since(*started) >= toast::LIFETIME {
                     self.notice = None;
                     self.toast_started = None;
                 }
@@ -3234,38 +3235,7 @@ impl Ui {
         let Some((notice, error)) = &self.notice else {
             return;
         };
-        let area = frame.area();
-        let width = area.width.saturating_sub(2).min(64);
-        if width < 4 {
-            return;
-        }
-        let text = crate::model::clean(notice);
-        let rows = wrapped(&text, width.saturating_sub(2));
-        let height = (rows.len() as u16)
-            .saturating_add(2)
-            .min(area.height.saturating_sub(2));
-        if height < 3 {
-            return;
-        }
-        let rect = Rect::new(
-            area.right().saturating_sub(width + 1),
-            area.bottom().saturating_sub(height + 1),
-            width,
-            height,
-        );
-        let color = if *error { RED } else { GREEN };
-        frame.render_widget(Clear, rect);
-        frame.render_widget(
-            Paragraph::new(rows.into_iter().map(Line::from).collect::<Vec<_>>())
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_style(Style::default().fg(color)),
-                )
-                .style(Style::default().fg(color).bg(BG)),
-            rect,
-        );
-        self.toast_rect = rect;
+        self.toast_rect = toast::draw(frame, frame.area(), notice, *error);
     }
     fn draw_list(&mut self, frame: &mut Frame, rect: Rect) {
         let area = panel(

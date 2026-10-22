@@ -4,7 +4,7 @@ use ratatui::{
     Frame,
     layout::{Constraint, Layout, Rect},
     style::Style,
-    text::{Line, Span},
+    text::Line,
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 
@@ -263,6 +263,10 @@ impl Panel {
                 .wrap(Wrap { trim: false }),
             footer,
         );
+        self.expire_notification_test(Instant::now());
+        if let Some((message, error, _)) = &self.notification_test {
+            crate::agents::ui::toast::draw(frame, full, message, *error);
+        }
     }
     fn draw_details(&mut self, frame: &mut Frame, area: Rect, spec: &SettingSpec) {
         frame.render_widget(block(" Details & preview ".into()), area);
@@ -291,6 +295,7 @@ impl Panel {
                 Style::default().fg(DIM),
             ),
         ];
+        let mut notification_sample = None;
         let visual = self.preview_config().clone();
         let lines = match spec.preview {
             Preview::Diff => diff_preview(&visual, inner.width),
@@ -347,15 +352,13 @@ impl Panel {
                     SettingId::ErrorNotification => ("Session failed", preferences.error),
                     _ => ("Turn completed", preferences.completion),
                 };
-                let mut lines = vec![
-                    Line::from(Span::styled(
-                        format!("Example · {label}"),
-                        Style::default().fg(ACCENT),
-                    )),
-                    Line::from(
-                        "Only explicit Test sends this synthetic example. Sound test plays standalone audio; Quiet keeps it silent.",
-                    ),
-                ];
+                notification_sample = Some((
+                    format!("Example · {label}"),
+                    spec.id == SettingId::ErrorNotification,
+                ));
+                let mut lines = vec![Line::from(
+                    "Only explicit Test sends this synthetic example. Sound test plays standalone audio; Quiet keeps it silent.",
+                )];
                 if !enabled {
                     lines.push(Line::from("Disabled in draft: Test remains silent."));
                 }
@@ -393,13 +396,28 @@ impl Panel {
                 bindings.hint(crate::shortcuts::ids::QUEUE)
             )));
         }
+        let sample_height = if notification_sample.is_some() {
+            inner.height.saturating_sub(4).min(8)
+        } else {
+            0
+        };
+        let text_area = Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(sample_height),
+        );
         frame.render_widget(
             Paragraph::new(details)
                 .style(Style::default().bg(PANEL))
                 .wrap(Wrap { trim: false })
                 .scroll((self.details_scroll, 0)),
-            inner,
+            text_area,
         );
+        if let Some((message, error)) = notification_sample {
+            let sample_area = Rect::new(inner.x, text_area.bottom(), inner.width, sample_height);
+            crate::agents::ui::toast::draw(frame, sample_area, &message, error);
+        }
     }
 }
 /// Real review diff formatting on isolated synthetic data.
