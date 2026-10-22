@@ -109,7 +109,7 @@ fn drafts_merge_fresh_unrelated_updates_and_remaps_without_replacing_the_draft()
     first.set(SettingId::WrapDiff, SettingValue::Bool(true))?;
     first.set(
         SettingId::Shortcut("settings.open".into()),
-        SettingValue::Shortcut(Some(KeyChord::character(','))),
+        SettingValue::Shortcut(Some(crate::shortcuts::key(BindingKey::Function(9), 0))),
     )?;
     other.set(
         SettingId::Shortcut("session.new".into()),
@@ -644,5 +644,35 @@ fn unknown_action_overrides_are_preserved_but_not_editable_controls() -> Result<
             .bindings
             .contains_key("future.action")
     );
+    Ok(())
+}
+
+#[test]
+fn editing_reservations_reject_locked_save_without_writing_or_losing_draft() -> Result<()> {
+    use crate::shortcuts::{ids, key};
+    for (action, chord) in [
+        (ids::SETTINGS_SAVE, key(BindingKey::Character('z'), 0)),
+        (ids::SETTINGS_OPEN, key(BindingKey::Right, 4)),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let storage = store(&dir);
+        storage.update_config(|_| {})?;
+        let bytes = fs::read(&storage.config)?;
+        let mut draft = storage.settings_draft()?;
+        draft.set(
+            SettingId::Shortcut(action.0.into()),
+            SettingValue::Shortcut(Some(chord)),
+        )?;
+        let error = storage
+            .save_settings_draft(&mut draft)
+            .err()
+            .context("invalid remap accepted")?;
+        assert!(
+            error.to_string().contains("reserved for text editing"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(&storage.config)?, bytes);
+        assert!(!draft.edited().is_empty());
+    }
     Ok(())
 }

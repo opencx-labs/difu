@@ -7,6 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers as M};
 
 mod catalog;
 mod chord;
+mod editing;
 pub use chord::{capture, label, normalize};
 pub mod contexts;
 pub mod ids;
@@ -66,7 +67,11 @@ impl<'a> Bindings<'a> {
             return Vec::new();
         };
         if let Some(chord) = self.config.preferences.keyboard.bindings.get(action.0) {
-            return vec![normalize(chord.clone())];
+            let chord = normalize(chord.clone());
+            return editing::allows(spec, context, &chord, self.config)
+                .then_some(chord)
+                .into_iter()
+                .collect();
         }
         if let Some(chord) = send_companions(self.config.preferences.input.send_key)
             .into_iter()
@@ -140,22 +145,17 @@ impl<'a> Bindings<'a> {
                     chord.key != BindingKey::Escape,
                     "Escape is reserved for closing dialogs"
                 );
-                if chord.key == BindingKey::Left
-                    && chord.modifiers.shift
-                    && action.contexts.iter().any(|c| {
-                        [contexts::AGENT_COMPOSER, contexts::AGENT_COMPOSER_PANES].contains(c)
-                    })
-                {
+                for context in &action.contexts {
                     anyhow::ensure!(
-                        action.id == ids::QUESTION_OPEN,
-                        "Shift+Left is reserved for composer text selection; only the question action has an explicit override"
-                    );
-                    anyhow::ensure!(
-                        self.config
-                            .preferences
-                            .keyboard
-                            .question_overrides_selection,
-                        "Shift+Left selects composer text. Enable the explicit question text-selection override before assigning it."
+                        editing::allows(action, *context, &chord, self.config),
+                        "{} is reserved for text editing in {}.{}",
+                        label(&chord),
+                        context.0,
+                        if action.id == ids::QUESTION_OPEN && chord == key(BindingKey::Left, 4) {
+                            " Enable the explicit question text-selection override before assigning Shift+Left."
+                        } else {
+                            " Choose another shortcut."
+                        }
                     );
                 }
             }

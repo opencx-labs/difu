@@ -215,3 +215,74 @@ fn quit_action_keeps_selection_copy_precedence_and_does_not_submit_the_draft() -
     }
     Ok(())
 }
+
+#[test]
+fn editing_reservations_preserve_actual_composer_input_from_invalid_stored_globals() -> Result<()> {
+    use crate::{editor::Editor, shortcuts::Bindings};
+    for (code, modifiers) in [
+        (KeyCode::Char('z'), KeyModifiers::NONE),
+        (KeyCode::Char('x'), KeyModifiers::NONE),
+        (KeyCode::Right, KeyModifiers::SHIFT),
+        (KeyCode::Left, KeyModifiers::SHIFT),
+        (KeyCode::Char('a'), KeyModifiers::CONTROL),
+        (KeyCode::Char('e'), KeyModifiers::CONTROL),
+        (KeyCode::Char('u'), KeyModifiers::CONTROL),
+        (KeyCode::Char('b'), KeyModifiers::ALT),
+        (KeyCode::Char('f'), KeyModifiers::ALT),
+        (KeyCode::Char('a'), KeyModifiers::SUPER),
+        (KeyCode::Char('z'), KeyModifiers::SUPER),
+        (KeyCode::Home, KeyModifiers::NONE),
+        (KeyCode::End, KeyModifiers::SUPER | KeyModifiers::SHIFT),
+        (KeyCode::Backspace, KeyModifiers::ALT),
+        (KeyCode::Delete, KeyModifiers::NONE),
+        (KeyCode::Enter, KeyModifiers::SHIFT),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        let event = KeyEvent::new(code, modifiers);
+        let chord = crate::shortcuts::capture(event).ok_or_else(|| anyhow::anyhow!("capture"))?;
+        let mut config = Config::default();
+        config
+            .preferences
+            .keyboard
+            .bindings
+            .insert(ids::SETTINGS_OPEN.0.into(), chord);
+        let mut shell = Shell::new(storage, config.clone(), None);
+        shell.agents.selected = Some("editing-only".into());
+        shell.agents.drilled = true;
+        shell.agents.focus = crate::agents::ui::Focus::Composer;
+        let mut expected = Editor::from("alpha beta");
+        expected.insert("!");
+        expected.cursor = 3;
+        shell
+            .agents
+            .positions
+            .entry("editing-only".into())
+            .or_default()
+            .draft = expected.clone();
+        expected.key(event);
+        shell.key(event);
+        assert!(shell.settings.is_none(), "global stole {event:?}");
+        let actual = &shell
+            .agents
+            .positions
+            .get("editing-only")
+            .ok_or_else(|| anyhow::anyhow!("position"))?
+            .draft;
+        assert_eq!(actual.text(), expected.text(), "text for {event:?}");
+        assert_eq!(actual.cursor, expected.cursor, "cursor for {event:?}");
+        assert_eq!(
+            actual.selected_text(),
+            expected.selected_text(),
+            "selection for {event:?}"
+        );
+        assert!(
+            Bindings::new(&config).validate().is_err(),
+            "accepted {event:?}"
+        );
+    }
+    Ok(())
+}

@@ -489,7 +489,7 @@ mod tests {
 #[cfg(test)]
 mod settings_integration_tests {
     use super::*;
-    use crate::settings::{Category, KeyChord, SettingId, SettingValue};
+    use crate::settings::{Category, SettingId, SettingValue};
     use anyhow::{Context, Result};
     fn fixture() -> Result<(tempfile::TempDir, Shell)> {
         let dir = tempfile::tempdir()?;
@@ -777,18 +777,15 @@ mod settings_integration_tests {
     fn settings_shortcut_override_replaces_default_and_slash_aliases_request_sections() -> Result<()>
     {
         let (_dir, mut shell) = fixture()?;
-        shell
-            .reviews
-            .config
-            .preferences
-            .keyboard
-            .bindings
-            .insert("settings.open".into(), KeyChord::character('x'));
+        shell.reviews.config.preferences.keyboard.bindings.insert(
+            "settings.open".into(),
+            crate::shortcuts::key(crate::settings::BindingKey::Function(9), 0),
+        );
         assert!(!settings_panel::is_open_shortcut(
             &shell.reviews.config,
             KeyEvent::new(KeyCode::Char(','), KeyModifiers::CONTROL)
         ));
-        shell.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        shell.key(KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE));
         assert!(shell.settings.is_some());
         shell.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         for (command, category) in [

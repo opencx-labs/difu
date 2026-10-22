@@ -147,3 +147,126 @@ fn selection_override_authorizes_only_the_question_action() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn editing_reservations_keep_owned_defaults_presets_and_only_exact_question_exception() -> Result<()>
+{
+    // Explicitly storing an existing default must not disable that alias in its original context.
+    for action in all() {
+        for default in &action.defaults {
+            let mut config = Config::default();
+            config
+                .preferences
+                .keyboard
+                .bindings
+                .insert(action.id.0.into(), default.chord.clone());
+            for context in &default.contexts {
+                assert_eq!(
+                    Bindings::new(&config).effective(action.id, *context),
+                    vec![normalize(default.chord.clone())],
+                    "{} in {}",
+                    action.id.0,
+                    context.0
+                );
+            }
+        }
+    }
+    for preset in [SendKey::Enter, SendKey::CtrlEnter] {
+        let mut config = Config::default();
+        config.preferences.input.send_key = preset;
+        for (id, chord) in send_companions(preset) {
+            config
+                .preferences
+                .keyboard
+                .bindings
+                .insert(id.0.into(), chord.clone());
+            assert_eq!(
+                Bindings::new(&config).effective(id, contexts::AGENT_COMPOSER),
+                vec![chord]
+            );
+        }
+        Bindings::new(&config).validate()?;
+    }
+    let mut config = Config::default();
+    config.preferences.keyboard.question_overrides_selection = true;
+    for chord in [
+        key(BindingKey::Right, 4),
+        key(BindingKey::Left, 5),
+        key(BindingKey::Character('z'), 0),
+    ] {
+        config
+            .preferences
+            .keyboard
+            .bindings
+            .insert(ids::QUESTION_OPEN.0.into(), chord);
+        assert!(Bindings::new(&config).validate().is_err());
+        assert!(
+            Bindings::new(&config)
+                .effective(ids::QUESTION_OPEN, contexts::AGENT_COMPOSER)
+                .is_empty()
+        );
+    }
+    config
+        .preferences
+        .keyboard
+        .bindings
+        .insert(ids::QUESTION_OPEN.0.into(), key(BindingKey::Left, 4));
+    Bindings::new(&config).validate()?;
+    assert!(Bindings::new(&config).matches(
+        ids::QUESTION_OPEN,
+        contexts::AGENT_COMPOSER,
+        KeyEvent::new(KeyCode::Left, M::SHIFT)
+    ));
+    Ok(())
+}
+
+#[test]
+fn editing_reservations_are_contextual_and_hints_exclude_suppressed_keys() -> Result<()> {
+    let mut config = Config::default();
+    config.preferences.keyboard.bindings.insert(
+        ids::PALETTE_PIN.0.into(),
+        key(BindingKey::Character('z'), 0),
+    );
+    let bindings = Bindings::new(&config);
+    assert!(bindings.validate().is_err());
+    assert!(bindings.hint(ids::PALETTE_PIN).is_empty());
+    assert!(!bindings.matches(
+        ids::PALETTE_PIN,
+        contexts::PALETTE,
+        KeyEvent::new(KeyCode::Char('z'), M::NONE)
+    ));
+    assert!(
+        !bindings.matches(
+            ids::PALETTE_PIN,
+            contexts::PALETTE,
+            KeyEvent::new(KeyCode::Char('p'), M::SUPER)
+        ),
+        "invalid override must not restore removed defaults"
+    );
+    config.preferences.keyboard.bindings.clear();
+    config.preferences.keyboard.bindings.insert(
+        ids::SESSION_NEW.0.into(),
+        key(BindingKey::Character('z'), 0),
+    );
+    Bindings::new(&config).validate()?;
+    assert_eq!(
+        Bindings::new(&config).resolve(
+            contexts::AGENT_LIST,
+            KeyEvent::new(KeyCode::Char('z'), M::NONE)
+        ),
+        Some(ids::SESSION_NEW)
+    );
+    for (character, modifiers) in [('c', 1), ('v', 1), ('c', 8), ('v', 8)] {
+        config.preferences.keyboard.bindings.insert(
+            ids::SETTINGS_OPEN.0.into(),
+            key(BindingKey::Character(character), modifiers),
+        );
+        assert!(
+            Bindings::new(&config)
+                .effective(ids::SETTINGS_OPEN, contexts::AGENT_COMPOSER)
+                .is_empty(),
+            "copy/paste must retain precedence"
+        );
+    }
+    Ok(())
+}

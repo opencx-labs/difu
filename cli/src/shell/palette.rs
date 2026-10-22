@@ -1516,4 +1516,25 @@ mod tests {
         }
         Ok(())
     }
+    #[test]
+    fn editing_reservations_keep_invalid_stored_palette_keys_in_the_query() -> Result<()> {
+        use crate::settings::BindingKey;
+        use crate::shortcuts::{ids, key};
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        let mut shell = fixture(storage.clone())?;
+        shell.reviews.config.preferences.keyboard.bindings.insert(
+            ids::PALETTE_PIN.0.into(),
+            key(BindingKey::Character('z'), 0),
+        );
+        query(&mut shell, "");
+        let before = shell.reviews.config.pinned_sessions.clone();
+        shell.key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE));
+        assert_eq!(shell.palette.as_ref().context("palette")?.query.text(), "z");
+        assert_eq!(shell.reviews.config.pinned_sessions, before);
+        Ok(())
+    }
 }

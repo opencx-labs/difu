@@ -920,3 +920,89 @@ fn remapped_panel_hints_show_committed_keys_and_capture_ignores_paste_repeat_rel
     assert!(narrow_screen(&mut panel)?.contains("F7 Save"));
     Ok(())
 }
+
+#[test]
+fn editing_reservations_keep_search_typing_and_capture_isolation() -> Result<()> {
+    use crate::shortcuts::{ids, key};
+    for (code, chord, before, after) in [
+        (
+            KeyCode::Char('z'),
+            key(BindingKey::Character('z'), 0),
+            "",
+            "z",
+        ),
+        (KeyCode::Backspace, key(BindingKey::Backspace, 0), "az", "a"),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let storage = storage(&dir);
+        storage.update_config(|config| {
+            config
+                .preferences
+                .keyboard
+                .bindings
+                .insert(ids::SETTINGS_SAVE.0.into(), chord);
+        })?;
+        let bytes = std::fs::read(&storage.config)?;
+        let mut panel = Panel::new(&storage, None)?;
+        panel.search_focused = true;
+        panel.query = before.into();
+        panel
+            .draft
+            .set(SettingId::WrapDiff, SettingValue::Bool(true))?;
+        let outcome = panel.key(KeyEvent::new(code, KeyModifiers::NONE), &storage);
+        assert_eq!(panel.query, after);
+        assert!(outcome.saved.is_none());
+        assert!(!panel.draft.edited().is_empty());
+        assert_eq!(std::fs::read(&storage.config)?, bytes);
+    }
+    for (action, event) in [
+        (
+            ids::SETTINGS_SAVE,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE),
+        ),
+        (
+            ids::SETTINGS_OPEN,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+        ),
+    ] {
+        let dir = tempfile::tempdir()?;
+        let storage = storage(&dir);
+        let mut panel = Panel::new(&storage, None)?;
+        panel.shortcut_action(&SettingId::Shortcut(action.0.into()));
+        panel.key(event, &storage);
+        assert!(
+            panel
+                .error
+                .as_ref()
+                .is_some_and(|s| s.contains("reserved for text editing")),
+            "{:?}",
+            panel.error
+        );
+        assert!(panel.draft.edited().is_empty());
+        assert_eq!(panel.capture, Some(action));
+        assert!(!storage.config.exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn editing_reservations_preserve_settings_field_alt_character_input() -> Result<()> {
+    use crate::shortcuts::{ids, key};
+    let dir = tempfile::tempdir()?;
+    let storage = storage(&dir);
+    storage.update_config(|config| {
+        config.preferences.keyboard.bindings.insert(
+            ids::SETTINGS_EDIT_ACCEPT.0.into(),
+            key(BindingKey::Character('z'), 2),
+        );
+    })?;
+    let mut panel = Panel::new(&storage, None)?;
+    panel.edit = Some("draft".into());
+    panel.key(
+        KeyEvent::new(KeyCode::Char('z'), KeyModifiers::ALT),
+        &storage,
+    );
+    assert_eq!(panel.edit.as_deref(), Some("draftz"));
+    assert!(panel.draft.edited().is_empty());
+    Ok(())
+}
