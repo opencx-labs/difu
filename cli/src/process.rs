@@ -1,3 +1,6 @@
+#[cfg(test)]
+pub(crate) mod fixture;
+
 use anyhow::{Context, Result, bail};
 use nix::{
     sys::signal::{Signal, kill, killpg},
@@ -199,6 +202,8 @@ fn streaming_limit(
     limit: Option<usize>,
 ) -> Result<Output> {
     cancel.check()?;
+    #[cfg(test)]
+    fixture::adapt(command)?;
     let name = command.get_program().to_string_lossy().to_string();
     command
         .stdin(if input.is_some() {

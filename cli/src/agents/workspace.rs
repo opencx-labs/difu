@@ -315,6 +315,11 @@ pub(crate) fn changes_context(
         current()? == patch,
         "Changes moved since this diff opened. Refresh before loading context."
     );
+    let canonical = crate::diff::parse_patch(patch)?;
+    ensure!(
+        files == canonical,
+        "Context files do not match the canonical patch. Refresh and retry."
+    );
     let mut result = Vec::new();
     if let Some(pr) = pr {
         let config = storage.load_config()?;
@@ -797,6 +802,7 @@ mod tests {
         git(root, &["init", "-b", "main"])?;
         let text = (1..=31).map(|n| format!("line {n}\n")).collect::<String>();
         fs::write(root.join("file.ts"), &text)?;
+        fs::write(root.join("second.ts"), "old second\n")?;
         git(root, &["add", "."])?;
         git(root, &["commit", "-m", "base"])?;
         let mut session = Session::new(
@@ -821,11 +827,49 @@ mod tests {
         fs::write(root.join("file.ts"), text.replace("line 16", "changed 16"))?;
         let patch = changes(&session, &storage, &cancel)?;
         let files = crate::diff::parse("M\0file.ts\0", &patch)?;
+        for variant in 0..4 {
+            let mut invalid = files.clone();
+            let file = invalid.first_mut().context("file")?;
+            match variant {
+                0 => {
+                    file.path = "unrelated.ts".into();
+                    file.old_path = file.path.clone();
+                }
+                1 => file.hunks.clear(),
+                2 => {
+                    file.hunks
+                        .first_mut()
+                        .context("hunk")?
+                        .lines
+                        .first_mut()
+                        .context("line")?
+                        .text = "forged".into()
+                }
+                _ => {
+                    invalid.clear();
+                }
+            }
+            assert!(
+                changes_context(&session, &storage, None, &patch, &invalid, &cancel).is_err(),
+                "invalid variant {variant}"
+            );
+        }
         let result = changes_context(&session, &storage, None, &patch, &files, &cancel)?;
         let (_, lines) = result.first().context("expanded file")?;
         assert_eq!(lines.first().and_then(|l| l.new), Some(1));
         assert_eq!(lines.last().and_then(|l| l.new), Some(31));
         crate::context::FileContext::new(files.first().context("canonical")?, lines.clone())?;
+        fs::write(root.join("second.ts"), "new second\n")?;
+        let two_patch = changes(&session, &storage, &cancel)?;
+        let mut two_files = crate::diff::parse_patch(&two_patch)?;
+        assert_eq!(
+            changes_context(&session, &storage, None, &two_patch, &two_files, &cancel)?.len(),
+            2
+        );
+        two_files.reverse();
+        assert!(
+            changes_context(&session, &storage, None, &two_patch, &two_files, &cancel).is_err()
+        );
         fs::write(root.join("file.ts"), "moved\n")?;
         assert!(changes_context(&session, &storage, None, &patch, &files, &cancel).is_err());
         Ok(())

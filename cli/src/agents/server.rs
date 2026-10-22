@@ -1778,6 +1778,182 @@ mod clear_tests {
         .map(|s| s.trim().to_owned())
     }
     #[test]
+    fn changes_context_request_fetches_uncached_pr_revisions_from_a_local_remote() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let origin = root.join("origin");
+        let local = root.join("local");
+        let home = root.join("home");
+        for path in [&origin, &local, &home] {
+            fs::create_dir(path)?;
+        }
+        git(&origin, &["init", "-b", "main"])?;
+        let text = (1..=31).map(|n| format!("line {n}\n")).collect::<String>();
+        fs::write(origin.join("original.ts"), &text)?;
+        git(&origin, &["add", "."])?;
+        git(&origin, &["commit", "-m", "base"])?;
+        let base = git(&origin, &["rev-parse", "HEAD"])?;
+        fs::rename(origin.join("original.ts"), origin.join("renamed.ts"))?;
+        fs::write(
+            origin.join("renamed.ts"),
+            text.replace("line 16", "PR changed 16"),
+        )?;
+        git(&origin, &["add", "."])?;
+        git(&origin, &["commit", "-m", "rename and edit"])?;
+        let head = git(&origin, &["rev-parse", "HEAD"])?;
+        let patch = crate::process::checked(
+            crate::repo::git(&origin).args([
+                "diff",
+                "--no-color",
+                "--find-renames",
+                "--unified=3",
+                &base,
+                &head,
+                "--",
+            ]),
+            &Cancel::default(),
+        )?;
+        let files = crate::diff::parse_patch(&patch)?;
+        let canonical = files.clone();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files.first().map(|f| f.path.as_str()), Some("renamed.ts"));
+        assert_eq!(
+            files.first().map(|f| f.old_path.as_str()),
+            Some("original.ts")
+        );
+        git(&local, &["init", "-b", "main"])?;
+        let pr = PrKey {
+            owner: "fixture".into(),
+            repo: "context".into(),
+            number: 7,
+        };
+        let url = "https://github.com/fixture/context.git";
+        git(&local, &["remote", "add", "origin", url])?;
+        assert!(git(&local, &["cat-file", "-e", &format!("{base}^{{commit}}")]).is_err());
+        assert!(git(&local, &["cat-file", "-e", &format!("{head}^{{commit}}")]).is_err());
+        fs::write(local.join("renamed.ts"), "unrelated local working source\n")?;
+        let diff_response = root.join("diff-response.txt");
+        fs::write(&diff_response, &patch)?;
+        let detail_response = root.join("detail-response.json");
+        fs::write(
+            &detail_response,
+            serde_json::to_vec(&serde_json::json!({
+                "number": 7, "title": "Rename and edit", "body": "Fixture", "draft": false,
+                "user": {"login": "fixture"}, "head": {"sha": head, "ref": "feature"},
+                "base": {"sha": base, "ref": "main"}, "state": "open", "merged": false,
+                "additions": 1, "deletions": 1, "changed_files": 1,
+                "requested_reviewers": [], "requested_teams": []
+            }))?,
+        )?;
+        let mut response = b"HTTP/2.0 200 OK\nX-Ratelimit-Remaining: 100\n\n".to_vec();
+        response.extend(fs::read(&detail_response)?);
+        fs::write(&detail_response, response)?;
+        let mut session = Session::new(
+            "context".into(),
+            Job::Coding(Launch {
+                repository: local.clone(),
+                isolated: false,
+                base: "main".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.workspace = Some(local.clone());
+        session.workspace_ready = true;
+        let store = Arc::new(Store::fixture(home, vec![session]));
+        let service = Service {
+            remote: super::remote::Remote::start(store.storage.clone()),
+            store,
+            workers: Mutex::new(BTreeMap::new()),
+            action_locks: Mutex::new(BTreeMap::new()),
+            launch_lock: Mutex::new(()),
+        };
+        assert!(crate::github::store::load(&service.store.storage, &pr).is_none());
+        let scope = crate::process::fixture::Scope::new(
+            service.store.storage.clone(),
+            vec![
+                (
+                    vec!["pr".into(), "diff".into(), pr.url(), "--color=never".into()],
+                    diff_response,
+                ),
+                (
+                    vec![
+                        "api".into(),
+                        "repos/fixture/context/pulls/7".into(),
+                        "--include".into(),
+                    ],
+                    detail_response,
+                ),
+            ],
+            (
+                url.into(),
+                origin,
+                vec![
+                    format!("+{head}:refs/difu/fixture/context/pr/7/head"),
+                    format!("+{base}:refs/difu/fixture/context/pr/7/base"),
+                ],
+            ),
+        )?;
+        let discovered = Storage::discover()?;
+        assert_eq!(discovered.cache, service.store.storage.cache);
+        assert!(discovered.cache.starts_with(&root));
+        assert!(discovered.config.starts_with(&root));
+        let Reply::ChangesContext(context) = service.handle(Request::ChangesContext {
+            id: "context".into(),
+            pr: Some(pr.clone()),
+            patch: patch.clone(),
+            files: files.clone(),
+        })?
+        else {
+            anyhow::bail!("Expected ChangesContext reply")
+        };
+        scope.verify()?;
+        assert_eq!(context.len(), 1);
+        let (path, lines) = context.first().context("context file")?;
+        assert_eq!(path, "renamed.ts");
+        assert_eq!(lines.first().map(|line| line.text.as_str()), Some("line 1"));
+        assert_eq!(lines.last().map(|line| line.text.as_str()), Some("line 31"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.new == Some(16) && line.text == "PR changed 16")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.old == Some(16) && line.text == "line 16")
+        );
+        assert_eq!(files, canonical);
+        crate::context::FileContext::new(files.first().context("canonical file")?, lines.clone())?;
+        assert_eq!(
+            git(
+                &local,
+                &["rev-parse", "refs/difu/fixture/context/pr/7/head"]
+            )?,
+            head
+        );
+        assert_eq!(
+            git(
+                &local,
+                &["rev-parse", "refs/difu/fixture/context/pr/7/base"]
+            )?,
+            base
+        );
+        assert_eq!(
+            fs::read_to_string(local.join("renamed.ts"))?,
+            "unrelated local working source\n"
+        );
+        let cached = crate::github::store::load(&discovered, &pr).context("isolated PR cache")?;
+        assert_eq!(cached.diff.context("cached patch")?.value, patch);
+        assert_eq!(cached.detail.context("cached detail")?.value.head, head);
+        assert!(crate::github::store::root(&discovered).is_dir());
+        drop(scope);
+        assert!(crate::process::fixture::storage().is_none());
+        Ok(())
+    }
+
+    #[test]
     fn clear_discards_context_links_and_work_then_prepares_fresh_main() -> Result<()> {
         for manual_title in [false, true] {
             let temp = tempfile::tempdir()?;

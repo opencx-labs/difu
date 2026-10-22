@@ -42,87 +42,6 @@ struct Rendered {
     ),
     rows: Arc<Vec<super::patch::SourceRow>>,
 }
-fn unquote(path: &str) -> String {
-    let path = path.trim_end_matches('\t');
-    let Some(quoted) = path.strip_prefix('"').and_then(|p| p.strip_suffix('"')) else {
-        return path.to_owned();
-    };
-    let mut bytes = quoted.bytes().peekable();
-    let mut decoded = Vec::new();
-    while let Some(byte) = bytes.next() {
-        if byte != b'\\' {
-            decoded.push(byte);
-            continue;
-        }
-        let Some(escaped) = bytes.next() else {
-            break;
-        };
-        if (b'0'..=b'7').contains(&escaped) {
-            let mut value = u16::from(escaped - b'0');
-            for _ in 0..2 {
-                if let Some(digit) = bytes
-                    .peek()
-                    .copied()
-                    .filter(|digit| (b'0'..=b'7').contains(digit))
-                {
-                    bytes.next();
-                    value = value * 8 + u16::from(digit - b'0');
-                }
-            }
-            decoded.push(value as u8);
-        } else {
-            decoded.push(match escaped {
-                b'n' => b'\n',
-                b't' => b'\t',
-                b'r' => b'\r',
-                b'b' => 8,
-                b'f' => 12,
-                b'v' => 11,
-                b'a' => 7,
-                other => other,
-            });
-        }
-    }
-    String::from_utf8_lossy(&decoded).into_owned()
-}
-fn file_path(section: &str) -> String {
-    let metadata = section
-        .lines()
-        .take_while(|line| !line.starts_with("@@"))
-        .collect::<Vec<_>>();
-    for prefix in ["rename to ", "+++ ", "--- "] {
-        if let Some(path) = metadata.iter().find_map(|line| line.strip_prefix(prefix)) {
-            let path = unquote(path);
-            if path == "/dev/null" {
-                continue;
-            }
-            return if prefix == "rename to " {
-                path
-            } else {
-                path.strip_prefix("a/")
-                    .or_else(|| path.strip_prefix("b/"))
-                    .unwrap_or(&path)
-                    .to_owned()
-            };
-        }
-    }
-    let header = metadata
-        .first()
-        .and_then(|line| line.strip_prefix("diff --git "))
-        .unwrap_or("Changes");
-    // Mode-only and binary changes have no +++ header. Their source/destination
-    // paths are identical; use equality to disambiguate spaces inside a path.
-    for (index, _) in header.match_indices(' ') {
-        let left = unquote(header.get(..index).unwrap_or_default());
-        let right = unquote(header.get(index + 1..).unwrap_or_default());
-        if let (Some(left), Some(right)) = (left.strip_prefix("a/"), right.strip_prefix("b/"))
-            && left == right
-        {
-            return right.to_owned();
-        }
-    }
-    header.to_owned()
-}
 impl From<String> for Document {
     fn from(source: String) -> Self {
         let mut sections = Vec::<String>::new();
@@ -138,31 +57,8 @@ impl From<String> for Document {
         let files = sections
             .into_iter()
             .map(|patch| {
-                let path = file_path(&patch);
-                let status = if patch.lines().any(|line| line.starts_with("new file mode ")) {
-                    "A"
-                } else if patch
-                    .lines()
-                    .any(|line| line.starts_with("deleted file mode "))
-                {
-                    "D"
-                } else {
-                    "M"
-                };
-                let names = if let Some(old) = patch
-                    .lines()
-                    .find_map(|line| line.strip_prefix("rename from "))
-                {
-                    format!("R\0{}\0{path}\0", unquote(old))
-                } else if let Some(old) = patch
-                    .lines()
-                    .find_map(|line| line.strip_prefix("copy from "))
-                {
-                    format!("C\0{}\0{path}\0", unquote(old))
-                } else {
-                    format!("{status}\0{path}\0")
-                };
-                let diff = crate::diff::parse(&names, &patch)
+                let path = crate::diff::patch_path(&patch);
+                let diff = crate::diff::parse_patch(&patch)
                     .and_then(|files| {
                         files
                             .into_iter()
@@ -458,9 +354,7 @@ impl Ui {
         patch: &str,
         result: Result<Reply, String>,
     ) {
-        if self.selected.as_deref() != Some(source.id.as_str())
-            || self.change_source(&source.id) != *source
-        {
+        if self.change_source(&source.id) != *source {
             return;
         }
         let Some(document) = self
@@ -1232,12 +1126,33 @@ mod tests {
                 .is_empty()
         );
         ui.change_request = 99; // An unchanged background refresh must not invalidate this result.
+        ui.selected = Some("two".into()); // Reply arrives while another session is selected.
+        let mut stale_source = source.clone();
+        stale_source.revision += 1;
+        ui.receive_change_context(
+            &stale_source,
+            7,
+            patch,
+            Ok(Reply::ChangesContext(vec![(
+                "file.ts".into(),
+                full.clone(),
+            )])),
+        );
+        assert!(
+            ui.changes
+                .get("one")
+                .context("document")?
+                .context
+                .is_empty()
+        );
         ui.receive_change_context(
             &source,
             7,
             patch,
             Ok(Reply::ChangesContext(vec![("file.ts".into(), full)])),
         );
+        ui.selected = Some("one".into());
+        ui.receive_changes("one".into(), Document::from(patch));
         let document = ui.changes.get_mut("one").context("document")?;
         code.context_lines = 10;
         let rows = document.reflow(&mut position, 100, true, true, &code);

@@ -622,6 +622,46 @@ fn code_offsets(
     offsets
 }
 
+impl TextRow {
+    /// Reveal whitespace on the selected source side without altering its peer.
+    pub(crate) fn selected_spans(
+        &self,
+        side: crate::review::Side,
+        split: bool,
+        width: usize,
+    ) -> Vec<Span<'static>> {
+        let Some(marked) = &self.marked_spans else {
+            return self.spans.clone();
+        };
+        if !split {
+            return marked.clone();
+        }
+        let boundary = width.saturating_sub(1) / 2;
+        let (left, right) = if side == crate::review::Side::Left {
+            (marked, &self.spans)
+        } else {
+            (&self.spans, marked)
+        };
+        let mut spans = Vec::new();
+        for (source, start, end) in [(left, 0, boundary), (right, boundary, width)] {
+            let mut position: usize = 0;
+            for span in source {
+                let next = position + span.width();
+                let from = position.max(start);
+                let to = next.min(end);
+                if from < to {
+                    spans.push(Span::styled(
+                        crop(&span.content, from - position, to - from),
+                        span.style,
+                    ));
+                }
+                position = next;
+            }
+        }
+        spans
+    }
+}
+
 pub(crate) fn code_rows_with_preferences(
     path: &str,
     lines: &[DiffLine],
@@ -1365,9 +1405,14 @@ fn paint_diff(
                 && (start.start.min(end.end)..=start.start.max(end.end)).contains(&line.start)
         })
     });
-    if selected && let Some(marked) = &row.marked_spans {
+    if selected && row.marked_spans.is_some() {
         frame.render_widget(
-            Paragraph::new(Line::from(marked.clone())).style(row.style),
+            Paragraph::new(Line::from(row.selected_spans(
+                app.workflow.side,
+                split,
+                usize::from(code.width),
+            )))
+            .style(row.style),
             code,
         );
     }
@@ -3011,6 +3056,100 @@ mod tests {
     }
 
     #[test]
+    fn split_selected_whitespace_marks_only_the_selected_source_side() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = guide_app(dir.path());
+        app.view = View::Diff;
+        app.focus = Focus::Content;
+        app.config.unified = false;
+        app.config.preferences.code.line_numbers = false;
+        app.config.preferences.code.context_lines = 0;
+        app.config.preferences.code.whitespace = crate::settings::Whitespace::SelectedLines;
+        let old = "\told token ".repeat(10);
+        let new = "\tnew token ".repeat(10);
+        let patch = format!(
+            "diff --git a/file.ts b/file.ts\n--- a/file.ts\n+++ b/file.ts\n@@ -1 +1 @@\n-{old}\n+{new}\n"
+        );
+        let files = crate::diff::parse("M\0file.ts\0", &patch)?;
+        let review = app.reviews.values_mut().next().context("review")?;
+        std::sync::Arc::make_mut(review.snapshot.as_mut().context("snapshot")?).files = files;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30))?;
+        for wrap in [false, true] {
+            app.config.wrap_diff = wrap;
+            app.invalidate();
+            terminal.draw(|f| draw(f, &mut app))?;
+            let row = app
+                .document
+                .as_ref()
+                .context("doc")?
+                .rows
+                .iter()
+                .position(|r| {
+                    matches!(
+                        r.right.target,
+                        Some(crate::workflow::Target::Code {
+                            old: Some(1),
+                            new: Some(1),
+                            ..
+                        })
+                    )
+                })
+                .context("paired row")?;
+            for (side, marked, plain, copied) in [
+                (
+                    crate::review::Side::Left,
+                    "→···old·token",
+                    "    new token",
+                    &old,
+                ),
+                (
+                    crate::review::Side::Right,
+                    "→···new·token",
+                    "    old token",
+                    &new,
+                ),
+            ] {
+                app.workflow.cursor = Some(row);
+                app.workflow.side = side;
+                app.workflow.selection = Some(crate::review::Anchor {
+                    path: "file.ts".into(),
+                    side,
+                    start: 1,
+                    end: 1,
+                });
+                terminal.draw(|f| draw(f, &mut app))?;
+                let screen = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(
+                    screen.contains(marked),
+                    "selected {side:?}, wrap {wrap}: {screen}"
+                );
+                assert!(
+                    screen.contains(plain),
+                    "unselected {side:?}, wrap {wrap}: {screen}"
+                );
+                let unwanted = if side == crate::review::Side::Left {
+                    "new·token"
+                } else {
+                    "old·token"
+                };
+                assert!(
+                    !screen.contains(unwanted),
+                    "unselected continuation marked: {screen}"
+                );
+                app.action(Action::Copy);
+                assert_eq!(app.clipboard.as_deref(), Some(copied.as_str()));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn diff_reading_intent_and_selection_survive_wrap_preview_discard() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut app = guide_app(dir.path());
@@ -3065,6 +3204,15 @@ mod tests {
         app.preview_diff_settings(Some(&preview));
         terminal.draw(|f| draw(f, &mut app))?;
         assert!(app.scroll < position);
+        app.action(Action::Help);
+        terminal.draw(|f| draw(f, &mut app))?;
+        app.key_event(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        app.action(Action::Focus(Focus::Navigation));
+        terminal.draw(|f| draw(f, &mut app))?;
+        app.action(Action::Focus(Focus::Content));
         app.preview_diff_settings(None);
         terminal.draw(|f| draw(f, &mut app))?;
         assert_eq!(app.workflow.cursor, Some(position));

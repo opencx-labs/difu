@@ -163,6 +163,10 @@ pub struct Storage {
 }
 impl Storage {
     pub fn discover() -> Result<Self> {
+        #[cfg(test)]
+        if let Some(storage) = crate::process::fixture::storage() {
+            return Ok(storage);
+        }
         let config = dirs::config_dir()
             .context("Cannot locate your configuration directory")?
             .join("difu");

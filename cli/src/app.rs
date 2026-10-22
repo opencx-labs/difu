@@ -1980,9 +1980,23 @@ impl App {
         }));
     }
     pub fn action(&mut self, action: Action) {
-        if !matches!(
+        if matches!(
             action,
-            Action::Copy | Action::ToggleWrap | Action::ToggleLayout | Action::ExpandHunk(..)
+            Action::SelectRepository(_)
+                | Action::OpenRepository
+                | Action::SelectPr(_)
+                | Action::OpenPr
+                | Action::SetView(_)
+                | Action::SetInbox(_)
+                | Action::SetState(_)
+                | Action::Back
+                | Action::SelectFile(_)
+                | Action::SelectDirectory(_)
+                | Action::Jump(_)
+                | Action::Chapter(_)
+                | Action::GoToChapter(_)
+                | Action::Scroll(_)
+                | Action::FastScroll(_)
         ) {
             self.diff_reading = None;
         }

@@ -469,6 +469,21 @@ fn diff_preview_uses_context_gutters_wrap_and_selected_whitespace() {
         "unselected old line: {text}"
     );
     assert!(!text.contains("fn greeting"), "{text}");
+    config.unified = false;
+    let split = draw::diff_preview(&config, 100)
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        split.contains("    println!(\"Hi\")"),
+        "unselected split side: {split}"
+    );
+    assert!(
+        split.contains("····println!"),
+        "selected split side: {split}"
+    );
+    config.unified = true;
     let mut counts = Vec::new();
     for context in [0, 3, 5, 10] {
         config.preferences.code.context_lines = context;

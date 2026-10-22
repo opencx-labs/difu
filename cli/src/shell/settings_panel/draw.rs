@@ -403,7 +403,11 @@ pub(crate) fn diff_preview(config: &Config, width: u16) -> Vec<Line<'static>> {
             Some(crate::workflow::Target::Code { new: Some(12), .. })
         );
         Line::from(if selected {
-            row.marked_spans.unwrap_or(row.spans)
+            row.selected_spans(
+                crate::review::Side::Right,
+                !config.unified,
+                usize::from(width.max(1)),
+            )
         } else {
             row.spans
         })
