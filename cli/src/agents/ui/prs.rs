@@ -617,6 +617,25 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert_eq!(screen.matches("PR #42 · Open").count(), 2);
+        let conversation = ui
+            .hits
+            .iter()
+            .find_map(|(rect, action)| {
+                matches!(action, Action::Focus(Focus::Conversation)).then_some(*rect)
+            })
+            .context("conversation border")?;
+        let pill = ui
+            .hits
+            .iter()
+            .find_map(|(rect, action)| matches!(action, Action::PullRequest(0)).then_some(*rect))
+            .context("PR pill")?;
+        assert_eq!(pill.y, conversation.bottom() - 2);
+        assert!(pill.x > conversation.x && pill.right() < conversation.right());
+        let status_row = (conversation.x..conversation.right())
+            .filter_map(|x| terminal.backend().buffer().cell((x, pill.y - 1)))
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(status_row.contains("/permissions"), "{status_row}");
         assert!(ui.prs.visible.contains("one"));
         assert!(!screen.contains("Shells (0)"));
         ui.summaries.first_mut().context("summary")?.status = Status::Waiting;

@@ -3094,18 +3094,19 @@ impl Ui {
             frame.render_widget(Paragraph::new("Resize to at least 40 × 12"), area);
             return;
         }
-        let resources = self.visible_resources();
-        let session_prs = self
-            .selected
-            .as_ref()
-            .map(|id| self.prs.all(id).to_vec())
-            .unwrap_or_default();
-        let resource_height = u16::from(!resources.is_empty() || !session_prs.is_empty());
+        let panel = self.panels.visible();
+        let conversation_visible =
+            (!panel || self.panels.right) && !(self.drilled && self.changes_visible);
+        let footer_height = if conversation_visible {
+            0
+        } else {
+            self.session_footer_height()
+        };
         let content = Rect::new(
             1,
             2,
             area.width.saturating_sub(2),
-            area.height.saturating_sub(2 + resource_height),
+            area.height.saturating_sub(2 + footer_height),
         );
         self.viewport = content.height.saturating_sub(2) as usize;
         let list_width = if self.list_visible {
@@ -3119,7 +3120,6 @@ impl Ui {
         } else {
             0
         };
-        let panel = self.panels.visible();
         let bottom = panel
             && self.panels.right
             && self.preferences.layout.helper_placement
@@ -3169,47 +3169,16 @@ impl Ui {
         if changes.width > 0 && changes.height > 0 {
             self.draw_panel(frame, changes);
         }
-        let mut x = conversation.x;
-        for (artifacts, count) in resources {
-            let label = format!(
-                " {} ({count}) ",
-                if artifacts { "Artifacts" } else { "Shells" }
-            );
-            let width = (label.len() as u16).min(conversation.right().saturating_sub(x));
-            self.button(
+        if footer_height > 0 {
+            self.draw_session_footer(
                 frame,
-                Rect::new(x, content.bottom(), width, 1),
-                &label,
-                Action::Resources(artifacts),
-                self.focus == Focus::Resources(artifacts),
+                Rect::new(
+                    conversation.x,
+                    content.bottom(),
+                    conversation.width,
+                    footer_height,
+                ),
             );
-            x = x.saturating_add(width + 1);
-        }
-        for (index, link) in session_prs.iter().enumerate() {
-            let pr = &link.pr;
-            let stale = self.selected.as_ref().is_some_and(|id| self.prs.stale(id));
-            let label = format!(
-                " PR #{} · {}{} ",
-                pr.key.number,
-                pr.label(),
-                if stale { " · stale" } else { "" }
-            );
-            let width = (unicode_width::UnicodeWidthStr::width(label.as_str()) as u16)
-                .min(conversation.right().saturating_sub(x));
-            if width == 0 {
-                break;
-            }
-            let rect = Rect::new(x, content.bottom(), width, 1);
-            self.hits.push((rect, Action::PullRequest(index)));
-            frame.render_widget(
-                Paragraph::new(label).style(if self.focus == Focus::PullRequest(index) {
-                    Style::default().bg(prs::color(pr)).fg(crate::ui::INK)
-                } else {
-                    Style::default().fg(prs::color(pr)).bg(BG)
-                }),
-                rect,
-            );
-            x = x.saturating_add(width + 1);
         }
         self.text_selection.highlight(frame);
         self.draw_modal(frame);
@@ -3518,6 +3487,15 @@ impl Ui {
             !self.panels.focused && matches!(self.focus, Focus::Conversation | Focus::Composer),
         );
         self.hits.push((rect, Action::Focus(Focus::Conversation)));
+        let footer_height = self.session_footer_height().min(area.height);
+        let footer = Rect::new(
+            area.x,
+            area.bottom().saturating_sub(footer_height),
+            area.width,
+            footer_height,
+        );
+        area.height = area.height.saturating_sub(footer_height);
+        self.draw_session_footer(frame, footer);
         let Some(id) = self.selected.clone() else {
             frame.render_widget(Paragraph::new("Launch a coding agent with n.\n\nSessions and review jobs keep running when difu closes.").wrap(Wrap { trim:false }).style(Style::default().fg(DIM)), area);
             return;
@@ -3560,6 +3538,7 @@ impl Ui {
             0
         };
         let dock_composer = composer_height > 0
+            && footer_height == 0
             && matches!(self.modal, Some(Modal::Commands { .. }))
             && !area.is_empty();
         if dock_composer {
@@ -4857,20 +4836,28 @@ mod tests {
         let session = ui.sessions.get_mut("one").context("session")?;
         session.provider = provider::Provider::Claude;
         session.permission_state.mode = Some("auto".into());
-        for (width, height) in [(104, 32), (48, 12), (22, 10)] {
+        for (width, height, resources) in [
+            (104, 32, false),
+            (48, 12, false),
+            (22, 10, false),
+            (104, 32, true),
+            (48, 12, true),
+            (22, 10, true),
+        ] {
+            if resources {
+                ui.panels
+                    .shells
+                    .insert("one".into(), vec![serde_json::json!({"itemId": "shell"})]);
+            }
+            ui.hits.clear();
+            let status_y = height - 2 - u16::from(resources);
             let mut terminal = Terminal::new(TestBackend::new(width, height))?;
             terminal.draw(|frame| ui.draw_conversation(frame, frame.area()))?;
             let buffer = terminal.backend().buffer();
+            assert_eq!(buffer.cell((2, status_y)).context("status")?.symbol(), "A");
+            assert_eq!(buffer.cell((2, status_y)).context("status")?.fg, ACCENT);
             assert_eq!(
-                buffer.cell((2, height - 2)).context("status")?.symbol(),
-                "A"
-            );
-            assert_eq!(buffer.cell((2, height - 2)).context("status")?.fg, ACCENT);
-            assert_eq!(
-                buffer
-                    .cell((1, height - 2))
-                    .context("status inset")?
-                    .symbol(),
+                buffer.cell((1, status_y)).context("status inset")?.symbol(),
                 " "
             );
             for x in 1..width - 1 {
@@ -4882,7 +4869,30 @@ mod tests {
                     "─"
                 );
             }
-            let input_y = height - 4;
+            if resources {
+                let footer = ui
+                    .hits
+                    .iter()
+                    .find_map(|(rect, action)| {
+                        matches!(action, Action::Resources(false)).then_some(*rect)
+                    })
+                    .context("shell control")?;
+                assert_eq!(footer.y, status_y + 1);
+                assert!(footer.x > 0 && footer.right() < width);
+                assert_eq!(
+                    buffer.cell((2, footer.y)).context("shell label")?.symbol(),
+                    "S"
+                );
+                assert!(
+                    ui.hits
+                        .iter()
+                        .rev()
+                        .find(|(rect, _)| rect.contains((footer.x, footer.y).into()))
+                        .is_some_and(|(_, action)| matches!(action, Action::Resources(false))),
+                    "the footer must receive clicks instead of the conversation"
+                );
+            }
+            let input_y = status_y - 2;
             assert_eq!(
                 buffer
                     .cell((2, input_y))
