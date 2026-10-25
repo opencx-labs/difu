@@ -336,11 +336,7 @@ impl Highlight {
         plain: Color,
         now: Instant,
     ) {
-        let (from, to) = if self.on {
-            (plain, highlight)
-        } else {
-            (highlight, plain)
-        };
+        let from = if self.on { plain } else { highlight };
         let total = usize::from(area.width) * usize::from(area.height);
         for position in area.positions() {
             let Some(cell) = buffer.cell_mut(position) else {
@@ -358,9 +354,11 @@ impl Highlight {
             if now < at {
                 cell.bg = from;
             } else if now < at + FLAP {
-                cell.set_symbol("▀");
-                cell.fg = to;
-                cell.bg = from;
+                // Keep the terminal's default background in the background channel:
+                // used as a foreground, Reset draws the terminal's text color.
+                cell.set_symbol(if self.on { "▀" } else { "▄" });
+                cell.fg = highlight;
+                cell.bg = plain;
             }
         }
     }
@@ -1078,6 +1076,75 @@ pub(super) fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selection_flaps_keep_background_colors_out_of_terminal_foregrounds() -> anyhow::Result<()> {
+        use crate::theme::{self, Role as ThemeRole};
+        use anyhow::Context;
+        use ratatui::layout::Rect;
+
+        let start = Instant::now();
+        let area = Rect::new(3, 2, 8, 3);
+        let highlight = theme::slot(ThemeRole::UserMessage);
+        let background = theme::slot(ThemeRole::Background);
+        for (index, theme) in theme::themes().iter().enumerate() {
+            theme::select(index);
+            for on in [true, false] {
+                for right_to_left in [false, true] {
+                    let flip = Highlight::start(on, right_to_left, start, Default::default())
+                        .context("selection animation")?;
+                    for elapsed in [0, 60, 150, 240] {
+                        let mut buffer = Buffer::empty(area);
+                        buffer.set_style(
+                            area,
+                            Style::default().bg(if on { highlight } else { background }),
+                        );
+                        flip.apply(
+                            &mut buffer,
+                            area,
+                            highlight,
+                            background,
+                            start + Duration::from_millis(elapsed),
+                        );
+                        theme::present(&mut buffer);
+                        let flaps: Vec<_> = buffer
+                            .content
+                            .iter()
+                            .filter(|cell| matches!(cell.symbol(), "▀" | "▄"))
+                            .collect();
+                        assert!(!flaps.is_empty());
+                        for cell in flaps {
+                            assert_ne!(
+                                cell.fg,
+                                Color::Reset,
+                                "{} must not draw a flap using the terminal's text color",
+                                theme.id
+                            );
+                            let halves = if cell.symbol() == "▀" {
+                                (cell.fg, cell.bg)
+                            } else {
+                                (cell.bg, cell.fg)
+                            };
+                            let selected = theme.color(ThemeRole::UserMessage);
+                            let plain = theme.color(ThemeRole::Background);
+                            assert_eq!(
+                                halves,
+                                if on {
+                                    (selected, plain)
+                                } else {
+                                    (plain, selected)
+                                },
+                                "{} must keep the new color above the old color",
+                                theme.id
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        theme::select(0);
+        Ok(())
+    }
 
     fn plain(lines: &[Line]) -> String {
         lines

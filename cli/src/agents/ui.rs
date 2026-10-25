@@ -60,7 +60,7 @@ use ratatui::{
     layout::Rect,
     style::Style,
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap},
 };
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -2990,18 +2990,6 @@ fn panel(frame: &mut Frame, rect: Rect, title: &str, focused: bool) -> Rect {
     frame.render_widget(block, rect);
     inner(rect)
 }
-fn join_bottom_border(frame: &mut Frame, rect: Rect) {
-    if rect.width > 1 && rect.height > 1 {
-        for x in [rect.x, rect.right().saturating_sub(1)] {
-            if let Some(cell) = frame
-                .buffer_mut()
-                .cell_mut((x, rect.bottom().saturating_sub(1)))
-            {
-                cell.set_symbol("┴");
-            }
-        }
-    }
-}
 fn editor(frame: &mut Frame, rect: Rect, label: &str, value: &Editor, focused: bool) {
     editor_with(frame, rect, label, value, focused, None);
 }
@@ -3017,6 +3005,31 @@ fn editor_with(
     transform: Option<Rows>,
 ) {
     let area = panel(frame, rect, label, focused);
+    editor_rows(frame, area, value, focused, transform);
+}
+fn composer_editor(
+    frame: &mut Frame,
+    rect: Rect,
+    value: &Editor,
+    focused: bool,
+    transform: Option<Rows>,
+) -> Rect {
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(if focused { ACCENT } else { BORDER }))
+        .padding(Padding::horizontal(1));
+    let area = block.inner(rect);
+    frame.render_widget(block, rect);
+    editor_rows(frame, area, value, focused, transform);
+    area
+}
+fn editor_rows(
+    frame: &mut Frame,
+    area: Rect,
+    value: &Editor,
+    focused: bool,
+    transform: Option<Rows>,
+) {
     if area.is_empty() {
         return;
     }
@@ -3533,21 +3546,10 @@ impl Ui {
                     1,
                     self.preferences.input.composer_max_height.clamp(3, 20) as usize,
                 ) as u16;
-            (lines + 3 + self.voice_rows(area.width)).min(area.height.saturating_sub(3))
+            (lines + 2 + self.voice_rows(area.width)).min(area.height.saturating_sub(3))
         } else {
             0
         };
-        let dock_composer = composer_height > 0
-            && footer_height == 0
-            && matches!(self.modal, Some(Modal::Commands { .. }))
-            && !area.is_empty();
-        if dock_composer {
-            // The input's last row shares the pane border; reclaim the old inset.
-            area.height = area
-                .height
-                .saturating_add(1)
-                .min(rect.bottom().saturating_sub(area.y));
-        }
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
@@ -3832,9 +3834,6 @@ impl Ui {
             }
             if matches!(self.modal, Some(Modal::Commands { .. })) {
                 self.draw_commands(frame, composer);
-                if dock_composer {
-                    join_bottom_border(frame, composer);
-                }
                 return;
             }
             let status_y = composer.bottom().saturating_sub(1);
@@ -3861,7 +3860,7 @@ impl Ui {
             );
             let voice = self
                 .voice_rows(composer.width)
-                .min(composer.height.saturating_sub(3));
+                .min(composer.height.saturating_sub(2));
             let composer = if voice > 0 {
                 self.draw_voice(
                     frame,
@@ -3884,27 +3883,23 @@ impl Ui {
             let now = Instant::now();
             let focused =
                 self.focus == Focus::Composer && !self.panels.focused && self.modal.is_none();
-            if let Some(clearing) = reveal::clearing(position, now) {
-                editor_with(
+            let input_area = if let Some(clearing) = reveal::clearing(position, now) {
+                composer_editor(
                     frame,
                     composer,
-                    "",
                     &Editor::from(clearing.text()),
                     focused,
                     Some(&|lines: &mut [Line<'static>]| clearing.vanish(lines, now)),
-                );
+                )
             } else {
-                editor(frame, composer, "", &position.draft, focused);
-            }
+                composer_editor(frame, composer, &position.draft, focused, None)
+            };
             let clearing = position.clearing.is_some();
             if position.draft.chars.is_empty() && !clearing {
                 frame.render_widget(
                     Paragraph::new(placeholder).style(Style::default().fg(DIM)),
-                    inner(composer),
+                    input_area,
                 );
-            }
-            if dock_composer {
-                join_bottom_border(frame, composer);
             }
             self.hits.push((composer, Action::Focus(Focus::Composer)));
         } else if !self.drilled {
@@ -4892,7 +4887,19 @@ mod tests {
                     "the footer must receive clicks instead of the conversation"
                 );
             }
-            let input_y = status_y - 2;
+            let input_y = status_y - 1;
+            for x in 1..width - 1 {
+                assert_eq!(
+                    buffer.cell((x, input_y - 1)).context("separator")?.symbol(),
+                    "─"
+                );
+            }
+            for x in [1, width - 2] {
+                assert_eq!(
+                    buffer.cell((x, input_y)).context("input inset")?.symbol(),
+                    " "
+                );
+            }
             assert_eq!(
                 buffer
                     .cell((2, input_y))
@@ -8397,7 +8404,9 @@ mod tests {
         // Moving previews live; Esc returns to the saved theme. The picker
         // leaves the conversation visible so the preview shows on it.
         ui.drilled = true;
-        ui.open_theme();
+        ui.run_palette_command("/theme", "/theme");
+        assert!(ui.settings_requested.is_none());
+        assert!(matches!(ui.modal, Some(Modal::Theme { .. })));
         let (screen, _) = draw(&mut ui, 120, 40)?;
         assert!(
             screen.contains("Default")

@@ -3,7 +3,6 @@ use super::*;
 pub(crate) fn command_category(name: &str) -> Option<Category> {
     match name {
         "/settings" => Some(Category::Appearance),
-        "/theme" => Some(Category::Appearance),
         "/tweaks" => Some(Category::Motion),
         "/voice" => Some(Category::Input),
         _ => None,
