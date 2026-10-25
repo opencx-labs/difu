@@ -510,6 +510,10 @@ fn layout_width_visibility_and_bottom_helper_change_real_panes() -> anyhow::Resu
         command: "echo preview".into(),
     });
     ui.positions.entry("session".into()).or_default().draft = Editor::from("Keep composer");
+    ui.panels.shells.insert(
+        "session".into(),
+        vec![serde_json::json!({"itemId": "tool"})],
+    );
     for (width, requested, expected) in [(120, 0, 29), (120, 20, 20), (120, 40, 40), (40, 40, 18)] {
         config.preferences.layout.sidebar_width = requested;
         ui.apply_settings(&config);
@@ -537,6 +541,13 @@ fn layout_width_visibility_and_bottom_helper_change_real_panes() -> anyhow::Resu
         .context("conversation")?;
     assert!(ui.panels.rect.y > chat.y + chat.height / 2);
     assert!(ui.panels.rect.width > 80);
+    let footer = ui
+        .hits
+        .iter()
+        .find_map(|(rect, action)| matches!(action, Action::Resources(false)).then_some(*rect))
+        .context("shell footer")?;
+    assert_eq!(footer.y, chat.bottom() - 2);
+    assert!(footer.bottom() < ui.panels.rect.y);
     assert!(native_frame(&mut ui, 40, 12)?.contains("Shell output"));
     config.preferences.layout.helper_placement = Some(HelperPlacement::Main);
     config.agent_panel_right = false;

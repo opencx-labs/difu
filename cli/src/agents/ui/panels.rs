@@ -64,6 +64,71 @@ impl Ui {
             .filter(|(_, count)| *count > 0)
             .collect()
     }
+    pub(super) fn session_footer_height(&self) -> u16 {
+        u16::from(
+            !self.visible_resources().is_empty()
+                || self
+                    .selected
+                    .as_ref()
+                    .is_some_and(|id| !self.prs.all(id).is_empty()),
+        )
+    }
+    pub(super) fn draw_session_footer(&mut self, frame: &mut Frame, area: Rect) {
+        if area.is_empty() {
+            return;
+        }
+        let resources = self.visible_resources();
+        let session_prs = self
+            .selected
+            .as_ref()
+            .map(|id| self.prs.all(id).to_vec())
+            .unwrap_or_default();
+        let mut x = area.x;
+        for (artifacts, count) in resources {
+            let label = format!(
+                " {} ({count}) ",
+                if artifacts { "Artifacts" } else { "Shells" }
+            );
+            let width = (label.len() as u16).min(area.right().saturating_sub(x));
+            if width == 0 {
+                break;
+            }
+            self.button(
+                frame,
+                Rect::new(x, area.y, width, 1),
+                &label,
+                Action::Resources(artifacts),
+                self.focus == Focus::Resources(artifacts),
+            );
+            x = x.saturating_add(width + 1);
+        }
+        for (index, link) in session_prs.iter().enumerate() {
+            let pr = &link.pr;
+            let stale = self.selected.as_ref().is_some_and(|id| self.prs.stale(id));
+            let label = format!(
+                " PR #{} · {}{} ",
+                pr.key.number,
+                pr.label(),
+                if stale { " · stale" } else { "" }
+            );
+            let width = (unicode_width::UnicodeWidthStr::width(label.as_str()) as u16)
+                .min(area.right().saturating_sub(x));
+            if width == 0 {
+                break;
+            }
+            let rect = Rect::new(x, area.y, width, 1);
+            self.hits.push((rect, Action::PullRequest(index)));
+            frame.render_widget(
+                Paragraph::new(label).style(if self.focus == Focus::PullRequest(index) {
+                    Style::default().bg(prs::color(pr)).fg(crate::ui::INK)
+                } else {
+                    Style::default().fg(prs::color(pr)).bg(BG)
+                }),
+                rect,
+            );
+            x = x.saturating_add(width + 1);
+        }
+    }
     pub fn panel_right(&self) -> bool {
         self.panels.right
     }
