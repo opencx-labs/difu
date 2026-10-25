@@ -1,8 +1,10 @@
 # Settings
 
 Open `/settings`, press **Ctrl+,**, or choose Settings in **Cmd+K** from Agents or
-Reviews. `/theme`, `/tweaks` and `/voice` open the corresponding section. Your
-active session, composer draft, selection and reading position stay intact.
+Reviews. `/tweaks` and `/voice` open the corresponding section. `/theme` opens
+the compact theme picker with a live preview on your conversation; themes are
+also editable in Settings. Your active session, composer draft, selection and
+reading position stay intact.
 
 ## Browse, preview and save
 

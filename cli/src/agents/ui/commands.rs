@@ -568,7 +568,7 @@ impl Ui {
         true
     }
     pub(super) fn commands_height(&self) -> u16 {
-        self.command_entries().len().clamp(1, 8) as u16 + 4
+        self.command_entries().len().clamp(1, 8) as u16 + 3
     }
     pub(super) fn draw_commands(&mut self, frame: &mut Frame, area: Rect) {
         let bindings = crate::shortcuts::Bindings::new(&self.shortcut_config);
@@ -604,7 +604,7 @@ impl Ui {
             .saturating_add(1 + query.cursor)
             .min(input.chars.len());
         input.anchor = query.anchor.map(|n| start.saturating_add(n + 1));
-        let input_height = area.height.min(3);
+        let input_height = area.height.min(2);
         let available = area.height.saturating_sub(input_height + 1) as usize;
         let start = selected.saturating_sub(available.saturating_sub(1));
         for (row, (index, (name, description, _))) in entries
@@ -674,7 +674,7 @@ impl Ui {
                 1,
             ),
         );
-        editor(
+        composer_editor(
             frame,
             Rect::new(
                 area.x,
@@ -682,9 +682,9 @@ impl Ui {
                 area.width,
                 input_height,
             ),
-            "",
             &input,
             true,
+            None,
         );
     }
     pub(super) fn draw_status(&mut self, frame: &mut Frame, area: Rect) {

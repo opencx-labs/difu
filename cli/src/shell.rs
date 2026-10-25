@@ -818,7 +818,6 @@ mod settings_integration_tests {
         shell.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         for (command, category) in [
             ("/settings", Category::Appearance),
-            ("/theme", Category::Appearance),
             ("/tweaks", Category::Motion),
             ("/voice", Category::Input),
         ] {
@@ -827,6 +826,9 @@ mod settings_integration_tests {
             assert_eq!(shell.settings.as_ref().context("panel")?.category, category);
             shell.settings = None;
         }
+        shell.agents.run_palette_command("/theme", "/theme");
+        shell.take_settings_request();
+        assert!(shell.settings.is_none());
         Ok(())
     }
     #[test]

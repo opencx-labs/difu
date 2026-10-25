@@ -591,7 +591,7 @@ fn composer_height_and_paste_thresholds_use_real_editor_and_retain_source() -> a
         .map(|n| format!("composer row {n}"))
         .collect::<Vec<_>>()
         .join("\n");
-    for (limit, expected) in [(3, 5), (10, 12), (20, 22)] {
+    for (limit, expected) in [(3, 4), (10, 11), (20, 21)] {
         config.preferences.input.composer_max_height = limit;
         ui.preview_visual_settings(&config);
         ui.positions.entry("session".into()).or_default().draft = Editor::from(source.as_str());
