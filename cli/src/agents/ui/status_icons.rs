@@ -30,6 +30,16 @@ const STATUSES: [Status; 7] = [
     Status::Failed,
 ];
 
+/// Asynchronous questions may still need attention after the agent is ready.
+/// Request attention takes priority for the icon without changing run state.
+pub(super) fn display_status(status: Status, has_requests: bool) -> Status {
+    if has_requests {
+        Status::Waiting
+    } else {
+        status
+    }
+}
+
 pub(super) fn color(status: Status) -> Color {
     match status {
         Status::Starting => PURPLE,

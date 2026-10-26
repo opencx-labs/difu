@@ -3521,7 +3521,7 @@ impl Ui {
                     frame,
                     Rect::new(row.x.saturating_add(2), row.y, status_icons::WIDTH, 1)
                         .intersection(row),
-                    session.status,
+                    status_icons::display_status(session.status, session.pending > 0),
                     self.preferences.motion.sidebar() && self.tweaks.agent_reply_cps > 0,
                     self.modal.is_none() && self.notice.is_none(),
                 );
@@ -3566,7 +3566,15 @@ impl Ui {
             .selected
             .as_ref()
             .and_then(|id| self.sessions.get(id))
-            .map(|s| s.status)
+            .map(|s| {
+                status_icons::display_status(
+                    s.status,
+                    s.pending_question_count() > 0
+                        || s.pending
+                            .iter()
+                            .any(|p| p.method != "item/tool/requestUserInput"),
+                )
+            })
         {
             self.status_icons.draw(
                 frame,
@@ -5514,6 +5522,99 @@ mod tests {
         assert!(!screen.contains("Second card renamed"), "{screen}");
         let (screen, _) = draw_settled(&mut ui, 120, 40)?;
         assert!(screen.contains(&format!("📌  {first}")) && screen.contains("Second card renamed"));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_requests_show_the_hand_in_the_sidebar_and_chat_header() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        still(&mut ui);
+        ui.drilled = true;
+        let check = |ui: &mut Ui, expected: &str| -> Result<()> {
+            ui.summaries = vec![ui.sessions.get("one").context("session")?.summary()];
+            let mut terminal = Terminal::new(TestBackend::new(120, 40))?;
+            terminal.draw(|frame| ui.draw(frame))?;
+            let sidebar = ui
+                .hits
+                .iter()
+                .find_map(|(rect, action)| {
+                    matches!(action, Action::Select(id) if id == "one").then_some(*rect)
+                })
+                .context("sidebar row")?;
+            let chat = ui
+                .hits
+                .iter()
+                .find_map(|(rect, action)| {
+                    matches!(action, Action::Focus(Focus::Conversation)).then_some(*rect)
+                })
+                .context("conversation box")?;
+            for rect in [sidebar, chat] {
+                let icon = terminal
+                    .backend()
+                    .buffer()
+                    .cell((rect.x + 2, rect.y))
+                    .context("status icon")?;
+                assert_eq!(icon.symbol(), expected);
+                if expected.starts_with('✋') {
+                    assert_eq!(icon.fg, crate::ui::YELLOW);
+                }
+            }
+            Ok(())
+        };
+        for (status, normal) in [
+            (Status::Idle, "●"),
+            (Status::Running, "🏃\u{fe0e}"),
+            (Status::Interrupted, "⚠\u{fe0e}"),
+        ] {
+            let session = ui.sessions.get_mut("one").context("session")?;
+            session.status = status;
+            session.queue = vec!["A queued prompt is not a request".into()];
+            session.pending = vec![Pending {
+                id: serde_json::json!("questions"),
+                method: "item/tool/requestUserInput".into(),
+                params: serde_json::json!({
+                    "difuAsync": true,
+                    "questions": [{"id":"first", "question":"First?"}, {"id":"second", "question":"Second?"}],
+                    "difuAnswers": {"first":"Answered"}
+                }),
+                responded: false,
+            }];
+            check(&mut ui, "✋\u{fe0e}")?;
+            let session = ui.sessions.get_mut("one").context("session")?;
+            assert_eq!(
+                session.status, status,
+                "icons do not change execution state"
+            );
+            *session
+                .pending
+                .first_mut()
+                .context("questions")?
+                .params
+                .get_mut("difuAnswers")
+                .context("answers")? = serde_json::json!({"first":"Answered", "second":"Answered"});
+            check(&mut ui, normal)?;
+            ui.sessions
+                .get_mut("one")
+                .context("session")?
+                .pending
+                .push(Pending {
+                    id: serde_json::json!("approval"),
+                    method: "item/commandExecution/requestApproval".into(),
+                    params: serde_json::json!({}),
+                    responded: false,
+                });
+            check(&mut ui, "✋\u{fe0e}")?;
+            ui.sessions
+                .get_mut("one")
+                .context("session")?
+                .pending
+                .clear();
+            check(&mut ui, normal)?;
+        }
         Ok(())
     }
 
