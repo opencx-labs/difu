@@ -30,6 +30,10 @@ pub(super) struct Panels {
     pub installing: bool,
     pub checked: Option<Instant>,
     pub error: Option<String>,
+    footer_rect: Rect,
+    footer_scroll: u16,
+    footer_width: u16,
+    footer_focus: Option<Focus>,
 }
 impl Panels {
     pub fn new(right: bool) -> Self {
@@ -46,6 +50,10 @@ impl Panels {
             installing: false,
             checked: None,
             error: None,
+            footer_rect: Rect::default(),
+            footer_scroll: 0,
+            footer_width: 0,
+            footer_focus: None,
         }
     }
     pub fn visible(&self) -> bool {
@@ -73,61 +81,139 @@ impl Ui {
                     .is_some_and(|id| !self.prs.all(id).is_empty()),
         )
     }
+    /// Controls share one ordered list for drawing and keyboard traversal.
+    fn footer_items(&self) -> Vec<(String, Focus, Style)> {
+        let resources = self.visible_resources();
+        let mut items = Vec::new();
+        for artifacts in [true, false] {
+            if !artifacts && let Some(id) = &self.selected {
+                for (index, link) in self.prs.all(id).iter().enumerate() {
+                    let pr = &link.pr;
+                    let focus = Focus::PullRequest(index);
+                    items.push((
+                        format!(
+                            " PR #{} · {}{} ",
+                            pr.key.number,
+                            pr.label(),
+                            if self.prs.stale(id) { " · stale" } else { "" },
+                        ),
+                        focus,
+                        if self.focus == focus {
+                            Style::default().bg(prs::color(pr)).fg(crate::ui::INK)
+                        } else {
+                            Style::default().fg(prs::color(pr)).bg(BG)
+                        },
+                    ));
+                }
+            }
+            if let Some((_, count)) = resources.iter().find(|(kind, _)| *kind == artifacts) {
+                let focus = Focus::Resources(artifacts);
+                items.push((
+                    format!(
+                        " {} ({count}) ",
+                        if artifacts { "Artifacts" } else { "Shells" }
+                    ),
+                    focus,
+                    crate::ui::option_style(self.focus == focus),
+                ));
+            }
+        }
+        items
+    }
     pub(super) fn draw_session_footer(&mut self, frame: &mut Frame, area: Rect) {
+        self.draw_footer(frame, area, Line::default());
+    }
+    pub(super) fn draw_composer_footer(&mut self, frame: &mut Frame, area: Rect) {
+        let status = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.sessions.get(id))
+            .map(permissions_panel::composer_status)
+            .unwrap_or_default();
+        self.draw_footer(frame, area, status);
+    }
+    fn draw_footer(&mut self, frame: &mut Frame, area: Rect, mut line: Line<'static>) {
         if area.is_empty() {
             return;
         }
-        let resources = self.visible_resources();
-        let session_prs = self
-            .selected
-            .as_ref()
-            .map(|id| self.prs.all(id).to_vec())
-            .unwrap_or_default();
-        let mut x = area.x;
-        for (artifacts, count) in resources {
-            let label = format!(
-                " {} ({count}) ",
-                if artifacts { "Artifacts" } else { "Shells" }
-            );
-            let width = (label.len() as u16).min(area.right().saturating_sub(x));
-            if width == 0 {
-                break;
+        let mut controls = Vec::new();
+        for (label, focus, style) in self.footer_items() {
+            if line.width() > 0 {
+                line.spans.push(Span::raw(" "));
             }
-            self.button(
-                frame,
-                Rect::new(x, area.y, width, 1),
-                &label,
-                Action::Resources(artifacts),
-                self.focus == Focus::Resources(artifacts),
-            );
-            x = x.saturating_add(width + 1);
+            let start = line.width().min(usize::from(u16::MAX)) as u16;
+            line.spans.push(Span::styled(label, style));
+            let end = line.width().min(usize::from(u16::MAX)) as u16;
+            controls.push((start, end, focus));
         }
-        for (index, link) in session_prs.iter().enumerate() {
-            let pr = &link.pr;
-            let stale = self.selected.as_ref().is_some_and(|id| self.prs.stale(id));
-            let label = format!(
-                " PR #{} · {}{} ",
-                pr.key.number,
-                pr.label(),
-                if stale { " · stale" } else { "" }
-            );
-            let width = (unicode_width::UnicodeWidthStr::width(label.as_str()) as u16)
-                .min(area.right().saturating_sub(x));
-            if width == 0 {
-                break;
+        let width = line.width().min(usize::from(u16::MAX)) as u16;
+        let maximum = width.saturating_sub(area.width);
+        let scroll = &mut self.panels.footer_scroll;
+        if self.panels.footer_focus != Some(self.focus)
+            || self.panels.footer_rect.width != area.width
+        {
+            if let Some((start, end, _)) =
+                controls.iter().find(|(_, _, focus)| *focus == self.focus)
+            {
+                if *start < *scroll {
+                    *scroll = *start;
+                } else if *end > scroll.saturating_add(area.width) {
+                    *scroll = end.saturating_sub(area.width).min(*start);
+                }
+            } else {
+                *scroll = 0;
             }
-            let rect = Rect::new(x, area.y, width, 1);
-            self.hits.push((rect, Action::PullRequest(index)));
-            frame.render_widget(
-                Paragraph::new(label).style(if self.focus == Focus::PullRequest(index) {
-                    Style::default().bg(prs::color(pr)).fg(crate::ui::INK)
-                } else {
-                    Style::default().fg(prs::color(pr)).bg(BG)
-                }),
-                rect,
-            );
-            x = x.saturating_add(width + 1);
         }
+        *scroll = (*scroll).min(maximum);
+        let scroll = *scroll;
+        self.panels.footer_focus = Some(self.focus);
+        self.panels.footer_rect = area;
+        self.panels.footer_width = width;
+        frame.render_widget(Paragraph::new(line).scroll((0, scroll)), area);
+        for (start, end, focus) in controls {
+            let left = start.max(scroll);
+            let right = end.min(scroll.saturating_add(area.width));
+            if left >= right {
+                continue;
+            }
+            let action = match focus {
+                Focus::Resources(artifacts) => Action::Resources(artifacts),
+                Focus::PullRequest(index) => Action::PullRequest(index),
+                _ => continue,
+            };
+            self.hits.push((
+                Rect::new(area.x + (left - scroll), area.y, right - left, 1),
+                action,
+            ));
+        }
+    }
+    pub(super) fn reset_footer(&mut self, session_changed: bool) {
+        self.panels.footer_rect.height = 0;
+        if session_changed {
+            self.panels.footer_scroll = 0;
+            self.panels.footer_focus = None;
+        }
+    }
+    pub(super) fn footer_mouse(&mut self, event: MouseEvent) -> bool {
+        if self.modal.is_some()
+            || !self
+                .panels
+                .footer_rect
+                .contains((event.column, event.row).into())
+        {
+            return false;
+        }
+        let delta = match event.kind {
+            MouseEventKind::ScrollLeft => -4,
+            MouseEventKind::ScrollRight => 4,
+            _ => return false,
+        };
+        self.panels.footer_scroll = self.panels.footer_scroll.saturating_add_signed(delta).min(
+            self.panels
+                .footer_width
+                .saturating_sub(self.panels.footer_rect.width),
+        );
+        true
     }
     pub fn panel_right(&self) -> bool {
         self.panels.right
@@ -663,14 +749,11 @@ impl Ui {
         use crate::shortcuts::ids::*;
         let shortcut = self.shortcut(key);
         if self.modal.is_none() && !self.panels.focused && self.drilled {
-            let mut visible = self
-                .visible_resources()
+            let visible = self
+                .footer_items()
                 .into_iter()
-                .map(|(a, _)| Focus::Resources(a))
+                .map(|(_, focus, _)| focus)
                 .collect::<Vec<_>>();
-            if let Some(id) = &self.selected {
-                visible.extend((0..self.prs.all(id).len()).map(Focus::PullRequest));
-            }
             if self.focus == Focus::Composer
                 && shortcut == Some(COMPOSER_HISTORY_NEXT)
                 && let Some(first) = visible.first()
