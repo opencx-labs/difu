@@ -167,7 +167,7 @@ fn readable_error(error: &str, refresh: &str) -> String {
         format!("{first} · {refresh} retry")
     }
 }
-pub(super) fn composer_status(session: &Session, binding: &str) -> Line<'static> {
+pub(super) fn composer_status(session: &Session) -> Line<'static> {
     let state = &session.permission_state;
     let mut spans = vec![Span::styled(
         mode_label(state.mode.as_deref(), session.provider).to_owned(),
@@ -199,8 +199,18 @@ pub(super) fn composer_status(session: &Session, binding: &str) -> Line<'static>
             Style::default().fg(RED),
         ));
     } else if session.status == Status::Interrupted {
-        spans.push(Span::styled(" · Interrupted", Style::default().fg(DIM)));
-    } else if let Some(target) = &state.pending_mode {
+        spans.push(Span::styled(" · Interrupted", Style::default().fg(RED)));
+    } else {
+        let color = super::status_icons::color(session.status);
+        spans.push(Span::styled(
+            format!(" · {}", session.status.label()),
+            Style::default().fg(color),
+        ));
+    }
+    if matches!(session.status, Status::Failed | Status::Interrupted) {
+        return Line::from(spans);
+    }
+    if let Some(target) = &state.pending_mode {
         spans.push(Span::styled(
             if state.reload_pending {
                 format!(
@@ -226,10 +236,6 @@ pub(super) fn composer_status(session: &Session, binding: &str) -> Line<'static>
             Style::default().fg(DIM),
         ));
     }
-    spans.push(Span::styled(
-        format!("  {binding} · /permissions"),
-        Style::default().fg(DIM),
-    ));
     Line::from(spans)
 }
 fn mode_description(id: &str, provider: provider::Provider) -> &'static str {
@@ -2815,11 +2821,11 @@ mod tests {
         session.permission_state.reload_pending = true;
         session.status = Status::Failed;
         session.error = Some("Provider turn failed".into());
-        let failed = composer_status(&session, "Shift+Tab").to_string();
+        let failed = composer_status(&session).to_string();
         assert!(failed.starts_with("Manual · Turn failed"));
         assert!(!failed.contains("reconnect") && !failed.contains("switching"));
         session.status = Status::Interrupted;
-        let interrupted = composer_status(&session, "Shift+Tab");
+        let interrupted = composer_status(&session);
         assert!(interrupted.to_string().starts_with("Manual · Interrupted"));
         assert!(
             !interrupted.to_string().contains("reconnect")
@@ -2829,19 +2835,19 @@ mod tests {
             interrupted
                 .spans
                 .iter()
-                .any(|span| span.content.contains("Interrupted") && span.style.fg == Some(DIM))
+                .any(|span| span.content.contains("Interrupted") && span.style.fg == Some(RED))
         );
         session.status = Status::Waiting;
         session.error = None;
         assert!(
-            composer_status(&session, "Shift+Tab")
+            composer_status(&session)
                 .to_string()
                 .contains("switching to Bypass…")
         );
         session.status = Status::Failed;
         session.error = Some("channel is empty and sending half is closed".into());
         assert!(
-            composer_status(&session, "Shift+Tab")
+            composer_status(&session)
                 .to_string()
                 .contains("reconnect needed")
         );
@@ -2897,7 +2903,7 @@ mod tests {
         session.permission_state.mode = Some("auto".into());
         session.permission_state.pending_mode = Some("bypassPermissions".into());
         session.permission_state.reload_pending = true;
-        let composer = composer_status(&session, "Shift+Tab").to_string();
+        let composer = composer_status(&session).to_string();
         assert!(composer.contains("Auto") && composer.contains("reconnect needed"));
         assert!(!composer.contains("switching") && !composer.contains("pending"));
         ui.sessions.insert("one".into(), session);

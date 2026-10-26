@@ -133,7 +133,9 @@ pub(super) fn color(pr: &SessionPr) -> ratatui::style::Color {
     }
 }
 impl Ui {
-    pub(crate) fn configure_pr_images(&mut self, images: &crate::images::State) {
+    pub(crate) fn configure_images(&mut self, images: &crate::images::State, obscured: bool) {
+        self.status_icons
+            .configure(images.picker.as_ref(), obscured);
         if let Some(panels::View::PullRequest { app }) = &mut self.panels.view
             && app.images.supported() != images.supported()
         {
@@ -632,12 +634,70 @@ mod tests {
         assert_eq!(pill.y, conversation.bottom() - 2);
         assert!(pill.x > conversation.x && pill.right() < conversation.right());
         let status_row = (conversation.x..conversation.right())
-            .filter_map(|x| terminal.backend().buffer().cell((x, pill.y - 1)))
+            .filter_map(|x| terminal.backend().buffer().cell((x, pill.y)))
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(status_row.contains("/permissions"), "{status_row}");
+        assert!(
+            status_row.contains("Inherited · Inherited · Starting")
+                && status_row.contains("PR #42 · Open"),
+            "{status_row}"
+        );
+        assert!(!status_row.contains("/permissions") && !status_row.contains("Shift+Tab"));
         assert!(ui.prs.visible.contains("one"));
         assert!(!screen.contains("Shells (0)"));
+        ui.sessions
+            .get_mut("one")
+            .context("session")?
+            .artifacts
+            .push(super::super::super::artifacts::Artifact {
+                workspace: None,
+                path: "preview.html".into(),
+                title: "Preview".into(),
+            });
+        ui.panels
+            .shells
+            .insert("one".into(), vec![serde_json::json!({"itemId":"shell"})]);
+        terminal.draw(|f| ui.draw(f))?;
+        let controls = ui
+            .hits
+            .iter()
+            .filter_map(|(rect, action)| match action {
+                Action::Resources(true) => Some(("artifacts", *rect)),
+                Action::PullRequest(0) => Some(("pr", *rect)),
+                Action::Resources(false) => Some(("shells", *rect)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            controls.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+            ["artifacts", "pr", "shells"]
+        );
+        assert!(controls.iter().all(|(_, rect)| rect.y == pill.y));
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(ui.focus, Focus::Resources(true));
+        ui.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(ui.focus, Focus::PullRequest(0));
+        ui.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(ui.focus, Focus::Resources(false));
+        let mut narrow = ratatui::Terminal::new(ratatui::backend::TestBackend::new(48, 20))?;
+        narrow.draw(|f| ui.draw(f))?;
+        let shell = ui
+            .hits
+            .iter()
+            .find_map(|(rect, action)| matches!(action, Action::Resources(false)).then_some(*rect))
+            .context("focused shell stays reachable")?;
+        let label = (shell.x..shell.right())
+            .filter_map(|x| narrow.backend().buffer().cell((x, shell.y)))
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(label.contains("Shells (1)"), "{label}");
+        ui.sessions
+            .get_mut("one")
+            .context("session")?
+            .artifacts
+            .clear();
+        ui.panels.shells.clear();
+        ui.focus = Focus::Composer;
         ui.summaries.first_mut().context("summary")?.status = Status::Waiting;
         ui.sidebar.counts.insert(
             "one".into(),
@@ -750,7 +810,7 @@ mod tests {
         ui.panels.focused = true;
         let mut reviews = App::new(storage.clone(), Config::default());
         reviews.images.picker = Some(ratatui_image::picker::Picker::halfblocks());
-        ui.configure_pr_images(&reviews.images);
+        ui.configure_images(&reviews.images, false);
         let Some(panels::View::PullRequest { app }) = &ui.panels.view else {
             anyhow::bail!("Missing embedded PR");
         };

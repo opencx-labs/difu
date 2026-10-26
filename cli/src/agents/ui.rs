@@ -37,6 +37,7 @@ pub(crate) use overlay_shortcut_tests::prepare_slack_copy;
 mod shortcuts;
 mod sidebar;
 mod slack;
+mod status_icons;
 mod themes;
 pub(crate) mod toast;
 pub(in crate::agents) mod transcript;
@@ -398,6 +399,10 @@ pub struct Ui {
     sidebar_selected: Option<String>,
     /// Selection highlights flipping on or off, by session.
     sidebar_highlights: HashMap<String, flap::Highlight>,
+    status_icons: status_icons::Icons,
+    /// Last session drawn and the panel reveal started when its selection changed.
+    drawn_session: Option<String>,
+    session_switched: Option<Instant>,
     question_note_focused: bool,
     hits: Vec<(Rect, Action)>,
     pub viewport: usize,
@@ -496,6 +501,9 @@ impl Ui {
             sidebar_order: Vec::new(),
             sidebar_selected: None,
             sidebar_highlights: HashMap::new(),
+            status_icons: status_icons::Icons::default(),
+            drawn_session: None,
+            session_switched: None,
             question_note_focused: false,
             hits: Vec::new(),
             viewport: 20,
@@ -543,6 +551,7 @@ impl Ui {
     pub fn redraw_interval(&self) -> Option<Duration> {
         if self.preferences.motion.level == crate::settings::Motion::Full
             && (self.voice_active()
+                || self.session_switched.is_some()
                 || self.question_flip.animating(Instant::now())
                 || !self.sidebar_highlights.is_empty()
                 || self
@@ -574,10 +583,19 @@ impl Ui {
                 },
             );
         }
-        if let Some(panels::View::PullRequest { app }) = &self.panels.view {
-            return app.redraw_interval();
-        }
-        None
+        let icons = if self.preferences.motion.level == crate::settings::Motion::Full
+            && self.tweaks.agent_reply_cps > 0
+        {
+            self.status_icons.redraw_interval()
+        } else {
+            None
+        };
+        let panel = if let Some(panels::View::PullRequest { app }) = &self.panels.view {
+            app.redraw_interval()
+        } else {
+            None
+        };
+        icons.into_iter().chain(panel).min()
     }
     pub fn tick(&mut self, visible: bool) {
         if let Some(error) = self.cache_writer.error() {
@@ -2850,6 +2868,9 @@ impl Ui {
             }
             return;
         }
+        if self.footer_mouse(event) {
+            return;
+        }
         if self.panel_mouse(event) {
             return;
         }
@@ -2968,6 +2989,7 @@ impl Ui {
             board.age(second);
         }
         self.sidebar_highlights.clear();
+        self.session_switched = None;
         self.question_flip.age(second);
     }
 }
@@ -3098,6 +3120,8 @@ impl Ui {
     pub fn draw(&mut self, frame: &mut Frame) {
         self.text_selection.frame();
         self.hits.clear();
+        self.status_icons.begin_frame(Instant::now());
+        self.reset_footer(self.drawn_session != self.selected);
         let area = frame.area();
         frame.render_widget(
             Block::default().style(Style::default().bg(BG).fg(TEXT)),
@@ -3110,6 +3134,21 @@ impl Ui {
         let panel = self.panels.visible();
         let conversation_visible =
             (!panel || self.panels.right) && !(self.drilled && self.changes_visible);
+        if self.drawn_session != self.selected {
+            self.session_switched = (self.drawn_session.is_some()
+                && self.selected.is_some()
+                && conversation_visible
+                && self.preferences.motion.screen()
+                && self.tweaks.agent_reply_cps > 0)
+                .then(Instant::now);
+            self.drawn_session.clone_from(&self.selected);
+        }
+        if !conversation_visible
+            || !self.preferences.motion.screen()
+            || self.tweaks.agent_reply_cps == 0
+        {
+            self.session_switched = None;
+        }
         let footer_height = if conversation_visible {
             0
         } else {
@@ -3194,6 +3233,18 @@ impl Ui {
             );
         }
         self.text_selection.highlight(frame);
+        if let Some(started) = self.session_switched {
+            let duration = Duration::from_millis(u64::from(self.tweaks.capped(flap::SCREEN_MS)));
+            if !flap::region(
+                frame.buffer_mut(),
+                conversation,
+                started,
+                duration,
+                Instant::now(),
+            ) {
+                self.session_switched = None;
+            }
+        }
         self.draw_modal(frame);
         self.draw_toast(frame);
     }
@@ -3343,12 +3394,7 @@ impl Ui {
             let color = if deleting {
                 DIM
             } else {
-                match session.status {
-                    Status::Failed => RED,
-                    Status::Waiting => ACCENT,
-                    Status::Completed | Status::Idle => GREEN,
-                    _ => DIM,
-                }
+                status_icons::color(session.status)
             };
             let elapsed = if session.status.active() {
                 session
@@ -3380,17 +3426,19 @@ impl Ui {
             let pin = if session.id == super::orchestrator::ID
                 || self.pinned_sessions.contains(&session.id)
             {
-                "◆ "
+                "📌 "
             } else {
                 ""
             };
+            let icon_inset = usize::from(status_icons::WIDTH) + 3;
             let title_width = usize::from(row.width)
-                .saturating_sub(2 + unicode_width::UnicodeWidthStr::width(pin));
+                .saturating_sub(icon_inset + unicode_width::UnicodeWidthStr::width(pin));
             let mut lines = vec![
                 Line::from(Span::styled(
                     format!(
-                        "{} {pin}{}",
+                        "{} {} {pin}{}",
                         if selected { "›" } else { " " },
+                        " ".repeat(usize::from(status_icons::WIDTH)),
                         crate::ui::crop(&session.title, 0, title_width)
                     ),
                     Style::default().fg(if deleting {
@@ -3403,7 +3451,7 @@ impl Ui {
                 )),
                 Line::from(Span::styled(
                     format!(
-                        "  {}{}{}",
+                        "     {}{}{}",
                         session
                             .repository
                             .as_ref()
@@ -3425,20 +3473,20 @@ impl Ui {
             ];
             if let Some(stats) = self.sidebar.counts.get(&session.id) {
                 lines.push(Line::from(vec![
-                    Span::raw("  "),
+                    Span::raw("     "),
                     Span::styled(format!("+{}", stats.added), Style::default().fg(GREEN)),
                     Span::styled(format!(" -{}", stats.removed), Style::default().fg(RED)),
                 ]));
             }
             lines.push(Line::from(Span::styled(
-                format!("  {status}"),
+                format!("     {status}"),
                 Style::default().fg(color),
             )));
             for link in self.prs.all(&session.id) {
                 let pr = &link.pr;
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "  PR #{} · {}{}",
+                        "     PR #{} · {}{}",
                         pr.key.number,
                         pr.label(),
                         if self.prs.stale(&session.id) {
@@ -3469,6 +3517,14 @@ impl Ui {
                 highlight.apply(frame.buffer_mut(), row, background, BG, now);
             }
             if !deleting {
+                self.status_icons.draw(
+                    frame,
+                    Rect::new(row.x.saturating_add(2), row.y, status_icons::WIDTH, 1)
+                        .intersection(row),
+                    session.status,
+                    self.preferences.motion.sidebar() && self.tweaks.agent_reply_cps > 0,
+                    self.modal.is_none() && self.notice.is_none(),
+                );
                 self.hits.push((row, Action::Select(session.id.clone())));
             }
         }
@@ -3491,7 +3547,14 @@ impl Ui {
             .selected
             .as_ref()
             .and_then(|id| self.sessions.get(id))
-            .map(|s| format!("{} · {}", s.title, s.status.label()))
+            .map(|s| {
+                format!(
+                    "{} {} · {}",
+                    " ".repeat(usize::from(status_icons::WIDTH)),
+                    s.title,
+                    s.status.label()
+                )
+            })
             .unwrap_or_else(|| "Conversation".into());
         let mut area = panel(
             frame,
@@ -3499,8 +3562,36 @@ impl Ui {
             &crate::model::clean(&title),
             !self.panels.focused && matches!(self.focus, Focus::Conversation | Focus::Composer),
         );
+        if let Some(status) = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.sessions.get(id))
+            .map(|s| s.status)
+        {
+            self.status_icons.draw(
+                frame,
+                Rect::new(rect.x.saturating_add(2), rect.y, status_icons::WIDTH, 1)
+                    .intersection(rect),
+                status,
+                self.preferences.motion.level == crate::settings::Motion::Full
+                    && self.tweaks.agent_reply_cps > 0,
+                self.modal.is_none() && self.notice.is_none(),
+            );
+        }
         self.hits.push((rect, Action::Focus(Focus::Conversation)));
-        let footer_height = self.session_footer_height().min(area.height);
+        let composer_footer = self.drilled
+            && self
+                .selected
+                .as_ref()
+                .and_then(|id| self.sessions.get(id))
+                .is_some_and(|session| matches!(session.job, Job::Coding(_)))
+            && !self.question_panel()
+            && !matches!(self.modal, Some(Modal::Plan(_) | Modal::Commands { .. }));
+        let footer_height = if composer_footer {
+            0
+        } else {
+            self.session_footer_height().min(area.height)
+        };
         let footer = Rect::new(
             area.x,
             area.bottom().saturating_sub(footer_height),
@@ -3837,21 +3928,15 @@ impl Ui {
                 return;
             }
             let status_y = composer.bottom().saturating_sub(1);
-            if let Some(session) = self.sessions.get(&id) {
-                frame.render_widget(
-                    Paragraph::new(permissions_panel::composer_status(
-                        session,
-                        &crate::shortcuts::Bindings::new(&self.shortcut_config)
-                            .hint(crate::shortcuts::ids::COMPOSER_PERMISSION_MODE),
-                    )),
-                    Rect::new(
-                        composer.x.saturating_add(1),
-                        status_y,
-                        composer.width.saturating_sub(2),
-                        1,
-                    ),
-                );
-            }
+            self.draw_composer_footer(
+                frame,
+                Rect::new(
+                    composer.x.saturating_add(1),
+                    status_y,
+                    composer.width.saturating_sub(2),
+                    1,
+                ),
+            );
             let composer = Rect::new(
                 composer.x,
                 composer.y,
@@ -4845,7 +4930,7 @@ mod tests {
                     .insert("one".into(), vec![serde_json::json!({"itemId": "shell"})]);
             }
             ui.hits.clear();
-            let status_y = height - 2 - u16::from(resources);
+            let status_y = height - 2;
             let mut terminal = Terminal::new(TestBackend::new(width, height))?;
             terminal.draw(|frame| ui.draw_conversation(frame, frame.area()))?;
             let buffer = terminal.backend().buffer();
@@ -4865,6 +4950,10 @@ mod tests {
                 );
             }
             if resources {
+                ui.focus = Focus::Resources(false);
+                ui.hits.clear();
+                terminal.draw(|frame| ui.draw_conversation(frame, frame.area()))?;
+                let buffer = terminal.backend().buffer();
                 let footer = ui
                     .hits
                     .iter()
@@ -4872,12 +4961,13 @@ mod tests {
                         matches!(action, Action::Resources(false)).then_some(*rect)
                     })
                     .context("shell control")?;
-                assert_eq!(footer.y, status_y + 1);
+                assert_eq!(footer.y, status_y);
                 assert!(footer.x > 0 && footer.right() < width);
-                assert_eq!(
-                    buffer.cell((2, footer.y)).context("shell label")?.symbol(),
-                    "S"
-                );
+                let footer_text = (footer.x..footer.right())
+                    .filter_map(|x| buffer.cell((x, footer.y)))
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(footer_text.contains("Shells (1)"), "{footer_text}");
                 assert!(
                     ui.hits
                         .iter()
@@ -4887,6 +4977,10 @@ mod tests {
                     "the footer must receive clicks instead of the conversation"
                 );
             }
+            ui.focus = Focus::Composer;
+            ui.hits.clear();
+            terminal.draw(|frame| ui.draw_conversation(frame, frame.area()))?;
+            let buffer = terminal.backend().buffer();
             let input_y = status_y - 1;
             for x in 1..width - 1 {
                 assert_eq!(
@@ -5371,7 +5465,7 @@ mod tests {
         let restored = Ui::new(storage.clone(), &storage.load_config()?);
         assert!(restored.pinned_sessions.contains("two"));
         let (screen, _) = draw(&mut ui, 120, 40)?;
-        assert!(screen.contains("◆ Pinned task"));
+        assert!(screen.contains("📌  Pinned task"));
         assert!(!screen.contains("f Filter"));
         ui.summaries.last_mut().context("other")?.archived = true;
         assert!(ui.filtered().iter().all(|s| s.id != "two"));
@@ -5419,7 +5513,66 @@ mod tests {
         let (screen, _) = draw(&mut ui, 120, 40)?;
         assert!(!screen.contains("Second card renamed"), "{screen}");
         let (screen, _) = draw_settled(&mut ui, 120, 40)?;
-        assert!(screen.contains(&format!("◆ {first}")) && screen.contains("Second card renamed"));
+        assert!(screen.contains(&format!("📌  {first}")) && screen.contains("Second card renamed"));
+        Ok(())
+    }
+
+    #[test]
+    fn switching_sessions_reveals_once_and_respects_motion_settings() -> Result<()> {
+        for (level, screen, speed, animated) in [
+            (crate::settings::Motion::Full, true, 200, true),
+            (crate::settings::Motion::Full, false, 200, false),
+            (crate::settings::Motion::Full, true, 0, false),
+            (crate::settings::Motion::Reduced, true, 200, false),
+            (crate::settings::Motion::Off, true, 200, false),
+        ] {
+            let dir = tempfile::tempdir()?;
+            let mut ui = state(Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().join("cache"),
+            });
+            ui.preferences.motion.level = level;
+            ui.preferences.motion.screen_transition = screen;
+            ui.preferences.motion.sidebar = false;
+            ui.tweaks.agent_reply_cps = speed;
+            ui.drilled = true;
+            let mut second = ui.sessions.get("one").context("first session")?.clone();
+            second.id = "two".into();
+            second.title = "Second session".into();
+            ui.summaries.push(second.summary());
+            ui.sessions.insert("two".into(), second);
+            ui.positions.entry("one".into()).or_default().draft = Editor::from("First draft");
+            ui.positions.entry("two".into()).or_default().draft = Editor::from("Second draft");
+            draw(&mut ui, 120, 40)?;
+            assert!(ui.session_switched.is_none(), "initial render is immediate");
+            ui.select("two".into());
+            draw(&mut ui, 120, 40)?;
+            assert_eq!(ui.session_switched.is_some(), animated);
+            if let Some(started) = ui.session_switched {
+                draw(&mut ui, 120, 40)?;
+                assert_eq!(
+                    ui.session_switched,
+                    Some(started),
+                    "polling must not replay the switch"
+                );
+                ui.session_switched = Some(started - Duration::from_secs(1));
+                let (settled, _) = draw(&mut ui, 120, 40)?;
+                assert!(ui.session_switched.is_none());
+                assert!(settled.contains("Second session"));
+            }
+            assert_eq!(
+                ui.positions.get("one").context("first draft")?.draft.text(),
+                "First draft"
+            );
+            assert_eq!(
+                ui.positions
+                    .get("two")
+                    .context("second draft")?
+                    .draft
+                    .text(),
+                "Second draft"
+            );
+        }
         Ok(())
     }
 
@@ -6807,11 +6960,11 @@ mod tests {
         let (with_shell, _) = draw(&mut ui, 120, 40)?;
         assert!(with_shell.contains("Shells (1)"));
         assert!(!with_shell.contains("Artifacts (0)"));
-        assert_eq!(ui.conversation_height + 1, height);
+        assert_eq!(ui.conversation_height, height);
         ui.notice = Some(("Action accepted".into(), false));
         let (with_notice, _) = draw(&mut ui, 120, 40)?;
         assert_eq!(with_notice.matches("Action accepted").count(), 1);
-        assert_eq!(ui.conversation_height + 1, height);
+        assert_eq!(ui.conversation_height, height);
         assert!(ui.toast_rect.x > 40 && ui.toast_rect.y > 25);
         let rect = ui.toast_rect;
         ui.mouse(MouseEvent {

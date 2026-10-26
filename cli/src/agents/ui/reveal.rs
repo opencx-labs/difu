@@ -139,6 +139,14 @@ pub(super) fn latest_reply(session: &Session) -> Option<&Entry> {
         .find(|entry| entry.kind == "agentMessage" && entry.data.get("difuVoice").is_none())
 }
 
+/// A chat catching up only animates its five newest visible messages. The
+/// full section list includes history outside the current rendered window.
+pub(super) fn recent(sections: &[transcript::Section]) -> &[transcript::Section] {
+    sections
+        .get(sections.len().saturating_sub(5)..)
+        .unwrap_or_default()
+}
+
 /// Advance this frame's animations for the drawn session: flip in its newest
 /// reply and just-sent message. A new reply waits until `turn`, when the
 /// entries above it have flipped in. Replies already present when a session is
@@ -158,7 +166,11 @@ pub(super) fn apply(
 ) {
     let available = lines.len();
     let latest = latest_reply(session);
-    if !std::mem::replace(&mut position.replies_seen, true) || tweaks.agent_reply_cps == 0 {
+    let recent = recent(sections);
+    if !std::mem::replace(&mut position.replies_seen, true)
+        || tweaks.agent_reply_cps == 0
+        || latest.is_some_and(|entry| !recent.iter().any(|section| section.id == entry.id))
+    {
         position.reply = latest.map(|entry| Reply::shown(&entry.id, now));
     } else if let Some(entry) = latest {
         let range = rows(sections, start, total, available, &entry.id);
@@ -266,6 +278,7 @@ pub(super) fn apply(
         .filter(|pending| pending.text == sent.text && pending.failed.is_none())
         .map(PendingSend::entry_id)
         .chain(newest)
+        .filter(|id| recent.iter().any(|section| section.id == *id))
         .filter_map(|id| rows(sections, start, total, available, &id))
         .max_by_key(|range| range.start);
     if let Some(lines) = range.and_then(|range| lines.get_mut(range)) {
@@ -509,6 +522,155 @@ mod tests {
             assert_eq!(stored.sent_message_ms, sent);
             assert_eq!(stored.input_clear_ms, clear);
         }
+    }
+
+    #[test]
+    fn large_backlogs_show_history_at_once_and_animate_only_the_last_five() {
+        let tweaks = Tweaks {
+            max_animation_ms: 100,
+            ..Default::default()
+        };
+        let now = Instant::now();
+        for count in [4, 5, 40] {
+            let mut session = session(Status::Idle);
+            session.note("agentMessage", "Earlier reply");
+            let mut position = Position::default();
+            let render = |position: &mut Position, session: &Session, at| {
+                let (sections, mut lines) = window(session);
+                let total = lines.len();
+                let turn = flap::chat(
+                    position, session, &sections, 0, total, &mut lines, tweaks, 80, at,
+                );
+                apply(
+                    position, session, &sections, 0, total, &mut lines, tweaks, 80, at, turn,
+                );
+                text(&lines)
+            };
+            render(&mut position, &session, now);
+            for index in 0..count {
+                session.note("error", format!("Backlog note {index}"));
+            }
+            session.note("agentMessage", "Newest reply");
+            let (_, lines) = window(&session);
+            let expected = text(&lines);
+            let first = render(&mut position, &session, now);
+            let older = expected.len().saturating_sub(5);
+            assert_eq!(first.get(..older), expected.get(..older));
+            assert!(
+                first
+                    .iter()
+                    .zip(&expected)
+                    .skip(older)
+                    .all(|(shown, full)| shown != full),
+                "only the newest five wait for their animation"
+            );
+            assert_eq!(
+                position
+                    .boards
+                    .values()
+                    .filter(|b| b.animating(now))
+                    .count(),
+                4,
+                "four notes precede the separately animated reply"
+            );
+            assert_eq!(
+                render(&mut position, &session, now + Duration::from_secs(2)),
+                expected,
+                "catch-up time does not increase with the older backlog"
+            );
+            // Scrolling back through a partial window never replays old entries.
+            let (sections, mut lines) = window(&session);
+            let total = lines.len();
+            lines.truncate(older);
+            flap::chat(
+                &mut position,
+                &session,
+                &sections,
+                0,
+                total,
+                &mut lines,
+                tweaks,
+                80,
+                now,
+            );
+            assert_eq!(Some(text(&lines).as_slice()), expected.get(..older));
+            assert!(position.known.as_ref().is_some_and(|known| {
+                sections.iter().take(older).all(|s| known.contains(&s.id))
+            }));
+        }
+    }
+
+    #[test]
+    fn older_replies_and_voice_transcripts_do_not_hold_up_a_backlog() {
+        let now = Instant::now();
+        let mut session = session(Status::Running);
+        session.note("agentMessage", "Earlier reply");
+        session.entries.push(Entry {
+            id: "voice".into(),
+            kind: "userMessage".into(),
+            text: "Earlier voice transcript".into(),
+            data: serde_json::json!({"difuVoice": "user"}).into(),
+            ..Default::default()
+        });
+        let mut position = Position {
+            replies_seen: true,
+            ..Default::default()
+        };
+        let mut render = |session: &Session, at| {
+            let (sections, mut lines) = window(session);
+            let total = lines.len();
+            let turn = flap::chat(
+                &mut position,
+                session,
+                &sections,
+                0,
+                total,
+                &mut lines,
+                Tweaks::default(),
+                80,
+                at,
+            );
+            apply(
+                &mut position,
+                session,
+                &sections,
+                0,
+                total,
+                &mut lines,
+                Tweaks::default(),
+                80,
+                at,
+                turn,
+            );
+            flap::apply(
+                &mut position,
+                session,
+                &sections,
+                0,
+                total,
+                &mut lines,
+                80,
+                at,
+            );
+            text(&lines)
+        };
+        render(&session, now);
+        for index in 0..5 {
+            session.note("error", format!("Recent note {index}"));
+        }
+        let shown = render(&session, now + Duration::from_millis(10));
+        assert_eq!(shown.first().map(String::as_str), Some("Earlier reply"));
+        assert_eq!(
+            shown.get(1).map(String::as_str),
+            Some("Earlier voice transcript")
+        );
+        assert!(
+            position
+                .reply
+                .as_ref()
+                .is_some_and(|reply| !reply.shown.is_finite())
+        );
+        assert!(position.voice_flaps.is_empty());
     }
 
     #[test]

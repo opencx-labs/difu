@@ -521,7 +521,9 @@ fn timestamp_row(
             .and_then(chrono::DateTime::from_timestamp_millis)
     {
         lines.push(Line::styled(
-            time.format("%H:%M:%S UTC").to_string(),
+            time.with_timezone(&chrono::Local)
+                .format("%H:%M:%S")
+                .to_string(),
             Style::default().fg(DIM),
         ));
     }

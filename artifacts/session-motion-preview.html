@@ -1,0 +1,170 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>difu · Session motion study</title>
+<style>
+  :root{color-scheme:dark;--bg:#101211;--surface:#070908;--line:#2a302c;--text:#e2e8e3;--muted:#929c95;--green:#00ff41;--blue:#9ac9ff;--amber:#edc36a;--red:#ff737c;--mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+  *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);-webkit-font-smoothing:antialiased}button,textarea{font:inherit}button{cursor:pointer}button:focus-visible,a:focus-visible,input:focus-visible,textarea:focus-visible{outline:2px solid var(--green);outline-offset:4px}button{color:inherit}button:disabled{cursor:default}button svg{pointer-events:none}::selection{background:#18592c;color:white}
+  .page{max-width:1472px;padding:28px 44px 34px;margin:auto}.masthead{display:flex;align-items:center;justify-content:space-between;font:11px var(--mono);letter-spacing:.08em;color:var(--muted)}.brand{font-size:20px;color:var(--green);font-weight:700;letter-spacing:-1px}.masthead-left{display:flex;align-items:center;gap:18px}.divider{height:17px;width:1px;background:var(--line)}.proposal{display:flex;align-items:center;gap:8px}.proposal i{width:5px;height:5px;border-radius:50%;background:var(--green)}
+  .intro{display:flex;align-items:flex-end;justify-content:space-between;gap:30px;margin:30px 0 25px}h1{font-size:clamp(28px,3.1vw,43px);font-weight:500;letter-spacing:-1.6px;margin:0 0 10px;line-height:1.12}.intro p{margin:0;font-size:14px;color:var(--muted);line-height:1.65}.intro-index{font:11px var(--mono);color:var(--muted);white-space:nowrap;padding-bottom:5px}
+  .demo-toolbar{display:flex;justify-content:space-between;align-items:center;gap:18px;margin:0 0 12px;min-height:30px;font:11px var(--mono);color:var(--muted)}.try{display:flex;gap:9px;align-items:center}.try strong{font-weight:400;color:var(--green);white-space:nowrap}.controls{display:flex;align-items:center;gap:22px}.motion-label{display:flex;align-items:center;gap:7px;cursor:pointer}.motion-label input{accent-color:var(--green);width:13px;height:13px;margin:0}.replay{border:1px solid #39443b;background:#19201b;padding:7px 11px;font:11px var(--mono);border-radius:4px}.replay:hover{border-color:var(--green)}
+  .terminal{background:var(--surface);border:1px solid #39433b;border-radius:7px;box-shadow:0 20px 60px #0004;overflow:hidden;font:13px/1.6 var(--mono)}.window-bar{height:42px;background:#171b18;display:flex;align-items:center;border-bottom:1px solid var(--line);padding:0 17px;gap:9px;font-size:10px;color:#9ca89f;letter-spacing:.02em}.window-dot{width:7px;height:7px;background:#414b43;border-radius:50%}.window-title{margin-left:10px}.window-hint{margin-left:auto;color:#6e7b71}.top-tabs{display:flex;gap:4px;padding:10px 12px 7px;border-bottom:1px solid #202a23;height:48px}.top-tab{background:transparent;border:0;padding:2px 12px;color:var(--muted);font-size:12px}.top-tab[aria-selected=true]{background:#12361b;color:var(--green)}.top-tab kbd{font:10px var(--mono);opacity:.55;margin-left:7px}.workspace{height:478px;display:grid;grid-template-columns:270px minmax(0,1fr);padding:10px;gap:10px}.sessions{position:relative;border:1px solid #343c36;min-width:0;display:flex;flex-direction:column}.panel-label{font-size:11px;color:var(--muted);padding:7px 12px 9px}.session-list{display:grid;gap:3px;padding:0 5px}.session{background:transparent;border:1px solid transparent;width:100%;text-align:left;padding:12px 9px;min-width:0;position:relative}.session:hover{background:#111b14}.session[aria-pressed=true]{background:#102218;border-color:#245732}.session[aria-pressed=true]:before{content:"";position:absolute;left:-1px;top:-1px;bottom:-1px;width:2px;background:var(--green)}.session-heading{display:flex;align-items:center;gap:9px;min-width:0}.session-name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;color:#d6ded8}.session[aria-pressed=true] .session-name{color:var(--green)}.session-meta{font-size:10px;color:#798a7e;padding-left:33px;margin-top:3px}.session-status{font-size:10px;color:var(--muted);padding-left:33px;margin-top:1px}.session-footer{margin-top:auto;padding:12px 14px;color:#6c7b70;font-size:10px;border-top:1px solid #202a23}.session-footer b{font-weight:400;color:#a1b0a6}.conversation{position:relative;min-width:0;border:1px solid var(--green);display:flex;flex-direction:column;background:#070908;overflow:hidden}.conversation-header{display:flex;align-items:center;gap:9px;padding:9px 15px 6px;min-height:43px}.conversation-title{font-size:13px;color:var(--green);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.conversation-meta{color:#7f8d84;font-size:10px;padding:0 15px 8px;border-bottom:1px solid #17241b}.transcript{flex:1;min-height:0;overflow:auto;padding:17px 19px 12px;scrollbar-color:#304936 transparent}.message{margin-bottom:20px;max-width:820px}.message:last-child{margin-bottom:0}.message-label{display:flex;align-items:center;gap:10px;font-size:11px;margin-bottom:3px;color:var(--green)}.message-label.agent-label{color:#d8e5dc}.message time{display:block;color:#7d8b81;font-size:10px;font-variant-numeric:tabular-nums;margin-bottom:5px}.message p{margin:0;color:#c5d0c8;font-size:12px;line-height:1.8}.message.user{background:#0b2112;border-left:2px solid #26833d;padding:9px 12px}.message.user p{color:#d4e9d9}.tool-line{font-size:10px;color:#8fa598;border:1px solid #263a2d;padding:5px 9px;margin-top:10px;display:inline-flex;gap:9px}.tool-line .tool-dot{color:var(--green)}.work-note{display:flex;align-items:center;gap:7px;font-size:10px;color:var(--muted);padding:4px 15px 8px;min-height:28px}.live-dot{height:4px;width:4px;background:currentColor;border-radius:50%;flex-shrink:0}.composer{border-top:1px solid var(--green);margin:0 7px;padding:9px 6px 8px;min-width:0}.composer textarea{display:block;background:transparent;color:#dae9de;border:0;resize:none;width:100%;height:26px;font:13px/23px var(--mono);padding:0;outline-offset:0}.composer textarea::placeholder{color:#85958a}.composer textarea:focus-visible{outline:none}.footer-row{display:flex;align-items:center;gap:8px;min-height:26px;white-space:nowrap;font:11px var(--mono);overflow-x:auto;scrollbar-width:thin;scrollbar-color:#304936 transparent;padding-bottom:1px}.mode{color:var(--green)}.separator{color:#526356}.permission{color:#8c9b91}.footer-status{color:var(--muted)}.pill-divider{height:12px;width:1px;background:#314336;flex-shrink:0;margin:0 2px}.pill{border:1px solid #304336;background:#112016;padding:3px 7px;border-radius:3px;font:10px var(--mono);color:#bdcec2;white-space:nowrap;line-height:1.4}.pill:hover,.pill[aria-expanded=true]{border-color:var(--green);color:var(--green)}.pill.pr{color:#ade1b9}.pill .count{color:#dbe7df;margin-left:3px}.pill.pr .pr-dot{color:var(--green)}.flipping{border-color:#8bb797}.glyph{white-space:pre}.glyph.dim{color:#738279}.glyph.glow{color:var(--green)}
+  .status-icon{display:inline-flex;width:24px;height:24px;flex:0 0 24px;align-items:center;justify-content:center;vertical-align:middle}.status-icon svg{width:24px;height:24px;overflow:visible;shape-rendering:crispEdges}.runner-frame{opacity:0;animation:runner .48s steps(1,end) infinite}.runner-frame:nth-child(2){animation-delay:.12s}.runner-frame:nth-child(3){animation-delay:.24s}.runner-frame:nth-child(4){animation-delay:.36s}.signal-halo{animation:breathe 2.6s ease-in-out infinite;transform-origin:center}.warning-glow{animation:warning 2.4s ease-in-out infinite}.waiting-dot{animation:attention 1.8s steps(1,end) infinite}.starting-hourglass{transform-origin:12px 12px;animation:turn 2.8s ease-in-out infinite}.completed-mark{animation:complete .35s ease-out both;transform-origin:center}.error-glow{animation:warning 3.4s ease-in-out infinite}
+  @keyframes runner{0%,24.99%{opacity:1}25%,100%{opacity:0}}@keyframes breathe{0%,100%{opacity:.18}50%{opacity:.5}}@keyframes warning{0%,100%{opacity:.48}45%,60%{opacity:1}}@keyframes attention{0%,40%{opacity:.45}41%,100%{opacity:1}}@keyframes turn{0%,32%{transform:rotate(0)}47%,82%{transform:rotate(180deg)}97%,100%{transform:rotate(360deg)}}@keyframes complete{from{opacity:.2;transform:scale(.75)}to{opacity:1;transform:scale(1)}}
+  .preview-caption{display:flex;justify-content:space-between;gap:18px;font:10px/1.6 var(--mono);color:var(--muted);margin:12px 1px 25px}.preview-caption b{color:#b8c7bc;font-weight:400}.caption-right{text-align:right}.status-section{display:flex;align-items:baseline;justify-content:space-between;border-top:1px solid var(--line);padding-top:18px;margin-bottom:14px}.eyebrow{margin:0;font:10px var(--mono);color:#9fab9f;text-transform:uppercase;letter-spacing:.12em}.status-section span{font-size:11px;color:var(--muted)}.status-gallery{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:9px}.status-card{border:1px solid #29352d;background:#141b16;padding:12px 11px 11px;text-align:left;border-radius:4px;min-width:0}.status-card:hover{background:#1b2b20;border-color:#52745b}.status-card.active{border-color:#63876a}.status-card-top{display:flex;gap:7px;align-items:center;font-size:11px}.status-card small{display:block;color:#8f9e93;font:10px/1.5 var(--mono);margin-top:7px;white-space:nowrap}.page-foot{display:flex;justify-content:space-between;gap:20px;margin-top:23px;font-size:11px;color:#7f8c83}.page-foot strong{font-weight:400;color:#b6c2b9}.popover{position:absolute;right:12px;bottom:84px;z-index:10;background:#142019;border:1px solid #42654c;padding:15px 16px;width:300px;box-shadow:0 12px 30px #0008;max-width:calc(100% - 24px);font-size:11px}.popover[hidden]{display:none}.popover-title{display:flex;align-items:center;justify-content:space-between;color:var(--green);margin-bottom:14px}.close{border:0;background:transparent;padding:0 4px;color:#adc1b3;font-size:16px}.resource-item{border-top:1px solid #2c4032;padding:9px 0;color:#d0dfd5}.resource-item small{color:#8fa597;display:block;font-size:10px}.popover-note{font-size:9px;color:#8fa597;margin:5px 0 0}.review-page{grid-column:1/-1;border:1px solid var(--green);padding:25px;overflow:auto}.review-page h2{font-size:16px;color:var(--green);font-weight:400;margin:0 0 8px}.review-page p{color:#8c9b91;font-size:11px}.review-row{display:flex;justify-content:space-between;border-top:1px solid #293c2f;padding:19px 8px;font-size:12px;margin-top:20px}.review-row span:last-child{color:var(--green)}.review-note{padding-top:25px;color:#789181;font-size:11px}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+  body.reduce .status-icon *{animation:none!important}body.reduce .runner-frame{opacity:0}body.reduce .runner-frame:first-child{opacity:1}
+  @media(prefers-reduced-motion:reduce){.status-icon *{animation:none!important}.runner-frame{opacity:0}.runner-frame:first-child{opacity:1}}
+  @media(min-width:1350px){.workspace{grid-template-columns:290px minmax(0,1fr)}.footer-row{font-size:12px;gap:9px}.pill{font-size:11px}}
+  @media(max-width:1050px){.page{padding:24px}.workspace{grid-template-columns:220px minmax(0,1fr)}.session{padding:10px 7px}.session-name{font-size:11px}.status-gallery{grid-template-columns:repeat(4,minmax(0,1fr))}.permission{font-size:10px}.footer-row{gap:6px;font-size:10px}.pill{padding:3px 5px;font-size:10px}.intro-index{display:none}.preview-caption{font-size:9px}}
+  @media(max-width:700px){.page{padding:20px 14px}.masthead{font-size:9px}.masthead-left{gap:10px}.intro{margin:26px 0 20px}.intro p{font-size:12px;max-width:330px}.intro h1{font-size:31px}.demo-toolbar{align-items:flex-start;gap:8px;flex-direction:column}.controls{width:100%;justify-content:space-between;gap:12px}.try{font-size:10px}.workspace{height:auto;display:flex;flex-direction:column;gap:9px;padding:7px}.sessions{border:0}.panel-label,.session-meta,.session-status,.session-footer{display:none}.session-list{display:flex;overflow-x:auto;padding:0 0 4px;gap:5px}.session{flex:0 0 175px;padding:8px;min-height:44px;border:1px solid #293c2f}.conversation{height:457px}.conversation-title{font-size:11px}.conversation-meta{font-size:9px}.transcript{padding:14px 12px}.message p{font-size:11px}.window-hint{display:none}.window-bar{height:35px}.status-gallery{grid-template-columns:repeat(2,minmax(0,1fr))}.status-section span{font-size:10px}.preview-caption{flex-direction:column;gap:4px;margin-bottom:20px}.caption-right{text-align:left}.page-foot{font-size:10px;flex-direction:column;gap:6px}.review-page{min-height:450px}.review-row{gap:12px;font-size:11px}.popover{bottom:88px}.footer-row{min-height:29px}.status-card:last-child{grid-column:1/-1}.status-card small{white-space:normal}}
+</style>
+</head>
+<body>
+<main class="page">
+  <header class="masthead"><div class="masthead-left"><span class="brand">difu</span><span class="divider"></span><span>INTERACTION STUDY / 001</span></div><span class="proposal"><i></i> DESIGN PREVIEW</span></header>
+  <div class="intro"><div><h1>Sessions that feel alive.</h1><p>A familiar flip. A little character. Everything you need, on one line.</p></div><span class="intro-index">SESSION MOTION + STATUS + COMPOSER</span></div>
+  <div class="demo-toolbar"><span class="try"><strong>↳ Try it</strong> Switch sessions in the sidebar. Click the footer pills.</span><div class="controls"><label class="motion-label"><input type="checkbox" id="reduce"> Reduced motion</label><button class="replay" id="replay">↻ Replay switch</button></div></div>
+  <section class="terminal" aria-label="Interactive difu session preview">
+    <div class="window-bar"><span class="window-dot"></span><span class="window-dot"></span><span class="window-dot"></span><span class="window-title">difu — ~/projects/difu</span><span class="window-hint">SAMPLE SESSIONS · INTERACTIVE PREVIEW</span></div>
+    <div class="top-tabs" role="tablist" aria-label="Preview screen"><button class="top-tab" id="agents-tab" role="tab" aria-selected="true" aria-controls="workspace">Agents <kbd>1</kbd></button><button class="top-tab" id="reviews-tab" role="tab" aria-selected="false" aria-controls="workspace" tabindex="-1">Reviews <kbd>2</kbd></button></div>
+    <div class="workspace" id="workspace" role="tabpanel" aria-labelledby="agents-tab"></div>
+  </section>
+  <div class="preview-caption"><div><b id="transition-caption">Session box · split-flap reveal</b><span> / same rhythm as the Agents ↔ Reviews transition</span></div><div class="caption-right">Chat message times · <b id="timezone"></b></div></div>
+  <div class="status-section"><h2 class="eyebrow">A small cast of characters</h2><span>Click a state to try it on the selected session</span></div>
+  <div class="status-gallery" id="status-gallery" aria-label="Preview session statuses"></div>
+  <footer class="page-foot"><span><strong>One row:</strong> AI mode · permission mode · session status · artifacts · PRs · shells</span><span>Proposed visual treatment · app behavior unchanged</span></footer>
+  <div class="sr-only" role="status" aria-live="polite" id="announcement"></div>
+</main>
+<script>
+(() => {
+  'use strict';
+  const $ = (s) => document.querySelector(s);
+  const motionQuery = matchMedia('(prefers-reduced-motion: reduce)');
+  const states = {
+    working:{label:'Working',description:'A tiny runner',color:'#a5d2ff'},
+    ready:{label:'Ready',description:'A green signal',color:'#00ff41'},
+    interrupted:{label:'Interrupted',description:'A red warning',color:'#ff737c'},
+    waiting:{label:'Needs input',description:'A hand raised',color:'#edc36a'},
+    starting:{label:'Starting',description:'Turning the hourglass',color:'#acb3d9'},
+    completed:{label:'Completed',description:'A settled check',color:'#00ff41'},
+    failed:{label:'Failed',description:'A clear stop',color:'#ff737c'}
+  };
+  const escape = (s) => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const pixels = (rows,color) => rows.flatMap((row,y)=>[...row].flatMap((v,x)=>v==='1'?[`<rect x="${x*2}" y="${y*2}" width="2" height="2" fill="${color}"/>`]:[])).join('');
+  const runnerFrames = [
+    ['000000110000','000001111000','000000110000','000001100000','000011110100','000110011100','000000110000','000001100000','000011110000','000110011000','001100001100','001000000100'],
+    ['000000000000','000000110000','000001111000','000000110000','000001100000','000011111000','000110110000','000001100000','000011100000','000001110000','000000110000','000001100000'],
+    ['000000110000','000001111000','000000110000','000001100000','001001110000','001111001000','000001100000','000001100000','000011110000','000110011000','001100001100','001000000100'],
+    ['000000000000','000000110000','000001111000','000000110000','000001100000','000111100000','000001111000','000001100000','000001110000','000011100000','000011000000','000001100000']
+  ];
+  function icon(type){
+    const c=states[type].color;
+    let art='';
+    if(type==='working') art=runnerFrames.map(r=>`<g class="runner-frame">${pixels(r,c)}</g>`).join('');
+    if(type==='ready') art='<rect x="6" y="0" width="12" height="20" rx="2" fill="#203e29"/><rect x="8" y="2" width="8" height="16" fill="#07190b"/><rect x="10" y="3" width="4" height="3" fill="#4e302b"/><rect x="10" y="8" width="4" height="3" fill="#4e4429"/><rect class="signal-halo" x="6" y="10" width="12" height="10" fill="#00ff41"/><rect x="9" y="13" width="6" height="4" fill="#00ff41"/><rect x="11" y="20" width="2" height="4" fill="#5e8168"/>';
+    if(type==='interrupted') art=`<path class="warning-glow" d="M10 2h4v3h2v3h2v4h2v4h2v6H2v-6h2v-4h2V8h2V5h2z" fill="${c}"/><path d="M11 7h2v7h-2zm0 10h2v2h-2z" fill="#160809"/>`;
+    if(type==='waiting') art=pixels(['000001000000','000101010000','000101010100','000101010100','000111110100','000111111100','010111111100','011111111100','001111111000','000111110000','000111100000','000111100000'],c)+'<rect class="waiting-dot" x="20" y="0" width="3" height="3" fill="#edc36a"/>';
+    if(type==='starting') art=`<g class="starting-hourglass"><path d="M5 2h14v3h-2v3h-2v3h-2v2h2v3h2v3h2v3H5v-3h2v-3h2v-3h2v-2H9V8H7V5H5z" fill="${c}"/><path d="M8 5h8v2h-2v3h-4V7H8zm2 10h4v3h2v1H8v-1h2z" fill="#101211"/></g>`;
+    if(type==='completed') art=`<g class="completed-mark"><path d="M9 19H6v-3H3v-3H1v-3h4v3h3v2h2v-3h3V9h3V6h3V3h4v4h-3v3h-3v3h-3v3h-3v3z" fill="${c}"/></g>`;
+    if(type==='failed') art=`<path class="error-glow" d="M7 1h10v3h4v3h2v10h-2v4h-4v2H7v-2H3v-4H1V7h2V3h4z" fill="${c}"/><path d="M7 6h3v3h4V6h3v4h-3v4h3v4h-3v-3h-4v3H7v-4h3v-4H7z" fill="#180b0c"/>`;
+    return `<span class="status-icon" aria-hidden="true"><svg viewBox="0 0 24 24">${art}</svg></span>`;
+  }
+  const sessions=[
+    {title:'Session motion & status',branch:'feat/session-motion',state:'working',artifacts:2,pr:128,shells:1,note:'Working · refining the session transition',question:'Make switching sessions feel like switching from Agents to Reviews. Give each session a little character.',response:'I’m bringing the same split-flap reveal to the whole session box. The title, conversation, and composer arrive together, while the session list stays in place.',tool:'Editing the session transition'},
+    {title:'Polish the composer',branch:'feat/composer-footer',state:'ready',artifacts:1,pr:124,shells:1,note:'Ready for your next message',question:'Put artifacts, PRs, and shells in the footer after the AI mode and session status.',response:'The composer now has one compact footer. Artifacts, the linked PR, and shells sit beside the current mode and status, so everything is within reach.',tool:'Preview ready to review'},
+    {title:'Refine chat timestamps',branch:'fix/local-chat-time',state:'interrupted',artifacts:1,pr:126,shells:1,note:'Interrupted · send a message to continue',question:'Show message timestamps in my local time.',response:'I’ve located the chat message timestamp renderer. Each message will display its time in your local timezone, using the timestamp already saved with the message.',tool:'Work interrupted'},
+    {title:'Review navigation',branch:'feat/navigation',state:'waiting',artifacts:2,pr:131,shells:2,note:'Needs input · one question is waiting',question:'Take a look at how navigation feels between sessions.',response:'The transition is ready to preview. Try switching between sessions to see the full conversation box reveal, then use the state palette below to explore the status icons.',tool:'Waiting for your feedback'}
+  ];
+  const drafts=new Map();
+  let current=0,tab='agents',animation=0,cleanup=()=>{},reduced=motionQuery.matches;
+  const formatTime=new Intl.DateTimeFormat(undefined,{hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'});
+  const formatFull=new Intl.DateTimeFormat(undefined,{dateStyle:'full',timeStyle:'long'});
+  $('#timezone').textContent=Intl.DateTimeFormat().resolvedOptions().timeZone.replaceAll('_',' ');
+  $('#reduce').checked=reduced;document.body.classList.toggle('reduce',reduced);
+  const time=(iso)=>`<time datetime="${iso}" title="${escape(formatFull.format(new Date(iso)))}">${escape(formatTime.format(new Date(iso)))}</time>`;
+  function gallery(){
+    $('#status-gallery').innerHTML=Object.entries(states).map(([key,s])=>`<button class="status-card ${sessions[current].state===key?'active':''}" data-state="${key}" aria-pressed="${sessions[current].state===key}" aria-label="Preview ${s.label} status"><span class="status-card-top">${icon(key)}<span>${s.label}</span></span><small>${s.description}</small></button>`).join('');
+  }
+  function sidebar(){
+    return `<aside class="sessions" aria-label="Sessions"><div class="panel-label">Agents <span style="float:right;color:#708376">4 sessions</span></div><div class="session-list">${sessions.map((s,i)=>`<button class="session" data-session="${i}" aria-pressed="${i===current}" aria-label="${escape(s.title)}, ${states[s.state].label}"><span class="session-heading">${icon(s.state)}<span class="session-name">${escape(s.title)}</span></span><div class="session-meta">difu · Codex</div><div class="session-status" style="color:${states[s.state].color}">${states[s.state].label}${s.state==='working'?' · 24s':''}</div></button>`).join('')}</div><div class="session-footer"><b>~/projects/difu</b><br>4 sessions · 1 workspace</div></aside>`;
+  }
+  function conversation(){
+    const s=sessions[current],status=states[s.state];
+    return `<article class="conversation" aria-label="${escape(s.title)} session"><div class="conversation-header">${icon(s.state)}<span class="conversation-title">${escape(s.title)}</span></div><div class="conversation-meta">Coding · Codex · ${escape(s.branch)}</div><div class="transcript"><div class="message user"><div class="message-label">You</div>${time('2026-10-26T13:42:08Z')}<p>${escape(s.question)}</p></div><div class="message"><div class="message-label agent-label">Codex</div>${time('2026-10-26T13:42:21Z')}<p>${escape(s.response)}</p><div class="tool-line"><span class="tool-dot">›</span><span>${escape(s.tool)}</span></div></div></div><div class="work-note"><span class="live-dot" style="color:${status.color}"></span><span>${escape(s.note)}</span></div><div class="composer"><textarea rows="1" aria-label="Draft a message in this preview" placeholder="Ask anything…">${escape(drafts.get(current)||'')}</textarea><div class="footer-row" tabindex="0" aria-label="Session controls"><span class="mode">Regular</span><span class="separator">·</span><span class="permission">Approve for me</span><span class="separator">·</span><span class="footer-status" style="color:${status.color}">${status.label}</span><span class="pill-divider"></span><button class="pill" data-resource="artifacts" aria-expanded="false" aria-controls="resource-popover">Artifacts <span class="count">${s.artifacts}</span></button><button class="pill pr" data-resource="pr" aria-expanded="false" aria-controls="resource-popover">PR #${s.pr} <span class="pr-dot">·</span> Open</button><button class="pill" data-resource="shells" aria-expanded="false" aria-controls="resource-popover">Shells <span class="count">${s.shells}</span></button></div></div><section class="popover" id="resource-popover" aria-label="Sample session resources" hidden></section></article>`;
+  }
+  function saveDraft(){const input=$('.composer textarea');if(input)drafts.set(current,input.value);}
+  function stopAnimation(){cancelAnimationFrame(animation);cleanup();cleanup=()=>{};}
+  function reveal(root){
+    stopAnimation();if(reduced||!root)return;
+    const nodes=[],walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,{acceptNode(n){
+      if(!n.textContent.trim()||n.parentElement.closest('svg,textarea,[hidden],.sr-only'))return NodeFilter.FILTER_REJECT;
+      return NodeFilter.FILTER_ACCEPT;
+    }});
+    while(walker.nextNode()) nodes.push(walker.currentNode);
+    const spans=[],originals=[];
+    for(const node of nodes){
+      const parent=node.parentNode,holder=document.createElement('span');
+      holder.setAttribute('aria-hidden','true');
+      const accessible=document.createElement('span');accessible.className='sr-only';accessible.textContent=node.textContent;
+      for(const char of node.textContent){
+        if(/\s/.test(char)){holder.append(document.createTextNode(char));continue;}
+        const cell=document.createElement('span');cell.className='glyph';cell.textContent='\u00a0';holder.append(cell);spans.push({cell,char});
+      }
+      parent.replaceChild(holder,node);parent.insertBefore(accessible,holder);originals.push({holder,node,accessible});
+    }
+    root.classList.add('flipping');
+    const restore=()=>{for(const {holder,node,accessible}of originals){holder.replaceWith(node);accessible.remove();}root.classList.remove('flipping');};
+    cleanup=restore;
+    const start=performance.now(),sample='sessionmotionreadyworking';
+    function draw(now){
+      const elapsed=now-start;
+      spans.forEach(({cell,char},i)=>{
+        const age=elapsed-(i/Math.max(1,spans.length))*500;
+        if(age<40){cell.textContent='\u00a0';cell.className='glyph';}
+        else if(age<180){cell.textContent=/[a-z\d]/i.test(char)?sample[(char.charCodeAt(0)+i*7+Math.floor(elapsed/45)*11)%sample.length]:char;cell.className='glyph dim';}
+        else{cell.textContent=char;cell.className=age<315?'glyph glow':'glyph';}
+      });
+      if(elapsed<815)animation=requestAnimationFrame(draw);else{restore();cleanup=()=>{};}
+    }
+    animation=requestAnimationFrame(draw);
+  }
+  function render(animate=true,whole=false){
+    stopAnimation();
+    const isAgents=tab==='agents';
+    $('#agents-tab').setAttribute('aria-selected',String(isAgents));$('#agents-tab').tabIndex=isAgents?0:-1;
+    $('#reviews-tab').setAttribute('aria-selected',String(!isAgents));$('#reviews-tab').tabIndex=isAgents?-1:0;
+    $('#workspace').setAttribute('aria-labelledby',`${tab}-tab`);
+    if(isAgents)$('#workspace').innerHTML=sidebar()+conversation();
+    else $('#workspace').innerHTML='<section class="review-page"><h2>Pull requests</h2><p>difu · 3 open pull requests</p><div class="review-row"><span>#128 &nbsp; Add session motion and status icons</span><span>Open</span></div><div class="review-row"><span>#124 &nbsp; Bring session resources into the composer</span><span>Open</span></div><div class="review-row"><span>#126 &nbsp; Display local chat message times</span><span>Open</span></div><div class="review-note">Switch back to Agents to compare the session transition.</div></section>';
+    $('#transition-caption').textContent=isAgents?'Session box · split-flap reveal':'Full screen · tab transition reference';
+    gallery();if(animate)reveal(whole?$('#workspace'):isAgents?$('.conversation'):$('#workspace'));
+  }
+  function switchSession(index){saveDraft();current=index;const wasReviews=tab==='reviews';tab='agents';render(true,wasReviews);$('#announcement').textContent=`${sessions[index].title}. ${states[sessions[index].state].label}.`;}
+  function closePopover(){const p=$('.popover');if(p){p.hidden=true;p.innerHTML='';}document.querySelectorAll('[data-resource]').forEach(b=>b.setAttribute('aria-expanded','false'));}
+  function showResource(button){
+    stopAnimation();const wasOpen=button.getAttribute('aria-expanded')==='true';closePopover();if(wasOpen)return;
+    const kind=button.dataset.resource,s=sessions[current],p=$('.popover');
+    const items=kind==='artifacts'?['Session motion study','Footer layout preview'].slice(0,s.artifacts).map(t=>`<div class="resource-item">◇ ${t}<small>HTML artifact · available in this session</small></div>`).join(''):kind==='pr'?`<div class="resource-item">PR #${s.pr} · ${escape(s.title)}<small>Open · ${escape(s.branch)}</small></div>`:Array.from({length:s.shells},(_,i)=>`<div class="resource-item">› ${i?'git diff --stat':'git status --short'}<small>${i?'Completed':'Idle'} · ~/projects/difu</small></div>`).join('');
+    p.innerHTML=`<div class="popover-title"><span>${kind==='pr'?'Pull request':kind==='artifacts'?'Artifacts':'Shells'}</span><button class="close" aria-label="Close resource preview">×</button></div>${items}<p class="popover-note">Sample content for this interactive preview.</p>`;
+    p.hidden=false;button.setAttribute('aria-expanded','true');
+  }
+  document.addEventListener('click',e=>{
+    const session=e.target.closest('[data-session]');if(session){switchSession(Number(session.dataset.session));return;}
+    const state=e.target.closest('[data-state]');if(state){saveDraft();const s=sessions[current];s.state=state.dataset.state;s.note=({working:'Working · refining the session transition',ready:'Ready for your next message',interrupted:'Interrupted · send a message to continue',waiting:'Needs input · one question is waiting',starting:'Starting · preparing the session',completed:'Completed · work finished',failed:'Failed · the last turn could not finish'})[s.state];tab='agents';render(false);$('#announcement').textContent=`Previewing ${states[s.state].label} status.`;document.querySelector(`[data-state="${s.state}"]`).focus({preventScroll:true});return;}
+    const resource=e.target.closest('[data-resource]');if(resource){showResource(resource);return;}
+    if(e.target.closest('.close')){const b=document.querySelector('[data-resource][aria-expanded=true]');closePopover();b?.focus();return;}
+    if(!e.target.closest('.popover'))closePopover();
+  });
+  for(const name of ['agents','reviews'])$(`#${name}-tab`).addEventListener('click',()=>{if(tab===name)return;saveDraft();tab=name;render(true,true);});
+  $('.top-tabs').addEventListener('keydown',e=>{if(!['ArrowLeft','ArrowRight','Home','End'].includes(e.key))return;e.preventDefault();const name=e.key==='Home'?'agents':e.key==='End'?'reviews':tab==='agents'?'reviews':'agents';saveDraft();tab=name;render(true,true);$(`#${name}-tab`).focus();});
+  $('#replay').addEventListener('click',()=>reveal(tab==='agents'?$('.conversation'):$('#workspace')));
+  function setReduced(value){reduced=value;$('#reduce').checked=value;document.body.classList.toggle('reduce',value);if(value)stopAnimation();}
+  $('#reduce').addEventListener('change',e=>setReduced(e.target.checked));motionQuery.addEventListener('change',e=>setReduced(e.matches));
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'){const b=document.querySelector('[data-resource][aria-expanded=true]');closePopover();b?.focus();}});
+  render(false);
+})();
+</script>
+</body>
+</html>

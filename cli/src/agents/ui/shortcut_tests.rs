@@ -834,7 +834,7 @@ fn composer_completions_history_suggestion_and_paste_expansion_follow_bindings()
 }
 
 #[test]
-fn composer_and_menu_show_the_active_main_bindings() -> Result<()> {
+fn composer_hides_permission_hints_and_menu_shows_active_bindings() -> Result<()> {
     for action in [
         ids::COMPOSER_PERMISSION_MODE,
         ids::QUESTION_OPEN,
@@ -858,7 +858,17 @@ fn composer_and_menu_show_the_active_main_bindings() -> Result<()> {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(text.contains("F12"), "{action:?}: {text}");
+        if action == ids::COMPOSER_PERMISSION_MODE {
+            assert!(text.contains("unsent draft"), "{text}");
+            assert!(
+                !text.contains("F12")
+                    && !text.contains("Shift+Tab")
+                    && !text.contains("/permissions"),
+                "{text}"
+            );
+        } else {
+            assert!(text.contains("F12"), "{action:?}: {text}");
+        }
     }
     Ok(())
 }

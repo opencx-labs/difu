@@ -261,12 +261,32 @@ pub(super) fn screen(
     duration: Duration,
     now: Instant,
 ) -> bool {
-    let glyphs: Vec<char> = buffer.content.iter().filter_map(cell_glyph).collect();
+    let area = buffer.area;
+    region(buffer, area, started, duration, now)
+}
+
+/// The tab-switch reveal, restricted to one panel. Cells outside the panel,
+/// including the sidebar, retain their own content and animation timing.
+pub(super) fn region(
+    buffer: &mut Buffer,
+    area: ratatui::layout::Rect,
+    started: Instant,
+    duration: Duration,
+    now: Instant,
+) -> bool {
+    let area = area.intersection(buffer.area);
+    let glyphs: Vec<char> = area
+        .positions()
+        .filter_map(|position| buffer.cell(position).and_then(cell_glyph))
+        .collect();
     let sample = sample(glyphs.iter().copied());
     let total = glyphs.len().max(1);
     let frame = frame(now, started);
     let mut index = 0;
-    for cell in &mut buffer.content {
+    for position in area.positions() {
+        let Some(cell) = buffer.cell_mut(position) else {
+            continue;
+        };
         let Some(character) = cell_glyph(cell) else {
             continue;
         };
@@ -784,8 +804,9 @@ pub(super) fn paced(tweaks: crate::storage::Tweaks, changed: usize) -> Duration 
 /// Flips every chat entry that appears or changes after the session was first
 /// drawn: tool calls and their details, reasoning, plans, notes and messages.
 /// Entries flip in reading order, each waiting for the ones above it, so a
-/// batch of new entries plays one after another. Entries already there show as
-/// they are. The newest reply, a message being sent and voice transcripts play
+/// batch of new entries plays one after another. Only the five newest entries
+/// animate; older backlog and entries already there show immediately.
+/// The newest reply, a message being sent and voice transcripts play
 /// their own flips; returns when the newest reply's turn comes.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn chat(
@@ -827,7 +848,15 @@ pub(super) fn chat(
     // When everything above the current entry has arrived.
     let mut cursor = now;
     let mut reply_turn = now;
+    let recent = reveal::recent(sections);
     for section in sections {
+        if !recent.iter().any(|entry| entry.id == section.id) {
+            // Also mark offscreen history as seen so scrolling back cannot
+            // restart a backlog or keep the newest reply waiting behind it.
+            known.insert(section.id.clone());
+            position.boards.remove(&section.id);
+            continue;
+        }
         let rows = reveal::rows(sections, start, total, available, &section.id)
             .and_then(|range| lines.get_mut(range));
         if let Some(reply) = reply.filter(|reply| reply.id == section.id)
@@ -1038,7 +1067,11 @@ pub(super) fn apply(
     now: Instant,
 ) {
     let available = lines.len();
+    let recent = reveal::recent(sections);
     for entry in &session.entries {
+        if !recent.iter().any(|section| section.id == entry.id) {
+            continue;
+        }
         let Some(role) = voice_role(entry) else {
             continue;
         };
@@ -1065,11 +1098,12 @@ pub(super) fn apply(
         }
     }
     position.voice_flaps.retain(|id, flap| {
-        flap.animating(now)
-            || session
-                .entries
-                .iter()
-                .any(|entry| &entry.id == id && entry.finished_at.is_none())
+        recent.iter().any(|section| &section.id == id)
+            && (flap.animating(now)
+                || session
+                    .entries
+                    .iter()
+                    .any(|entry| &entry.id == id && entry.finished_at.is_none()))
     });
 }
 
@@ -1484,6 +1518,38 @@ mod tests {
             t0 + Duration::from_secs(1)
         ));
         assert_eq!(text(&settled), text(&buffer));
+    }
+
+    #[test]
+    fn session_reveal_never_changes_cells_outside_its_box() -> anyhow::Result<()> {
+        use anyhow::Context;
+        let area = ratatui::layout::Rect::new(12, 1, 18, 4);
+        let mut original = Buffer::empty(ratatui::layout::Rect::new(0, 0, 40, 7));
+        for cell in &mut original.content {
+            cell.set_symbol("x").set_style(Style::default().fg(TEXT));
+        }
+        let now = Instant::now();
+        let duration = Duration::from_millis(500);
+        let mut first = original.clone();
+        assert!(region(&mut first, area, now, duration, now));
+        for position in original.area.positions() {
+            let cell = first.cell(position).context("rendered cell")?;
+            if area.contains(position) {
+                assert_eq!(cell.symbol(), " ");
+            } else {
+                assert_eq!(Some(cell), original.cell(position));
+            }
+        }
+        let mut settled = original.clone();
+        assert!(!region(
+            &mut settled,
+            area,
+            now,
+            duration,
+            now + Duration::from_secs(1)
+        ));
+        assert_eq!(settled, original);
+        Ok(())
     }
 
     #[test]

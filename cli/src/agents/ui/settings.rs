@@ -64,6 +64,9 @@ mod runtime_tests;
 impl Ui {
     fn settle_disabled_motion(&mut self) {
         let motion = &self.preferences.motion;
+        if !motion.screen() || self.tweaks.agent_reply_cps == 0 {
+            self.session_switched = None;
+        }
         if !motion.sidebar() || self.tweaks.agent_reply_cps == 0 {
             self.sidebar_boards.clear();
             self.sidebar_highlights.clear();
