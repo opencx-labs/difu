@@ -39,6 +39,7 @@ pub(super) fn tools(session: &Session) -> Vec<Value> {
             super::management::tool(),
             super::questions::tool(),
             super::peers::tool(),
+            super::folders::tool(),
         ]
     }
 }

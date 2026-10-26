@@ -358,6 +358,9 @@ pub struct Session {
     /// The provider thread was given difu_peer_sessions.
     #[serde(default)]
     pub peer_tools: bool,
+    /// The provider thread was given difu_folders.
+    #[serde(default)]
+    pub folder_tools: bool,
     #[serde(skip)]
     pub artifact_requests: Vec<Pending>,
     #[serde(skip)]
@@ -444,6 +447,7 @@ impl Session {
             artifact_tools: false,
             question_tools: false,
             peer_tools: false,
+            folder_tools: false,
             artifact_requests: Vec::new(),
             question_requests: Vec::new(),
             shells: Vec::new(),

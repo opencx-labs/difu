@@ -9,6 +9,35 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 
+pub(super) const TOOL: &str = "difu_folders";
+pub(super) const INSTRUCTIONS: &str = "The user can organize difu's sidebar into folders. When they ask to create, fill, rename, reorder or remove folders, or to file sessions (including this one), use difu_folders rather than editing files or difu's source: folders lists the folders, this session's id and unfiled sessions; folder_create takes a name and optional ids; folder_move files ids into folder, files this session when ids are omitted, and returns them to the main list when folder is omitted; folder_rename, folder_delete (its sessions return to the main list; nothing is deleted) and folder_reorder (position 0 is first) take folder as an id or name. Folders only change the sidebar layout, so arranging them needs no extra confirmation.";
+
+/// The folder tool every coding session gets; the orchestrator has these actions in difu_sessions.
+pub(super) fn tool() -> Value {
+    json!({"type":"function","name":TOOL,"description":"Arrange difu's sidebar folders. folders lists folders with their sessions, this session's id and unfiled sessions. folder_create takes name and optional ids. folder_move files ids into folder (this session when ids are omitted), or back to the main list when folder is omitted. folder_rename (folder, name), folder_delete (folder; its sessions return to the main list, nothing is deleted) and folder_reorder (folder, position; 0 is first). folder is an id or name.","inputSchema":{"type":"object","properties":{
+        "action":{"type":"string","enum":["folders","folder_create","folder_rename","folder_delete","folder_move","folder_reorder"]},
+        "name":{"type":"string","description":"Folder name"},"folder":{"type":"string","description":"Folder id or name"},
+        "ids":{"type":"array","items":{"type":"string"},"maxItems":MAX_MOVE},"position":{"type":"integer","minimum":0}
+    },"required":["action"],"additionalProperties":false}})
+}
+
+/// difu_folders for a coding session; folder_move without ids files the caller.
+pub(super) fn handle_tool(store: &Store, caller: &str, args: &Value) -> Result<Value> {
+    let action = required(args, "action")?;
+    let mut args = args.clone();
+    if action == "folder_move"
+        && args.get("ids").is_none()
+        && let Some(object) = args.as_object_mut()
+    {
+        object.insert("ids".into(), json!([caller]));
+    }
+    let mut result = handle(store, &args, &action)?.context("Unknown folder action")?;
+    if let Some(object) = result.as_object_mut() {
+        object.insert("this_session".into(), json!(caller));
+    }
+    Ok(result)
+}
+
 pub const MAX_FOLDERS: usize = 64;
 const MAX_NAME: usize = 60;
 const MAX_MOVE: usize = 100;
@@ -223,11 +252,22 @@ fn view(store: &Store, folders: &[Folder]) -> Result<Value> {
         .iter()
         .flat_map(|f| f.sessions.iter().map(String::as_str))
         .collect();
-    let unfiled = summaries
+    let unfiled: Vec<_> = summaries
         .iter()
         .filter(|s| s.kind != "Orchestrator" && s.kind != "Guide" && !filed.contains(s.id.as_str()))
-        .count();
-    Ok(json!({"folders":folders.iter().map(listed).collect::<Vec<_>>(),"unfiled":unfiled}))
+        .collect();
+    let loose: Vec<_> = unfiled
+        .iter()
+        .take(50)
+        .map(|s| {
+            json!({"id":s.id,"title":super::orchestrator::short(&s.title,80),
+                "status":s.status,"archived":s.archived})
+        })
+        .collect();
+    Ok(
+        json!({"folders":folders.iter().map(listed).collect::<Vec<_>>(),
+        "unfiled":unfiled.len(),"unfiled_sessions":loose}),
+    )
 }
 
 /// Handles the orchestrator's folder actions; other actions return None.
@@ -440,6 +480,39 @@ mod tests {
         handle(&store, &json!({"folder":"widget bugs"}), "folder_delete")?;
         assert!(store.storage.load_config()?.session_folders.is_empty());
         assert!(handle(&store, &json!({}), "list")?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn any_coding_session_can_arrange_folders_and_file_itself() -> Result<()> {
+        let home_dir = tempfile::tempdir()?;
+        let store = Store::fixture(home_dir.path().into(), vec![session("one"), session("two")]);
+        let listed = handle_tool(&store, "one", &json!({"action":"folders"}))?;
+        assert_eq!(listed.get("this_session"), Some(&json!("one")));
+        assert_eq!(listed.get("unfiled"), Some(&json!(2)));
+        handle_tool(
+            &store,
+            "one",
+            &json!({"action":"folder_create","name":"Widget","ids":["two"]}),
+        )?;
+        // Without ids, folder_move files the calling session.
+        handle_tool(
+            &store,
+            "one",
+            &json!({"action":"folder_move","folder":"widget"}),
+        )?;
+        let saved = store.storage.load_config()?.session_folders;
+        assert_eq!(
+            saved.first().map(|f| f.sessions.clone()),
+            Some(vec!["two".to_owned(), "one".to_owned()])
+        );
+        assert!(handle_tool(&store, "one", &json!({"action":"delete","id":"two"})).is_err());
+        let tools = super::super::orchestrator::tools(&session("one"));
+        assert!(
+            tools
+                .iter()
+                .any(|tool| tool.get("name").and_then(Value::as_str) == Some(TOOL))
+        );
         Ok(())
     }
 

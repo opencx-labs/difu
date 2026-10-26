@@ -136,11 +136,13 @@ shows only that folder's sessions under **← All sessions · Esc**. Sessions yo
 start inside a folder are filed there, and opening a filed session from **Cmd+K**
 opens its folder. **Ctrl+↑/↓** on a folder card moves it among the folders.
 
-Ask the orchestrator to arrange them, for example "put the widget sessions in a
-Widget folder" or "rename Backlog to Later". It can create, rename, delete and
-reorder folders and move sessions in or out; deleting a folder returns its
-sessions to the main list and never deletes a session. The list picks up its
-changes within a second. Folders are saved in `config.json` as `session_folders`.
+Ask any agent to arrange them, for example "put this session in a Widget
+folder" or "rename Backlog to Later"; the orchestrator can do the same for any
+session. Agents can create, rename, delete and reorder folders and move sessions
+in or out; deleting a folder returns its sessions to the main list and never
+deletes a session. The list picks up their changes within a second. Codex chats
+started before this version get the folder tool after Clear or a new chat;
+Claude chats get it on their next start. Folders are saved in `config.json` as `session_folders`.
 
 ### Local diffs and branch PRs
 
