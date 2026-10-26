@@ -16,6 +16,7 @@ impl Ui {
         self.preferences = config.preferences.clone();
         self.pinned_sessions = config.pinned_sessions.clone();
         self.session_order = config.session_order.clone();
+        self.set_folders(config.session_folders.clone());
         self.change_wrap = config.wrap_diff;
         self.change_unified = config.unified;
         self.tweaks = config.tweaks;

@@ -5,6 +5,7 @@ pub mod client;
 pub mod connections;
 mod elicitation;
 mod engine;
+pub mod folders;
 mod guidance;
 mod management;
 pub mod mcp;

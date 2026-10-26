@@ -127,6 +127,21 @@ Session activity never changes list order. With the session list focused, use
 **Ctrl+↑/↓** to move the selected session within its pinned or unpinned group.
 The order persists across restarts; the orchestrator stays fixed at the top.
 
+### Folders
+
+Folders group sessions in the Agents list. Each folder is a card below the
+orchestrator showing how many sessions it holds and what they are doing; select
+it to preview its sessions, then **Enter** or click to open it. Inside, the list
+shows only that folder's sessions under **← All sessions · Esc**. Sessions you
+start inside a folder are filed there, and opening a filed session from **Cmd+K**
+opens its folder. **Ctrl+↑/↓** on a folder card moves it among the folders.
+
+Ask the orchestrator to arrange them, for example "put the widget sessions in a
+Widget folder" or "rename Backlog to Later". It can create, rename, delete and
+reorder folders and move sessions in or out; deleting a folder returns its
+sessions to the main list and never deletes a session. The list picks up its
+changes within a second. Folders are saved in `config.json` as `session_folders`.
+
 ### Local diffs and branch PRs
 
 Run `difu pr .` from a checkout to open the PR for its current branch. If the

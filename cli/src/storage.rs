@@ -121,6 +121,9 @@ pub struct Config {
     pub pinned_sessions: BTreeSet<String>,
     #[serde(default)]
     pub session_order: Vec<String>,
+    /// Sidebar folders, in display order; the orchestrator can arrange them.
+    #[serde(default)]
+    pub session_folders: Vec<crate::agents::folders::Folder>,
     #[serde(default)]
     pub model: ModelChoice,
     #[serde(default = "ModelChoice::conflict_default")]
@@ -160,6 +163,7 @@ impl Default for Config {
             pinned_repositories: BTreeSet::new(),
             pinned_sessions: BTreeSet::new(),
             session_order: Vec::new(),
+            session_folders: Vec::new(),
             model: ModelChoice::default(),
             conflict_model: ModelChoice::conflict_default(),
             unified: false,

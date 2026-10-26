@@ -7,6 +7,7 @@ mod codex_plan_picker;
 mod commands;
 mod defaults;
 mod flap;
+mod folders;
 mod inline_questions;
 mod mcp_panel;
 mod media;
@@ -176,6 +177,8 @@ enum Action {
     PlanChoice(usize),
     Select(String),
     OrchestratorBack,
+    OpenFolder(String),
+    FolderBack,
     Open,
     Focus(Focus),
     Resources(bool),
@@ -364,6 +367,11 @@ pub struct Ui {
     pub session_order: Vec<String>,
     pub archived: bool,
     orchestrator_list: bool,
+    session_folders: Vec<crate::agents::folders::Folder>,
+    /// The folder whose sessions the list shows; None is the main list.
+    folder_view: Option<String>,
+    /// A highlighted folder card in the main list; no session is selected then.
+    folder_cursor: Option<String>,
     pub modal: Option<Modal>,
     pub notice: Option<(String, bool)>,
     pub clipboard: Option<String>,
@@ -466,6 +474,9 @@ impl Ui {
             session_order: config.session_order.clone(),
             archived: false,
             orchestrator_list: false,
+            session_folders: config.session_folders.clone(),
+            folder_view: None,
+            folder_cursor: None,
             modal: None,
             notice: None,
             clipboard: None,
@@ -820,6 +831,7 @@ impl Ui {
                             self.notice = Some(("Chat deleted".into(), false));
                         }
                         self.summaries = sessions;
+                        self.reload_folders();
                         self.ensure_selected();
                     }
                     (Task::Repository(id), Reply::Session(session)) => {
@@ -934,6 +946,8 @@ impl Ui {
                             },
                             false,
                         );
+                        self.file_launched(&id);
+                        self.folder_cursor = None;
                         self.selected = Some(id.clone());
                         self.changes_visible = false;
                         self.positions.entry(id).or_default().follow = true;
@@ -1023,6 +1037,7 @@ impl Ui {
         self.tick_plan_prompt(visible);
     }
     fn filtered(&self) -> Vec<Summary> {
+        let filed = self.filed();
         let mut sessions = self
             .summaries
             .iter()
@@ -1033,6 +1048,11 @@ impl Ui {
                 } else {
                     s.kind != "Orchestrator" || s.id == super::orchestrator::ID
                 }
+            })
+            // Filed sessions show only inside their folder.
+            .filter(|s| {
+                self.orchestrator_list
+                    || filed.get(s.id.as_str()).copied() == self.folder_view.as_deref()
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -1081,6 +1101,8 @@ impl Ui {
     }
     fn close_orchestrator_list(&mut self) {
         self.orchestrator_list = false;
+        self.folder_view = None;
+        self.folder_cursor = None;
         self.drilled = false;
         self.archived = false;
         self.focus = Focus::List;
@@ -1088,6 +1110,10 @@ impl Ui {
         self.select(super::orchestrator::ID.into());
     }
     fn reorder_session(&mut self, down: bool) {
+        if self.folder_cursor.is_some() {
+            self.reorder_folder(down);
+            return;
+        }
         let list = self.filtered();
         let Some(index) = list
             .iter()
@@ -1161,16 +1187,26 @@ impl Ui {
         self.refreshed = None;
     }
     fn ensure_selected(&mut self) {
-        let list = self.selectable();
-        if !list.iter().any(|s| Some(&s.id) == self.selected.as_ref()) && !self.drilled {
-            self.selected = list.first().map(|s| s.id.clone());
+        let rows = self.selectable_rows();
+        if let Some(cursor) = self.folder_cursor.as_deref() {
+            if rows
+                .iter()
+                .any(|row| matches!(row, folders::Row::Folder(card) if card.id == cursor))
+            {
+                return;
+            }
+            self.folder_cursor = None;
         }
-    }
-    fn selectable(&self) -> Vec<Summary> {
-        self.filtered()
-            .into_iter()
-            .filter(|s| !self.deleting.contains(&s.id))
-            .collect()
+        let listed = rows.iter().any(
+            |row| matches!(row, folders::Row::Session(s) if Some(&s.id) == self.selected.as_ref()),
+        );
+        if !listed && !self.drilled {
+            match rows.into_iter().next() {
+                Some(folders::Row::Folder(card)) => self.focus_folder(card.id),
+                Some(folders::Row::Session(session)) => self.selected = Some(session.id),
+                None => self.selected = None,
+            }
+        }
     }
     fn select(&mut self, id: String) {
         if self.deleting.contains(&id) {
@@ -1181,6 +1217,7 @@ impl Ui {
             self.remember_answers();
             self.modal = None;
         }
+        self.folder_cursor = None;
         self.selected = Some(id.clone());
         self.positions.entry(id.clone()).or_default();
         if changed {
@@ -1204,16 +1241,19 @@ impl Ui {
         self.text_selection.clear();
     }
     fn move_list(&mut self, delta: i32) {
-        let list = self.selectable();
-        let current = list
+        let rows = self.selectable_rows();
+        let cursor = self.cursor();
+        let current = rows
             .iter()
-            .position(|s| Some(&s.id) == self.selected.as_ref())
+            .position(|row| Some(row.key()) == cursor)
             .unwrap_or(0);
         let index = current
             .saturating_add_signed(delta as isize)
-            .min(list.len().saturating_sub(1));
-        if let Some(session) = list.get(index) {
-            self.select(session.id.clone());
+            .min(rows.len().saturating_sub(1));
+        match rows.into_iter().nth(index) {
+            Some(folders::Row::Folder(card)) => self.focus_folder(card.id),
+            Some(folders::Row::Session(session)) => self.select(session.id),
+            None => {}
         }
     }
     fn interrupt_chat(&mut self, control: Control) {
@@ -1423,6 +1463,7 @@ impl Ui {
                 .summaries
                 .iter()
                 .any(|s| s.id == id && s.kind == "Orchestrator");
+        self.reveal_in_folder(&id);
         self.archived = self
             .summaries
             .iter()
@@ -1777,6 +1818,17 @@ impl Ui {
         }
         if self.orchestrator_list && !self.drilled && shortcut == Some(AGENTS_BACK) {
             self.close_orchestrator_list();
+            return;
+        }
+        if self.focus == Focus::List
+            && shortcut == Some(NAVIGATION_ACTIVATE)
+            && let Some(folder) = self.folder_cursor.clone()
+        {
+            self.open_folder(folder);
+            return;
+        }
+        if self.folder_view.is_some() && !self.drilled && shortcut == Some(AGENTS_BACK) {
+            self.close_folder();
             return;
         }
         if self.changes_visible
@@ -2629,6 +2681,8 @@ impl Ui {
             Action::RulesSave => self.save_rules(),
             Action::RulesCancel => self.close_rules(),
             Action::OrchestratorBack => self.close_orchestrator_list(),
+            Action::OpenFolder(id) => self.open_folder(id),
+            Action::FolderBack => self.close_folder(),
             Action::Select(id) => {
                 if id == super::orchestrator::ID && !self.orchestrator_list {
                     self.open_orchestrator_list();
@@ -2641,6 +2695,10 @@ impl Ui {
                 self.focus = Focus::List;
             }
             Action::Open => {
+                if let Some(folder) = self.folder_cursor.clone() {
+                    self.open_folder(folder);
+                    return;
+                }
                 if self.selected.as_deref() == Some(super::orchestrator::ID)
                     && !self.orchestrator_list
                 {
@@ -3220,6 +3278,13 @@ impl Ui {
         self.toast_rect = toast::draw(frame, frame.area(), notice, *error);
     }
     fn draw_list(&mut self, frame: &mut Frame, rect: Rect) {
+        let folder = self.open_folder_name().map(|name| {
+            crate::model::clean(&if self.archived {
+                format!("Archived · {name}")
+            } else {
+                name.to_owned()
+            })
+        });
         let area = panel(
             frame,
             rect,
@@ -3229,6 +3294,8 @@ impl Ui {
                 } else {
                     "Orchestrator chats"
                 }
+            } else if let Some(folder) = &folder {
+                folder
             } else if self.archived {
                 "Archived agents"
             } else {
@@ -3237,13 +3304,20 @@ impl Ui {
             !self.panels.focused && self.focus == Focus::List,
         );
         self.hits.push((rect, Action::Focus(Focus::List)));
-        if self.orchestrator_list {
+        if self.orchestrator_list || folder.is_some() {
             let back = Rect::new(area.x, area.y, area.width, 1);
             frame.render_widget(
                 Paragraph::new("← All sessions · Esc").style(Style::default().fg(DIM)),
                 back,
             );
-            self.hits.push((back, Action::OrchestratorBack));
+            self.hits.push((
+                back,
+                if self.orchestrator_list {
+                    Action::OrchestratorBack
+                } else {
+                    Action::FolderBack
+                },
+            ));
         }
         let items = Rect::new(
             area.x,
@@ -3251,17 +3325,21 @@ impl Ui {
             area.width,
             area.height.saturating_sub(1),
         );
-        let list = self.filtered();
-        let heights = list
+        let rows = self.rows();
+        let heights = rows
             .iter()
-            .map(|session| {
-                4 + usize::from(self.sidebar.counts.contains_key(&session.id))
-                    + self.prs.all(&session.id).len()
+            .map(|row| match row {
+                folders::Row::Folder(_) => 4,
+                folders::Row::Session(session) => {
+                    4 + usize::from(self.sidebar.counts.contains_key(&session.id))
+                        + self.prs.all(&session.id).len()
+                }
             })
             .collect::<Vec<_>>();
-        let selected = list
+        let cursor = self.cursor();
+        let selected = rows
             .iter()
-            .position(|s| Some(&s.id) == self.selected.as_ref())
+            .position(|row| Some(row.key()) == cursor)
             .unwrap_or(0);
         self.list_scroll = self.list_scroll.min(selected);
         while self.list_scroll < selected
@@ -3284,7 +3362,7 @@ impl Ui {
         if settled {
             self.sidebar_highlights.clear();
         }
-        let order: Vec<String> = list.iter().map(|session| session.id.clone()).collect();
+        let order: Vec<String> = rows.iter().map(folders::Row::key).collect();
         if !settled && order != self.sidebar_order {
             // A card moving into a slot flips from the text that was there.
             let previous: Vec<Option<flap::Board>> = self
@@ -3300,15 +3378,16 @@ impl Ui {
             }
         }
         self.sidebar_order = order;
-        if self.selected != self.sidebar_selected {
+        if cursor != self.sidebar_selected {
             if !settled {
-                let right_to_left = list
+                let right_to_left = self
+                    .sidebar_order
                     .iter()
-                    .position(|session| Some(&session.id) == self.sidebar_selected.as_ref())
+                    .position(|key| Some(key) == self.sidebar_selected.as_ref())
                     .is_some_and(|previous| selected > previous);
                 for (id, on) in [
                     (self.sidebar_selected.clone(), false),
-                    (self.selected.clone(), true),
+                    (cursor.clone(), true),
                 ] {
                     if let Some(id) = id
                         && let Some(highlight) =
@@ -3318,18 +3397,32 @@ impl Ui {
                     }
                 }
             }
-            self.sidebar_selected.clone_from(&self.selected);
+            self.sidebar_selected.clone_from(&cursor);
         }
-        let listed: HashSet<&str> = list.iter().map(|session| session.id.as_str()).collect();
+        let listed: HashSet<&str> = self.sidebar_order.iter().map(String::as_str).collect();
         self.sidebar_boards
             .retain(|id, _| listed.contains(id.as_str()));
         self.sidebar_highlights
             .retain(|id, highlight| listed.contains(id.as_str()) && !highlight.done(now));
-        for (index, session) in list.iter().enumerate().skip(self.list_scroll) {
+        for (index, entry) in rows.iter().enumerate().skip(self.list_scroll) {
             if offset >= usize::from(items.height) {
                 break;
             }
             let height = heights.get(index).copied().unwrap_or(4);
+            let session = match entry {
+                folders::Row::Folder(card) => {
+                    let row = Rect::new(
+                        items.x,
+                        items.y.saturating_add(offset as u16),
+                        items.width,
+                        (height as u16 - 1).min(items.height.saturating_sub(offset as u16)),
+                    );
+                    offset += height;
+                    self.draw_folder_card(frame, card, row, settled, now);
+                    continue;
+                }
+                folders::Row::Session(session) => session,
+            };
             let selected = Some(&session.id) == self.selected.as_ref();
             let deleting = self.deleting.contains(&session.id);
             let row = Rect::new(
@@ -3472,10 +3565,12 @@ impl Ui {
                 self.hits.push((row, Action::Select(session.id.clone())));
             }
         }
-        if list.is_empty() {
+        if rows.is_empty() {
             frame.render_widget(
                 Paragraph::new(if self.listing {
                     "Connecting…"
+                } else if self.folder_view.is_some() {
+                    "This folder is empty\n\nn · New agent here\nAsk the orchestrator to move sessions in"
                 } else {
                     "No matching sessions\n\nn · New agent"
                 })
@@ -3483,10 +3578,13 @@ impl Ui {
                 items,
             );
         }
-        self.sidebar_seen |= !list.is_empty();
+        self.sidebar_seen |= !rows.is_empty();
         self.prs.visible.extend(visible_pr_sessions);
     }
     fn draw_conversation(&mut self, frame: &mut Frame, rect: Rect) {
+        if self.draw_folder_overview(frame, rect) {
+            return;
+        }
         let title = self
             .selected
             .as_ref()
@@ -4530,7 +4628,7 @@ fn agent_help(query: &str, config: &Config) -> Vec<(String, &'static str)> {
         ("Cmd+K", "Search sessions, pull requests and commands"),
         (
             "Ctrl+↑ / ↓ in sessions",
-            "Reorder within the pinned or unpinned group (saved)",
+            "Reorder within the pinned or unpinned group, or move a folder (saved)",
         ),
         (
             "Tab / Shift+Tab",
