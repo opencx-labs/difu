@@ -638,7 +638,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(
-            status_row.contains("Regular") && status_row.contains("PR #42 · Open"),
+            status_row.contains("Inherited · Inherited · Starting")
+                && status_row.contains("PR #42 · Open"),
             "{status_row}"
         );
         assert!(!status_row.contains("/permissions") && !status_row.contains("Shift+Tab"));
