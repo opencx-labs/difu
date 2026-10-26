@@ -804,8 +804,9 @@ pub(super) fn paced(tweaks: crate::storage::Tweaks, changed: usize) -> Duration 
 /// Flips every chat entry that appears or changes after the session was first
 /// drawn: tool calls and their details, reasoning, plans, notes and messages.
 /// Entries flip in reading order, each waiting for the ones above it, so a
-/// batch of new entries plays one after another. Entries already there show as
-/// they are. The newest reply, a message being sent and voice transcripts play
+/// batch of new entries plays one after another. Only the five newest entries
+/// animate; older backlog and entries already there show immediately.
+/// The newest reply, a message being sent and voice transcripts play
 /// their own flips; returns when the newest reply's turn comes.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn chat(
@@ -847,7 +848,15 @@ pub(super) fn chat(
     // When everything above the current entry has arrived.
     let mut cursor = now;
     let mut reply_turn = now;
+    let recent = reveal::recent(sections);
     for section in sections {
+        if !recent.iter().any(|entry| entry.id == section.id) {
+            // Also mark offscreen history as seen so scrolling back cannot
+            // restart a backlog or keep the newest reply waiting behind it.
+            known.insert(section.id.clone());
+            position.boards.remove(&section.id);
+            continue;
+        }
         let rows = reveal::rows(sections, start, total, available, &section.id)
             .and_then(|range| lines.get_mut(range));
         if let Some(reply) = reply.filter(|reply| reply.id == section.id)
@@ -1058,7 +1067,11 @@ pub(super) fn apply(
     now: Instant,
 ) {
     let available = lines.len();
+    let recent = reveal::recent(sections);
     for entry in &session.entries {
+        if !recent.iter().any(|section| section.id == entry.id) {
+            continue;
+        }
         let Some(role) = voice_role(entry) else {
             continue;
         };
@@ -1085,11 +1098,12 @@ pub(super) fn apply(
         }
     }
     position.voice_flaps.retain(|id, flap| {
-        flap.animating(now)
-            || session
-                .entries
-                .iter()
-                .any(|entry| &entry.id == id && entry.finished_at.is_none())
+        recent.iter().any(|section| &section.id == id)
+            && (flap.animating(now)
+                || session
+                    .entries
+                    .iter()
+                    .any(|entry| &entry.id == id && entry.finished_at.is_none()))
     });
 }
 
