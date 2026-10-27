@@ -2650,9 +2650,18 @@ fn rejected_starting_mode_stays_pending_and_sends_no_first_turn() -> Result<()> 
     );
     fs::remove_file(temp.path().join("reject-mode-update"))?;
     control(&storage, &id, Control::Resume)?;
-    let ready = wait(&storage, &id, |s| s.status == Status::Idle)?;
+    // Reconnection becomes idle before the pending mode is acknowledged.
+    // Wait for that acknowledgement instead of sampling the intermediate mode.
+    let ready = wait(&storage, &id, |s| {
+        s.status == Status::Idle && s.permission_state.pending_mode.is_none()
+    })?;
     assert_eq!(ready.permission_state.mode.as_deref(), Some("plan"));
     assert!(ready.permission_state.pending_mode.is_none());
+    assert!(
+        frames(temp.path(), "protocol.jsonl")?
+            .iter()
+            .all(|f| f.get("method").and_then(Value::as_str) != Some("turn/start"))
+    );
     Ok(())
 }
 
