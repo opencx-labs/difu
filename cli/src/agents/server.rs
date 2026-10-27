@@ -1261,6 +1261,7 @@ fn reset_workspace(s: &mut Session, candidate: Session, revision: u64) {
     s.workspace_requests.clear();
     s.registration_requests.clear();
     s.artifact_requests.clear();
+    s.pr_requests.clear();
     s.question_requests.clear();
     s.deletion_requests.clear();
     s.job = candidate.job;
@@ -1302,6 +1303,7 @@ fn clear_conversation(s: &mut Session) {
     s.permissions = Value::Null;
     s.inherited_permissions = Value::Null;
     s.artifact_tools = false;
+    s.pr_tools = false;
     s.registration_tools = false;
     s.question_tools = false;
     s.peer_tools = false;

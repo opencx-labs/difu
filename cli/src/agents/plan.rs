@@ -49,6 +49,7 @@ fn ready(session: &Session) -> bool {
         && session.workspace_requests.is_empty()
         && session.registration_requests.is_empty()
         && session.artifact_requests.is_empty()
+        && session.pr_requests.is_empty()
         && session.question_requests.is_empty()
         && session.deletion_requests.is_empty()
         && session.orchestrator_requests.is_empty()

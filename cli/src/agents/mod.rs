@@ -14,6 +14,7 @@ mod orchestrator;
 mod peers;
 pub mod permissions;
 pub mod plan;
+mod pr_attachments;
 pub(crate) mod pr_cache;
 pub mod provider;
 mod questions;
@@ -353,12 +354,16 @@ pub struct Session {
     #[serde(default)]
     pub artifact_tools: bool,
     #[serde(default)]
+    pub pr_tools: bool,
+    #[serde(default)]
     pub question_tools: bool,
     /// The provider thread was given difu_peer_sessions.
     #[serde(default)]
     pub peer_tools: bool,
     #[serde(skip)]
     pub artifact_requests: Vec<Pending>,
+    #[serde(skip)]
+    pub pr_requests: Vec<Pending>,
     #[serde(skip)]
     pub question_requests: Vec<Pending>,
     #[serde(skip)]
@@ -441,9 +446,11 @@ impl Session {
             permissions: Value::Null,
             artifacts: Vec::new(),
             artifact_tools: false,
+            pr_tools: false,
             question_tools: false,
             peer_tools: false,
             artifact_requests: Vec::new(),
+            pr_requests: Vec::new(),
             question_requests: Vec::new(),
             shells: Vec::new(),
             entries: Vec::new(),

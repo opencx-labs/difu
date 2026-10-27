@@ -12,6 +12,19 @@ pub(crate) struct SessionLink {
     pub pr: github::SessionPr,
     #[serde(default)]
     pub workspace_revision: u64,
+    /// Explicit URL association; it does not establish checkout ownership.
+    #[serde(default)]
+    pub attached: bool,
+}
+
+impl SessionLink {
+    pub fn badge(&self) -> String {
+        if self.attached {
+            format!("PR {}", self.pr.key.id())
+        } else {
+            format!("PR #{}", self.pr.key.number)
+        }
+    }
 }
 
 fn deserialize_pr<'de, D: serde::Deserializer<'de>>(
@@ -72,7 +85,7 @@ fn references(storage: &Storage, links: &[SessionLink]) -> anyhow::Result<serde_
             github::store::session(storage, &link.pr)?;
         }
         values.push(serde_json::json!({
-            "workspace": link.workspace, "workspace_revision": link.workspace_revision, "pr": link.pr.key,
+            "workspace": link.workspace, "workspace_revision": link.workspace_revision, "pr": link.pr.key, "attached": link.attached,
         }));
     }
     Ok(serde_json::Value::Array(values))
@@ -147,7 +160,8 @@ pub(crate) fn current(
     workspace: &std::path::Path,
     branch: Option<&str>,
 ) -> bool {
-    link.workspace == workspace
+    !link.attached
+        && link.workspace == workspace
         && (link.pr.head_branch.is_empty() || branch == Some(link.pr.head_branch.as_str()))
 }
 
@@ -254,6 +268,49 @@ pub(super) fn disconnect(storage: &Storage, id: &str, revision: u64) -> anyhow::
         save_links(storage, &path, &links)?;
     }
     Ok(())
+}
+
+/// Associate a verified PR URL without assuming it belongs to this checkout.
+pub(super) fn attach(
+    storage: &Storage,
+    session: &super::Summary,
+    pr: github::SessionPr,
+    cancel: &Cancel,
+) -> anyhow::Result<()> {
+    let path = snapshot_path(storage, &session.id);
+    std::fs::create_dir_all(
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("Missing PR cache directory"))?,
+    )?;
+    let _lease = github::polling::lock(&path.with_extension("lock"), cancel)?;
+    let mut saved = snapshot(storage, &session.id);
+    anyhow::ensure!(
+        session.workspace_revision >= saved.disconnected_before,
+        "Session repository changed; retry attaching the PR"
+    );
+    for name in [SESSION_LINKS, "agent-prs.json"] {
+        let mut known = load_links(&storage.cache.join(name))
+            .remove(&session.id)
+            .unwrap_or_default();
+        saved.retain_connected(&mut known);
+        merge_links(&mut saved.links, known);
+    }
+    if let Some(link) = saved.links.iter_mut().find(|link| link.pr.key == pr.key) {
+        link.pr = pr;
+    } else {
+        saved.links.push(SessionLink {
+            workspace: session.workspace.clone(),
+            workspace_revision: session.workspace_revision,
+            attached: true,
+            pr,
+        });
+    }
+    sort_links(
+        &mut saved.links,
+        &session.workspace,
+        session.branch.as_deref(),
+    );
+    save_snapshot(storage, &path, &saved)
 }
 
 /// Branch switches in an existing worktree do not change its saved session ID.
@@ -412,6 +469,7 @@ fn update_session(
             links,
             prs.into_iter()
                 .map(|pr| SessionLink {
+                    attached: false,
                     workspace: workspace.path.clone(),
                     pr,
                     workspace_revision: session.workspace_revision,
@@ -574,6 +632,55 @@ mod tests {
     };
 
     #[test]
+    fn explicit_links_keep_full_identity_without_claiming_the_checkout() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let session = super::super::Session::new(
+            "links".into(),
+            super::super::Job::Coding(super::super::Launch {
+                repository: dir.path().into(),
+                isolated: true,
+                base: "HEAD".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        )
+        .summary();
+        let make = |repo: &str| github::SessionPr {
+            summary: None,
+            key: PrKey {
+                owner: "example".into(),
+                repo: repo.into(),
+                number: 42,
+            },
+            state: "OPEN".into(),
+            draft: false,
+            conflicts: false,
+            head_branch: "feature".into(),
+            head: String::new(),
+            updated: "2026-10-27".into(),
+        };
+        for repo in ["one", "two", "one"] {
+            attach(&storage, &session, make(repo), &Cancel::default())?;
+        }
+        let saved = snapshot(&storage, &session.id);
+        assert_eq!(saved.links.len(), 2);
+        for link in &saved.links {
+            assert!(link.attached);
+            assert!(!current(link, &session.workspace, Some("feature")));
+            assert_eq!(link.badge(), format!("PR example/{}#42", link.pr.key.repo));
+        }
+        disconnect(&storage, &session.id, 1)?;
+        assert!(attach(&storage, &session, make("three"), &Cancel::default()).is_err());
+        assert!(snapshot(&storage, &session.id).links.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn repository_reset_rejects_stale_links_and_in_flight_refreshes() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let storage = Storage {
@@ -593,6 +700,7 @@ mod tests {
         );
         session.status = super::super::Status::Idle;
         let link = SessionLink {
+            attached: false,
             workspace: dir.path().join("old-worktree"),
             workspace_revision: 0,
             pr: github::SessionPr {
@@ -687,6 +795,7 @@ mod tests {
         assert_eq!(current.branch.as_deref(), Some("new-session-branch"));
         assert_eq!(session.branch.as_deref(), Some("old-session-branch"));
         let make = |number, state: &str, branch: &str| SessionLink {
+            attached: false,
             workspace_revision: 0,
             workspace: dir.path().into(),
             pr: github::SessionPr {
@@ -736,6 +845,7 @@ mod tests {
         session.status = super::super::Status::Idle;
         let summary = session.summary();
         let link = SessionLink {
+            attached: false,
             workspace_revision: 0,
             workspace: summary.workspace.clone(),
             pr: github::SessionPr {
@@ -836,6 +946,7 @@ mod tests {
         session.status = super::super::Status::Idle;
         session.archived = true;
         let link = SessionLink {
+            attached: false,
             workspace_revision: 0,
             workspace: dir.path().into(),
             pr: github::SessionPr {
@@ -869,6 +980,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let path = dir.path().join("links.json");
         let make = |number, state: &str, workspace: &str, updated: &str| SessionLink {
+            attached: false,
             workspace_revision: 0,
             workspace: workspace.into(),
             pr: github::SessionPr {

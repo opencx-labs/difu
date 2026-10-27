@@ -3486,8 +3486,8 @@ impl Ui {
                 let pr = &link.pr;
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "     PR #{} · {}{}",
-                        pr.key.number,
+                        "     {} · {}{}",
+                        link.badge(),
                         pr.label(),
                         if self.prs.stale(&session.id) {
                             " · stale"
