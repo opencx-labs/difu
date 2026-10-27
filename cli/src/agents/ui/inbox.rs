@@ -959,7 +959,10 @@ mod tests {
         ui.open_questions_inbox();
         ui.move_inbox_session(true);
         let mut terminal = Terminal::new(TestBackend::new(110, 50))?;
-        terminal.draw(|frame| ui.draw_inbox(frame, frame.area()))?;
+        terminal.draw(|frame| {
+            let area = frame.area();
+            ui.draw_inbox(frame, area);
+        })?;
         let session = ui.sessions.get_mut("two").context("session")?;
         session.pending.first_mut().context("question")?.params["difuAnswers"] =
             json!({"a":"done"});
@@ -967,7 +970,10 @@ mod tests {
         let section = ui.inbox.sections.get(1).context("section")?;
         assert_eq!(section.items.len(), 1);
         assert!(section.leaving.is_none());
-        terminal.draw(|frame| ui.draw_inbox(frame, frame.area()))?;
+        terminal.draw(|frame| {
+            let area = frame.area();
+            ui.draw_inbox(frame, area);
+        })?;
         ui.sessions
             .get_mut("two")
             .context("session")?
@@ -996,7 +1002,10 @@ mod tests {
                 .items
                 .is_empty()
         );
-        terminal.draw(|frame| ui.draw_inbox(frame, frame.area()))?;
+        terminal.draw(|frame| {
+            let area = frame.area();
+            ui.draw_inbox(frame, area);
+        })?;
         let screen = terminal
             .backend()
             .buffer()
@@ -1016,7 +1025,10 @@ mod tests {
         ui.preferences.motion.level = crate::settings::Motion::Off;
         ui.open_questions_inbox();
         let mut terminal = Terminal::new(TestBackend::new(100, 30))?;
-        terminal.draw(|frame| ui.draw_inbox(frame, frame.area()))?;
+        terminal.draw(|frame| {
+            let area = frame.area();
+            ui.draw_inbox(frame, area);
+        })?;
         for session in ui.sessions.values_mut() {
             session.pending.clear();
         }
@@ -1029,7 +1041,10 @@ mod tests {
         assert!(ui.inbox.active.is_none());
         assert!(ui.focused_editor().is_none());
         assert!(ui.positions.values().all(|p| p.draft.text().is_empty()));
-        terminal.draw(|frame| ui.draw_inbox(frame, frame.area()))?;
+        terminal.draw(|frame| {
+            let area = frame.area();
+            ui.draw_inbox(frame, area);
+        })?;
         let screen = terminal
             .backend()
             .buffer()

@@ -2063,6 +2063,7 @@ mod clear_tests {
             let store = Arc::new(Store::fixture(home.clone(), vec![session.clone()]));
             fs::create_dir_all(&store.storage.cache)?;
             let link = SessionLink {
+                attached: false,
                 workspace: tree.clone(),
                 workspace_revision: 0,
                 pr: SessionPr {

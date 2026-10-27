@@ -479,7 +479,7 @@ pub(super) fn build() -> Vec<ActionSpec> {
             }
             entry.contexts.push(main);
             for binding in &mut entry.defaults {
-                if binding.contexts.contains(&base) && !binding.contexts.contains(&inbox) {
+                if binding.contexts.contains(&base) {
                     binding.contexts.push(main);
                 }
             }

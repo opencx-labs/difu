@@ -125,6 +125,10 @@ pub(super) fn entries() -> Vec<ActionSpec> {
             ids::AGENTS_SIDEBAR,
             "Toggle sessions sidebar",
             &[
+                contexts::AGENT_INBOX,
+                contexts::AGENT_INBOX_QUESTION,
+                contexts::AGENT_INBOX_NOTE,
+                contexts::AGENT_INBOX_APPROVAL,
                 contexts::AGENT_LIST,
                 contexts::AGENT_COMPOSER,
                 contexts::AGENT_COMPOSER_PANES,
@@ -140,6 +144,10 @@ pub(super) fn entries() -> Vec<ActionSpec> {
             ids::AGENTS_CHANGES,
             "Toggle Changes",
             &[
+                contexts::AGENT_INBOX,
+                contexts::AGENT_INBOX_QUESTION,
+                contexts::AGENT_INBOX_NOTE,
+                contexts::AGENT_INBOX_APPROVAL,
                 contexts::AGENT_LIST,
                 contexts::AGENT_COMPOSER,
                 contexts::AGENT_COMPOSER_PANES,
@@ -155,6 +163,10 @@ pub(super) fn entries() -> Vec<ActionSpec> {
             ids::AGENTS_MODELS,
             "Open model picker",
             &[
+                contexts::AGENT_INBOX,
+                contexts::AGENT_INBOX_QUESTION,
+                contexts::AGENT_INBOX_NOTE,
+                contexts::AGENT_INBOX_APPROVAL,
                 contexts::AGENT_LIST,
                 contexts::AGENT_COMPOSER,
                 contexts::AGENT_COMPOSER_PANES,
