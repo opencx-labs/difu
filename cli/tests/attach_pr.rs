@@ -45,7 +45,10 @@ fn command_attaches_cross_repo_pr_without_a_terminal_or_conversation_reset() -> 
     session.status = Status::Idle;
     session.thread_id = Some("original-codex-thread".into());
     session.note("agentMessage", "Existing conversation");
-    storage::atomic_json(&server::home(&storage)?.join("existing.json"), &session)?;
+    fs::write(
+        server::home(&storage)?.join("existing.json"),
+        serde_json::to_vec(&session)?,
+    )?;
     let bin = root.join("bin");
     fs::create_dir(&bin)?;
     let gh = bin.join("gh");
