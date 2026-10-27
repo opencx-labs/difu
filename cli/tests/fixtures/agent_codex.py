@@ -72,7 +72,7 @@ for line in sys.stdin:
         reply(request, {'data':[{'command':'fixture shell','cwd':os.getcwd(),'itemId':'shell-item','processId':'123'}], 'nextCursor':None})
     elif method == 'thread/read':
         assert params == {'threadId':'fixture-child','includeTurns':True}
-        reply(request, {'thread':{'id':'fixture-child','parentThreadId':thread_id,'agentNickname':'Reviewer','turns':[{'id':'child-turn','status':'completed','items':[{'type':'agentMessage','id':'child-reply','text':'Full child report'}]}]}})
+        reply(request, {'thread':{'id':'fixture-child','parentThreadId':thread_id,'agentNickname':'Reviewer','source':{'subAgent':{'thread_spawn':{'parent_thread_id':thread_id,'agent_path':'/root/reviewer'}}},'turns':[{'id':'child-turn','status':'completed','items':[{'type':'agentMessage','id':'child-reply','text':'Full child report'}]}]}})
     elif method == 'skills/list':
         reply(request, {'data':[{'cwd':params['cwds'][0], 'skills':[{'name':'fixture-skill','description':'Fixture skill for workspace discovery','enabled':True,'path':str(pathlib.Path(params['cwds'][0])/'.agents/skills/fixture/SKILL.md')}], 'errors':[]}]})
     elif method == 'thread/compact/start':
@@ -186,8 +186,9 @@ for line in sys.stdin:
             subprocess.Popen([sys.executable, text.split(': ', 1)[1]], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             complete()
         elif text == 'fixture subagent':
-            event('item/completed', {'threadId':thread_id,'turnId':active,'item':{'id':'child-launch','type':'collabAgentToolCall','tool':'spawnAgent','senderThreadId':thread_id,'receiverThreadIds':['fixture-child'],'prompt':'Check the schema','agentsStates':{'fixture-child':{'status':'running'}}}})
+            event('item/completed', {'threadId':thread_id,'turnId':active,'item':{'id':'child-launch','type':'subAgentActivity','agentThreadId':'fixture-child','agentPath':'/root/reviewer','kind':'started','model':'fixture-model','reasoningEffort':'high'}})
             event('item/started', {'threadId':'fixture-child','turnId':'child-turn','item':{'id':'child-reply','type':'agentMessage','text':'Partial child report'}})
+            event('item/completed', {'threadId':thread_id,'turnId':active,'item':{'id':'child-done','type':'subAgentActivity','agentThreadId':'fixture-child','agentPath':'/root/reviewer','kind':'completed','model':None,'reasoningEffort':None}})
             complete()
         elif text.startswith('fixture final plan') or text == 'fixture checklist only':
             if text == 'fixture final plan with question':
