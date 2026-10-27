@@ -795,6 +795,12 @@ pub(super) fn build() -> Vec<ActionSpec> {
         (contexts::AGENT_APPROVAL, contexts::AGENT_INBOX_APPROVAL),
     ] {
         for action in &mut entries {
+            if matches!(
+                action.id,
+                ids::QUESTION_NEXT_FIELD | ids::QUESTION_PREVIOUS_FIELD
+            ) {
+                continue;
+            }
             if action.contexts.contains(&base) && !action.contexts.contains(&inbox) {
                 action.contexts.push(inbox);
             }
