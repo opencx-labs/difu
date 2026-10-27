@@ -7,6 +7,7 @@ mod codex_plan_picker;
 mod commands;
 mod defaults;
 mod flap;
+mod folders;
 mod inline_questions;
 mod mcp_panel;
 mod media;
@@ -177,6 +178,9 @@ enum Action {
     PlanChoice(usize),
     Select(String),
     OrchestratorBack,
+    OpenFolder(String),
+    FolderBack,
+    FolderChoice(usize),
     Open,
     Focus(Focus),
     Resources(bool),
@@ -294,6 +298,16 @@ pub enum Modal {
         selected: usize,
     },
     Rename(Editor),
+    /// Files the selected session; typing filters folders or names a new one.
+    FolderPicker {
+        query: Editor,
+        selected: usize,
+    },
+    RenameFolder {
+        id: String,
+        name: Editor,
+    },
+    DeleteFolder(String),
     Model {
         model: Editor,
         effort: Editor,
@@ -365,6 +379,11 @@ pub struct Ui {
     pub session_order: Vec<String>,
     pub archived: bool,
     orchestrator_list: bool,
+    session_folders: Vec<crate::agents::folders::Folder>,
+    /// The folder whose sessions the list shows; None is the main list.
+    folder_view: Option<String>,
+    /// A highlighted folder card in the main list; no session is selected then.
+    folder_cursor: Option<String>,
     pub modal: Option<Modal>,
     pub notice: Option<(String, bool)>,
     pub clipboard: Option<String>,
@@ -471,6 +490,9 @@ impl Ui {
             session_order: config.session_order.clone(),
             archived: false,
             orchestrator_list: false,
+            session_folders: config.session_folders.clone(),
+            folder_view: None,
+            folder_cursor: None,
             modal: None,
             notice: None,
             clipboard: None,
@@ -838,6 +860,7 @@ impl Ui {
                             self.notice = Some(("Chat deleted".into(), false));
                         }
                         self.summaries = sessions;
+                        self.reload_folders();
                         self.ensure_selected();
                     }
                     (Task::Repository(id), Reply::Session(session)) => {
@@ -952,6 +975,8 @@ impl Ui {
                             },
                             false,
                         );
+                        self.file_launched(&id);
+                        self.folder_cursor = None;
                         self.selected = Some(id.clone());
                         self.changes_visible = false;
                         self.positions.entry(id).or_default().follow = true;
@@ -1041,6 +1066,7 @@ impl Ui {
         self.tick_plan_prompt(visible);
     }
     fn filtered(&self) -> Vec<Summary> {
+        let filed = self.filed();
         let mut sessions = self
             .summaries
             .iter()
@@ -1051,6 +1077,11 @@ impl Ui {
                 } else {
                     s.kind != "Orchestrator" || s.id == super::orchestrator::ID
                 }
+            })
+            // Filed sessions show only inside their folder.
+            .filter(|s| {
+                self.orchestrator_list
+                    || filed.get(s.id.as_str()).copied() == self.folder_view.as_deref()
             })
             .cloned()
             .collect::<Vec<_>>();
@@ -1099,6 +1130,8 @@ impl Ui {
     }
     fn close_orchestrator_list(&mut self) {
         self.orchestrator_list = false;
+        self.folder_view = None;
+        self.folder_cursor = None;
         self.drilled = false;
         self.archived = false;
         self.focus = Focus::List;
@@ -1106,6 +1139,10 @@ impl Ui {
         self.select(super::orchestrator::ID.into());
     }
     fn reorder_session(&mut self, down: bool) {
+        if self.folder_cursor.is_some() {
+            self.reorder_folder(down);
+            return;
+        }
         let list = self.filtered();
         let Some(index) = list
             .iter()
@@ -1179,16 +1216,26 @@ impl Ui {
         self.refreshed = None;
     }
     fn ensure_selected(&mut self) {
-        let list = self.selectable();
-        if !list.iter().any(|s| Some(&s.id) == self.selected.as_ref()) && !self.drilled {
-            self.selected = list.first().map(|s| s.id.clone());
+        let rows = self.selectable_rows();
+        if let Some(cursor) = self.folder_cursor.as_deref() {
+            if rows
+                .iter()
+                .any(|row| matches!(row, folders::Row::Folder(card) if card.id == cursor))
+            {
+                return;
+            }
+            self.folder_cursor = None;
         }
-    }
-    fn selectable(&self) -> Vec<Summary> {
-        self.filtered()
-            .into_iter()
-            .filter(|s| !self.deleting.contains(&s.id))
-            .collect()
+        let listed = rows.iter().any(
+            |row| matches!(row, folders::Row::Session(s) if Some(&s.id) == self.selected.as_ref()),
+        );
+        if !listed && !self.drilled {
+            match rows.into_iter().next() {
+                Some(folders::Row::Folder(card)) => self.focus_folder(card.id),
+                Some(folders::Row::Session(session)) => self.selected = Some(session.id),
+                None => self.selected = None,
+            }
+        }
     }
     fn select(&mut self, id: String) {
         if self.deleting.contains(&id) {
@@ -1199,6 +1246,7 @@ impl Ui {
             self.remember_answers();
             self.modal = None;
         }
+        self.folder_cursor = None;
         self.selected = Some(id.clone());
         self.positions.entry(id.clone()).or_default();
         if changed {
@@ -1222,16 +1270,19 @@ impl Ui {
         self.text_selection.clear();
     }
     fn move_list(&mut self, delta: i32) {
-        let list = self.selectable();
-        let current = list
+        let rows = self.selectable_rows();
+        let cursor = self.cursor();
+        let current = rows
             .iter()
-            .position(|s| Some(&s.id) == self.selected.as_ref())
+            .position(|row| Some(row.key()) == cursor)
             .unwrap_or(0);
         let index = current
             .saturating_add_signed(delta as isize)
-            .min(list.len().saturating_sub(1));
-        if let Some(session) = list.get(index) {
-            self.select(session.id.clone());
+            .min(rows.len().saturating_sub(1));
+        match rows.into_iter().nth(index) {
+            Some(folders::Row::Folder(card)) => self.focus_folder(card.id),
+            Some(folders::Row::Session(session)) => self.select(session.id),
+            None => {}
         }
     }
     fn interrupt_chat(&mut self, control: Control) {
@@ -1285,6 +1336,9 @@ impl Ui {
         );
     }
     pub(crate) fn menu_entries(&self) -> Vec<String> {
+        if self.folder_cursor.is_some() {
+            return self.folder_menu_entries();
+        }
         let archived = self
             .sessions
             .get(self.selected.as_deref().unwrap_or_default())
@@ -1322,6 +1376,7 @@ impl Ui {
             },
             "Repository rules",
             "Permissions and mode · Shift+Tab",
+            "Move to folder · F",
         ];
         if self.plan_available() {
             entries.push("Review completed plan");
@@ -1344,6 +1399,7 @@ impl Ui {
                     "Permissions and mode · Shift+Tab" => {
                         Some(("Permissions and mode", COMPOSER_PERMISSION_MODE))
                     }
+                    "Move to folder · F" => Some(("Move to folder", FOLDER_MOVE)),
                     _ => None,
                 };
                 replacement.map_or_else(
@@ -1354,8 +1410,16 @@ impl Ui {
             .collect()
     }
     pub(crate) fn menu_action(&mut self, index: usize) {
+        if self.folder_cursor.is_some() {
+            self.folder_menu_action(index);
+            return;
+        }
         match index {
-            20 => self.open_plan_prompt(),
+            21 => self.open_plan_prompt(),
+            20 => {
+                self.modal = None;
+                self.open_folder_picker();
+            }
             19 => self.open_permissions(),
             18 => self.open_rules(None),
             17 => {
@@ -1441,6 +1505,7 @@ impl Ui {
                 .summaries
                 .iter()
                 .any(|s| s.id == id && s.kind == "Orchestrator");
+        self.reveal_in_folder(&id);
         self.archived = self
             .summaries
             .iter()
@@ -1636,6 +1701,8 @@ impl Ui {
             Some(Modal::Plan(state)) => state.editor(),
             Some(
                 Modal::Rename(editor)
+                | Modal::FolderPicker { query: editor, .. }
+                | Modal::RenameFolder { name: editor, .. }
                 | Modal::QueuedEdit {
                     editor, focus: 0, ..
                 },
@@ -1757,6 +1824,14 @@ impl Ui {
             self.reorder_session(shortcut == Some(SESSION_REORDER_DOWN));
             return;
         }
+        if self.focus == Focus::List {
+            match shortcut {
+                Some(FOLDER_MOVE) => return self.open_folder_picker(),
+                Some(FOLDER_RENAME) => return self.open_rename_folder(),
+                Some(FOLDER_DELETE) => return self.open_delete_folder(),
+                _ => {}
+            }
+        }
         if self.drilled
             && matches!(shortcut, Some(CONVERSATION_PREVIOUS | CONVERSATION_NEXT))
             && matches!(self.focus, Focus::Composer | Focus::Conversation)
@@ -1795,6 +1870,17 @@ impl Ui {
         }
         if self.orchestrator_list && !self.drilled && shortcut == Some(AGENTS_BACK) {
             self.close_orchestrator_list();
+            return;
+        }
+        if self.focus == Focus::List
+            && shortcut == Some(NAVIGATION_ACTIVATE)
+            && let Some(folder) = self.folder_cursor.clone()
+        {
+            self.open_folder(folder);
+            return;
+        }
+        if self.folder_view.is_some() && !self.drilled && shortcut == Some(AGENTS_BACK) {
+            self.close_folder();
             return;
         }
         if self.changes_visible
@@ -2345,7 +2431,12 @@ impl Ui {
             Some(Modal::Repository(editor) | Modal::ChangeRepository(editor)) => {
                 editor.insert(text)
             }
-            Some(Modal::Rename(e) | Modal::QueuedEdit { editor: e, .. }) => e.insert(text),
+            Some(
+                Modal::Rename(e)
+                | Modal::FolderPicker { query: e, .. }
+                | Modal::RenameFolder { name: e, .. }
+                | Modal::QueuedEdit { editor: e, .. },
+            ) => e.insert(text),
             Some(Modal::Tweaks { fields, field }) => {
                 if let Some(editor) = fields.get_mut(*field) {
                     editor.insert(text);
@@ -2472,6 +2563,10 @@ impl Ui {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shortcut = self.shortcut(key);
         let menu = self.menu_entries();
+        let choices = match &self.modal {
+            Some(Modal::FolderPicker { query, .. }) => self.folder_choices(&query.text()).len(),
+            _ => 0,
+        };
         let mut action = None;
         match &mut self.modal {
             Some(Modal::Transcript {
@@ -2526,6 +2621,39 @@ impl Ui {
                 } else {
                     editor.key(key);
                 }
+            }
+            Some(Modal::FolderPicker { query, selected }) => match shortcut {
+                Some(crate::shortcuts::ids::NAVIGATION_UP) => {
+                    *selected = selected.saturating_sub(1)
+                }
+                Some(crate::shortcuts::ids::NAVIGATION_DOWN) => {
+                    *selected = (*selected + 1).min(choices.saturating_sub(1))
+                }
+                Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) => {
+                    action = Some(Action::FolderChoice(*selected))
+                }
+                _ if key.code == KeyCode::Char('u') && ctrl => {
+                    *query = Editor::default();
+                    *selected = 0;
+                }
+                _ => {
+                    query.key(key);
+                    *selected = 0;
+                }
+            },
+            Some(Modal::RenameFolder { id, name }) => {
+                if shortcut == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) {
+                    let (id, name) = (id.clone(), name.text());
+                    self.rename_folder(&id, &name);
+                } else {
+                    name.key(key);
+                }
+            }
+            Some(Modal::DeleteFolder(id))
+                if shortcut == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) =>
+            {
+                let id = id.clone();
+                self.delete_folder(&id);
             }
             Some(Modal::Delete) if shortcut == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) => {
                 if let Some(id) = self.selected.clone()
@@ -2647,6 +2775,9 @@ impl Ui {
             Action::RulesSave => self.save_rules(),
             Action::RulesCancel => self.close_rules(),
             Action::OrchestratorBack => self.close_orchestrator_list(),
+            Action::OpenFolder(id) => self.open_folder(id),
+            Action::FolderBack => self.close_folder(),
+            Action::FolderChoice(index) => self.choose_folder(index),
             Action::Select(id) => {
                 if id == super::orchestrator::ID && !self.orchestrator_list {
                     self.open_orchestrator_list();
@@ -2659,6 +2790,10 @@ impl Ui {
                 self.focus = Focus::List;
             }
             Action::Open => {
+                if let Some(folder) = self.folder_cursor.clone() {
+                    self.open_folder(folder);
+                    return;
+                }
                 if self.selected.as_deref() == Some(super::orchestrator::ID)
                     && !self.orchestrator_list
                 {
@@ -3271,6 +3406,13 @@ impl Ui {
         self.toast_rect = toast::draw(frame, frame.area(), notice, *error);
     }
     fn draw_list(&mut self, frame: &mut Frame, rect: Rect) {
+        let folder = self.open_folder_name().map(|name| {
+            crate::model::clean(&if self.archived {
+                format!("Archived · {name}")
+            } else {
+                name.to_owned()
+            })
+        });
         let area = panel(
             frame,
             rect,
@@ -3280,6 +3422,8 @@ impl Ui {
                 } else {
                     "Orchestrator chats"
                 }
+            } else if let Some(folder) = &folder {
+                folder
             } else if self.archived {
                 "Archived agents"
             } else {
@@ -3288,13 +3432,20 @@ impl Ui {
             !self.panels.focused && self.focus == Focus::List,
         );
         self.hits.push((rect, Action::Focus(Focus::List)));
-        if self.orchestrator_list {
+        if self.orchestrator_list || folder.is_some() {
             let back = Rect::new(area.x, area.y, area.width, 1);
             frame.render_widget(
                 Paragraph::new("← All sessions · Esc").style(Style::default().fg(DIM)),
                 back,
             );
-            self.hits.push((back, Action::OrchestratorBack));
+            self.hits.push((
+                back,
+                if self.orchestrator_list {
+                    Action::OrchestratorBack
+                } else {
+                    Action::FolderBack
+                },
+            ));
         }
         let items = Rect::new(
             area.x,
@@ -3302,17 +3453,21 @@ impl Ui {
             area.width,
             area.height.saturating_sub(1),
         );
-        let list = self.filtered();
-        let heights = list
+        let rows = self.rows();
+        let heights = rows
             .iter()
-            .map(|session| {
-                4 + usize::from(self.sidebar.counts.contains_key(&session.id))
-                    + self.prs.all(&session.id).len()
+            .map(|row| match row {
+                folders::Row::Folder(_) => 4,
+                folders::Row::Session(session) => {
+                    4 + usize::from(self.sidebar.counts.contains_key(&session.id))
+                        + self.prs.all(&session.id).len()
+                }
             })
             .collect::<Vec<_>>();
-        let selected = list
+        let cursor = self.cursor();
+        let selected = rows
             .iter()
-            .position(|s| Some(&s.id) == self.selected.as_ref())
+            .position(|row| Some(row.key()) == cursor)
             .unwrap_or(0);
         self.list_scroll = self.list_scroll.min(selected);
         while self.list_scroll < selected
@@ -3335,7 +3490,7 @@ impl Ui {
         if settled {
             self.sidebar_highlights.clear();
         }
-        let order: Vec<String> = list.iter().map(|session| session.id.clone()).collect();
+        let order: Vec<String> = rows.iter().map(folders::Row::key).collect();
         if !settled && order != self.sidebar_order {
             // A card moving into a slot flips from the text that was there.
             let previous: Vec<Option<flap::Board>> = self
@@ -3351,15 +3506,16 @@ impl Ui {
             }
         }
         self.sidebar_order = order;
-        if self.selected != self.sidebar_selected {
+        if cursor != self.sidebar_selected {
             if !settled {
-                let right_to_left = list
+                let right_to_left = self
+                    .sidebar_order
                     .iter()
-                    .position(|session| Some(&session.id) == self.sidebar_selected.as_ref())
+                    .position(|key| Some(key) == self.sidebar_selected.as_ref())
                     .is_some_and(|previous| selected > previous);
                 for (id, on) in [
                     (self.sidebar_selected.clone(), false),
-                    (self.selected.clone(), true),
+                    (cursor.clone(), true),
                 ] {
                     if let Some(id) = id
                         && let Some(highlight) =
@@ -3369,18 +3525,32 @@ impl Ui {
                     }
                 }
             }
-            self.sidebar_selected.clone_from(&self.selected);
+            self.sidebar_selected.clone_from(&cursor);
         }
-        let listed: HashSet<&str> = list.iter().map(|session| session.id.as_str()).collect();
+        let listed: HashSet<&str> = self.sidebar_order.iter().map(String::as_str).collect();
         self.sidebar_boards
             .retain(|id, _| listed.contains(id.as_str()));
         self.sidebar_highlights
             .retain(|id, highlight| listed.contains(id.as_str()) && !highlight.done(now));
-        for (index, session) in list.iter().enumerate().skip(self.list_scroll) {
+        for (index, entry) in rows.iter().enumerate().skip(self.list_scroll) {
             if offset >= usize::from(items.height) {
                 break;
             }
             let height = heights.get(index).copied().unwrap_or(4);
+            let session = match entry {
+                folders::Row::Folder(card) => {
+                    let row = Rect::new(
+                        items.x,
+                        items.y.saturating_add(offset as u16),
+                        items.width,
+                        (height as u16 - 1).min(items.height.saturating_sub(offset as u16)),
+                    );
+                    offset += height;
+                    self.draw_folder_card(frame, card, row, settled, now);
+                    continue;
+                }
+                folders::Row::Session(session) => session,
+            };
             let selected = Some(&session.id) == self.selected.as_ref();
             let deleting = self.deleting.contains(&session.id);
             let row = Rect::new(
@@ -3528,10 +3698,12 @@ impl Ui {
                 self.hits.push((row, Action::Select(session.id.clone())));
             }
         }
-        if list.is_empty() {
+        if rows.is_empty() {
             frame.render_widget(
                 Paragraph::new(if self.listing {
                     "Connecting…"
+                } else if self.folder_view.is_some() {
+                    "This folder is empty\n\nn · New agent here\nf on a session in the main list · file it here"
                 } else {
                     "No matching sessions\n\nn · New agent"
                 })
@@ -3539,10 +3711,13 @@ impl Ui {
                 items,
             );
         }
-        self.sidebar_seen |= !list.is_empty();
+        self.sidebar_seen |= !rows.is_empty();
         self.prs.visible.extend(visible_pr_sessions);
     }
     fn draw_conversation(&mut self, frame: &mut Frame, rect: Rect) {
+        if self.draw_folder_overview(frame, rect) {
+            return;
+        }
         let title = self
             .selected
             .as_ref()
@@ -4076,6 +4251,9 @@ impl Ui {
             Some(Modal::Queue { .. }) => "Queued outgoing messages",
             Some(Modal::QueuedEdit { .. }) => "Edit queued message",
             Some(Modal::Rename(_)) => "Rename session",
+            Some(Modal::FolderPicker { .. }) => "Move to folder",
+            Some(Modal::RenameFolder { .. }) => "Rename folder",
+            Some(Modal::DeleteFolder(_)) => "Delete folder",
             Some(Modal::Model { .. }) => "Session model",
             Some(Modal::ModelPicker(_)) => "Select model",
             Some(Modal::Approval { .. }) => "Agent needs your input",
@@ -4281,6 +4459,10 @@ impl Ui {
                 self.shortcut_context()
             )
         );
+        let picker = match &self.modal {
+            Some(Modal::FolderPicker { query, .. }) => self.folder_choices(&query.text()),
+            _ => Vec::new(),
+        };
         match &mut self.modal {
             Some(
                 Modal::Transcript { .. }
@@ -4353,6 +4535,32 @@ impl Ui {
                     value,
                     true,
                 );
+            }
+            Some(Modal::FolderPicker { query, selected }) => {
+                editor(
+                    frame,
+                    Rect::new(area.x, area.y, area.width, 3.min(area.height)),
+                    &format!("Type to filter or name a new folder · {activate_hint} move"),
+                    query,
+                    true,
+                );
+                *selected = (*selected).min(picker.len().saturating_sub(1));
+                let selected = *selected;
+                self.draw_folder_picker(frame, area, selected, &picker, &mut deferred);
+            }
+            Some(Modal::RenameFolder { name, .. }) => {
+                editor(
+                    frame,
+                    Rect::new(area.x, area.y, area.width, 3.min(area.height)),
+                    &format!("Folder name · {activate_hint} save"),
+                    name,
+                    true,
+                );
+            }
+            Some(Modal::DeleteFolder(id)) => {
+                let id = id.clone();
+                let prompt = self.delete_folder_prompt(&id, &activate_hint);
+                frame.render_widget(Paragraph::new(prompt).wrap(Wrap { trim: false }), area);
             }
             Some(Modal::Delete) => {
                 frame.render_widget(Paragraph::new(format!("Stop this agent and permanently delete its difu chat, saved questions, queue, and attachments? Its unlocked difu-owned worktree will also be removed, including all uncommitted, untracked, and ignored files. Existing directories, named branches, commits, and native provider history are not deleted.\n\n{activate_hint} confirms · Esc cancels")).wrap(Wrap { trim:false }), area);
@@ -4623,7 +4831,11 @@ fn agent_help(query: &str, config: &Config) -> Vec<(String, &'static str)> {
         ("Cmd+K", "Search sessions, pull requests and commands"),
         (
             "Ctrl+↑ / ↓ in sessions",
-            "Reorder within the pinned or unpinned group (saved)",
+            "Reorder within the pinned or unpinned group, or move a folder (saved)",
+        ),
+        (
+            "f / e / x in sessions",
+            "Move the session to a folder (type a new name to create one); rename or delete the highlighted folder",
         ),
         (
             "Tab / Shift+Tab",
@@ -4730,6 +4942,7 @@ fn agent_help(query: &str, config: &Config) -> Vec<(String, &'static str)> {
             "Enter / Esc" => hints(&[NAVIGATION_ACTIVATE, CONVERSATION_INTERRUPT]),
             "Cmd+K" => hints(&[PALETTE_OPEN]),
             "Ctrl+↑ / ↓ in sessions" => hints(&[SESSION_REORDER_UP, SESSION_REORDER_DOWN]),
+            "f / e / x in sessions" => hints(&[FOLDER_MOVE, FOLDER_RENAME, FOLDER_DELETE]),
             "Tab / Shift+Tab" => hints(&[NAVIGATION_NEXT_FOCUS, NAVIGATION_PREVIOUS_FOCUS]),
             "Drag · Ctrl+C / Cmd+C" => format!("Drag · Ctrl+C / {}", hints(&[SELECTION_COPY])),
             "Ctrl+V / Cmd+V" => hints(&[COMPOSER_ATTACH]),

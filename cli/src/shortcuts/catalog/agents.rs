@@ -36,6 +36,24 @@ pub(super) fn entries() -> Vec<ActionSpec> {
             &[key(BindingKey::Down, 1)],
         ),
         entry(
+            ids::FOLDER_MOVE,
+            "Move session to a folder",
+            &[contexts::AGENT_LIST],
+            &[key(BindingKey::Character('f'), 0)],
+        ),
+        entry(
+            ids::FOLDER_RENAME,
+            "Rename folder",
+            &[contexts::AGENT_LIST],
+            &[key(BindingKey::Character('e'), 0)],
+        ),
+        entry(
+            ids::FOLDER_DELETE,
+            "Delete folder",
+            &[contexts::AGENT_LIST],
+            &[key(BindingKey::Character('x'), 0)],
+        ),
+        entry(
             ids::AGENTS_HELP,
             "Agent keyboard help",
             &[
