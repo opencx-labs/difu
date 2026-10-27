@@ -1,5 +1,5 @@
 //! Claude Code adapter. The rest of difu uses Session/Control, never Claude wire frames.
-mod events;
+pub(super) mod events;
 mod mcp_control;
 mod permissions_control;
 mod plan_control;
@@ -294,7 +294,7 @@ fn defer_questions(
         .and_then(Value::as_str)
         .or_else(|| request_id.as_str())
         .context("Missing Claude tool ID")?;
-    let pending = Pending {
+    let mut pending = Pending {
         id: json!(question_request(tool)),
         method: "item/tool/requestUserInput".into(),
         params: json!({"difuAsync":true,"toolUseId":tool,"questions":questions}),
@@ -303,6 +303,7 @@ fn defer_questions(
     // Persist the questions before Claude can continue past them.
     store.update(id, |s| {
         if !s.pending.iter().any(|p| p.id == pending.id) {
+            super::questions::attach_context(&s.entries, &mut pending);
             s.pending.push(pending);
         }
     })?;
@@ -708,7 +709,7 @@ fn command(
                 }
             })?;
         }
-        Control::RefreshShells => {}
+        Control::RefreshShells | Control::ReadSubagent { .. } => {}
         Control::CloseShell { .. } => {
             anyhow::bail!("This provider does not expose background terminals")
         }

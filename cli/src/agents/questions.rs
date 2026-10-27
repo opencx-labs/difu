@@ -4,7 +4,54 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 
 pub(super) const TOOL: &str = "difu_remove_questions";
-pub(super) const INSTRUCTIONS: &str = "Use difu_remove_questions to remove stale unanswered questions from this session's question panel. Pass questions: [] to list pending question IDs, then pass the request_id and question_id of each question to remove. Removal does not answer a question or grant approval.";
+pub(super) const INSTRUCTIONS: &str = "The user often reads only the question panel, without reading chat. Every question must be self-contained: include the relevant finding, the concrete proposal or decision, your recommendation, and the consequences or tradeoffs of the choices. Restate any details needed to answer; never rely on 'as above', 'the proposed plan', or other chat references. Keep options meaningful on their own. Difu also attaches preceding assistant explanations as context, but this does not replace writing a complete question.\n\nUse difu_remove_questions to remove stale unanswered questions from this session's question panel. Pass questions: [] to list pending question IDs, then pass the request_id and question_id of each question to remove. Removal does not answer a question or grant approval.";
+
+/// Freeze the explanation at the question's position, never including later chat.
+pub(super) fn attach_context(entries: &[super::Entry], pending: &mut Pending) {
+    if pending.method != "item/tool/requestUserInput" || pending.params.get("difuContext").is_some()
+    {
+        return;
+    }
+    let anchor = pending
+        .params
+        .get("itemId")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .or_else(|| {
+            pending
+                .params
+                .get("toolUseId")
+                .and_then(Value::as_str)
+                .map(|id| format!("claude-tool-{id}"))
+        });
+    let end = anchor
+        .as_ref()
+        .and_then(|id| entries.iter().position(|e| &e.id == id))
+        .unwrap_or(entries.len());
+    let before = entries.get(..end).unwrap_or_default();
+    let start = before
+        .iter()
+        .rposition(|e| matches!(e.kind.as_str(), "userMessage" | "sending"))
+        .map_or(0, |i| i + 1);
+    let context = before
+        .iter()
+        .skip(start)
+        .filter(|e| matches!(e.kind.as_str(), "agentMessage" | "plan") && !e.text.trim().is_empty())
+        .map(|e| e.text.as_str())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if let Some(params) = pending.params.as_object_mut() {
+        params.insert("difuContext".into(), json!(context));
+    }
+}
+
+pub(super) fn context(pending: &Pending) -> Option<&str> {
+    pending
+        .params
+        .get("difuContext")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+}
 
 pub(super) fn tool() -> Value {
     json!({"type":"function","name":TOOL,"description":"Remove specific stale, unanswered asynchronous questions from this session's question panel. Pass an empty questions array to inspect pending questions and their IDs. Returns the remaining questions. Removal persists across restarts and does not submit answers or grant approval.","inputSchema":{"type":"object","properties":{"questions":{"type":"array","items":{"type":"object","properties":{"request_id":{"type":"string"},"question_id":{"type":"string"}},"required":["request_id","question_id"],"additionalProperties":false}}},"required":["questions"],"additionalProperties":false}})
@@ -213,12 +260,14 @@ impl Session {
                     .map(|label| json!({"label":label,"description":""})).collect();
                 json!({"id":index.to_string(),"header":format!("Question {}", index + 1),"question":question.get("title"),"options":options})
             }).collect();
-            self.pending.push(Pending {
+            let mut pending = Pending {
                 id: json!(id),
                 method: "item/tool/requestUserInput".into(),
                 params: json!({"difuAsync":true,"itemId":entry.id,"questions":questions}),
                 responded: false,
-            });
+            };
+            attach_context(&self.entries, &mut pending);
+            self.pending.push(pending);
         }
     }
 
@@ -278,6 +327,25 @@ pub(super) fn answer_text(pending: &Pending, response: &Value) -> Result<String>
 mod tests {
     use super::*;
     use crate::agents::{Job, Launch, engine::apply_event};
+    #[test]
+    fn question_context_is_scoped_frozen_and_survives_replay() -> Result<()> {
+        let mut s = session();
+        s.note("agentMessage", "Old unrelated proposal");
+        s.note("userMessage", "Explain the new schema");
+        s.note("agentMessage", "The proposed limit is $1,000.");
+        s.note("reasoning", "Private scratchpad must not be context");
+        s.note("agentMessage", "Existing rows keep their current limit.");
+        apply_event(&mut s, &question_event("q", "item/completed"));
+        let expected = "The proposed limit is $1,000.\n\nExisting rows keep their current limit.";
+        assert_eq!(s.pending.first().and_then(context), Some(expected));
+        s.note("agentMessage", "Later unrelated work");
+        apply_event(&mut s, &question_event("q", "item/completed"));
+        let mut restored: Session = serde_json::from_value(serde_json::to_value(&s)?)?;
+        restored.pending.clear();
+        restored.restore_async_questions();
+        assert_eq!(restored.pending.first().and_then(context), Some(expected));
+        Ok(())
+    }
 
     fn session() -> Session {
         Session::new(

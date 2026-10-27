@@ -117,6 +117,7 @@ impl Connection {
                 "stdio",
             ])
             .env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1")
+            .env("CLAUDE_CODE_FORWARD_SUBAGENT_TEXT", "1")
             .current_dir(options.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

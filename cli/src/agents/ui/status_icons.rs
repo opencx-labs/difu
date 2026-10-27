@@ -153,7 +153,7 @@ impl Icons {
     ) {
         // Kitty transmits a cached image only once. Never consume that first
         // transmission in a buffer which a modal, palette or toast will cover.
-        let graphics = unobscured && !self.obscured;
+        let graphics = unobscured && !self.obscured && !crate::images::drawing_deferred();
         let animated = animated && graphics;
         if area.width < WIDTH || area.height == 0 {
             return;

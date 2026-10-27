@@ -5,7 +5,7 @@
 //! In the chat, rows still waiting for their first character take no space, so
 //! entries grow row by row. Timings match Codex's realtime transcript cells.
 use super::{Entry, Position, Session, reveal, transcript};
-use crate::ui::{ACCENT, DIM, PANEL, PURPLE, TEXT};
+use crate::ui::{ACCENT, BG, DIM, PANEL, PURPLE, TEXT};
 use crate::voice::Role;
 use ratatui::{
     buffer::{Buffer, Cell, CellDiffOption},
@@ -253,7 +253,8 @@ fn cell_glyph(cell: &Cell) -> Option<char> {
 pub(super) const SCREEN_MS: u32 = 500;
 
 /// Flips a whole drawn screen in, in reading order over `duration` from
-/// `started`, as when switching tabs. Backgrounds and images show at once.
+/// `started`, as when switching tabs. Every cell participates, including blank
+/// padding, backgrounds and borders. Image escape sequences reveal intact.
 /// Returns whether the flip is still playing.
 pub(super) fn screen(
     buffer: &mut Buffer,
@@ -280,20 +281,42 @@ pub(super) fn region(
         .filter_map(|position| buffer.cell(position).and_then(cell_glyph))
         .collect();
     let sample = sample(glyphs.iter().copied());
-    let total = glyphs.len().max(1);
+    let total = (usize::from(area.width) * usize::from(area.height)).max(1);
     let frame = frame(now, started);
-    let mut index = 0;
-    for position in area.positions() {
+    for (index, position) in area.positions().enumerate() {
         let Some(cell) = buffer.cell_mut(position) else {
             continue;
         };
-        let Some(character) = cell_glyph(cell) else {
+        let image = cell.diff_option != CellDiffOption::None
+            || cell
+                .symbol()
+                .chars()
+                .any(|c| c == '\x1b' || c == '\u{10EEEE}');
+        // Image transports include escape sequences plus Skip cells. Release the
+        // entire payload together after the sweep, never scramble encoded bytes
+        // or expose an image while blanking cells it has already painted.
+        if image {
+            if now < started + duration + BLANK {
+                cell.reset();
+                cell.set_style(Style::default().bg(BG).fg(TEXT));
+            }
             continue;
-        };
+        }
+        let character = cell.symbol().chars().next().unwrap_or(' ');
         let arrived = started + duration.mul_f64(index as f64 / total as f64);
-        index += 1;
-        if now < arrived {
-            cell.set_symbol(" ");
+        if now < arrived + BLANK {
+            cell.reset();
+            cell.set_style(Style::default().bg(BG).fg(TEXT));
+            continue;
+        }
+        if cell.bg != BG && now < arrived + FLAP {
+            let background = cell.bg;
+            cell.reset();
+            cell.set_symbol("▀")
+                .set_style(Style::default().fg(background).bg(BG));
+            continue;
+        }
+        if character.is_whitespace() {
             continue;
         }
         match face(character, now.saturating_duration_since(arrived)) {
@@ -1498,9 +1521,12 @@ mod tests {
     }
 
     #[test]
-    fn a_switched_screen_flips_in_while_images_show_at_once() {
+    fn a_switched_screen_reveals_text_backgrounds_and_intact_images() {
         let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 10, 2));
         buffer.set_string(0, 0, "Agents tab", Style::default());
+        if let Some(cell) = buffer.cell_mut((9, 1)) {
+            cell.set_style(Style::default().bg(ACCENT));
+        }
         if let Some(cell) = buffer.cell_mut((0, 1)) {
             cell.set_symbol("\u{10EEEE}");
         }
@@ -1509,7 +1535,15 @@ mod tests {
         let mut first = buffer.clone();
         assert!(screen(&mut first, t0, duration, t0));
         assert!(!text(&first).contains("Agents"), "{}", text(&first));
-        assert!(text(&first).contains('\u{10EEEE}'), "images stay put");
+        assert_eq!(
+            first.cell((9, 1)).map(|c| c.bg),
+            Some(BG),
+            "blank colored padding also waits"
+        );
+        assert!(
+            !text(&first).contains('\u{10EEEE}'),
+            "images wait for the reveal"
+        );
         let mut settled = buffer.clone();
         assert!(!screen(
             &mut settled,
@@ -1517,7 +1551,7 @@ mod tests {
             duration,
             t0 + Duration::from_secs(1)
         ));
-        assert_eq!(text(&settled), text(&buffer));
+        assert_eq!(settled, buffer);
     }
 
     #[test]

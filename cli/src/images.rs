@@ -27,6 +27,24 @@ use url::Url;
 const MAX_BYTES: usize = 10 * 1024 * 1024;
 const CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
+thread_local! {
+    static DRAWING_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// Prevent one-shot image transmissions from being consumed by a screen reveal
+/// that would immediately cover them. Nested renderers retain the outer scope.
+pub(crate) struct DrawingGuard(bool);
+pub(crate) fn defer_drawing(defer: bool) -> DrawingGuard {
+    DrawingGuard(DRAWING_DEFERRED.with(|current| current.replace(current.get() || defer)))
+}
+pub(crate) fn drawing_deferred() -> bool {
+    DRAWING_DEFERRED.with(std::cell::Cell::get)
+}
+impl Drop for DrawingGuard {
+    fn drop(&mut self) {
+        DRAWING_DEFERRED.with(|current| current.set(self.0));
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Request {
     pub source: String,
@@ -718,6 +736,9 @@ fn paint_image(
         return;
     }
     let key = request_render(app, request, rect.width, height);
+    if drawing_deferred() {
+        return;
+    }
     match app.images.entries.get(&key) {
         Some(Ok(image)) => frame.render_widget(
             SlicedImage::new(image, SignedPosition::from((0, -(offset as i16)))),
@@ -1307,6 +1328,53 @@ Useful summary text.
         Ok(())
     }
 
+    #[test]
+    fn deferred_kitty_preview_keeps_its_first_image_transmission() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut app = App::new(
+            Storage {
+                config: dir.path().join("config"),
+                cache: dir.path().join("cache"),
+            },
+            Default::default(),
+        );
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        app.images.picker = Some(picker.clone());
+        let request = Request::new("docs/image.png".into(), "Screenshot".into(), &pr());
+        app.images.entries.insert(
+            RenderKey {
+                id: request.id(),
+                width: 10,
+                height: Some(4),
+            },
+            Ok(SlicedProtocol::new(
+                &picker,
+                DynamicImage::new_rgb8(20, 40),
+                Some(Size::new(10, 4)),
+            )?),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(10, 4))?;
+        let symbols = |buffer: &ratatui::buffer::Buffer| {
+            buffer
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>()
+        };
+        {
+            let _outer = defer_drawing(true);
+            let _inner = defer_drawing(false);
+            terminal.draw(|f| paint_image(f, &mut app, &request, f.area(), Some(4), 0))?;
+            assert!(!symbols(terminal.backend().buffer()).contains("a=T"));
+        }
+        terminal.draw(|f| paint_image(f, &mut app, &request, f.area(), Some(4), 0))?;
+        assert!(symbols(terminal.backend().buffer()).contains("a=T"));
+        terminal.draw(|f| paint_image(f, &mut app, &request, f.area(), Some(4), 0))?;
+        assert!(!symbols(terminal.backend().buffer()).contains("a=T"));
+        app.shutdown();
+        Ok(())
+    }
     #[test]
     fn inline_previews_fill_width_for_landscape_portrait_and_small_images() -> Result<()> {
         for protocol in [

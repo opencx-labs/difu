@@ -70,6 +70,9 @@ for line in sys.stdin:
     elif method == 'config/read': reply(request, {'config':{'model':'fixture-model','model_reasoning_effort':'high','developer_instructions':'Preserve inherited guidance.'},'origins':{}})
     elif method == 'thread/backgroundTerminals/list':
         reply(request, {'data':[{'command':'fixture shell','cwd':os.getcwd(),'itemId':'shell-item','processId':'123'}], 'nextCursor':None})
+    elif method == 'thread/read':
+        assert params == {'threadId':'fixture-child','includeTurns':True}
+        reply(request, {'thread':{'id':'fixture-child','parentThreadId':thread_id,'agentNickname':'Reviewer','turns':[{'id':'child-turn','status':'completed','items':[{'type':'agentMessage','id':'child-reply','text':'Full child report'}]}]}})
     elif method == 'skills/list':
         reply(request, {'data':[{'cwd':params['cwds'][0], 'skills':[{'name':'fixture-skill','description':'Fixture skill for workspace discovery','enabled':True,'path':str(pathlib.Path(params['cwds'][0])/'.agents/skills/fixture/SKILL.md')}], 'errors':[]}]})
     elif method == 'thread/compact/start':
@@ -181,6 +184,10 @@ for line in sys.stdin:
             emit({'id':900+turn,'method':'item/tool/call','params':{'threadId':thread_id,'turnId':active,'tool':'difu_present_artifact','arguments':{'path':'report.html','title':'Fixture report'}}})
         elif text.startswith('fixture shell: '):
             subprocess.Popen([sys.executable, text.split(': ', 1)[1]], start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            complete()
+        elif text == 'fixture subagent':
+            event('item/completed', {'threadId':thread_id,'turnId':active,'item':{'id':'child-launch','type':'collabAgentToolCall','tool':'spawnAgent','senderThreadId':thread_id,'receiverThreadIds':['fixture-child'],'prompt':'Check the schema','agentsStates':{'fixture-child':{'status':'running'}}}})
+            event('item/started', {'threadId':'fixture-child','turnId':'child-turn','item':{'id':'child-reply','type':'agentMessage','text':'Partial child report'}})
             complete()
         elif text.startswith('fixture final plan') or text == 'fixture checklist only':
             if text == 'fixture final plan with question':

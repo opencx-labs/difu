@@ -27,6 +27,7 @@ mod shared;
 pub mod shells;
 pub mod slack;
 mod startup;
+mod subagents;
 mod suggestions;
 mod title;
 mod transport;
@@ -354,6 +355,8 @@ pub struct Session {
     #[serde(default)]
     pub artifacts: Vec<artifacts::Artifact>,
     #[serde(default)]
+    pub subagents: Vec<subagents::Subagent>,
+    #[serde(default)]
     pub artifact_tools: bool,
     #[serde(default)]
     pub pr_tools: bool,
@@ -454,6 +457,7 @@ impl Session {
             permission_state: permissions::State::default(),
             permissions: Value::Null,
             artifacts: Vec::new(),
+            subagents: Vec::new(),
             artifact_tools: false,
             pr_tools: false,
             shell_tools: false,
@@ -774,6 +778,9 @@ pub enum Control {
         response: std::sync::mpsc::Sender<Result<Option<String>, String>>,
     },
     ReadUsage,
+    ReadSubagent {
+        agent: String,
+    },
     Message {
         text: String,
         queue: bool,
@@ -817,6 +824,10 @@ pub enum Control {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
+    Subagent {
+        id: String,
+        agent: String,
+    },
     Notifications(notifications::Command),
     Permissions {
         id: String,

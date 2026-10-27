@@ -59,6 +59,7 @@ impl Ui {
                 Modal::Transcript { .. } => AGENT_TRANSCRIPT,
                 Modal::InstallBrowser { .. } => AGENT_RESOURCE_PICKER,
                 Modal::Resources { .. } => AGENT_RESOURCE_LIST,
+                Modal::Subagents { .. } => AGENT_RESOURCE_PICKER,
                 Modal::AgentDefaults(form) => {
                     if form.field < 3 {
                         AGENT_DEFAULTS
@@ -136,7 +137,7 @@ impl Ui {
             Focus::Composer => AGENT_COMPOSER,
             Focus::Changes => AGENT_CHANGES,
             Focus::ChangeTree => AGENT_CHANGE_TREE,
-            Focus::Resources(_) | Focus::PullRequest(_) => AGENT_RESOURCES,
+            Focus::Resources(_) | Focus::Subagents | Focus::PullRequest(_) => AGENT_RESOURCES,
         }
     }
     pub(super) fn shortcut(&self, key: KeyEvent) -> Option<ActionId> {

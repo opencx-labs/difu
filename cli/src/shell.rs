@@ -394,6 +394,12 @@ impl Shell {
         }
     }
     pub fn draw(&mut self, frame: &mut Frame) {
+        let _images = crate::images::defer_drawing(
+            self.settings.is_none()
+                && self
+                    .switched
+                    .is_some_and(|started| self.agents.screen_images_waiting(started)),
+        );
         if let Some(panel) = &mut self.settings {
             panel.refresh_preview(&self.reviews.config);
         }

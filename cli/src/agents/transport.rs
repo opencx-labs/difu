@@ -16,6 +16,14 @@ pub struct Delta {
     pub session: Box<Session>,
     pub count: usize,
     pub entries: Vec<(usize, Entry)>,
+    #[serde(default)]
+    pub subagents: Vec<ChildDelta>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ChildDelta {
+    id: String,
+    count: usize,
+    entries: Vec<(usize, Entry)>,
 }
 impl Delta {
     pub fn between(previous: &Session, next: &Session) -> Self {
@@ -29,14 +37,36 @@ impl Delta {
         let mut session = next.clone();
         let count = session.entries.len();
         session.entries.clear();
+        let subagents = session
+            .subagents
+            .iter_mut()
+            .map(|child| {
+                let old = previous.subagents.iter().find(|a| a.id == child.id);
+                let entries = child
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, e)| old.and_then(|a| a.entries.get(*i)) != Some(*e))
+                    .map(|(i, e)| (i, e.clone()))
+                    .collect();
+                let delta = ChildDelta {
+                    id: child.id.clone(),
+                    count: child.entries.len(),
+                    entries,
+                };
+                child.entries.clear();
+                delta
+            })
+            .collect();
         Self {
             base: previous.version,
             session: Box::new(session),
             count,
             entries,
+            subagents,
         }
     }
-    pub fn apply(self, current: &mut Session) -> Result<()> {
+    pub fn apply(mut self, current: &mut Session) -> Result<()> {
         ensure!(
             self.base == current.version && self.session.id == current.id,
             "Session update base changed; reconnecting"
@@ -61,6 +91,35 @@ impl Delta {
             }
         }
         ensure!(entries.len() == self.count, "Incomplete session update");
+        for delta in self.subagents {
+            let mut entries = current
+                .subagents
+                .iter_mut()
+                .find(|a| a.id == delta.id)
+                .map(|a| std::mem::take(&mut a.entries))
+                .unwrap_or_default();
+            entries.truncate(delta.count);
+            for (index, entry) in delta.entries {
+                if let Some(slot) = entries.get_mut(index) {
+                    *slot = entry;
+                } else {
+                    ensure!(
+                        index == entries.len() && index < delta.count,
+                        "Incomplete sub-agent update"
+                    );
+                    entries.push(entry);
+                }
+            }
+            ensure!(entries.len() == delta.count, "Incomplete sub-agent update");
+            let child = self
+                .session
+                .subagents
+                .iter_mut()
+                .find(|a| a.id == delta.id)
+                .context("Unknown sub-agent update")?;
+            ensure!(child.entries.is_empty(), "Invalid sub-agent metadata");
+            child.entries = entries;
+        }
         *current = *self.session;
         current.entries = entries;
         Ok(())

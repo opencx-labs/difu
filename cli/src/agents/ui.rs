@@ -40,6 +40,7 @@ mod shortcuts;
 mod sidebar;
 mod slack;
 mod status_icons;
+mod subagents;
 mod terminals;
 mod themes;
 pub(crate) mod toast;
@@ -81,6 +82,7 @@ pub enum Focus {
     Changes,
     ChangeTree,
     Resources(bool),
+    Subagents,
     PullRequest(usize),
 }
 pub(super) struct PendingSend {
@@ -191,6 +193,9 @@ enum Action {
     Open,
     Focus(Focus),
     Resources(bool),
+    Subagents,
+    Subagent(usize),
+    SubagentEntry(String),
     PullRequest(usize),
     Resource(bool, usize),
     RefreshArtifact,
@@ -238,6 +243,9 @@ enum Action {
     DismissNotice,
 }
 pub enum Modal {
+    Subagents {
+        selected: usize,
+    },
     Mcp(Box<mcp_panel::State>),
     Permissions(Box<permissions_panel::State>),
     Plan(Box<plan_prompt::Prompt>),
@@ -338,6 +346,7 @@ struct ResultMessage {
 }
 #[derive(Clone)]
 enum Task {
+    Subagent(String, String),
     Mcp(String, u64),
     Permissions(String, u64),
     DecidePlan(String, String),
@@ -710,6 +719,11 @@ impl Ui {
                 continue;
             }
             match &message.kind {
+                Task::Subagent(id, agent) => self.subagent_loaded(
+                    id,
+                    agent,
+                    message.result.as_ref().err().map(|e| format!("{e:#}")),
+                ),
                 Task::Shells(_) => {
                     self.panels.loading = false;
                     self.panels.checked = Some(Instant::now());
@@ -752,6 +766,9 @@ impl Ui {
                     self.sidebar.finished(id);
                 }
                 Task::Skills(..) => self.skills_loading = None,
+            }
+            if matches!(message.kind, Task::Subagent(..)) {
+                continue;
             }
             if let Task::Permissions(id, request) = &message.kind {
                 self.finish_permissions(id, *request, message.result);
@@ -2978,6 +2995,9 @@ impl Ui {
             }
             Action::PullRequest(index) => self.open_pr_panel(index),
             Action::Resources(artifacts) => self.open_resources(artifacts),
+            Action::Subagents => self.open_subagents(),
+            Action::Subagent(index) => self.select_subagent(index),
+            Action::SubagentEntry(id) => self.toggle_subagent_entry(id),
             Action::Resource(artifacts, index) => self.select_resource(artifacts, index),
             Action::RefreshArtifact => self.refresh_artifact(),
             Action::ExternalArtifact => self.external_artifact(),
@@ -3054,6 +3074,12 @@ impl Ui {
         }
         let duration = Duration::from_millis(u64::from(self.tweaks.capped(flap::SCREEN_MS)));
         self.tweaks.agent_reply_cps > 0 && flap::screen(buffer, started, duration, Instant::now())
+    }
+    pub(crate) fn screen_images_waiting(&self, started: Instant) -> bool {
+        self.preferences.motion.screen()
+            && self.tweaks.agent_reply_cps > 0
+            && started.elapsed()
+                < Duration::from_millis(u64::from(self.tweaks.capped(flap::SCREEN_MS)) + 40)
     }
     /// Scrolls the open information modal by `rows`, reporting whether there
     /// was one: a message, usage, status, help or a request for your input.
@@ -3385,16 +3411,12 @@ impl Ui {
         if self.drawn_session != shown {
             self.session_switched = (self.drawn_session.is_some()
                 && self.selected.is_some()
-                && conversation_visible
                 && self.preferences.motion.screen()
                 && self.tweaks.agent_reply_cps > 0)
                 .then(Instant::now);
             self.drawn_session = shown;
         }
-        if !conversation_visible
-            || !self.preferences.motion.screen()
-            || self.tweaks.agent_reply_cps == 0
-        {
+        if !self.preferences.motion.screen() || self.tweaks.agent_reply_cps == 0 {
             self.session_switched = None;
         }
         let footer_height = if conversation_visible {
@@ -3459,6 +3481,10 @@ impl Ui {
         if list_width > 0 {
             self.draw_list(frame, list);
         }
+        let _images = crate::images::defer_drawing(
+            self.session_switched
+                .is_some_and(|started| self.screen_images_waiting(started)),
+        );
         if self.inbox.visible {
             self.draw_inbox(frame, conversation);
         } else if panel && !self.panels.right {
@@ -3487,7 +3513,12 @@ impl Ui {
             let duration = Duration::from_millis(u64::from(self.tweaks.capped(flap::SCREEN_MS)));
             if !flap::region(
                 frame.buffer_mut(),
-                conversation,
+                Rect::new(
+                    conversation.x,
+                    content.y,
+                    content.width.saturating_sub(list_width),
+                    content.height.saturating_add(footer_height),
+                ),
                 started,
                 duration,
                 Instant::now(),
@@ -4393,6 +4424,7 @@ impl Ui {
         );
         let menu_entries = self.menu_entries();
         let title = match self.modal {
+            Some(Modal::Subagents { .. }) => "Sub-agents",
             Some(Modal::Transcript { .. }) => "Message",
             Some(Modal::InstallBrowser { .. }) => "Optional HTML preview · Esc cancels",
             Some(Modal::AgentDefaults(_)) => "New agent defaults",
@@ -4593,6 +4625,10 @@ impl Ui {
             return;
         }
         let mut deferred = Vec::new();
+        if let Some(Modal::Subagents { selected }) = self.modal {
+            self.draw_subagents(frame, area, selected);
+            return;
+        }
         if let Some(Modal::Resources {
             artifacts,
             selected,
@@ -4632,6 +4668,7 @@ impl Ui {
                 | Modal::Model { .. }
                 | Modal::ModelPicker(_)
                 | Modal::Resources { .. }
+                | Modal::Subagents { .. }
                 | Modal::InstallBrowser { .. },
             ) => {}
             Some(Modal::ChangeRepository(value)) => {
@@ -5180,6 +5217,93 @@ mod tests {
         ui.sessions.insert(session.id.clone(), session);
         ui.select("one".into());
         ui
+    }
+    #[test]
+    fn question_context_opens_at_top_and_options_remain_reachable() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        still(&mut ui);
+        let context = (0..70)
+            .map(|i| format!("Context detail {i:02}\n\n"))
+            .collect::<String>();
+        ui.sessions.get_mut("one").context("session")?.pending.push(Pending {
+            id: serde_json::json!("q"), method: "item/tool/requestUserInput".into(), responded: false,
+            params: serde_json::json!({"difuAsync":true,"difuContext":context,"questions":[{"id":"scope","question":"Approve this schema?","options":[{"label":"Build the schema"},{"label":"Revise it"}]}]}),
+        });
+        ui.open_question(0);
+        let (text, _) = draw(&mut ui, 100, 24)?;
+        assert!(text.contains("Approve this schema?") && text.contains("Context detail 00"));
+        assert!(!text.contains("Context detail 69"));
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        let (text, _) = draw(&mut ui, 100, 24)?;
+        assert!(text.contains("Revise it"));
+        assert!(!text.contains("Context detail 00"));
+        Ok(())
+    }
+    #[test]
+    fn subagents_badge_picker_and_read_only_pane_share_helper_controls() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        still(&mut ui);
+        ui.drilled = true;
+        let s = ui.sessions.get_mut("one").context("session")?;
+        let mut child = super::super::subagents::Subagent::new(provider::Provider::Claude, "child");
+        child.name = "Reviewer".into();
+        child.task = "Check the schema".into();
+        child.state = super::super::subagents::State::Completed;
+        child.entries.push(Entry {
+            id: "reply".into(),
+            kind: "agentMessage".into(),
+            text: "Child report only".to_owned().into(),
+            ..Entry::default()
+        });
+        s.subagents.push(child);
+        let (text, _) = draw(&mut ui, 130, 35)?;
+        assert!(text.contains("subagents 1"));
+        assert!(!text.contains("Child report only"));
+        ui.focus = Focus::Subagents;
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(ui.modal, Some(Modal::Subagents { .. })));
+        let (text, _) = draw(&mut ui, 130, 35)?;
+        assert!(text.contains("Completed") && text.contains("Check the schema"));
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(ui.panels.view, Some(panels::View::Subagent(_))));
+        let (text, _) = draw(&mut ui, 130, 35)?;
+        assert!(text.contains("Child report only"));
+        let right = ui.panels.right;
+        ui.key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT));
+        assert_ne!(ui.panels.right, right);
+        let draft = ui.positions.get("one").context("position")?.draft.text();
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        assert_eq!(
+            ui.positions.get("one").context("position")?.draft.text(),
+            draft
+        );
+        let child = ui
+            .sessions
+            .get_mut("one")
+            .context("session")?
+            .subagents
+            .first_mut()
+            .context("child")?;
+        child.entries.first_mut().context("message")?.text = (0..80)
+            .map(|i| format!("Child row {i:02}\n\n"))
+            .collect::<String>()
+            .into();
+        let (text, _) = draw(&mut ui, 130, 35)?;
+        assert!(text.contains("Child row 79") && !text.contains("Child row 00"));
+        ui.key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
+        let (text, _) = draw(&mut ui, 130, 35)?;
+        assert!(text.contains("Child row 00") && !text.contains("Child row 79"));
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.panels.view.is_none());
+        Ok(())
     }
     #[test]
     fn notification_presence_follows_conversation_visibility_with_helper_placements() -> Result<()>
