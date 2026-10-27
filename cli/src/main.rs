@@ -38,6 +38,14 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Inspect a session's shared shells using difu_shell action JSON.
+    Shell {
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        session: String,
+        /// JSON action, for example '{"action":"list"}'.
+        #[arg(value_parser = serde_json::from_str::<serde_json::Value>)]
+        action: serde_json::Value,
+    },
     /// Attach a GitHub pull request to a session, including another repository.
     AttachPr {
         /// Full GitHub pull request URL.
@@ -76,6 +84,23 @@ fn main() -> Result<()> {
         } else {
             difu::agents::server::run(storage)
         };
+    }
+    if let Some(Commands::Shell { session, action }) = &args.command {
+        let storage = Storage::discover()?;
+        difu::agents::client::ensure_running(&storage)?;
+        match difu::agents::client::request(
+            &storage,
+            difu::agents::Request::ShellTool {
+                id: session.clone(),
+                args: action.clone(),
+            },
+        )? {
+            difu::agents::Reply::Shell(value) => {
+                println!("{}", serde_json::to_string_pretty(&value)?)
+            }
+            other => anyhow::bail!("Unexpected shell reply: {other:?}"),
+        }
+        return Ok(());
     }
     if let Some(Commands::AttachPr { url, session }) = &args.command {
         let storage = Storage::discover()?;

@@ -40,6 +40,7 @@ mod shortcuts;
 mod sidebar;
 mod slack;
 mod status_icons;
+mod terminals;
 mod themes;
 pub(crate) mod toast;
 pub(in crate::agents) mod transcript;
@@ -146,6 +147,9 @@ pub struct Position {
     pub scroll_anchor: Option<(String, usize)>,
     transcript_viewport: Option<(u16, u16, u64)>,
     keep_transcript_position: bool,
+    question_height: Option<u16>,
+    question_reflow: Option<inline_questions::Reflow>,
+    question_scroll: bool,
     pub answers: HashMap<String, questions::Draft>,
     question_choices: HashMap<(String, usize), usize>,
     question_notes: HashMap<(String, usize, usize), Editor>,
@@ -345,6 +349,7 @@ enum Task {
     ChangesContext(changes::Source, u64, String),
     Statistics(String, u64),
     Shells(String),
+    Terminal(String, terminals::Operation),
     OpenArtifact,
     OpenLink,
     InstallBrowser(String, std::path::PathBuf, String),
@@ -579,6 +584,9 @@ impl Ui {
         });
     }
     pub fn redraw_interval(&self) -> Option<Duration> {
+        if self.panels.visible() && matches!(self.panels.view, Some(panels::View::Terminal(_))) {
+            return Some(Duration::from_millis(50));
+        }
         if self.preferences.motion.level == crate::settings::Motion::Full
             && (self.voice_active()
                 || self.session_switched.is_some()
@@ -626,7 +634,18 @@ impl Ui {
         } else {
             None
         };
-        icons.into_iter().chain(panel).min()
+        let user_command = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.sessions.get(id))
+            .is_some_and(|session| {
+                session.entries.iter().any(|entry| {
+                    entry.finished_at.is_none()
+                        && entry.data.get("difuUserShell").and_then(Value::as_bool) == Some(true)
+                })
+            })
+            .then_some(Duration::from_secs(1));
+        icons.into_iter().chain(panel).chain(user_command).min()
     }
     pub fn tick(&mut self, visible: bool) {
         if let Some(error) = self.cache_writer.error() {
@@ -674,6 +693,10 @@ impl Ui {
                 self.finish_plan_choice(id, plan_id, message.result);
                 continue;
             }
+            if let Task::Terminal(id, operation) = &message.kind {
+                self.finish_terminal(id, operation.clone(), message.result);
+                continue;
+            }
             if let Task::Send(id, token) = &message.kind {
                 self.finish_send(id, *token, message.result);
                 continue;
@@ -713,6 +736,7 @@ impl Ui {
                 }
                 Task::Defaults(_)
                 | Task::Send(..)
+                | Task::Terminal(..)
                 | Task::Question
                 | Task::OpenArtifact
                 | Task::OpenLink
@@ -2401,6 +2425,7 @@ impl Ui {
                 p.scroll_anchor = None;
                 p.keep_transcript_position = false;
                 p.transcript_viewport = None;
+                p.question_reflow = None;
                 p.conversation = p.conversation.saturating_add_signed(delta as isize).min(
                     self.conversation_lines
                         .saturating_sub(self.conversation_height),
@@ -2420,6 +2445,10 @@ impl Ui {
         }
     }
     pub fn paste(&mut self, text: &str) {
+        if self.terminal_input() {
+            self.terminal_paste(text);
+            return;
+        }
         if self.inbox.visible && self.modal.is_none() {
             return;
         }
@@ -3887,6 +3916,18 @@ impl Ui {
         if !self.question_panel() {
             self.question_flip = Default::default();
         }
+        let shell_cwd = self.command_mode().then(|| {
+            self.sessions
+                .get(&id)
+                .and_then(|session| session.workspace.as_ref())
+                .map(|path| format!("pwd: {}", path.display()))
+                .unwrap_or_else(|| "pwd: Worktree is not ready".into())
+        });
+        let cwd_lines = shell_cwd
+            .as_ref()
+            .map(|cwd| wrapped(&crate::model::clean(cwd), area.width.saturating_sub(2)))
+            .unwrap_or_default();
+        let cwd_height = (cwd_lines.len() as u16).min(area.height.saturating_sub(6));
         let composer_height = if self.question_panel() {
             self.question_height(area.width)
                 .min(area.height.saturating_sub(5))
@@ -3905,10 +3946,13 @@ impl Ui {
                     1,
                     self.preferences.input.composer_max_height.clamp(3, 20) as usize,
                 ) as u16;
-            (lines + 2 + self.voice_rows(area.width)).min(area.height.saturating_sub(3))
+            (lines + 2 + self.voice_rows(area.width) + cwd_height)
+                .min(area.height.saturating_sub(3))
         } else {
             0
         };
+        let question_open = self.question_panel();
+        let reclaimed = self.reconcile_question_space(&id, question_open, composer_height);
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
@@ -3974,12 +4018,12 @@ impl Ui {
             area.y + 1,
             area.width,
             area.height
-                .saturating_sub(composer_height + requests_height + 1),
+                .saturating_sub(composer_height + reclaimed + requests_height + 1),
         );
         self.conversation_height = usize::from(body.height);
         let position = self.positions.entry(id.clone()).or_default();
         if let Some((old_width, old_height, version)) = position.transcript_viewport {
-            if old_width != body.width || version != session.version {
+            if position.question_scroll || old_width != body.width || version != session.version {
                 position.keep_transcript_position = false;
             } else if old_height != body.height {
                 position.keep_transcript_position = true;
@@ -4038,11 +4082,12 @@ impl Ui {
         } else {
             usize::from(body.height)
         });
-        position.conversation = if match self.preferences.conversation.auto_scroll {
+        position.conversation = if (match self.preferences.conversation.auto_scroll {
             crate::settings::AutoScroll::WhenAtBottom => position.follow,
             crate::settings::AutoScroll::Always => true,
             crate::settings::AutoScroll::Manual => false,
-        } && !position.keep_transcript_position
+        } || position.question_scroll)
+            && !position.keep_transcript_position
         {
             maximum
         } else {
@@ -4224,6 +4269,26 @@ impl Ui {
                     composer.y + voice,
                     composer.width,
                     composer.height - voice,
+                )
+            } else {
+                composer
+            };
+            let composer = if cwd_height > 0 {
+                frame.render_widget(
+                    Paragraph::new(cwd_lines.into_iter().map(Line::from).collect::<Vec<_>>())
+                        .style(Style::default().fg(DIM)),
+                    Rect::new(
+                        composer.x + 1,
+                        composer.y,
+                        composer.width.saturating_sub(2),
+                        cwd_height,
+                    ),
+                );
+                Rect::new(
+                    composer.x,
+                    composer.y + cwd_height,
+                    composer.width,
+                    composer.height.saturating_sub(cwd_height),
                 )
             } else {
                 composer
@@ -9554,6 +9619,11 @@ mod tests {
         assert!(screen.contains("New streamed output"));
         ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         draw(&mut ui, 120, 35)?;
+        assert_eq!(
+            ui.positions.get("one").context("position")?.conversation,
+            ui.conversation_lines.saturating_sub(ui.conversation_height),
+            "closing questions must reclaim their space and bring the last message to the bottom"
+        );
         ui.focus = Focus::Conversation;
         ui.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
         draw(&mut ui, 120, 35)?;

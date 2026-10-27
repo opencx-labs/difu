@@ -102,7 +102,7 @@ impl ChildGroup {
 /// Freeze the provider and its descendants before killing them, so terminating
 /// a shell cannot orphan a server in a separate process group. Only processes
 /// descended from this live child are selected; cwd and cached PIDs are unused.
-fn stop_descendants(root: Pid) -> Result<()> {
+pub(crate) fn stop_descendants(root: Pid) -> Result<()> {
     match kill(root, Signal::SIGSTOP) {
         Ok(()) => {}
         Err(nix::errno::Errno::ESRCH) => return Ok(()),

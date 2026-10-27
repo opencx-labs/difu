@@ -98,7 +98,7 @@ impl Ui {
                 Modal::Help(_) => AGENT_HELP,
             };
         }
-        if self.browser_input() {
+        if self.browser_input() || self.terminal_input() {
             return if self.panels.right {
                 AGENT_BROWSER
             } else {

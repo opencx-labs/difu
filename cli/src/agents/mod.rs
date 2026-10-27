@@ -24,6 +24,7 @@ pub mod remote;
 mod rules;
 pub mod server;
 mod shared;
+pub mod shells;
 pub mod slack;
 mod startup;
 mod suggestions;
@@ -357,6 +358,8 @@ pub struct Session {
     #[serde(default)]
     pub pr_tools: bool,
     #[serde(default)]
+    pub shell_tools: bool,
+    #[serde(default)]
     pub question_tools: bool,
     /// The provider thread was given difu_peer_sessions.
     #[serde(default)]
@@ -368,6 +371,8 @@ pub struct Session {
     pub artifact_requests: Vec<Pending>,
     #[serde(skip)]
     pub pr_requests: Vec<Pending>,
+    #[serde(skip)]
+    pub shell_requests: Vec<Pending>,
     #[serde(skip)]
     pub question_requests: Vec<Pending>,
     #[serde(skip)]
@@ -451,11 +456,13 @@ impl Session {
             artifacts: Vec::new(),
             artifact_tools: false,
             pr_tools: false,
+            shell_tools: false,
             question_tools: false,
             peer_tools: false,
             folder_tools: false,
             artifact_requests: Vec::new(),
             pr_requests: Vec::new(),
+            shell_requests: Vec::new(),
             question_requests: Vec::new(),
             shells: Vec::new(),
             entries: Vec::new(),
@@ -539,7 +546,10 @@ impl Session {
     pub fn tool_running(&self) -> bool {
         self.turn_id.is_some()
             && self.entries.iter().any(|entry| {
-                entry.is_tool() && entry.started_at.is_some() && entry.finished_at.is_none()
+                entry.is_tool()
+                    && entry.data.get("difuUserShell").and_then(Value::as_bool) != Some(true)
+                    && entry.started_at.is_some()
+                    && entry.finished_at.is_none()
             })
     }
     pub fn is_pending_steering(&self, entry: &Entry) -> bool {
@@ -782,6 +792,9 @@ pub enum Control {
     InterruptAndSend,
     Compact,
     RefreshShells,
+    CloseShell {
+        process: String,
+    },
     ReplaceQueued {
         index: usize,
         expected: Prompt,
@@ -903,6 +916,14 @@ pub enum Request {
     Shells {
         id: String,
     },
+    Shell {
+        id: String,
+        action: shells::Action,
+    },
+    ShellTool {
+        id: String,
+        args: Value,
+    },
     WorkspacePaths {
         id: String,
     },
@@ -933,6 +954,7 @@ pub enum Reply {
         version: String,
     },
     Shells(Vec<Value>),
+    Shell(Value),
     Sessions(Vec<Summary>),
     Session(Box<Session>),
     SessionDelta(transport::Delta),

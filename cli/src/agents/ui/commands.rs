@@ -22,6 +22,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "theme",
         "Pick a colour theme; Default restores the original colours",
     ),
+    (
+        "shell",
+        "Open a shared interactive shell in the session worktree",
+    ),
     ("compact", "Compact the current conversation"),
     ("model", "Choose a model"),
     ("effort", "Choose the reasoning level"),
@@ -253,6 +257,7 @@ impl Ui {
         self.available_commands("", false, false)
     }
     pub(crate) fn prepare_palette(&mut self) {
+        self.release_terminal_focus();
         if self
             .selected
             .as_ref()
@@ -400,6 +405,7 @@ impl Ui {
             "/voice" => self.toggle_voice(),
             "/tweaks" => self.open_tweaks(),
             "/theme" => self.open_theme(),
+            "/shell" => self.open_terminal(),
             "/compact" => self.control(Control::Compact),
             "/model" => self.open_model_picker(),
             "/effort" => self.open_model(1),

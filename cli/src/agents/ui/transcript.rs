@@ -226,6 +226,7 @@ pub(in crate::agents) fn activity_text(session: &Session) -> (String, Option<Str
     }
     if let Some(entry) = session.entries.iter().rev().find(|e| {
         e.started_at.is_some()
+            && e.data.get("difuUserShell").and_then(Value::as_bool) != Some(true)
             && e.finished_at.is_none()
             && !matches!(
                 e.kind.as_str(),
@@ -388,12 +389,22 @@ fn preview(
     let budget = usize::from(width.max(1)).saturating_mul(limit.max(16));
     let mut data = serde_json::Map::new();
     for key in [
-        "command", "server", "tool", "query", "path", "status", "exitCode", "review",
+        "command",
+        "server",
+        "tool",
+        "query",
+        "path",
+        "status",
+        "exitCode",
+        "review",
+        "difuUserShell",
     ] {
         if let Some(value) = entry.data.get(key) {
             if let Some(text) = value.as_str() {
                 data.insert(key.into(), Value::String(prefix(text, budget)));
-            } else if key == "exitCode" && value.is_i64() {
+            } else if (key == "exitCode" && value.is_i64())
+                || (key == "difuUserShell" && value.is_boolean())
+            {
                 data.insert(key.into(), value.clone());
             }
         }
@@ -699,7 +710,8 @@ pub(super) fn render_entries_with_preferences(
                         .is_some_and(|n| n != 0);
                 let running = entry.started_at.is_some()
                     && entry.finished_at.is_none()
-                    && session.status.active();
+                    && (session.status.active()
+                        || entry.data.get("difuUserShell").and_then(Value::as_bool) == Some(true));
                 let state = if failed {
                     "failed"
                 } else if running {

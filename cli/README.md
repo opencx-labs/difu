@@ -183,12 +183,38 @@ merge, and comment controls apply only to PRs.
 ### Agents
 
 The session list excludes Guide-generation jobs; guides remain available in Reviews.
-The bottom **Shells** control lists Codex’s open background shells and opens their
-available streamed output. **Artifacts** lists HTML deliverables explicitly
+The bottom **Shells** control lists shared interactive shells, running user commands,
+and Codex’s background shells. Select one and press **Enter** to open it, or **x**
+to terminate it. **Artifacts** lists HTML deliverables explicitly
 registered by new coding sessions. Codex is instructed to prefer self-contained
 HTML for reports and visual deliverables. Existing sessions keep their original
 tool catalog. Empty Shells/Artifacts controls are hidden; available controls use a
 single compact row beneath the conversation.
+
+Start a chat input with **!** to run a Bash command immediately in the session's
+worktree, including while the agent is working. The working directory appears
+above the input before you submit. Output streams into chat; completed results
+are included as context with the next agent input without starting an AI reply.
+Running commands appear under **Shells**, where **x** cancels them.
+
+Use **/shell** in **Cmd+K** or the chat command picker to open a persistent terminal
+in the session worktree. Type directly into it, use **Tab** for shell completion,
+and **Ctrl+C** to interrupt its foreground command. Directory and environment
+changes persist in that shell. **Esc** hides the pane while the process keeps
+running; reopen it from **Shells**. Shared shells use normal local-terminal access
+for both providers and remain running when the difu UI closes. They stop when the
+session is archived/deleted, its worktree is discarded, or the service exits.
+
+Agents can list, open, read, write to and close these shells through `difu_shell`.
+While a human focuses a shell, agent writes are rejected without queueing; reads
+remain available. Agent input is enabled again when the human leaves the pane. Existing
+Codex conversations can use the same actions through the compatibility command:
+
+```sh
+difu shell --session SESSION_ID '{"action":"list"}'
+difu shell --session SESSION_ID '{"action":"read","shell":"SHELL_ID"}'
+difu shell --session SESSION_ID '{"action":"write","shell":"SHELL_ID","text":"pwd","enter":true}'
+```
 
 The **Questions & requests** card sits above the orchestrator. **Option+Q**
 (**Alt+Q**) opens pending questions and permission requests across all current

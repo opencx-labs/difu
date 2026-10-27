@@ -6,6 +6,24 @@ type QuestionLines = (
     Vec<(usize, usize, Action)>,
 );
 
+/// Release the question's old space gradually while keeping the chat at its end.
+pub(super) struct Reflow {
+    rows: u16,
+    started: Instant,
+    duration: Duration,
+}
+impl Reflow {
+    fn remaining(&self, now: Instant) -> u16 {
+        if self.duration.is_zero() {
+            return 0;
+        }
+        let progress = (now.saturating_duration_since(self.started).as_secs_f64()
+            / self.duration.as_secs_f64())
+        .min(1.0);
+        (f64::from(self.rows) * (1.0 - progress).powi(3)).round() as u16
+    }
+}
+
 /// The inline question's split-flap: each question flips in as it opens, and
 /// an answered one flips away like the composer's text after a send.
 #[derive(Default)]
@@ -85,6 +103,41 @@ impl Flip {
 }
 
 impl Ui {
+    pub(super) fn reconcile_question_space(&mut self, id: &str, open: bool, height: u16) -> u16 {
+        let position = self.positions.entry(id.to_owned()).or_default();
+        position.question_scroll = false;
+        if open {
+            position.question_height = Some(height);
+            position.question_reflow = None;
+            return 0;
+        }
+        if let Some(previous) = position.question_height.take() {
+            position.question_reflow = Some(Reflow {
+                rows: previous.saturating_sub(height),
+                started: Instant::now(),
+                duration: Duration::from_millis(u64::from(self.tweaks.capped(220))),
+            });
+        }
+        let Some(reflow) = &position.question_reflow else {
+            return 0;
+        };
+        let remaining = if self.preferences.motion.level == crate::settings::Motion::Full
+            && self.tweaks.agent_reply_cps > 0
+        {
+            reflow.remaining(Instant::now())
+        } else {
+            0
+        };
+        position.question_scroll = true;
+        position.follow = true;
+        position.keep_transcript_position = false;
+        position.scroll_anchor = None;
+        if remaining == 0 {
+            position.question_reflow = None;
+        }
+        remaining
+    }
+
     fn question_note_key(&self) -> Option<(String, usize, usize)> {
         let Some(Modal::Approval {
             pending,
@@ -955,6 +1008,18 @@ impl Ui {
 mod settings_refresh_tests {
     use super::*;
     use anyhow::Context;
+    #[test]
+    fn question_space_collapses_smoothly_and_finishes_at_zero() {
+        let started = Instant::now();
+        let reflow = Reflow {
+            rows: 32,
+            started,
+            duration: Duration::from_millis(220),
+        };
+        assert_eq!(reflow.remaining(started), 32);
+        assert_eq!(reflow.remaining(started + Duration::from_millis(110)), 4);
+        assert_eq!(reflow.remaining(started + Duration::from_millis(220)), 0);
+    }
     #[test]
     fn committed_refresh_settles_clearing_without_redisplaying_an_inflight_answer()
     -> anyhow::Result<()> {

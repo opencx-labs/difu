@@ -86,6 +86,7 @@ impl Shell {
         shell
     }
     pub(crate) fn open_settings(&mut self, category: Option<crate::settings::Category>) {
+        self.agents.release_terminal_focus();
         self.agents.cancel_voice();
         self.palette = None;
         self.settings_action_open = false;

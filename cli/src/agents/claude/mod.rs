@@ -136,6 +136,9 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                 super::peers::TOOL => {
                     super::peers::handle(store, id, args).map(|value| value.to_string())
                 }
+                super::shells::TOOL => {
+                    super::shells::tool_call(store, id, args).map(|value| value.to_string())
+                }
                 super::pr_attachments::TOOL => {
                     super::pr_attachments::handle(store, id, args, &Cancel::default())
                         .map(|value| value.to_string())
@@ -180,6 +183,7 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                     super::questions::TOOL,
                     super::peers::TOOL,
                     super::pr_attachments::TOOL,
+                    super::shells::TOOL,
                     super::folders::TOOL,
                 ]
                 .contains(&name)
@@ -414,6 +418,10 @@ fn send(
         content.push(json!({"type":"text","text":context}));
     }
     content.push(json!({"type":"text","text":prompt.text()}));
+    let (shell_ids, shell_context) = super::shells::context(&session);
+    if let Some(context) = shell_context {
+        content.push(json!({"type":"text","text":context}));
+    }
     if let Some(context) = super::questions::pending_context(&session, prompt) {
         content.push(json!({"type":"text","text":context}));
     }
@@ -465,6 +473,7 @@ fn send(
         store.save(id)?;
         return Err(error);
     }
+    store.update(id, |session| super::shells::delivered(session, &shell_ids))?;
     decoder.sending();
     store.save(id)
 }
@@ -700,6 +709,9 @@ fn command(
             })?;
         }
         Control::RefreshShells => {}
+        Control::CloseShell { .. } => {
+            anyhow::bail!("This provider does not expose background terminals")
+        }
     }
     store.save(id)
 }
@@ -722,6 +734,7 @@ pub(super) fn instructions(session: &Session) -> String {
         super::pr_attachments::INSTRUCTIONS,
         super::folders::INSTRUCTIONS
     );
+    let instructions = format!("{instructions}\n\n{}", super::shells::instructions(session));
     let instructions = if session.native_setup {
         instructions
     } else {
@@ -848,6 +861,7 @@ fn connect_once(
         s.error = None;
         s.artifact_tools = true;
         s.pr_tools = true;
+        s.shell_tools = true;
         s.registration_tools = true;
         s.question_tools = true;
         s.peer_tools = true;

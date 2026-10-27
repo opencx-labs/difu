@@ -123,11 +123,12 @@ impl Window {
                 sections,
             };
         }
-        let follow = match self.conversation.auto_scroll {
+        let follow = (match self.conversation.auto_scroll {
             crate::settings::AutoScroll::WhenAtBottom => position.follow,
             crate::settings::AutoScroll::Always => true,
             crate::settings::AutoScroll::Manual => false,
-        } && !position.keep_transcript_position;
+        } || position.question_scroll)
+            && !position.keep_transcript_position;
         // Reflow can shorten an entry or move the viewport's maximum above it.
         // Clamp only the display position, retaining the reader's source intent
         // until navigation/following replaces it or the source disappears.
@@ -204,7 +205,10 @@ impl Window {
                     (entry.started_at.is_some() && entry.finished_at.is_none()).then(|| {
                         (
                             session.status,
-                            if session.status.active() {
+                            if session.status.active()
+                                || entry.data.get("difuUserShell").and_then(Value::as_bool)
+                                    == Some(true)
+                            {
                                 chrono::Utc::now().timestamp_millis() / 100
                             } else {
                                 session.updated
