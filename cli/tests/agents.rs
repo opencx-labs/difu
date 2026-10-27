@@ -1013,9 +1013,23 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
     let clean = launch(&storage, &repo, "wait for deletion")?;
     let current = wait(&storage, &clean, |s| s.status == Status::Running)?;
     let tree = current.workspace.context("Missing deletion worktree")?;
-    let Reply::Shells(shells) = client::request(&storage, Request::Shells { id: clean.clone() })?
-    else {
-        anyhow::bail!("Missing shells");
+    // The picker returns cached shells immediately while refreshing the provider
+    // in the background, so a busy agent never delays shared terminal access.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let shells = loop {
+        let Reply::Shells(shells) =
+            client::request(&storage, Request::Shells { id: clean.clone() })?
+        else {
+            anyhow::bail!("Missing shells");
+        };
+        if !shells.is_empty() {
+            break shells;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "Background shells did not refresh"
+        );
+        std::thread::sleep(Duration::from_millis(20));
     };
     assert_eq!(
         shells
