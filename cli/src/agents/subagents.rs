@@ -146,10 +146,71 @@ pub(super) fn restore(session: &mut Session) {
             }
         }
     }
+    // v0.32.0 retained collaboration activity in the parent transcript without
+    // registering its children. Recover missing IDs, even in a mixed session,
+    // while preserving newer state already stored in the separate child list.
+    let known: std::collections::HashSet<_> = session
+        .subagents
+        .iter()
+        .filter(|a| a.provider == Provider::Codex)
+        .map(|a| a.native_id.clone())
+        .collect();
+    let activity: Vec<_> = session
+        .entries
+        .iter()
+        .filter(|e| {
+            e.kind == "subAgentActivity"
+                && string(&e.data, "agentThreadId").is_some_and(|id| !known.contains(id))
+        })
+        .map(|e| e.data.clone())
+        .collect();
+    let parent = session.thread_id.clone();
+    for item in activity {
+        codex_activity(session, parent.as_deref(), &item);
+    }
     for child in &mut session.subagents {
         if child.state.active() {
             child.finish(State::Interrupted);
         }
+    }
+}
+
+fn path_name(path: &str) -> &str {
+    path.rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path)
+}
+
+/// Collaboration tools report a lifecycle item on the owning thread. The
+/// item's completion only finishes the announcement, not the child task.
+fn codex_activity(session: &mut Session, parent: Option<&str>, item: &Value) {
+    if string(item, "type") != Some("subAgentActivity")
+        || !parent.is_some_and(|id| {
+            session.thread_id.as_deref() == Some(id)
+                || session
+                    .subagents
+                    .iter()
+                    .any(|a| a.provider == Provider::Codex && a.native_id == id)
+        })
+    {
+        return;
+    }
+    let Some(id) = string(item, "agentThreadId") else {
+        return;
+    };
+    if session.thread_id.as_deref() == Some(id) {
+        return;
+    }
+    let child = codex_child(session, id);
+    child.parent = parent.map(String::from);
+    if let Some(path) = string(item, "agentPath") {
+        child.name = path_name(path).into();
+    }
+    match string(item, "kind") {
+        Some("started" | "interacted") => child.state = State::Running,
+        Some("interrupted") => child.finish(State::Interrupted),
+        Some("completed") => child.finish(State::Completed),
+        _ => {}
     }
 }
 
@@ -243,7 +304,12 @@ pub(super) fn codex_metadata(session: &mut Session, thread: &Value) -> Option<St
     if let Some(parent) = parent {
         child.parent = Some(parent.into());
     }
-    if let Some(name) = string(thread, "agentNickname")
+    if let Some(name) = thread
+        .pointer("/source/subAgent/thread_spawn/agent_path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(path_name)
+        .or_else(|| string(thread, "agentNickname"))
         .or_else(|| string(thread, "name"))
         .or_else(|| string(thread, "agentRole"))
     {
@@ -270,6 +336,10 @@ pub(super) fn codex_event(session: &mut Session, event: &Value) -> bool {
     }
     if let Some(item) = params.get("item") {
         codex_collab(session, item);
+        let parent = string(params, "threadId")
+            .map(String::from)
+            .or_else(|| session.thread_id.clone());
+        codex_activity(session, parent.as_deref(), item);
     }
     let Some(id) = string(params, "threadId") else {
         return false;
@@ -364,6 +434,7 @@ pub(super) fn codex_history(session: &mut Session, id: &str, thread: &Value) {
                     order.push(id.to_owned());
                 }
                 codex_collab(session, item);
+                codex_activity(session, Some(id), item);
                 let child = codex_child(session, id);
                 let ongoing = string(turn, "status") == Some("inProgress")
                     && string(item, "status") == Some("inProgress");
@@ -707,6 +778,91 @@ mod tests {
         s.turn_id = Some("parent-turn".into());
         s.status = super::super::Status::Running;
         s
+    }
+    fn activity(id: &str, path: &str, kind: &str) -> Value {
+        json!({"method":"item/completed","params":{"threadId":"parent-thread","item":{
+            "type":"subAgentActivity","id":format!("{id}-{kind}"),"kind":kind,
+            "agentThreadId":id,"agentPath":path,"model":null,"reasoningEffort":null
+        }}})
+    }
+    #[test]
+    fn subagent_activity_tracks_lifecycle_without_finishing_the_parent() {
+        let mut s = session();
+        let started = activity("badge", "/root/badge_check", "started");
+        super::super::engine::apply_event(&mut s, &started);
+        super::super::engine::apply_event(&mut s, &started);
+        assert_eq!(s.subagents.len(), 1);
+        assert_eq!(s.subagents.first().map(|a| a.state), Some(State::Running));
+        for (kind, expected) in [
+            ("completed", State::Completed),
+            ("interacted", State::Running),
+            ("interrupted", State::Interrupted),
+        ] {
+            super::super::engine::apply_event(
+                &mut s,
+                &activity("badge", "/root/badge_check", kind),
+            );
+            assert_eq!(s.subagents.first().map(|a| a.state), Some(expected));
+            assert_eq!(s.status, super::super::Status::Running);
+            assert_eq!(s.turn_id.as_deref(), Some("parent-turn"));
+        }
+        let mut foreign = activity("foreign", "/root/foreign", "started");
+        foreign["params"]["threadId"] = json!("unrelated-thread");
+        super::super::engine::apply_event(&mut s, &foreign);
+        assert_eq!(s.subagents.len(), 1);
+        let mut nested = activity("nested", "/root/badge_check/nested", "started");
+        nested["params"]["threadId"] = json!("badge");
+        super::super::engine::apply_event(&mut s, &nested);
+        assert_eq!(s.subagents.len(), 2);
+        assert_eq!(
+            s.subagents.last().and_then(|a| a.parent.as_deref()),
+            Some("badge")
+        );
+    }
+    #[test]
+    fn subagent_activity_recovers_both_saved_launches_in_a_mixed_session() -> anyhow::Result<()> {
+        let mut s = session();
+        for (id, path) in [
+            ("badge", "/root/badge_check"),
+            ("transcript", "/root/transcript_check"),
+        ] {
+            for kind in ["started", "completed"] {
+                super::super::engine::apply_event(&mut s, &activity(id, path, kind));
+            }
+        }
+        // v0.32.0 saved these items but did not add them to its child list.
+        s.subagents.clear();
+        let known = codex_child(&mut s, "existing");
+        known.finish(State::Closed);
+        s.entries.push(Entry {
+            id: "old-existing-start".into(),
+            kind: "subAgentActivity".into(),
+            data: activity("existing", "/root/existing", "started")["params"]["item"]
+                .clone()
+                .into(),
+            ..Entry::default()
+        });
+        let mut restored: Session = serde_json::from_value(serde_json::to_value(s)?)?;
+        restore(&mut restored);
+        assert_eq!(restored.subagents.len(), 3);
+        let recovered: Vec<_> = restored
+            .subagents
+            .iter()
+            .map(|a| (a.name.as_str(), a.state))
+            .collect();
+        assert_eq!(
+            recovered,
+            [
+                ("Sub-agent", State::Closed),
+                ("badge_check", State::Completed),
+                ("transcript_check", State::Completed)
+            ]
+        );
+        let previous = serde_json::to_value(&restored.subagents)?;
+        restore(&mut restored);
+        assert_eq!(previous, serde_json::to_value(&restored.subagents)?);
+        assert_eq!(restored.entries.len(), 5);
+        Ok(())
     }
     #[test]
     fn subagents_history_orders_earlier_items_before_live_output() {

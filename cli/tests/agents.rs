@@ -133,6 +133,7 @@ fn subagent_history_refresh_is_read_only_and_survives_restart() -> Result<()> {
     })?;
     let child = parent.subagents.first().context("child")?;
     let child_id = child.id.clone();
+    assert_eq!(child.name, "reviewer");
     assert_eq!(
         child.entries.first().map(|e| e.text.as_str()),
         Some("Partial child report")
@@ -169,6 +170,10 @@ fn subagent_history_refresh_is_read_only_and_survives_restart() -> Result<()> {
         },
     )?;
     let refreshed = session(&storage, &id)?;
+    assert_eq!(
+        refreshed.subagents.first().map(|a| a.name.as_str()),
+        Some("reviewer")
+    );
     assert_eq!(refreshed.status, parent.status);
     assert_eq!(refreshed.thread_id, parent.thread_id);
     assert_eq!(refreshed.turn_id, parent.turn_id);
