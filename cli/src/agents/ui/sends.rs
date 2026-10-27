@@ -17,6 +17,9 @@ impl Ui {
         );
     }
     pub(super) fn send(&mut self, queue: bool) {
+        if self.run_shell_command() {
+            return;
+        }
         if self.busy || self.media_pending.is_some() || self.command_draft() {
             return;
         }

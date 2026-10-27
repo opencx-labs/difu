@@ -54,6 +54,8 @@ pub struct NativeSession {
     #[serde(default)]
     pub pr_tools: bool,
     #[serde(default)]
+    pub shell_tools: bool,
+    #[serde(default)]
     pub registration_tools: bool,
     #[serde(default)]
     pub question_tools: bool,
@@ -100,6 +102,7 @@ pub fn switch(
             inherited_permissions: session.inherited_permissions.clone(),
             artifact_tools: session.artifact_tools,
             pr_tools: session.pr_tools,
+            shell_tools: session.shell_tools,
             registration_tools: session.registration_tools,
             question_tools: session.question_tools,
             peer_tools: session.peer_tools,
@@ -134,6 +137,7 @@ pub fn switch(
     session.inherited_permissions = target.inherited_permissions;
     session.artifact_tools = target.artifact_tools;
     session.pr_tools = target.pr_tools;
+    session.shell_tools = target.shell_tools;
     session.registration_tools = target.registration_tools;
     session.question_tools = target.question_tools;
     session.peer_tools = target.peer_tools;

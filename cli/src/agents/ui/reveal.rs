@@ -105,6 +105,7 @@ impl Position {
     }
     pub(super) fn animating_at(&self, now: Instant) -> bool {
         self.sent.is_some()
+            || self.question_reflow.is_some()
             || self.clearing.is_some()
             || !self.voice_flaps.is_empty()
             || self.reply.as_ref().is_some_and(|r| r.shown.is_finite())

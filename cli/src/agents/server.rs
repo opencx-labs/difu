@@ -26,6 +26,7 @@ pub struct Store {
     changed: Condvar,
     save_lock: Mutex<()>,
     pub(super) notifications: Option<notifications::Dispatcher>,
+    pub(super) shells: shells::Manager,
 }
 impl Store {
     #[cfg(test)]
@@ -40,6 +41,7 @@ impl Store {
             changed: Condvar::new(),
             save_lock: Mutex::new(()),
             notifications: None,
+            shells: shells::Manager::default(),
         }
     }
     pub fn get(&self, id: &str) -> Result<Session> {
@@ -1011,6 +1013,13 @@ impl Service {
                 }
                 // Validate first so an invalid path leaves the current connection intact.
                 self.stop_worker(&id)?;
+                let _shell_lifecycle = self
+                    .store
+                    .shells
+                    .lifecycle
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
+                self.store.shells.stop_session(&self.store, &id)?;
                 // Preparation can record a branch/worktree while the new path is being
                 // validated. Join the cancelled worker before reading cleanup ownership.
                 let previous = self.store.get(&id)?;
@@ -1051,6 +1060,13 @@ impl Service {
                 }
                 // Validate first so a missing repository leaves the session intact.
                 self.stop_worker(&id)?;
+                let _shell_lifecycle = self
+                    .store
+                    .shells
+                    .lifecycle
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
+                self.store.shells.stop_session(&self.store, &id)?;
                 let previous = self.store.get(&id)?;
                 super::workspace::discard(&previous, &self.store.home, &Cancel::default())?;
                 let revision = previous.workspace_revision.saturating_add(1);
@@ -1083,6 +1099,15 @@ impl Service {
                 if archived {
                     self.stop_worker(&id)?;
                 }
+                let _shell_lifecycle = self
+                    .store
+                    .shells
+                    .lifecycle
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
+                if archived {
+                    self.store.shells.stop_session(&self.store, &id)?;
+                }
                 self.store.update(&id, |s| {
                     s.archived = archived;
                     if archived {
@@ -1092,25 +1117,52 @@ impl Service {
                 self.store.save(&id)?;
                 Ok(Reply::Ok)
             }
+            Request::ShellTool { id, args } => {
+                Ok(Reply::Shell(shells::tool_call(&self.store, &id, &args)?))
+            }
+            Request::Shell { id, action } => Ok(Reply::Shell(self.store.shells.handle(
+                &self.store,
+                &id,
+                action,
+            )?)),
             Request::Shells { id } => {
-                let sender = self
+                let mut shells = self.store.shells.list(&id)?;
+                shells.extend(self.store.get(&id)?.shells);
+                if let Some(sender) = self
                     .workers
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Worker lock failed"))?
                     .get(&id)
-                    .filter(|w| !w.handle.is_finished())
-                    .map(|w| w.sender.clone());
-                let Some(sender) = sender else {
-                    return Ok(Reply::Shells(Vec::new()));
-                };
-                let (tx, rx) = mpsc::channel();
-                sender.send(Command {
-                    control: Control::RefreshShells,
-                    reply: tx,
-                })?;
-                rx.recv_timeout(Duration::from_secs(50))
-                    .context("Shell list unavailable while the agent is busy")??;
-                Ok(Reply::Shells(self.store.get(&id)?.shells))
+                    .filter(|worker| !worker.handle.is_finished())
+                    .map(|worker| worker.sender.clone())
+                    && self
+                        .store
+                        .shells
+                        .refreshing
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Shell refresh lock failed"))?
+                        .insert(id.clone())
+                {
+                    let (reply, response) = mpsc::channel();
+                    if sender
+                        .send(Command {
+                            control: Control::RefreshShells,
+                            reply,
+                        })
+                        .is_ok()
+                    {
+                        let store = self.store.clone();
+                        thread::spawn(move || {
+                            let _ = response.recv();
+                            if let Ok(mut refreshing) = store.shells.refreshing.lock() {
+                                refreshing.remove(&id);
+                            }
+                        });
+                    } else if let Ok(mut refreshing) = self.store.shells.refreshing.lock() {
+                        refreshing.remove(&id);
+                    }
+                }
+                Ok(Reply::Shells(shells))
             }
             Request::Delete { id } => {
                 let session = self.store.get(&id)?;
@@ -1123,6 +1175,13 @@ impl Service {
                         .update(&id, |s| s.deletion_progress = Some(DeletionStage::Stopping))?;
                     // Confirmation explicitly authorizes stopping the session before cleanup.
                     self.stop_worker(&id)?;
+                    let _shell_lifecycle = self
+                        .store
+                        .shells
+                        .lifecycle
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
+                    self.store.shells.stop_session(&self.store, &id)?;
                     self.store.update(&id, |s| {
                         if s.status.active() {
                             s.status = Status::Interrupted;
@@ -1186,6 +1245,13 @@ impl Service {
                         .join()
                         .map_err(|_| anyhow::anyhow!("Session worker stopped unexpectedly"))?;
                 }
+                let _shell_lifecycle = self
+                    .store
+                    .shells
+                    .lifecycle
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
+                self.store.shells.stop_session(&self.store, &id)?;
                 super::workspace::cleanup(&session, &self.store.home, &Cancel::default())?;
                 self.store.update(&id, |s| {
                     s.archived = true;
@@ -1272,6 +1338,7 @@ fn reset_workspace(s: &mut Session, candidate: Session, revision: u64) {
     s.registration_requests.clear();
     s.artifact_requests.clear();
     s.pr_requests.clear();
+    s.shell_requests.clear();
     s.question_requests.clear();
     s.deletion_requests.clear();
     s.job = candidate.job;
@@ -1314,6 +1381,7 @@ fn clear_conversation(s: &mut Session) {
     s.inherited_permissions = Value::Null;
     s.artifact_tools = false;
     s.pr_tools = false;
+    s.shell_tools = false;
     s.registration_tools = false;
     s.question_tools = false;
     s.peer_tools = false;
@@ -1452,6 +1520,7 @@ pub fn run(storage: Storage) -> Result<()> {
                 session.unsent(text);
             }
         }
+        shells::restore(&mut session);
         session.restore_async_questions();
         super::plan::reconcile(&mut session);
         storage::atomic_json(&path, &session)?;
@@ -1468,6 +1537,7 @@ pub fn run(storage: Storage) -> Result<()> {
             changed: Condvar::new(),
             save_lock: Mutex::new(()),
             notifications: Some(notifications),
+            shells: shells::Manager::default(),
         }),
         workers: Mutex::new(BTreeMap::new()),
         action_locks: Mutex::new(BTreeMap::new()),
@@ -1498,6 +1568,9 @@ pub fn run(storage: Storage) -> Result<()> {
             }
             Err(error) => return Err(error.into()),
         }
+        if let Err(error) = service.store.shells.tick(&service.store) {
+            eprintln!("Shell output: {error:#}");
+        }
         if flushed.elapsed() < Duration::from_millis(500) {
             continue;
         }
@@ -1524,6 +1597,7 @@ pub fn run(storage: Storage) -> Result<()> {
             .join()
             .map_err(|_| anyhow::anyhow!("Agent worker stopped unexpectedly"))?;
     }
+    service.store.shells.stop_all(&service.store)?;
     // Persist interrupted state before exit; no queued prompt or mutation is replayed.
     for session in service.store.list()? {
         if session.status.active() {
@@ -1627,6 +1701,7 @@ mod watch_tests {
             changed: Condvar::new(),
             save_lock: Mutex::new(()),
             notifications: None,
+            shells: shells::Manager::default(),
         });
         let (client, mut server) = UnixStream::pair()?;
         client.set_read_timeout(Some(Duration::from_secs(2)))?;

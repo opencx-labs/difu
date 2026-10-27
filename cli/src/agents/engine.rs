@@ -364,6 +364,18 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
             });
             return;
         }
+        if session.shell_tools
+            && method == "item/tool/call"
+            && params.get("tool").and_then(Value::as_str) == Some(super::shells::TOOL)
+        {
+            session.shell_requests.push(Pending {
+                id: id.clone(),
+                method: method.into(),
+                params: params.clone(),
+                responded: false,
+            });
+            return;
+        }
 
         if !session.native_setup
             && session.deferred_workspace
@@ -434,7 +446,10 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                 if let Some(data) = entry.data.as_object_mut() {
                     data.remove("difuSteeringTurn");
                 }
-                if entry.started_at.is_some() && entry.finished_at.is_none() {
+                if entry.data.get("difuUserShell").and_then(Value::as_bool) != Some(true)
+                    && entry.started_at.is_some()
+                    && entry.finished_at.is_none()
+                {
                     entry.finished_at = Some(chrono::Utc::now().timestamp_millis());
                     if entry.kind != "agentMessage"
                         && entry.kind != "reasoning"
@@ -767,6 +782,10 @@ fn send_turn(
     if let Some(context) = &session.provider_context {
         input.push(json!({"type":"text","text":context}));
     }
+    let (shell_ids, shell_context) = super::shells::context(&session);
+    if let Some(context) = shell_context {
+        input.push(json!({"type":"text","text":context}));
+    }
     if let Some(context) = super::questions::pending_context(&session, prompt) {
         input.push(json!({"type":"text","text":context}));
     }
@@ -884,6 +903,7 @@ fn send_turn(
                 }
 
                 s.provider_context = None;
+                super::shells::delivered(s, &shell_ids);
                 s.finish_steering_wait();
                 if session.waiting_for_workspace() && !steer {
                     s.permissions = json!({"sandbox":isolation::read_only_policy(&session),"approvalPolicy":isolation::investigation_approvals(),
@@ -1020,6 +1040,19 @@ fn command(
                 }
             })?;
             store.save(id)?;
+        }
+        Control::CloseShell { process } => {
+            rpc.call(
+                "thread/backgroundTerminals/terminate",
+                json!({"threadId":session.thread_id,"processId":process}),
+                cancel,
+                |value| event(store, id, value),
+            )?;
+            store.update(id, |session| {
+                session.shells.retain(|shell| {
+                    shell.get("processId").and_then(Value::as_str) != Some(&process)
+                })
+            })?;
         }
         Control::RefreshShells => {
             let mut shells = Vec::new();
@@ -1541,6 +1574,7 @@ fn instructions(session: &Session) -> String {
             super::pr_attachments::command_instructions(&session.id)
         )
     };
+    let base = format!("{base}\n\n{}", super::shells::instructions(session));
     if session.artifact_tools {
         format!("{base}\n\n{}", super::artifacts::INSTRUCTIONS)
     } else {
@@ -1554,6 +1588,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
         store.update(id, |s| {
             s.artifact_tools = true;
             s.pr_tools = true;
+            s.shell_tools = true;
             s.registration_tools = true;
             s.question_tools = true;
             s.peer_tools = true;
@@ -1643,6 +1678,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
             store.update(id, |s| {
                 s.artifact_tools = true;
                 s.pr_tools = true;
+                s.shell_tools = true;
                 s.registration_tools = true;
                 s.question_tools = true;
                 s.peer_tools = true;
@@ -1810,6 +1846,7 @@ pub fn run(
                 let read_only = matches!(
                     command_request.control,
                     Control::RefreshShells
+                        | Control::CloseShell { .. }
                         | Control::ReadUsage
                         | Control::Mcp { .. }
                         | Control::Permissions { .. }
@@ -1972,6 +2009,38 @@ pub fn run(
                 rpc.write(json!({"id":request.id,"result":{"success":result.is_ok(),"contentItems":[{"type":"inputText","text":text}]}}))?;
             }
         }
+        let requests = store.inspect(id, |s| s.shell_requests.clone())?;
+        if !requests.is_empty() {
+            store.update(id, |s| s.shell_requests.clear())?;
+            for request in requests {
+                let result = (|| -> Result<Value> {
+                    let session = store.get(id)?;
+                    ensure!(
+                        request.params.get("threadId").and_then(Value::as_str)
+                            == session.thread_id.as_deref()
+                            && request.params.get("turnId").and_then(Value::as_str)
+                                == session.turn_id.as_deref(),
+                        "Shell request belongs to another turn"
+                    );
+                    let args = request
+                        .params
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let args = if let Some(text) = args.as_str() {
+                        serde_json::from_str(text)?
+                    } else {
+                        args
+                    };
+                    super::shells::tool_call(store, id, &args)
+                })();
+                let text = match &result {
+                    Ok(value) => value.to_string(),
+                    Err(error) => format!("{error:#}"),
+                };
+                rpc.write(json!({"id":request.id,"result":{"success":result.is_ok(),"contentItems":[{"type":"inputText","text":text}]}}))?;
+            }
+        }
         let requests = store.inspect(id, |s| s.artifact_requests.clone())?;
         if !requests.is_empty() {
             store.update(id, |s| s.artifact_requests.clear())?;
@@ -2060,6 +2129,40 @@ fn validate_response(pending: &Pending, response: &Value) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn completing_an_agent_turn_leaves_user_shell_commands_running() {
+        let mut session = Session::new(
+            "one".into(),
+            Job::Coding(super::super::Launch {
+                repository: ".".into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.turn_id = Some("turn".into());
+        session.entries.push(Entry {
+            id: "difu-shell-test".into(),
+            kind: "commandExecution".into(),
+            text: "sleep 30".into(),
+            data: json!({"difuUserShell":true,"status":"inProgress"}).into(),
+            started_at: Some(1),
+            ..Entry::default()
+        });
+        apply_event(
+            &mut session,
+            &json!({"method":"turn/completed","params":{"turn":{"id":"turn","status":"completed"}}}),
+        );
+        assert!(
+            session
+                .entries
+                .iter()
+                .all(|entry| entry.finished_at.is_none())
+        );
+        assert!(super::super::shells::context(&session).1.is_none());
+    }
+    #[test]
     fn new_sessions_keep_rules_and_tools_while_old_sessions_keep_their_policy() -> Result<()> {
         let mut session = Session::new(
             "policy".into(),
@@ -2075,6 +2178,7 @@ mod tests {
         session.repository_rules = "Use the repository service layer.".into();
         session.artifact_tools = true;
         session.pr_tools = true;
+        session.shell_tools = true;
         session.registration_tools = true;
         session.question_tools = true;
         session.peer_tools = true;
@@ -2093,6 +2197,7 @@ mod tests {
             for tool in [
                 "difu_present_artifact",
                 "difu_attach_pr",
+                "difu_shell",
                 "difu_remove_questions",
                 "difu_register_worktree",
                 "difu_delete_session",
@@ -2109,10 +2214,13 @@ mod tests {
 
         let mut resumed = restored.clone();
         resumed.pr_tools = false;
+        resumed.shell_tools = false;
         resumed.thread_id = Some("existing-codex-thread".into());
         let prompt = instructions(&resumed);
         assert!(prompt.contains("difu attach-pr <URL> --session 'policy'"));
         assert!(!prompt.contains("difu_attach_pr"));
+        assert!(!prompt.contains("Use difu_shell"));
+        assert!(prompt.contains("difu shell --session 'policy'"));
         assert!(super::super::claude::instructions(&resumed).contains("difu_attach_pr"));
 
         let mut old = saved;

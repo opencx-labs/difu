@@ -6,6 +6,7 @@ pub(super) enum View {
     PullRequest {
         app: Box<crate::app::App>,
     },
+    Terminal(Box<terminals::Terminal>),
     Shell {
         id: String,
         command: String,
@@ -253,6 +254,7 @@ impl Ui {
             browser.focus(visible && self.panels.focused && self.modal.is_none());
             browser.tick();
         }
+        self.tick_terminal(visible);
         if visible
             && self.panels.error.is_none()
             && !self.panels.loading
@@ -264,7 +266,7 @@ impl Ui {
             && self
                 .sessions
                 .get(&id)
-                .is_some_and(|s| matches!(s.job, Job::Coding(_)) && s.thread_id.is_some())
+                .is_some_and(|s| matches!(s.job, Job::Coding(_)))
         {
             self.panels.loading = true;
             self.task(Task::Shells(id.clone()), Request::Shells { id }, false);
@@ -349,18 +351,28 @@ impl Ui {
             let Some(shell) = self.panels.shells.get(id).and_then(|s| s.get(index)) else {
                 return;
             };
-            self.panels.view = Some(View::Shell {
-                id: shell
-                    .get("itemId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .into(),
-                command: shell
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Shell")
-                    .into(),
-            });
+            if shell.get("local").and_then(Value::as_bool) == Some(true) {
+                self.panels.view = Some(View::Terminal(Box::new(terminals::Terminal::new(
+                    shell
+                        .get("itemId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .into(),
+                ))));
+            } else {
+                self.panels.view = Some(View::Shell {
+                    id: shell
+                        .get("itemId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .into(),
+                    command: shell
+                        .get("command")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Shell")
+                        .into(),
+                });
+            }
         }
         self.panels.session = self.selected.clone();
         self.panels.hidden = false;
@@ -565,6 +577,17 @@ impl Ui {
         if !self.panels.focused || !self.panels.visible() {
             return false;
         }
+        if self.terminal_input() {
+            if key.code == KeyCode::Esc {
+                self.release_terminal_focus();
+                self.panels.hidden = true;
+                self.panels.focused = false;
+                self.focus = Focus::Composer;
+            } else {
+                self.terminal_key(key);
+            }
+            return true;
+        }
         if self.panels.right
             && matches!(
                 shortcut,
@@ -651,6 +674,16 @@ impl Ui {
         }) = &mut self.panels.view
         {
             browser.mouse(event);
+        } else if matches!(self.panels.view, Some(View::Terminal(_))) {
+            match event.kind {
+                MouseEventKind::ScrollDown => {
+                    self.panels.scroll = self.panels.scroll.saturating_sub(3)
+                }
+                MouseEventKind::ScrollUp => {
+                    self.panels.scroll = self.panels.scroll.saturating_add(3).min(2000)
+                }
+                _ => {}
+            }
         } else {
             match event.kind {
                 MouseEventKind::ScrollDown => {
@@ -729,6 +762,16 @@ impl Ui {
             frame.render_widget(Paragraph::new(empty).wrap(Wrap { trim: false }), area);
             return;
         }
+        let area = if !artifacts && area.height > 1 {
+            frame.render_widget(
+                Paragraph::new("Enter Open · x Terminate · Esc Back")
+                    .style(Style::default().fg(DIM)),
+                Rect::new(area.x, area.bottom() - 1, area.width, 1),
+            );
+            Rect::new(area.x, area.y, area.width, area.height - 1)
+        } else {
+            area
+        };
         let offset = selected.saturating_sub(area.height.saturating_sub(1) as usize);
         for (index, item) in items
             .iter()
@@ -819,6 +862,9 @@ impl Ui {
         let count = self.resources(artifacts).len();
         match shortcut {
             _ if key.code == KeyCode::Esc => self.modal = None,
+            _ if !artifacts && key.code == KeyCode::Char('x') && key.modifiers.is_empty() => {
+                self.close_shell(selected)
+            }
             Some(NAVIGATION_ACTIVATE) => self.select_resource(artifacts, selected),
             Some(NAVIGATION_UP | NAVIGATION_DOWN) => {
                 self.modal = Some(Modal::Resources {
@@ -838,6 +884,7 @@ impl Ui {
         let title = match &self.panels.view {
             Some(View::PullRequest { .. }) => "Pull request",
             Some(View::Shell { .. }) => "Shell output",
+            Some(View::Terminal(_)) => "Shared shell",
             Some(View::Artifact { title, .. }) => title,
             _ => return,
         };
@@ -891,6 +938,9 @@ impl Ui {
             self.panels.rect = inner;
         }
         match &mut self.panels.view {
+            Some(View::Terminal(terminal)) => {
+                terminal.draw(frame, inner, self.panels.focused && self.modal.is_none())
+            }
             Some(View::PullRequest { app }) => {
                 app.render_area = Some(inner);
                 crate::ui::draw(frame, app);

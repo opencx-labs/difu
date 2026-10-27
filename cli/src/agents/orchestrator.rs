@@ -36,6 +36,7 @@ pub(super) fn tools(session: &Session) -> Vec<Value> {
         vec![
             super::artifacts::tool(),
             super::pr_attachments::tool(),
+            super::shells::tool(),
             super::registration::tool(),
             super::management::tool(),
             super::questions::tool(),
