@@ -60,8 +60,8 @@ impl Card {
         }
         text
     }
-    /// The most urgent state first, and its colour.
-    pub(super) fn status(&self) -> (String, ratatui::style::Color) {
+    /// The most urgent state first, and its colour; `empty` when none.
+    pub(super) fn status(&self, empty: String) -> (String, ratatui::style::Color) {
         let count =
             |test: fn(Status) -> bool| self.sessions.iter().filter(|s| test(s.status)).count();
         let waiting = count(|s| s == Status::Waiting);
@@ -97,7 +97,7 @@ impl Card {
             GREEN
         };
         if parts.is_empty() {
-            ("Ask the orchestrator to file sessions here".into(), DIM)
+            (empty, DIM)
         } else {
             (parts.join(" · "), color)
         }
@@ -224,9 +224,10 @@ impl Ui {
             self.set_folders(config.session_folders);
         }
     }
-    pub(super) fn set_folders(&mut self, folders: Vec<Folder>) {
+    /// Saves `folders` in the view and drops a view or cursor that vanished.
+    fn store_folders(&mut self, folders: Vec<Folder>) -> bool {
         if folders == self.session_folders {
-            return;
+            return false;
         }
         self.session_folders = folders;
         if let Some(view) = &self.folder_view
@@ -238,6 +239,12 @@ impl Ui {
             && !self.session_folders.iter().any(|f| &f.id == cursor)
         {
             self.folder_cursor = None;
+        }
+        true
+    }
+    pub(super) fn set_folders(&mut self, folders: Vec<Folder>) {
+        if !self.store_folders(folders) {
+            return;
         }
         // Follow the selected session when it was filed elsewhere.
         if self.orchestrator_list {
@@ -305,7 +312,7 @@ impl Ui {
             false,
         );
         self.hits.push((rect, Action::OpenFolder(card.id.clone())));
-        let (status, color) = card.status();
+        let (status, color) = card.status(self.empty_folder_hint());
         let mut lines = vec![
             Line::from(Span::styled(card.detail(), Style::default().fg(TEXT))),
             Line::from(Span::styled(status, Style::default().fg(color))),
@@ -338,23 +345,325 @@ impl Ui {
         let hint =
             |action| bindings.primary_hint_in(action, crate::shortcuts::contexts::AGENT_LIST);
         use crate::shortcuts::ids::{
-            NAVIGATION_ACTIVATE, SESSION_REORDER_DOWN, SESSION_REORDER_UP,
+            FOLDER_DELETE, FOLDER_MOVE, FOLDER_RENAME, NAVIGATION_ACTIVATE, SESSION_REORDER_DOWN,
+            SESSION_REORDER_UP,
         };
         lines.push(Line::from(Span::styled(
             format!(
-                "{} · Open folder    {} / {} · Move folder",
+                "{} · Open    {} · Rename    {} · Delete    {} / {} · Move",
                 hint(NAVIGATION_ACTIVATE),
+                hint(FOLDER_RENAME),
+                hint(FOLDER_DELETE),
                 hint(SESSION_REORDER_UP),
                 hint(SESSION_REORDER_DOWN)
             ),
             Style::default().fg(DIM),
         )));
         lines.push(Line::from(Span::styled(
-            "Ask the orchestrator to create, rename or fill folders.",
+            format!(
+                "{} on any session files it in a folder. Agents can arrange folders too.",
+                hint(FOLDER_MOVE)
+            ),
             Style::default().fg(DIM),
         )));
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
         true
+    }
+}
+
+/// One row of the Move to folder picker.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Choice {
+    New(String),
+    Folder(String),
+    Unfile,
+}
+
+/// Folder card actions in the `/` menu and Cmd+K, by index.
+const FOLDER_MENU: [&str; 5] = [
+    "Open folder",
+    "Rename folder",
+    "Delete folder",
+    "Move folder earlier",
+    "Move folder later",
+];
+
+impl Ui {
+    fn folder(&self, id: &str) -> Option<&Folder> {
+        self.session_folders.iter().find(|f| f.id == id)
+    }
+    /// Sessions in `folder` that still exist, archived ones included.
+    fn members(&self, folder: &Folder) -> usize {
+        folder
+            .sessions
+            .iter()
+            .filter(|id| self.summaries.iter().any(|s| &&s.id == id))
+            .count()
+    }
+    /// Only coding sessions are filed; the orchestrator and its chats stay put.
+    fn fileable(&self) -> Option<String> {
+        let id = self.selected.as_ref()?;
+        let summary = self.summaries.iter().find(|s| &s.id == id)?;
+        (summary.kind == "Coding"
+            && id != super::super::orchestrator::ID
+            && self.folder_cursor.is_none()
+            && !self.orchestrator_list)
+            .then(|| id.clone())
+    }
+    pub(super) fn open_folder_picker(&mut self) {
+        if self.fileable().is_none() {
+            self.notice = Some((
+                "Select a coding session to file it in a folder".into(),
+                false,
+            ));
+            return;
+        }
+        self.modal = Some(Modal::FolderPicker {
+            query: Editor::default(),
+            selected: 0,
+        });
+    }
+    /// The picker rows for `query`: matching folders, then a new folder when
+    /// that name is free, so typing part of a name and Enter picks the match.
+    pub(super) fn folder_choices(&self, query: &str) -> Vec<(Choice, String)> {
+        let name = query.split_whitespace().collect::<Vec<_>>().join(" ");
+        let needle = name.to_lowercase();
+        let home = self
+            .selected
+            .as_deref()
+            .and_then(|id| folders::home(&self.session_folders, id))
+            .map(|f| f.id.clone());
+        let mut choices = Vec::new();
+        for folder in &self.session_folders {
+            if !folder.name.to_lowercase().contains(&needle) {
+                continue;
+            }
+            let count = self.members(folder);
+            let mut label = format!(
+                "📁 {} · {count} session{}",
+                folder.name,
+                if count == 1 { "" } else { "s" }
+            );
+            if home.as_deref() == Some(folder.id.as_str()) {
+                label.push_str(" · here now");
+            }
+            choices.push((Choice::Folder(folder.id.clone()), label));
+        }
+        if !name.is_empty()
+            && !self
+                .session_folders
+                .iter()
+                .any(|f| f.name.to_lowercase() == needle)
+        {
+            choices.push((Choice::New(name.clone()), format!("+ New folder “{name}”")));
+        }
+        if name.is_empty() && home.is_some() {
+            choices.push((Choice::Unfile, "← Main list · no folder".into()));
+        }
+        choices
+    }
+    /// Applies picker row `index` to the selected session.
+    pub(super) fn choose_folder(&mut self, index: usize) {
+        let Some(Modal::FolderPicker { query, .. }) = &self.modal else {
+            return;
+        };
+        let Some((choice, _)) = self.folder_choices(&query.text()).into_iter().nth(index) else {
+            return;
+        };
+        let Some(id) = self.fileable() else {
+            self.modal = None;
+            return;
+        };
+        let position = self.position();
+        let ids = [id];
+        let result = self.storage.try_update_config(|config| {
+            let target = match &choice {
+                Choice::New(name) => Some(folders::create(&mut config.session_folders, name)?),
+                Choice::Folder(folder) => Some(folder.clone()),
+                Choice::Unfile => None,
+            };
+            folders::file(&mut config.session_folders, &ids, target.as_deref())
+        });
+        match result {
+            Ok(config) => {
+                self.modal = None;
+                self.moved(config.session_folders, position);
+            }
+            // Keep the picker open so a taken or overlong name can be fixed.
+            Err(error) => self.notice = Some((format!("{error:#}"), true)),
+        }
+    }
+    /// Status line of an empty folder card.
+    fn empty_folder_hint(&self) -> String {
+        format!(
+            "Press {} on a session to add it",
+            crate::shortcuts::Bindings::new(&self.shortcut_config).primary_hint_in(
+                crate::shortcuts::ids::FOLDER_MOVE,
+                crate::shortcuts::contexts::AGENT_LIST
+            )
+        )
+    }
+    /// The highlighted row's index among the selectable rows.
+    fn position(&self) -> Option<usize> {
+        let cursor = self.cursor()?;
+        self.selectable_rows()
+            .iter()
+            .position(|row| row.key() == cursor)
+    }
+    /// After a move from the keyboard the cursor stays at the same list
+    /// position, so several sessions can be filed in a row. An open chat is
+    /// followed into its new folder instead.
+    fn moved(&mut self, folders: Vec<Folder>, position: Option<usize>) {
+        if self.drilled {
+            self.set_folders(folders);
+            return;
+        }
+        self.store_folders(folders);
+        let rows = self.selectable_rows();
+        match position.and_then(|p| rows.get(p).or(rows.last())) {
+            Some(Row::Folder(card)) => self.focus_folder(card.id.clone()),
+            Some(Row::Session(session)) => self.select(session.id.clone()),
+            None => self.ensure_selected(),
+        }
+    }
+    /// The folder card under the cursor, for rename and delete.
+    fn card(&self) -> Option<&Folder> {
+        self.folder(self.folder_cursor.as_deref()?)
+    }
+    pub(super) fn open_rename_folder(&mut self) {
+        let Some(folder) = self.card() else {
+            return;
+        };
+        let mut name = Editor::default();
+        name.insert(&folder.name);
+        self.modal = Some(Modal::RenameFolder {
+            id: folder.id.clone(),
+            name,
+        });
+    }
+    pub(super) fn rename_folder(&mut self, id: &str, name: &str) {
+        let result = self
+            .storage
+            .try_update_config(|config| folders::rename(&mut config.session_folders, id, name));
+        match result {
+            Ok(config) => {
+                self.modal = None;
+                self.set_folders(config.session_folders);
+            }
+            Err(error) => self.notice = Some((format!("{error:#}"), true)),
+        }
+    }
+    pub(super) fn open_delete_folder(&mut self) {
+        if let Some(folder) = self.card() {
+            self.modal = Some(Modal::DeleteFolder(folder.id.clone()));
+        }
+    }
+    /// Deletes the folder only; its sessions return to the main list.
+    pub(super) fn delete_folder(&mut self, id: &str) {
+        let position = self.position();
+        let result = self
+            .storage
+            .try_update_config(|config| folders::remove(&mut config.session_folders, id).map(drop));
+        self.modal = None;
+        match result {
+            Ok(config) => self.moved(config.session_folders, position),
+            Err(error) => self.notice = Some((format!("{error:#}"), true)),
+        }
+    }
+    pub(super) fn delete_folder_prompt(&self, id: &str, confirm: &str) -> String {
+        let Some(folder) = self.folder(id) else {
+            return "This folder no longer exists.\n\nEsc closes".into();
+        };
+        let count = self.members(folder);
+        let sessions = match count {
+            0 => "It is empty.".to_owned(),
+            1 => "Its session moves back to the main list.".to_owned(),
+            n => format!("Its {n} sessions move back to the main list."),
+        };
+        format!(
+            "Delete the folder “{}”? {sessions} No session, chat or worktree is deleted.\n\n{confirm} confirms · Esc cancels",
+            folder.name
+        )
+    }
+    /// The `/` menu while a folder card is highlighted.
+    pub(super) fn folder_menu_entries(&self) -> Vec<String> {
+        use crate::shortcuts::{Bindings, contexts::AGENT_LIST, ids::*};
+        let bindings = Bindings::new(&self.shortcut_config);
+        let hints = [
+            NAVIGATION_ACTIVATE,
+            FOLDER_RENAME,
+            FOLDER_DELETE,
+            SESSION_REORDER_UP,
+            SESSION_REORDER_DOWN,
+        ];
+        FOLDER_MENU
+            .iter()
+            .zip(hints)
+            .map(|(label, id)| format!("{label} · {}", bindings.primary_hint_in(id, AGENT_LIST)))
+            .collect()
+    }
+    pub(super) fn folder_menu_action(&mut self, index: usize) {
+        let Some(id) = self.folder_cursor.clone() else {
+            return;
+        };
+        self.modal = None;
+        match index {
+            0 => self.open_folder(id),
+            1 => self.open_rename_folder(),
+            2 => self.open_delete_folder(),
+            3 => self.reorder_folder(false),
+            4 => self.reorder_folder(true),
+            _ => {}
+        }
+    }
+    /// What the `/` menu acts on: the highlighted folder or session.
+    pub(crate) fn menu_subject(&self) -> Option<String> {
+        if let Some(folder) = self.card() {
+            return Some(format!("Folder · {}", folder.name));
+        }
+        let id = self.selected.as_ref()?;
+        self.summaries
+            .iter()
+            .find(|s| &s.id == id)
+            .map(|s| s.title.clone())
+    }
+    pub(super) fn draw_folder_picker(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        selected: usize,
+        choices: &[(Choice, String)],
+        deferred: &mut Vec<(Rect, String, Action, bool)>,
+    ) {
+        let list = Rect::new(
+            area.x,
+            area.y.saturating_add(3),
+            area.width,
+            area.height.saturating_sub(3),
+        );
+        if choices.is_empty() {
+            frame.render_widget(
+                Paragraph::new(if self.session_folders.is_empty() {
+                    "Type a name to create your first folder"
+                } else {
+                    "No folder matches"
+                })
+                .style(Style::default().fg(DIM)),
+                list,
+            );
+        }
+        for (offset, (_, label)) in choices.iter().enumerate().take(list.height as usize) {
+            deferred.push((
+                Rect::new(list.x, list.y + offset as u16, list.width, 1),
+                format!(
+                    "{} {}",
+                    if offset == selected { ">" } else { " " },
+                    crate::model::clean(label)
+                ),
+                Action::FolderChoice(offset),
+                offset == selected,
+            ));
+        }
     }
 }
 
@@ -369,7 +678,7 @@ impl Ui {
         now: Instant,
     ) {
         let selected = self.folder_cursor.as_deref() == Some(card.id.as_str());
-        let (status, color) = card.status();
+        let (status, color) = card.status(self.empty_folder_hint());
         let title_width = usize::from(row.width).saturating_sub(5);
         let mut lines = vec![
             Line::from(Span::styled(
@@ -616,6 +925,168 @@ mod tests {
         assert!(ui.drilled);
         ui.open_session("one".into());
         assert!(ui.folder_view.is_none());
+        Ok(())
+    }
+
+    fn type_text(ui: &mut Ui, text: &str) {
+        for c in text.chars() {
+            press(ui, KeyCode::Char(c));
+        }
+    }
+    fn saved_home(ui: &Ui, id: &str) -> Result<Option<String>> {
+        let saved = ui.storage.load_config()?.session_folders;
+        Ok(crate::agents::folders::home(&saved, id).map(|f| f.id.clone()))
+    }
+
+    #[test]
+    fn f_files_sessions_into_new_and_existing_folders() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = fixture(dir.path())?;
+        ui.select("one".into());
+        press(&mut ui, KeyCode::Char('f'));
+        assert!(matches!(ui.modal, Some(Modal::FolderPicker { .. })));
+        type_text(&mut ui, "Back log");
+        let shown = screen(&mut ui)?;
+        assert!(shown.contains("+ New folder “Back log”"), "{shown}");
+        press(&mut ui, KeyCode::Enter);
+        assert!(ui.modal.is_none());
+        assert_eq!(saved_home(&ui, "one")?.as_deref(), Some("back-log"));
+        // The cursor keeps its place: the new folder card took that row.
+        assert_eq!(
+            keys(&ui),
+            ["orchestrator", "folder:widget", "folder:back-log"]
+        );
+        assert_eq!(ui.folder_cursor.as_deref(), Some("back-log"));
+
+        // Part of a name picks the existing folder before offering a new one.
+        ui.open_folder("widget".into());
+        ui.select("two".into());
+        press(&mut ui, KeyCode::Char('f'));
+        type_text(&mut ui, "back");
+        let Some(Modal::FolderPicker { query, .. }) = &ui.modal else {
+            anyhow::bail!("picker closed");
+        };
+        let choices: Vec<Choice> = ui
+            .folder_choices(&query.text())
+            .into_iter()
+            .map(|(choice, _)| choice)
+            .collect();
+        assert_eq!(
+            choices,
+            [
+                Choice::Folder("back-log".into()),
+                Choice::New("back".into())
+            ]
+        );
+        press(&mut ui, KeyCode::Enter);
+        assert_eq!(saved_home(&ui, "two")?.as_deref(), Some("back-log"));
+        // Still inside Widget, on the session that moved up.
+        assert_eq!(ui.folder_view.as_deref(), Some("widget"));
+        assert_eq!(ui.selected.as_deref(), Some("three"));
+
+        // The last row returns a filed session to the main list.
+        press(&mut ui, KeyCode::Char('f'));
+        let shown = screen(&mut ui)?;
+        assert!(shown.contains("Widget · 1 session · here now"), "{shown}");
+        press(&mut ui, KeyCode::Down);
+        press(&mut ui, KeyCode::Down);
+        press(&mut ui, KeyCode::Enter);
+        assert_eq!(saved_home(&ui, "three")?, None);
+        assert!(screen(&mut ui)?.contains("This folder is empty"));
+        Ok(())
+    }
+
+    #[test]
+    fn folder_cards_rename_and_delete_from_the_keyboard() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = fixture(dir.path())?;
+        ui.storage.try_update_config(|config| {
+            crate::agents::folders::create(&mut config.session_folders, "Later").map(drop)
+        })?;
+        ui.reload_folders();
+        // Rename and delete only act on folder cards.
+        ui.select("one".into());
+        press(&mut ui, KeyCode::Char('e'));
+        press(&mut ui, KeyCode::Char('x'));
+        assert!(ui.modal.is_none());
+
+        ui.focus_folder("widget".into());
+        press(&mut ui, KeyCode::Char('e'));
+        assert!(matches!(ui.modal, Some(Modal::RenameFolder { .. })));
+        for _ in 0.."Widget".len() {
+            press(&mut ui, KeyCode::Backspace);
+        }
+        type_text(&mut ui, "later");
+        press(&mut ui, KeyCode::Enter);
+        // A taken name keeps the dialog open with the reason.
+        assert!(matches!(ui.modal, Some(Modal::RenameFolder { .. })));
+        assert!(
+            ui.notice
+                .as_ref()
+                .is_some_and(|(text, error)| *error && text.contains("already exists"))
+        );
+        for _ in 0.."later".len() {
+            press(&mut ui, KeyCode::Backspace);
+        }
+        type_text(&mut ui, "Widget UI");
+        press(&mut ui, KeyCode::Enter);
+        assert!(ui.modal.is_none());
+        let saved = ui.storage.load_config()?.session_folders;
+        assert_eq!(
+            saved.first().map(|f| (f.id.as_str(), f.name.as_str())),
+            Some(("widget", "Widget UI"))
+        );
+
+        press(&mut ui, KeyCode::Char('x'));
+        let shown = screen(&mut ui)?;
+        assert!(
+            shown.contains("Its 2 sessions move back to the main list"),
+            "{shown}"
+        );
+        press(&mut ui, KeyCode::Enter);
+        assert!(ui.modal.is_none());
+        let saved = ui.storage.load_config()?.session_folders;
+        assert_eq!(saved.len(), 1);
+        assert!(ui.filtered().iter().any(|s| s.id == "two"));
+        // The next card takes the deleted card's place under the cursor.
+        assert_eq!(ui.folder_cursor.as_deref(), Some("later"));
+        Ok(())
+    }
+
+    #[test]
+    fn the_menu_and_palette_offer_folder_actions() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = fixture(dir.path())?;
+        ui.focus_folder("widget".into());
+        let entries = ui.menu_entries();
+        assert_eq!(
+            entries.first().map(String::as_str),
+            Some("Open folder · Enter")
+        );
+        assert_eq!(ui.menu_subject().as_deref(), Some("Folder · Widget"));
+        let rename = entries
+            .iter()
+            .position(|label| label.starts_with("Rename folder"))
+            .context("rename entry")?;
+        ui.menu_action(rename);
+        assert!(matches!(ui.modal, Some(Modal::RenameFolder { .. })));
+        ui.modal = None;
+
+        ui.select("one".into());
+        let entries = ui.menu_entries();
+        let file = entries
+            .iter()
+            .position(|label| label == "Move to folder · f")
+            .context("move entry")?;
+        ui.menu_action(file);
+        assert!(matches!(ui.modal, Some(Modal::FolderPicker { .. })));
+        ui.modal = None;
+
+        // The orchestrator stays out of folders.
+        ui.select(super::super::super::orchestrator::ID.into());
+        press(&mut ui, KeyCode::Char('f'));
+        assert!(ui.modal.is_none());
+        assert!(ui.notice.is_some());
         Ok(())
     }
 

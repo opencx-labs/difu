@@ -492,10 +492,7 @@ impl Shell {
                 title: label.clone(),
                 detail: self
                     .agents
-                    .selected
-                    .as_ref()
-                    .and_then(|id| self.agents.summaries.iter().find(|s| &s.id == id))
-                    .map(|session| session.title.clone())
+                    .menu_subject()
                     .unwrap_or_else(|| "Select an agent session first".into()),
                 search: format!("{label} session controls actions"),
                 category: "Agents",

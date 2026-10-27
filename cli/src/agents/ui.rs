@@ -179,6 +179,7 @@ enum Action {
     OrchestratorBack,
     OpenFolder(String),
     FolderBack,
+    FolderChoice(usize),
     Open,
     Focus(Focus),
     Resources(bool),
@@ -296,6 +297,16 @@ pub enum Modal {
         selected: usize,
     },
     Rename(Editor),
+    /// Files the selected session; typing filters folders or names a new one.
+    FolderPicker {
+        query: Editor,
+        selected: usize,
+    },
+    RenameFolder {
+        id: String,
+        name: Editor,
+    },
+    DeleteFolder(String),
     Model {
         model: Editor,
         effort: Editor,
@@ -1307,6 +1318,9 @@ impl Ui {
         );
     }
     pub(crate) fn menu_entries(&self) -> Vec<String> {
+        if self.folder_cursor.is_some() {
+            return self.folder_menu_entries();
+        }
         let archived = self
             .sessions
             .get(self.selected.as_deref().unwrap_or_default())
@@ -1344,6 +1358,7 @@ impl Ui {
             },
             "Repository rules",
             "Permissions and mode · Shift+Tab",
+            "Move to folder · F",
         ];
         if self.plan_available() {
             entries.push("Review completed plan");
@@ -1366,6 +1381,7 @@ impl Ui {
                     "Permissions and mode · Shift+Tab" => {
                         Some(("Permissions and mode", COMPOSER_PERMISSION_MODE))
                     }
+                    "Move to folder · F" => Some(("Move to folder", FOLDER_MOVE)),
                     _ => None,
                 };
                 replacement.map_or_else(
@@ -1376,8 +1392,16 @@ impl Ui {
             .collect()
     }
     pub(crate) fn menu_action(&mut self, index: usize) {
+        if self.folder_cursor.is_some() {
+            self.folder_menu_action(index);
+            return;
+        }
         match index {
-            20 => self.open_plan_prompt(),
+            21 => self.open_plan_prompt(),
+            20 => {
+                self.modal = None;
+                self.open_folder_picker();
+            }
             19 => self.open_permissions(),
             18 => self.open_rules(None),
             17 => {
@@ -1659,6 +1683,8 @@ impl Ui {
             Some(Modal::Plan(state)) => state.editor(),
             Some(
                 Modal::Rename(editor)
+                | Modal::FolderPicker { query: editor, .. }
+                | Modal::RenameFolder { name: editor, .. }
                 | Modal::QueuedEdit {
                     editor, focus: 0, ..
                 },
@@ -1779,6 +1805,14 @@ impl Ui {
         {
             self.reorder_session(shortcut == Some(SESSION_REORDER_DOWN));
             return;
+        }
+        if self.focus == Focus::List {
+            match shortcut {
+                Some(FOLDER_MOVE) => return self.open_folder_picker(),
+                Some(FOLDER_RENAME) => return self.open_rename_folder(),
+                Some(FOLDER_DELETE) => return self.open_delete_folder(),
+                _ => {}
+            }
         }
         if self.drilled
             && matches!(shortcut, Some(CONVERSATION_PREVIOUS | CONVERSATION_NEXT))
@@ -2379,7 +2413,12 @@ impl Ui {
             Some(Modal::Repository(editor) | Modal::ChangeRepository(editor)) => {
                 editor.insert(text)
             }
-            Some(Modal::Rename(e) | Modal::QueuedEdit { editor: e, .. }) => e.insert(text),
+            Some(
+                Modal::Rename(e)
+                | Modal::FolderPicker { query: e, .. }
+                | Modal::RenameFolder { name: e, .. }
+                | Modal::QueuedEdit { editor: e, .. },
+            ) => e.insert(text),
             Some(Modal::Tweaks { fields, field }) => {
                 if let Some(editor) = fields.get_mut(*field) {
                     editor.insert(text);
@@ -2506,6 +2545,10 @@ impl Ui {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let shortcut = self.shortcut(key);
         let menu = self.menu_entries();
+        let choices = match &self.modal {
+            Some(Modal::FolderPicker { query, .. }) => self.folder_choices(&query.text()).len(),
+            _ => 0,
+        };
         let mut action = None;
         match &mut self.modal {
             Some(Modal::Transcript {
@@ -2560,6 +2603,39 @@ impl Ui {
                 } else {
                     editor.key(key);
                 }
+            }
+            Some(Modal::FolderPicker { query, selected }) => match shortcut {
+                Some(crate::shortcuts::ids::NAVIGATION_UP) => {
+                    *selected = selected.saturating_sub(1)
+                }
+                Some(crate::shortcuts::ids::NAVIGATION_DOWN) => {
+                    *selected = (*selected + 1).min(choices.saturating_sub(1))
+                }
+                Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) => {
+                    action = Some(Action::FolderChoice(*selected))
+                }
+                _ if key.code == KeyCode::Char('u') && ctrl => {
+                    *query = Editor::default();
+                    *selected = 0;
+                }
+                _ => {
+                    query.key(key);
+                    *selected = 0;
+                }
+            },
+            Some(Modal::RenameFolder { id, name }) => {
+                if shortcut == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) {
+                    let (id, name) = (id.clone(), name.text());
+                    self.rename_folder(&id, &name);
+                } else {
+                    name.key(key);
+                }
+            }
+            Some(Modal::DeleteFolder(id))
+                if shortcut == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) =>
+            {
+                let id = id.clone();
+                self.delete_folder(&id);
             }
             Some(Modal::Delete) if shortcut == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) => {
                 if let Some(id) = self.selected.clone()
@@ -2683,6 +2759,7 @@ impl Ui {
             Action::OrchestratorBack => self.close_orchestrator_list(),
             Action::OpenFolder(id) => self.open_folder(id),
             Action::FolderBack => self.close_folder(),
+            Action::FolderChoice(index) => self.choose_folder(index),
             Action::Select(id) => {
                 if id == super::orchestrator::ID && !self.orchestrator_list {
                     self.open_orchestrator_list();
@@ -3570,7 +3647,7 @@ impl Ui {
                 Paragraph::new(if self.listing {
                     "Connecting…"
                 } else if self.folder_view.is_some() {
-                    "This folder is empty\n\nn · New agent here\nAsk the orchestrator to move sessions in"
+                    "This folder is empty\n\nn · New agent here\nf on a session in the main list · file it here"
                 } else {
                     "No matching sessions\n\nn · New agent"
                 })
@@ -4081,6 +4158,9 @@ impl Ui {
             Some(Modal::Queue { .. }) => "Queued outgoing messages",
             Some(Modal::QueuedEdit { .. }) => "Edit queued message",
             Some(Modal::Rename(_)) => "Rename session",
+            Some(Modal::FolderPicker { .. }) => "Move to folder",
+            Some(Modal::RenameFolder { .. }) => "Rename folder",
+            Some(Modal::DeleteFolder(_)) => "Delete folder",
             Some(Modal::Model { .. }) => "Session model",
             Some(Modal::ModelPicker(_)) => "Select model",
             Some(Modal::Approval { .. }) => "Agent needs your input",
@@ -4286,6 +4366,10 @@ impl Ui {
                 self.shortcut_context()
             )
         );
+        let picker = match &self.modal {
+            Some(Modal::FolderPicker { query, .. }) => self.folder_choices(&query.text()),
+            _ => Vec::new(),
+        };
         match &mut self.modal {
             Some(
                 Modal::Transcript { .. }
@@ -4358,6 +4442,32 @@ impl Ui {
                     value,
                     true,
                 );
+            }
+            Some(Modal::FolderPicker { query, selected }) => {
+                editor(
+                    frame,
+                    Rect::new(area.x, area.y, area.width, 3.min(area.height)),
+                    &format!("Type to filter or name a new folder · {activate_hint} move"),
+                    query,
+                    true,
+                );
+                *selected = (*selected).min(picker.len().saturating_sub(1));
+                let selected = *selected;
+                self.draw_folder_picker(frame, area, selected, &picker, &mut deferred);
+            }
+            Some(Modal::RenameFolder { name, .. }) => {
+                editor(
+                    frame,
+                    Rect::new(area.x, area.y, area.width, 3.min(area.height)),
+                    &format!("Folder name · {activate_hint} save"),
+                    name,
+                    true,
+                );
+            }
+            Some(Modal::DeleteFolder(id)) => {
+                let id = id.clone();
+                let prompt = self.delete_folder_prompt(&id, &activate_hint);
+                frame.render_widget(Paragraph::new(prompt).wrap(Wrap { trim: false }), area);
             }
             Some(Modal::Delete) => {
                 frame.render_widget(Paragraph::new(format!("Stop this agent and permanently delete its difu chat, saved questions, queue, and attachments? Its unlocked difu-owned worktree will also be removed, including all uncommitted, untracked, and ignored files. Existing directories, named branches, commits, and native provider history are not deleted.\n\n{activate_hint} confirms · Esc cancels")).wrap(Wrap { trim:false }), area);
@@ -4631,6 +4741,10 @@ fn agent_help(query: &str, config: &Config) -> Vec<(String, &'static str)> {
             "Reorder within the pinned or unpinned group, or move a folder (saved)",
         ),
         (
+            "f / e / x in sessions",
+            "Move the session to a folder (type a new name to create one); rename or delete the highlighted folder",
+        ),
+        (
             "Tab / Shift+Tab",
             "Cycle visible panes; composer permission mode has its own shortcut",
         ),
@@ -4735,6 +4849,7 @@ fn agent_help(query: &str, config: &Config) -> Vec<(String, &'static str)> {
             "Enter / Esc" => hints(&[NAVIGATION_ACTIVATE, CONVERSATION_INTERRUPT]),
             "Cmd+K" => hints(&[PALETTE_OPEN]),
             "Ctrl+↑ / ↓ in sessions" => hints(&[SESSION_REORDER_UP, SESSION_REORDER_DOWN]),
+            "f / e / x in sessions" => hints(&[FOLDER_MOVE, FOLDER_RENAME, FOLDER_DELETE]),
             "Tab / Shift+Tab" => hints(&[NAVIGATION_NEXT_FOCUS, NAVIGATION_PREVIOUS_FOCUS]),
             "Drag · Ctrl+C / Cmd+C" => format!("Drag · Ctrl+C / {}", hints(&[SELECTION_COPY])),
             "Ctrl+V / Cmd+V" => hints(&[COMPOSER_ATTACH]),

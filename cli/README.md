@@ -134,15 +134,24 @@ orchestrator showing how many sessions it holds and what they are doing; select
 it to preview its sessions, then **Enter** or click to open it. Inside, the list
 shows only that folder's sessions under **← All sessions · Esc**. Sessions you
 start inside a folder are filed there, and opening a filed session from **Cmd+K**
-opens its folder. **Ctrl+↑/↓** on a folder card moves it among the folders.
+opens its folder.
 
-Ask any agent to arrange them, for example "put this session in a Widget
-folder" or "rename Backlog to Later"; the orchestrator can do the same for any
-session. Agents can create, rename, delete and reorder folders and move sessions
-in or out; deleting a folder returns its sessions to the main list and never
-deletes a session. The list picks up their changes within a second. Codex chats
+| Key | In the sessions list |
+| --- | --- |
+| **f** | Move the selected session to a folder. Type to filter, or type a new name to create one; the last row returns a filed session to the main list. |
+| **e** | Rename the highlighted folder. |
+| **x** | Delete the highlighted folder. Its sessions return to the main list; no session is deleted. |
+| **Ctrl+↑/↓** | Move the highlighted folder among the folders. |
+
+The same actions are in the **/** menu and **Cmd+K**. The cursor stays in place
+after a move, so you can file several sessions in a row.
+
+Agents can arrange folders too: ask any agent "put this session in a Widget
+folder" or "move the auth sessions into Auth"; the orchestrator can do the same
+for any session. The list picks up their changes within a second. Codex chats
 started before this version get the folder tool after Clear or a new chat;
-Claude chats get it on their next start. Folders are saved in `config.json` as `session_folders`.
+Claude chats get it on their next start. Folders are saved in `config.json` as
+`session_folders`.
 
 ### Local diffs and branch PRs
 
