@@ -372,35 +372,35 @@ pub(super) fn entries() -> Vec<ActionSpec> {
         entry(
             ids::QUESTION_PREVIOUS,
             "Previous pending question",
-            &[contexts::AGENT_QUESTION, contexts::AGENT_QUESTION_NOTE],
+            &[
+                contexts::AGENT_QUESTION,
+                contexts::AGENT_QUESTION_NOTE,
+                contexts::AGENT_INBOX,
+                contexts::AGENT_INBOX_APPROVAL,
+            ],
             &[key(BindingKey::Up, 2)],
         ),
         entry(
             ids::QUESTION_NEXT,
             "Next pending question or composer",
-            &[contexts::AGENT_QUESTION, contexts::AGENT_QUESTION_NOTE],
+            &[
+                contexts::AGENT_QUESTION,
+                contexts::AGENT_QUESTION_NOTE,
+                contexts::AGENT_INBOX,
+                contexts::AGENT_INBOX_APPROVAL,
+            ],
             &[key(BindingKey::Down, 2)],
         ),
         entry(
             ids::QUESTION_NEXT_FIELD,
             "Next question field",
-            &[
-                contexts::AGENT_QUESTION,
-                contexts::AGENT_QUESTION_NOTE,
-                contexts::AGENT_INBOX,
-                contexts::AGENT_INBOX_APPROVAL,
-            ],
+            &[contexts::AGENT_QUESTION, contexts::AGENT_QUESTION_NOTE],
             &[key(BindingKey::Tab, 0)],
         ),
         entry(
             ids::QUESTION_PREVIOUS_FIELD,
             "Previous question field",
-            &[
-                contexts::AGENT_QUESTION,
-                contexts::AGENT_QUESTION_NOTE,
-                contexts::AGENT_INBOX,
-                contexts::AGENT_INBOX_APPROVAL,
-            ],
+            &[contexts::AGENT_QUESTION, contexts::AGENT_QUESTION_NOTE],
             &[key(BindingKey::Tab, 4)],
         ),
         entry(

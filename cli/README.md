@@ -219,8 +219,12 @@ difu shell --session SESSION_ID '{"action":"write","shell":"SHELL_ID","text":"pw
 The **Questions & requests** card sits above the orchestrator. **Option+Q**
 (**Alt+Q**) opens pending questions and permission requests across all current
 sessions, including sessions inside folders. **Command+Up/Down** moves between
-session sections; **Tab/Shift+Tab** moves between items. Drafts stay with their
-question when you switch sessions. A section collapses with split-flap motion
+session sections; **Option+Up/Down** moves between questions. Each session has
+its own border, and the top-right session map shows question counts and highlights
+the focused session. Only the focused question uses the primary colour.
+**Tab/Shift+Tab** moves focus between the questions view and the sessions list;
+**Up** from the first session selects the Questions & requests card. Drafts stay
+with their question when you switch sessions. A section collapses with split-flap motion
 only after all its items resolve, leaving a compact completed row. Reduced
 motion skips the collapse animation. **Esc** returns to the selected session.
 

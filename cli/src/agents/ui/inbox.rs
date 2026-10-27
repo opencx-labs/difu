@@ -76,6 +76,35 @@ fn items(session: &Session) -> Vec<Item> {
         .collect()
 }
 
+fn section_header(title: &str, width: u16, color: ratatui::style::Color) -> Line<'static> {
+    let title = crate::ui::crop(title, 0, usize::from(width.saturating_sub(5)));
+    let padding = usize::from(width.saturating_sub(5))
+        .saturating_sub(unicode_width::UnicodeWidthStr::width(title.as_str()));
+    Line::from(Span::styled(
+        format!("┌─ {title} {}┐", "─".repeat(padding)),
+        Style::default().fg(color),
+    ))
+}
+
+fn section_row(line: Line<'static>, width: u16, color: ratatui::style::Color) -> Line<'static> {
+    let mut remaining = usize::from(width.saturating_sub(4));
+    let mut spans = vec![Span::styled("│ ", Style::default().fg(color))];
+    for span in line.spans {
+        let text = crate::ui::crop(&span.content, 0, remaining);
+        remaining = remaining.saturating_sub(unicode_width::UnicodeWidthStr::width(text.as_str()));
+        spans.push(Span::styled(
+            text,
+            Style::default()
+                .fg(TEXT)
+                .patch(line.style)
+                .patch(span.style),
+        ));
+    }
+    spans.push(Span::raw(" ".repeat(remaining)));
+    spans.push(Span::styled(" │", Style::default().fg(color)));
+    Line::from(spans)
+}
+
 impl Ui {
     pub(super) fn inbox_count(&self) -> (usize, usize) {
         self.summaries
@@ -88,6 +117,7 @@ impl Ui {
 
     pub(super) fn open_questions_inbox(&mut self) {
         if self.inbox.visible {
+            self.focus = Focus::Composer;
             return;
         }
         self.remember_answers();
@@ -295,6 +325,7 @@ impl Ui {
         else {
             return;
         };
+        let sidebar = self.inbox.visible && self.focus == Focus::List;
         self.remember_answers();
         self.select(key.session.clone());
         self.inbox.visible = true;
@@ -317,7 +348,11 @@ impl Ui {
         self.inbox.active = Some(key);
         self.inbox.reveal = true;
         self.question_note_focused = false;
-        self.focus = Focus::Composer;
+        self.focus = if sidebar {
+            Focus::List
+        } else {
+            Focus::Composer
+        };
     }
 
     pub(super) fn inbox_item_action(&mut self, key: Key, action: Option<Box<Action>>) {
@@ -328,6 +363,7 @@ impl Ui {
         {
             return;
         }
+        self.focus = Focus::Composer;
         if self.inbox.active.as_ref() != Some(&key) || self.modal.is_none() {
             self.focus_inbox_item(key.clone());
         }
@@ -406,6 +442,22 @@ impl Ui {
         if !self.inbox.visible || !matches!(self.modal, None | Some(Modal::Approval { .. })) {
             return false;
         }
+        if self.focus == Focus::List {
+            match self.shortcut(key) {
+                Some(NAVIGATION_DOWN | NAVIGATION_FAST_DOWN | NAVIGATION_PAGE_DOWN) => {
+                    self.move_list(1);
+                }
+                Some(NAVIGATION_LAST) => self.move_list(i32::MAX),
+                Some(NAVIGATION_ACTIVATE | NAVIGATION_NEXT_FOCUS | NAVIGATION_PREVIOUS_FOCUS) => {
+                    self.focus = Focus::Composer;
+                    self.inbox.reveal = true;
+                }
+                Some(AGENTS_SIDEBAR) => self.toggle_list(),
+                _ if key.code == KeyCode::Esc => self.close_questions_inbox(),
+                _ => {}
+            }
+            return true;
+        }
         match self.shortcut(key) {
             Some(SELECTION_COPY) => {
                 self.copy_chat_selection();
@@ -421,12 +473,14 @@ impl Ui {
             }
             Some(INBOX_PREVIOUS_SESSION) => self.move_inbox_session(false),
             Some(INBOX_NEXT_SESSION) => self.move_inbox_session(true),
-            Some(QUESTION_NEXT_FIELD | QUESTION_NEXT | NAVIGATION_NEXT_FOCUS) => {
-                self.move_inbox_item(true)
+            Some(NAVIGATION_NEXT_FOCUS | NAVIGATION_PREVIOUS_FOCUS) => {
+                self.remember_answers();
+                self.list_visible = true;
+                self.panels.focused = false;
+                self.focus = Focus::List;
             }
-            Some(QUESTION_PREVIOUS_FIELD | QUESTION_PREVIOUS | NAVIGATION_PREVIOUS_FOCUS) => {
-                self.move_inbox_item(false)
-            }
+            Some(QUESTION_NEXT_FIELD | QUESTION_NEXT) => self.move_inbox_item(true),
+            Some(QUESTION_PREVIOUS_FIELD | QUESTION_PREVIOUS) => self.move_inbox_item(false),
             Some(NAVIGATION_PAGE_UP) => {
                 self.inbox.scroll = self.inbox.scroll.saturating_sub(5);
                 self.inbox.reveal = false;
@@ -584,7 +638,11 @@ impl Ui {
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" Questions & requests · {count} pending "))
-            .border_style(Style::default().fg(crate::ui::YELLOW));
+            .border_style(Style::default().fg(if self.focus == Focus::List {
+                DIM
+            } else {
+                ACCENT
+            }));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         if inner.height < 3 || inner.width < 4 {
@@ -600,12 +658,37 @@ impl Ui {
             .style(Style::default().fg(DIM)),
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
-        let area = Rect::new(
+        let content = Rect::new(
             inner.x + 1,
             inner.y + 2,
             inner.width.saturating_sub(2),
             inner.height.saturating_sub(3),
         );
+        let (area, minimap) = if content.width >= 36 {
+            let width = (content.width / 3).clamp(12, 32);
+            (
+                Rect::new(
+                    content.x,
+                    content.y,
+                    content.width - width - 1,
+                    content.height,
+                ),
+                Rect::new(content.right() - width, content.y, width, content.height),
+            )
+        } else {
+            let height =
+                (self.inbox.sections.len().saturating_add(2) as u16).min(content.height / 3);
+            (
+                Rect::new(
+                    content.x,
+                    content.y + height,
+                    content.width,
+                    content.height - height,
+                ),
+                Rect::new(content.x, content.y, content.width, height),
+            )
+        };
+        let question_width = area.width.saturating_sub(4).max(1);
         let mut lines = Vec::new();
         let mut hits: Vec<(usize, usize, Action)> = Vec::new();
         let mut cursor = None;
@@ -619,17 +702,11 @@ impl Ui {
                 .inbox
                 .active
                 .as_ref()
-                .is_some_and(|key| key.session == id);
+                .is_some_and(|key| key.session == id)
+                && self.focus != Focus::List;
             let complete = section.items.is_empty();
             let title = format!(
-                "{} {} · {}",
-                if complete {
-                    "✓"
-                } else if active {
-                    "›"
-                } else {
-                    " "
-                },
+                "{} · {}",
                 section.title,
                 if complete {
                     format!("{} resolved", section.answered)
@@ -638,20 +715,8 @@ impl Ui {
                 }
             );
             let header = lines.len();
-            lines.extend(wrapped(&title, area.width).into_iter().map(|line| {
-                Line::from(Span::styled(
-                    line,
-                    Style::default()
-                        .fg(if complete {
-                            GREEN
-                        } else if active {
-                            crate::ui::YELLOW
-                        } else {
-                            TEXT
-                        })
-                        .bg(PANEL),
-                ))
-            }));
+            let border = if active { ACCENT } else { DIM };
+            lines.push(section_header(&title, area.width, border));
             if let Some(item) = section.items.first() {
                 hits.push((
                     header,
@@ -682,8 +747,10 @@ impl Ui {
                 for item in section.items.clone() {
                     body.push(Line::default());
                     let offset = lines.len() + body.len();
-                    let focused = self.inbox.active.as_ref() == Some(&item.key);
-                    if focused {
+                    let item_hit_start = hits.len();
+                    let selected = self.inbox.active.as_ref() == Some(&item.key);
+                    let focused = selected && self.focus != Focus::List;
+                    if selected {
                         active_row = Some(offset);
                     }
                     body.push(Line::from(Span::styled(
@@ -697,10 +764,10 @@ impl Ui {
                     let start = body.len();
                     if let Some(field) = item.key.field {
                         if let Some((question, question_cursor, question_hits)) =
-                            self.inbox_question_lines(&id, &item.pending, field, area.width)
+                            self.inbox_question_lines(&id, &item.pending, field, question_width)
                         {
                             if let Some((x, y)) = question_cursor {
-                                cursor = Some((x, lines.len() + start + y));
+                                cursor = Some((x + 2, lines.len() + start + y));
                             }
                             for (row, height, action) in question_hits {
                                 hits.push((
@@ -755,7 +822,7 @@ impl Ui {
                                     .unwrap_or_else(|_| "Cannot display request".into())
                             });
                         body.extend(
-                            wrapped(&description, area.width)
+                            wrapped(&description, question_width)
                                 .into_iter()
                                 .map(Line::from),
                         );
@@ -791,13 +858,30 @@ impl Ui {
                             }
                         }
                     }
-                    hits.push((offset, 1, Action::InboxItem(item.key.clone(), None)));
+                    hits.insert(
+                        item_hit_start,
+                        (
+                            offset,
+                            lines.len() + body.len() - offset,
+                            Action::InboxItem(item.key.clone(), None),
+                        ),
+                    );
                 }
                 if let Some(section) = self.inbox.sections.get_mut(index) {
                     section.rows.clone_from(&body);
                 }
             }
-            lines.extend(body);
+            lines.extend(
+                body.into_iter()
+                    .map(|line| section_row(line, area.width, border)),
+            );
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "└{}┘",
+                    "─".repeat(usize::from(area.width.saturating_sub(2)))
+                ),
+                Style::default().fg(border),
+            )));
             lines.push(Line::default());
         }
         if self.inbox.sections.is_empty()
@@ -874,19 +958,78 @@ impl Ui {
         }
         frame.render_widget(
             Paragraph::new(format!(
-                " {} next item · {} previous · Esc back",
+                " {} sessions list · {}/{} question · Esc back",
                 bindings.primary_hint_in(
-                    crate::shortcuts::ids::QUESTION_NEXT_FIELD,
+                    crate::shortcuts::ids::NAVIGATION_NEXT_FOCUS,
                     crate::shortcuts::contexts::AGENT_INBOX
                 ),
                 bindings.primary_hint_in(
-                    crate::shortcuts::ids::QUESTION_PREVIOUS_FIELD,
+                    crate::shortcuts::ids::QUESTION_PREVIOUS,
+                    crate::shortcuts::contexts::AGENT_INBOX
+                ),
+                bindings.primary_hint_in(
+                    crate::shortcuts::ids::QUESTION_NEXT,
                     crate::shortcuts::contexts::AGENT_INBOX
                 )
             ))
             .style(Style::default().fg(DIM)),
             Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
         );
+        self.draw_inbox_minimap(frame, minimap);
+    }
+
+    fn draw_inbox_minimap(&mut self, frame: &mut Frame, area: Rect) {
+        let area = Rect::new(
+            area.x,
+            area.y,
+            area.width,
+            area.height
+                .min(self.inbox.sections.len().saturating_add(2) as u16),
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" Sessions · questions ")
+            .border_style(Style::default().fg(DIM));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let active = self.inbox.active.as_ref().map(|key| key.session.as_str());
+        let selected = self
+            .inbox
+            .sections
+            .iter()
+            .position(|section| Some(section.id.as_str()) == active)
+            .unwrap_or(0);
+        let offset = selected.saturating_sub(usize::from(inner.height).saturating_sub(1));
+        for (row, section) in self
+            .inbox
+            .sections
+            .iter()
+            .skip(offset)
+            .take(usize::from(inner.height))
+            .enumerate()
+        {
+            let focused = Some(section.id.as_str()) == active && self.focus != Focus::List;
+            let count = section.items.len().to_string();
+            let width = usize::from(inner.width).saturating_sub(count.len() + 1);
+            let name = crate::ui::crop(&section.title, 0, width);
+            let padding =
+                width.saturating_sub(unicode_width::UnicodeWidthStr::width(name.as_str()));
+            let row = Rect::new(inner.x, inner.y + row as u16, inner.width, 1);
+            frame.render_widget(
+                Paragraph::new(format!("{name}{} {count}", " ".repeat(padding))).style(
+                    if focused {
+                        crate::ui::user_message_style().fg(ACCENT)
+                    } else {
+                        Style::default().fg(TEXT)
+                    },
+                ),
+                row,
+            );
+            if let Some(item) = section.items.first() {
+                self.hits
+                    .push((row, Action::InboxItem(item.key.clone(), None)));
+            }
+        }
     }
 }
 
@@ -952,6 +1095,18 @@ mod tests {
             Some("First draft")
         );
         ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(ui.focus, Focus::List);
+        assert!(ui.focused_editor().is_none());
+        ui.paste("Do not edit an unfocused question");
+        ui.sync_inbox();
+        assert_eq!(ui.focus, Focus::List);
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(ui.focus, Focus::Composer);
+        assert_eq!(
+            ui.focused_editor().map(Editor::text).as_deref(),
+            Some("First draft")
+        );
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
         assert_eq!(
             ui.focused_editor().map(Editor::text).as_deref(),
             Some("Second draft")
@@ -965,6 +1120,162 @@ mod tests {
                 .draft
                 .text()
                 .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sidebar_arrows_reach_questions_and_tab_returns_without_editing_answers() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = fixture(dir.path());
+        let first = ui.filtered().first().context("first session")?.id.clone();
+        ui.select(first.clone());
+        ui.focus = Focus::List;
+        ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert!(ui.inbox.visible);
+        assert_eq!(ui.focus, Focus::List);
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        ui.paste("Keep this draft");
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(ui.inbox.visible);
+        assert_eq!(ui.focus, Focus::List);
+        ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert!(!ui.inbox.visible);
+        assert_eq!(ui.focus, Focus::List);
+        assert_eq!(ui.selected.as_deref(), Some(first.as_str()));
+        ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(
+            ui.focused_editor().map(Editor::text).as_deref(),
+            Some("Keep this draft")
+        );
+        Ok(())
+    }
+
+    fn text_position(buffer: &ratatui::buffer::Buffer, text: &str) -> Result<(u16, u16)> {
+        for y in buffer.area.top()..buffer.area.bottom() {
+            let row = (buffer.area.left()..buffer.area.right())
+                .filter_map(|x| buffer.cell((x, y)))
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            if let Some(index) = row.find(text) {
+                let prefix = row.get(..index).context("text boundary")?;
+                return Ok((
+                    buffer.area.x + unicode_width::UnicodeWidthStr::width(prefix) as u16,
+                    y,
+                ));
+            }
+        }
+        anyhow::bail!("Missing rendered text: {text}")
+    }
+
+    #[test]
+    fn borders_and_minimap_follow_focus_and_questions_remain_neutral_elsewhere() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = fixture(dir.path());
+        ui.preferences.motion.level = crate::settings::Motion::Off;
+        ui.open_questions_inbox();
+        ui.paste("Saved answer");
+        let mut terminal = Terminal::new(TestBackend::new(120, 50))?;
+        terminal.draw(|frame| {
+            ui.draw_inbox(frame, frame.area());
+        })?;
+        let buffer = terminal.backend().buffer();
+        let one = text_position(buffer, "Question for one")?;
+        let two = text_position(buffer, "Question for two")?;
+        assert_eq!(buffer.cell(one).context("active question")?.fg, ACCENT);
+        assert_eq!(buffer.cell(two).context("inactive question")?.fg, TEXT);
+        for (name, color) in [
+            ("Session one · 1 pending", ACCENT),
+            ("Session two · 1 pending", DIM),
+        ] {
+            let (_, y) = text_position(buffer, name)?;
+            let border = buffer.cell((2, y)).context("section border")?;
+            assert_eq!(border.symbol(), "┌");
+            assert_eq!(border.fg, color);
+        }
+        let (map, action) = ui
+            .hits
+            .iter()
+            .rev()
+            .find(|(rect, action)| {
+                rect.x > 80
+                    && matches!(action, Action::InboxItem(key, None) if key.session == "two")
+            })
+            .cloned()
+            .context("minimap session")?;
+        assert_eq!(
+            buffer
+                .cell((map.right() - 1, map.y))
+                .context("question count")?
+                .symbol(),
+            "1"
+        );
+        ui.action(action);
+        assert_eq!(ui.selected.as_deref(), Some("two"));
+        terminal.draw(|frame| {
+            ui.draw_inbox(frame, frame.area());
+        })?;
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((map.x, map.y))
+                .context("focused map row")?
+                .fg,
+            ACCENT
+        );
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        terminal.draw(|frame| {
+            ui.draw_inbox(frame, frame.area());
+        })?;
+        assert_eq!(
+            terminal
+                .backend()
+                .buffer()
+                .cell((map.x, map.y))
+                .context("unfocused map row")?
+                .fg,
+            TEXT
+        );
+        ui.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Up, KeyModifiers::SUPER));
+        assert_eq!(
+            ui.focused_editor().map(Editor::text).as_deref(),
+            Some("Saved answer")
+        );
+        for width in [24, 40, 80] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 20))?;
+            terminal.draw(|frame| {
+                ui.draw_inbox(frame, frame.area());
+            })?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_rows_align_with_the_questions_card_without_a_selection_chevron() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = fixture(dir.path());
+        ui.preferences.motion.level = crate::settings::Motion::Off;
+        ui.select("one".into());
+        let mut terminal = Terminal::new(TestBackend::new(50, 30))?;
+        terminal.draw(|frame| {
+            ui.draw_list(frame, frame.area());
+        })?;
+        let buffer = terminal.backend().buffer();
+        let (questions_x, _) = text_position(buffer, "Questions & requests")?;
+        let (session_x, y) = text_position(buffer, "Session one")?;
+        assert_eq!(session_x, questions_x);
+        assert!(
+            (buffer.area.left()..session_x)
+                .all(|x| buffer.cell((x, y)).is_none_or(|cell| cell.symbol() != "›"))
+        );
+        assert_eq!(
+            buffer.cell((session_x, y)).context("selected session")?.bg,
+            crate::ui::user_message_style()
+                .bg
+                .context("selection background")?
         );
         Ok(())
     }

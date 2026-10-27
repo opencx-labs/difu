@@ -294,6 +294,10 @@ pub(super) fn entries() -> Vec<ActionSpec> {
             ids::NAVIGATION_NEXT_FOCUS,
             "Focus next pane or field",
             &[
+                contexts::AGENT_INBOX,
+                contexts::AGENT_INBOX_QUESTION,
+                contexts::AGENT_INBOX_NOTE,
+                contexts::AGENT_INBOX_APPROVAL,
                 contexts::AGENT_LIST,
                 contexts::AGENT_COMPOSER_PANES,
                 contexts::AGENT_CONVERSATION,
@@ -323,6 +327,10 @@ pub(super) fn entries() -> Vec<ActionSpec> {
             ids::NAVIGATION_PREVIOUS_FOCUS,
             "Focus previous pane or field",
             &[
+                contexts::AGENT_INBOX,
+                contexts::AGENT_INBOX_QUESTION,
+                contexts::AGENT_INBOX_NOTE,
+                contexts::AGENT_INBOX_APPROVAL,
                 contexts::AGENT_LIST,
                 contexts::AGENT_COMPOSER_PANES,
                 contexts::AGENT_CONVERSATION,

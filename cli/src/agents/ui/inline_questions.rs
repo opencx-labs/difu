@@ -625,14 +625,15 @@ impl Ui {
         let question = questions.get(field)?;
         let position = self.positions.get(id);
         let request = pending.id.to_string();
-        let active = self.selected.as_deref() == Some(id)
+        let shown = self.selected.as_deref() == Some(id)
             && matches!(&self.modal, Some(Modal::Approval { pending: shown, field: shown_field, .. })
                 if shown.id == pending.id && *shown_field == field);
+        let active = shown && (!self.inbox.visible || self.focus != Focus::List);
         let saved = position.and_then(|p| p.answers.get(&request));
         let (answers, choice) = match &self.modal {
             Some(Modal::Approval {
                 answers, selected, ..
-            }) if active => (answers.clone(), *selected),
+            }) if shown => (answers.clone(), *selected),
             _ => (
                 saved
                     .map(|draft| draft.answers.clone())
@@ -659,8 +660,12 @@ impl Ui {
             Line::from(Span::styled(
                 s,
                 Style::default()
-                    .fg(ACCENT)
-                    .add_modifier(ratatui::style::Modifier::BOLD),
+                    .fg(if active { ACCENT } else { TEXT })
+                    .add_modifier(if active {
+                        ratatui::style::Modifier::BOLD
+                    } else {
+                        ratatui::style::Modifier::empty()
+                    }),
             ))
         })
         .collect();
@@ -687,7 +692,11 @@ impl Ui {
                 .unwrap_or_default();
             let prefix = format!(
                 "{} {}{}. ",
-                if index == *selected { "›" } else { " " },
+                if active && index == *selected {
+                    "›"
+                } else {
+                    " "
+                },
                 if !multi {
                     ""
                 } else if checks.is_some_and(|checks| checks.contains(&index)) {
@@ -703,7 +712,11 @@ impl Ui {
                     .map(|s| {
                         Line::from(Span::styled(
                             s,
-                            Style::default().fg(if index == *selected { ACCENT } else { TEXT }),
+                            Style::default().fg(if active && index == *selected {
+                                ACCENT
+                            } else {
+                                TEXT
+                            }),
                         ))
                     }),
             );
@@ -731,7 +744,11 @@ impl Ui {
                 }
                 let (rows, (x, y)) = display.styled_layout(
                     usize::from(width).saturating_sub(indent).max(1),
-                    Style::default().bg(ACCENT).fg(crate::ui::INK),
+                    if active {
+                        Style::default().bg(ACCENT).fg(crate::ui::INK)
+                    } else {
+                        Style::default().fg(TEXT)
+                    },
                 );
                 if active && self.question_note_focused {
                     cursor = Some((indent + x, start + y));
@@ -759,11 +776,11 @@ impl Ui {
         }
         let start = lines.len();
         let prefix = if options.is_empty() {
-            "› ".into()
+            if active { "› " } else { "  " }.into()
         } else {
             format!(
                 "{} {}. ",
-                if *selected == options.len() {
+                if active && *selected == options.len() {
                     "›"
                 } else {
                     " "
@@ -779,7 +796,11 @@ impl Ui {
             }
             let (rows, (x, y)) = answer.styled_layout(
                 usize::from(width).saturating_sub(prefix_width).max(1),
-                Style::default().bg(ACCENT).fg(crate::ui::INK),
+                if active {
+                    Style::default().bg(ACCENT).fg(crate::ui::INK)
+                } else {
+                    Style::default().fg(TEXT)
+                },
             );
             if *selected == options.len() {
                 cursor = Some((prefix_width + x, start + y));
@@ -788,7 +809,7 @@ impl Ui {
                 lines.push(Line::from(vec![
                     Span::styled(
                         prefix,
-                        Style::default().fg(if *selected == options.len() {
+                        Style::default().fg(if active && *selected == options.len() {
                             ACCENT
                         } else {
                             TEXT

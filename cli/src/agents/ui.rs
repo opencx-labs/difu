@@ -1324,19 +1324,30 @@ impl Ui {
     }
     fn move_list(&mut self, delta: i32) {
         let rows = self.selectable_rows();
+        let inbox_row = !self.orchestrator_list && self.folder_view.is_none();
         let cursor = self.cursor();
-        let current = rows
-            .iter()
-            .position(|row| Some(row.key()) == cursor)
-            .unwrap_or(0);
+        let current = if inbox_row && self.inbox.visible {
+            0
+        } else {
+            rows.iter()
+                .position(|row| Some(row.key()) == cursor)
+                .unwrap_or(0)
+                + usize::from(inbox_row)
+        };
         let index = current
             .saturating_add_signed(delta as isize)
-            .min(rows.len().saturating_sub(1));
-        match rows.into_iter().nth(index) {
+            .min((rows.len() + usize::from(inbox_row)).saturating_sub(1));
+        if inbox_row && index == 0 {
+            self.open_questions_inbox();
+            self.focus = Focus::List;
+            return;
+        }
+        match rows.into_iter().nth(index - usize::from(inbox_row)) {
             Some(folders::Row::Folder(card)) => self.focus_folder(card.id),
             Some(folders::Row::Session(session)) => self.select(session.id),
             None => {}
         }
+        self.focus = Focus::List;
     }
     fn interrupt_chat(&mut self, control: Control) {
         if let Some(id) = self.selected.clone()
@@ -1745,6 +1756,9 @@ impl Ui {
         }
     }
     fn focused_editor(&self) -> Option<&Editor> {
+        if self.inbox.visible && self.focus == Focus::List {
+            return None;
+        }
         if self.question_note_focused
             && let Some(note) = self.question_note()
         {
@@ -2449,7 +2463,7 @@ impl Ui {
             self.terminal_paste(text);
             return;
         }
-        if self.inbox.visible && self.modal.is_none() {
+        if self.inbox.visible && (self.modal.is_none() || self.focus == Focus::List) {
             return;
         }
         if self.modal.is_none()
@@ -3714,14 +3728,13 @@ impl Ui {
             } else {
                 ""
             };
-            let icon_inset = usize::from(status_icons::WIDTH) + 3;
+            let icon_inset = usize::from(status_icons::WIDTH) + 1;
             let title_width = usize::from(row.width)
                 .saturating_sub(icon_inset + unicode_width::UnicodeWidthStr::width(pin));
             let mut lines = vec![
                 Line::from(Span::styled(
                     format!(
-                        "{} {} {pin}{}",
-                        if selected { "›" } else { " " },
+                        "{} {pin}{}",
                         " ".repeat(usize::from(status_icons::WIDTH)),
                         crate::ui::crop(&session.title, 0, title_width)
                     ),
@@ -3735,7 +3748,7 @@ impl Ui {
                 )),
                 Line::from(Span::styled(
                     format!(
-                        "     {}{}{}",
+                        "   {}{}{}",
                         session
                             .repository
                             .as_ref()
@@ -3757,20 +3770,20 @@ impl Ui {
             ];
             if let Some(stats) = self.sidebar.counts.get(&session.id) {
                 lines.push(Line::from(vec![
-                    Span::raw("     "),
+                    Span::raw("   "),
                     Span::styled(format!("+{}", stats.added), Style::default().fg(GREEN)),
                     Span::styled(format!(" -{}", stats.removed), Style::default().fg(RED)),
                 ]));
             }
             lines.push(Line::from(Span::styled(
-                format!("     {status}"),
+                format!("   {status}"),
                 Style::default().fg(color),
             )));
             for link in self.prs.all(&session.id) {
                 let pr = &link.pr;
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "     {} · {}{}",
+                        "   {} · {}{}",
                         link.badge(),
                         pr.label(),
                         if self.prs.stale(&session.id) {
@@ -3803,8 +3816,7 @@ impl Ui {
             if !deleting {
                 self.status_icons.draw(
                     frame,
-                    Rect::new(row.x.saturating_add(2), row.y, status_icons::WIDTH, 1)
-                        .intersection(row),
+                    Rect::new(row.x, row.y, status_icons::WIDTH, 1).intersection(row),
                     status_icons::display_status(session.status, session.pending > 0),
                     self.preferences.motion.sidebar() && self.tweaks.agent_reply_cps > 0,
                     self.modal.is_none() && self.notice.is_none(),
@@ -5580,7 +5592,8 @@ mod tests {
                 ui.move_list(-1);
                 ui.ensure_selected();
                 assert_eq!(ui.selected.as_deref(), selected);
-                assert!(!ui.drilled);
+                assert!(ui.inbox.visible);
+                assert_eq!(ui.focus, Focus::List);
                 if with_other_session {
                     ui.open_session("two".into());
                     ui.paste("Continue other work");
@@ -5601,7 +5614,7 @@ mod tests {
                     .map_err(|_| anyhow::anyhow!("Fixture panicked"))??;
                 assert!(ui.deleting.is_empty());
                 assert!(ui.busy && matches!(ui.modal, Some(Modal::Help(_))));
-                assert_eq!(ui.drilled, with_other_session);
+                assert!(ui.drilled);
                 assert_eq!(ui.sessions.contains_key("one"), fails);
                 assert_eq!(ui.summaries.iter().any(|s| s.id == "one"), fails);
                 if with_other_session {
@@ -5867,8 +5880,21 @@ mod tests {
         // Moving the selection flips the highlight off one card and onto the
         // other, a flap at a time.
         ui.select("two".into());
-        let (screen, _) = draw(&mut ui, 120, 40)?;
+        draw(&mut ui, 120, 40)?;
         assert_eq!(ui.sidebar_highlights.len(), 2);
+        // The status icon now occupies the first cells. Sample after the
+        // highlight has advanced into the text instead of under that icon.
+        ui.sidebar_highlights.insert(
+            "two".into(),
+            flap::Highlight::start(
+                true,
+                false,
+                Instant::now() - Duration::from_millis(40),
+                ui.tweaks,
+            )
+            .context("selection animation")?,
+        );
+        let (screen, _) = draw(&mut ui, 120, 40)?;
         assert!(screen.contains('▀'));
         let (screen, _) = draw_settled(&mut ui, 120, 40)?;
         assert!(!screen.contains('▀'));
@@ -5910,11 +5936,11 @@ mod tests {
                     matches!(action, Action::Focus(Focus::Conversation)).then_some(*rect)
                 })
                 .context("conversation box")?;
-            for rect in [sidebar, chat] {
+            for (rect, inset) in [(sidebar, 0), (chat, 2)] {
                 let icon = terminal
                     .backend()
                     .buffer()
-                    .cell((rect.x + 2, rect.y))
+                    .cell((rect.x + inset, rect.y))
                     .context("status icon")?;
                 assert_eq!(icon.symbol(), expected);
                 if expected.starts_with('✋') {

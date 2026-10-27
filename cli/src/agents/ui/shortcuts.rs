@@ -18,6 +18,9 @@ impl Ui {
 
     pub(crate) fn shortcut_context(&self) -> Context {
         if self.inbox.visible && matches!(self.modal, None | Some(Modal::Approval { .. })) {
+            if self.focus == Focus::List {
+                return AGENT_LIST;
+            }
             return if self.inline_question() {
                 if self.question_note_focused {
                     AGENT_INBOX_NOTE
