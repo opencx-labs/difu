@@ -679,7 +679,10 @@ impl Ui {
     ) {
         let selected = self.folder_cursor.as_deref() == Some(card.id.as_str());
         let (status, color) = card.status(self.empty_folder_hint());
-        let title_width = usize::from(row.width).saturating_sub(5);
+        // Line up with session cards: the folder glyph sits in their status
+        // light column and the detail lines share their indent.
+        let inset = " ".repeat(usize::from(super::status_icons::WIDTH) + 3);
+        let title_width = usize::from(row.width).saturating_sub(inset.len());
         let mut lines = vec![
             Line::from(Span::styled(
                 format!(
@@ -690,11 +693,11 @@ impl Ui {
                 Style::default().fg(if selected { ACCENT } else { TEXT }),
             )),
             Line::from(Span::styled(
-                format!("  {}", card.detail()),
+                format!("{inset}{}", card.detail()),
                 Style::default().fg(DIM),
             )),
             Line::from(Span::styled(
-                format!("  {status}"),
+                format!("{inset}{status}"),
                 Style::default().fg(color),
             )),
         ];
