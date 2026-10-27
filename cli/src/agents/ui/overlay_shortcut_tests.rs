@@ -1268,6 +1268,8 @@ fn copy_metadata_and_hidden_draft_guards_match_real_agents_selection_owners() ->
         "AgentHelperMain",
         "AgentQuestion",
         "AgentQuestionNote",
+        "AgentInboxQuestion",
+        "AgentInboxNote",
         "AgentQueueEditor",
         "AgentPlanFeedback",
         "AgentCommands",
@@ -1294,6 +1296,7 @@ fn copy_metadata_and_hidden_draft_guards_match_real_agents_selection_owners() ->
     );
     for (phase, custom) in BINDING_PHASES {
         for surface in [
+            "inbox",
             "status",
             "pending",
             "queue",
@@ -1313,6 +1316,10 @@ fn copy_metadata_and_hidden_draft_guards_match_real_agents_selection_owners() ->
                 .draft
                 .key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
             match surface {
+                "inbox" => {
+                    ui.inbox.visible = true;
+                    ui.modal = None;
+                }
                 "status" => ui.modal = Some(Modal::Status { scroll: 0 }),
                 "pending" => ui.modal = Some(Modal::Pending { selected: 0 }),
                 "queue" => ui.modal = Some(Modal::Queue { selected: 0 }),

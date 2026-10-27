@@ -285,6 +285,9 @@ impl Ui {
     }
 
     fn focus_inbox_item(&mut self, key: Key) {
+        if self.deleting.contains(&key.session) {
+            return;
+        }
         let Some(index) = self
             .sessions
             .get(&key.session)
@@ -318,16 +321,24 @@ impl Ui {
     }
 
     pub(super) fn inbox_item_action(&mut self, key: Key, action: Option<Box<Action>>) {
-        if !self
-            .inbox
-            .sections
-            .iter()
-            .any(|s| s.items.iter().any(|item| item.key == key))
+        if self.deleting.contains(&key.session)
+            || !self.sessions.get(&key.session).is_some_and(|session| {
+                !session.archived && items(session).iter().any(|item| item.key == key)
+            })
         {
             return;
         }
         if self.inbox.active.as_ref() != Some(&key) || self.modal.is_none() {
-            self.focus_inbox_item(key);
+            self.focus_inbox_item(key.clone());
+        }
+        // A card can disappear between drawing and the click. Never dispatch its
+        // action against whichever other session happens to remain selected.
+        if self.inbox.active.as_ref() != Some(&key)
+            || self.selected.as_ref() != Some(&key.session)
+            || !matches!(&self.modal, Some(Modal::Approval { pending, field, .. })
+                if pending.id == key.request && key.field.is_none_or(|expected| expected == *field))
+        {
+            return;
         }
         if let Some(action) = action {
             self.action(*action);
@@ -929,6 +940,9 @@ mod tests {
         assert_eq!(ui.inbox_count(), (2, 2));
         assert_eq!(ui.inbox.sections.len(), 2);
         ui.paste("First draft");
+        ui.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::SUPER));
+        ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::SUPER));
+        assert_eq!(ui.clipboard.as_deref(), Some("First draft"));
         ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::SUPER));
         assert_eq!(ui.selected.as_deref(), Some("two"));
         ui.paste("Second draft");
@@ -1072,6 +1086,34 @@ mod tests {
             .map(|c| c.symbol())
             .collect::<String>();
         assert!(screen.contains("All caught up"));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_item_click_cannot_change_another_sessions_answer() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = fixture(dir.path());
+        ui.open_questions_inbox();
+        ui.paste("Keep the first draft");
+        let target = ui
+            .inbox
+            .sections
+            .get(1)
+            .and_then(|s| s.items.first())
+            .context("second item")?
+            .key
+            .clone();
+        ui.sessions
+            .get_mut("two")
+            .context("second session")?
+            .pending
+            .clear();
+        ui.inbox_item_action(target, Some(Box::new(Action::QuestionChoice(9))));
+        assert_eq!(ui.selected.as_deref(), Some("one"));
+        assert_eq!(
+            ui.focused_editor().map(Editor::text).as_deref(),
+            Some("Keep the first draft")
+        );
         Ok(())
     }
 
