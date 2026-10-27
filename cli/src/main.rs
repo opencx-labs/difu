@@ -43,7 +43,7 @@ enum Commands {
         #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
         session: String,
         /// JSON action, for example '{"action":"list"}'.
-        #[arg(value_parser = serde_json::from_str::<serde_json::Value>)]
+        #[arg(value_parser = parse_shell_action)]
         action: serde_json::Value,
     },
     /// Attach a GitHub pull request to a session, including another repository.
@@ -67,6 +67,10 @@ enum Commands {
         #[arg(value_parser = ["."])]
         target: String,
     },
+}
+
+fn parse_shell_action(text: &str) -> Result<serde_json::Value, serde_json::Error> {
+    serde_json::from_str(text)
 }
 
 fn main() -> Result<()> {

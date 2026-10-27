@@ -928,7 +928,9 @@ mod tests {
                 .any(|entry| entry.id == first && entry.finished_at.is_none())
         );
         assert_eq!(context(&session).0, vec![second.clone()]);
-        store.update("one", |session| delivered(session, &[second.clone()]))?;
+        store.update("one", |session| {
+            delivered(session, std::slice::from_ref(&second))
+        })?;
         store.shells.handle(
             &store,
             "one",
