@@ -714,7 +714,10 @@ impl Ui {
                             } else {
                                 format!(
                                     "  [ Send answer · {} ]",
-                                    bindings.hint(crate::shortcuts::ids::QUESTION_SUBMIT)
+                                    bindings.primary_hint_in(
+                                        crate::shortcuts::ids::QUESTION_SUBMIT,
+                                        crate::shortcuts::contexts::AGENT_INBOX_QUESTION
+                                    )
                                 )
                             },
                             Style::default().fg(GREEN),
@@ -859,8 +862,18 @@ impl Ui {
             frame.set_cursor_position((area.x + x as u16, area.y + (row - scroll) as u16));
         }
         frame.render_widget(
-            Paragraph::new(" Tab next item · Shift+Tab previous · Esc back")
-                .style(Style::default().fg(DIM)),
+            Paragraph::new(format!(
+                " {} next item · {} previous · Esc back",
+                bindings.primary_hint_in(
+                    crate::shortcuts::ids::QUESTION_NEXT_FIELD,
+                    crate::shortcuts::contexts::AGENT_INBOX
+                ),
+                bindings.primary_hint_in(
+                    crate::shortcuts::ids::QUESTION_PREVIOUS_FIELD,
+                    crate::shortcuts::contexts::AGENT_INBOX
+                )
+            ))
+            .style(Style::default().fg(DIM)),
             Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
         );
     }
@@ -964,8 +977,14 @@ mod tests {
             ui.draw_inbox(frame, area);
         })?;
         let session = ui.sessions.get_mut("two").context("session")?;
-        session.pending.first_mut().context("question")?.params["difuAnswers"] =
-            json!({"a":"done"});
+        session
+            .pending
+            .first_mut()
+            .context("question")?
+            .params
+            .as_object_mut()
+            .context("params")?
+            .insert("difuAnswers".into(), json!({"a":"done"}));
         ui.sync_inbox();
         let section = ui.inbox.sections.get(1).context("section")?;
         assert_eq!(section.items.len(), 1);

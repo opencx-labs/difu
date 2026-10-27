@@ -122,7 +122,7 @@ retain cached results.
 
 Pin or unpin a session in its actions menu, or select it in Cmd+K and press
 **Cmd+P**. Pins persist across restarts and appear first in the session list,
-with a ◆ marker, within the current active/archived view.
+with a 📌 marker, within the current active/archived view.
 Session activity never changes list order. With the session list focused, use
 **Ctrl+↑/↓** to move the selected session within its pinned or unpinned group.
 The order persists across restarts; the orchestrator stays fixed at the top.
@@ -189,6 +189,14 @@ registered by new coding sessions. Codex is instructed to prefer self-contained
 HTML for reports and visual deliverables. Existing sessions keep their original
 tool catalog. Empty Shells/Artifacts controls are hidden; available controls use a
 single compact row beneath the conversation.
+
+The **Questions & requests** card sits above the orchestrator. **Option+Q**
+(**Alt+Q**) opens pending questions and permission requests across all current
+sessions, including sessions inside folders. **Command+Up/Down** moves between
+session sections; **Tab/Shift+Tab** moves between items. Drafts stay with their
+question when you switch sessions. A section collapses with split-flap motion
+only after all its items resolve, leaving a compact completed row. Reduced
+motion skips the collapse animation. **Esc** returns to the selected session.
 
 Shells and HTML artifacts can use the right helper canvas or the main
 conversation area. **Alt+P** switches placement and remembers the choice; **Esc**
@@ -337,6 +345,12 @@ they are not polled in the background. Network failures retain cached history an
 add **stale** to session PR badges. Badges show **Open**, **Draft**, **Merged**,
 **Closed**, or **Has conflicts**.
 The sidebar shows status below the diff counts, followed by the PR history.
+
+Agents can explicitly attach a PR from any repository with **difu_attach_pr** and
+its full GitHub URL. Attached PRs appear in the session list, input footer, and
+**Option+D** diff tabs, labeled with their repository. Attaching a URL neither
+switches workspaces nor treats that PR as owning the current checkout. The tool
+is available in new Codex conversations and in Claude sessions.
 
 The session diff pane shows the selected PR's published diff whenever the session
 has linked PRs, including when its worktree has been removed. Multiple PRs appear
