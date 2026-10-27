@@ -378,6 +378,9 @@ impl Ui {
         }) = &mut self.modal
         {
             *active = field;
+            if super::super::questions::context(pending).is_some() {
+                self.question_reveal = false;
+            }
             *selected = self
                 .selected
                 .as_ref()
@@ -669,6 +672,11 @@ impl Ui {
             ))
         })
         .collect();
+        if let Some(context) = super::super::questions::context(pending) {
+            lines.push(Line::default());
+            lines.push(Line::styled("Context", Style::default().fg(DIM)));
+            lines.extend(transcript::prose_links(context, width).0);
+        }
         let multi = question.get("multiSelect").and_then(Value::as_bool) == Some(true);
         if multi {
             lines.push(Line::from(Span::styled(

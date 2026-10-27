@@ -356,6 +356,7 @@ impl Ui {
                     return true;
                 };
                 let mut x = area.x;
+                let context = super::super::questions::context(pending).map(String::from);
                 for (index, q) in questions.iter().enumerate() {
                     let label = format!(
                         " {}{} ",
@@ -386,7 +387,12 @@ impl Ui {
                     .get("question")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                let lines = wrapped(text, area.width);
+                let text = if let Some(context) = context {
+                    format!("{text}\n\nContext\n{context}")
+                } else {
+                    text.to_owned()
+                };
+                let lines = wrapped(&text, area.width);
                 let count = lines
                     .len()
                     .min(usize::from(area.height.saturating_sub(15)).max(3));

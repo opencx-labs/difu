@@ -915,6 +915,41 @@ impl Service {
                         .map_err(anyhow::Error::msg)?,
                 ))
             }
+            Request::Subagent { id, agent } => {
+                let session = self.store.get(&id)?;
+                let child = session
+                    .subagents
+                    .iter()
+                    .find(|a| a.id == agent)
+                    .context("Sub-agent is no longer available")?;
+                if child.provider == provider::Provider::Claude {
+                    return Ok(Reply::Ok);
+                }
+                let sender = self
+                    .workers
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("Worker lock failed"))?
+                    .get(&id)
+                    .filter(|w| {
+                        !w.handle.is_finished() && session.provider == provider::Provider::Codex
+                    })
+                    .map(|w| w.sender.clone());
+                if let Some(sender) = sender {
+                    let (reply, response) = mpsc::channel();
+                    sender
+                        .send(Command {
+                            control: Control::ReadSubagent { agent },
+                            reply,
+                        })
+                        .context("Provider disconnected before sub-agent history was read")?;
+                    response
+                        .recv_timeout(Duration::from_secs(60))
+                        .context("Provider did not return sub-agent history in time")??;
+                } else {
+                    super::engine::read_subagent(&self.store, &id, &agent, &Cancel::default())?;
+                }
+                Ok(Reply::Ok)
+            }
             Request::Usage { id } => {
                 let session = self.store.get(&id)?;
                 ensure!(
@@ -1366,6 +1401,7 @@ fn reset_workspace(s: &mut Session, candidate: Session, revision: u64) {
 fn clear_conversation(s: &mut Session) {
     super::plan::invalidate(s);
     s.entries.clear();
+    s.subagents.clear();
     s.slack_route = None;
     s.slack_after = 0;
     s.thread_id = None;
@@ -1508,6 +1544,7 @@ pub fn run(storage: Storage) -> Result<()> {
             session.pending.retain(Pending::is_async_question);
             session.note("system", "Service restarted. Work was interrupted; send a message or choose Continue to resume. No prompt or publication action was replayed.");
         }
+        subagents::restore(&mut session);
         for entry in &mut session.entries {
             if entry.kind == "sending" {
                 entry.kind = "unsent or unacknowledged".into();
@@ -1522,6 +1559,9 @@ pub fn run(storage: Storage) -> Result<()> {
         }
         shells::restore(&mut session);
         session.restore_async_questions();
+        for pending in &mut session.pending {
+            super::questions::attach_context(&session.entries, pending);
+        }
         super::plan::reconcile(&mut session);
         storage::atomic_json(&path, &session)?;
         sessions.insert(session.id.clone(), session);

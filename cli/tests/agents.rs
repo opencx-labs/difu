@@ -95,6 +95,119 @@ fn launch(storage: &Storage, root: &Path, prompt: &str) -> Result<String> {
     Ok(id)
 }
 #[test]
+fn subagent_history_refresh_is_read_only_and_survives_restart() -> Result<()> {
+    let tmp = tempfile::Builder::new()
+        .prefix("difu-child-")
+        .tempdir_in("/tmp")?;
+    let root = tmp.path();
+    let repo = root.join("repo");
+    fs::create_dir(&repo)?;
+    git(&repo, &["init", "-b", "main"])?;
+    fs::write(repo.join("tracked.txt"), "fixture\n")?;
+    git(&repo, &["add", "."])?;
+    git(&repo, &["commit", "-m", "base"])?;
+    git(&repo, &["remote", "add", "origin", "."])?;
+    let bin = root.join("bin");
+    fs::create_dir(&bin)?;
+    for (name, source) in [
+        ("codex", include_str!("fixtures/agent_codex.py")),
+        ("gh", "#!/bin/sh\nprintf '[]\\n'\n"),
+    ] {
+        let file = bin.join(name);
+        fs::write(&file, source)?;
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o700))?;
+    }
+    let path = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").context("PATH")?,
+    )))?;
+    let storage = Storage {
+        config: root.join("config.json"),
+        cache: root.join("cache"),
+    };
+    let mut service = support::Service::start(&storage, |c| {
+        c.env("PATH", &path).env("DIFU_AGENT_FIXTURE", root);
+    })?;
+    let id = launch(&storage, &repo, "fixture subagent")?;
+    let parent = wait(&storage, &id, |s| {
+        s.status == Status::Idle && s.turn_id.is_none() && !s.subagents.is_empty()
+    })?;
+    let child = parent.subagents.first().context("child")?;
+    let child_id = child.id.clone();
+    assert_eq!(
+        child.entries.first().map(|e| e.text.as_str()),
+        Some("Partial child report")
+    );
+    assert!(
+        !parent
+            .entries
+            .iter()
+            .any(|e| e.text.contains("child report"))
+    );
+    let protocol = || -> Result<Vec<serde_json::Value>> {
+        fs::read_to_string(root.join("protocol.jsonl"))?
+            .lines()
+            .map(|line| serde_json::from_str(line).map_err(Into::into))
+            .collect()
+    };
+    let mutations = |calls: &[serde_json::Value]| {
+        calls
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.get("method").and_then(serde_json::Value::as_str),
+                    Some("thread/start" | "thread/resume" | "turn/start" | "turn/steer")
+                )
+            })
+            .count()
+    };
+    let before = mutations(&protocol()?);
+    client::request(
+        &storage,
+        Request::Subagent {
+            id: id.clone(),
+            agent: child_id.clone(),
+        },
+    )?;
+    let refreshed = session(&storage, &id)?;
+    assert_eq!(refreshed.status, parent.status);
+    assert_eq!(refreshed.thread_id, parent.thread_id);
+    assert_eq!(refreshed.turn_id, parent.turn_id);
+    assert_eq!(
+        serde_json::to_value(&refreshed.entries)?,
+        serde_json::to_value(&parent.entries)?
+    );
+    assert_eq!(
+        refreshed
+            .subagents
+            .first()
+            .and_then(|a| a.entries.first())
+            .map(|e| e.text.as_str()),
+        Some("Full child report")
+    );
+    assert_eq!(mutations(&protocol()?), before);
+    service.stop()?;
+    service = support::Service::start(&storage, |c| {
+        c.env("PATH", &path).env("DIFU_AGENT_FIXTURE", root);
+    })?;
+    let restored = session(&storage, &id)?;
+    assert_eq!(
+        serde_json::to_value(&restored.subagents)?,
+        serde_json::to_value(&refreshed.subagents)?
+    );
+    client::request(
+        &storage,
+        Request::Subagent {
+            id: id.clone(),
+            agent: child_id,
+        },
+    )?;
+    assert_eq!(mutations(&protocol()?), before);
+    assert_eq!(session(&storage, &id)?.subagents.len(), 1);
+    service.stop()?;
+    Ok(())
+}
+
+#[test]
 fn archiving_and_deleting_stop_provider_shells_and_their_servers() -> Result<()> {
     let tmp = tempfile::Builder::new()
         .prefix("difu-shell-cleanup-")

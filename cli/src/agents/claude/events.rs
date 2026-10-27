@@ -14,7 +14,7 @@ const PERMISSION_CANCEL_DIAGNOSTIC: &str =
     "[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use";
 
 #[derive(Default)]
-pub(super) struct Decoder {
+pub(in crate::agents) struct Decoder {
     message: String,
     blocks: HashMap<u64, String>,
     input: HashMap<String, String>,
@@ -23,7 +23,7 @@ pub(super) struct Decoder {
     result_outcome: Option<(Option<String>, bool)>,
     interruption: Option<Interruption>,
 }
-fn text(value: &Value) -> String {
+pub(in crate::agents) fn text(value: &Value) -> String {
     if let Some(text) = value.as_str() {
         text.into()
     } else if let Some(blocks) = value.as_array() {
@@ -44,8 +44,8 @@ fn kind(block: &Value) -> &'static str {
         _ => "system",
     }
 }
-fn block_entry(
-    session: &mut Session,
+pub(in crate::agents) fn block_entry(
+    entries: &mut Vec<Entry>,
     message: &str,
     index: u64,
     block: &Value,
@@ -70,13 +70,17 @@ fn block_entry(
             .into(),
         _ => block.get("input").map(Value::to_string).unwrap_or_default(),
     };
-    let data = if entry_kind == "mcpToolCall" {
+    let mut data = if entry_kind == "mcpToolCall" {
         json!({"server":"Claude Code","tool":block.get("name"),"arguments":block.get("input"),"status":"inProgress"})
     } else {
         block.clone()
     };
+    if let Some(data) = data.as_object_mut() {
+        data.insert("difuClaudeMessage".into(), json!(message));
+        data.insert("difuClaudeIndex".into(), json!(index));
+    }
     let now = chrono::Utc::now().timestamp_millis();
-    if let Some(entry) = session.entries.iter_mut().find(|entry| entry.id == id) {
+    if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
         // A full assistant frame reconciles deltas; it does not finish a tool call.
         if entry.finished_at.is_none() || entry_kind != "mcpToolCall" {
             entry.text = content.into();
@@ -86,7 +90,7 @@ fn block_entry(
             entry.finished_at = Some(now);
         }
     } else {
-        session.entries.push(Entry {
+        entries.push(Entry {
             timestamp: Some(chrono::Utc::now().timestamp_millis()),
             id: id.clone(),
             kind: entry_kind.into(),
@@ -97,6 +101,71 @@ fn block_entry(
         });
     }
     id
+}
+
+/// Claude can emit one completed content block per assistant frame. Its local
+/// array index is not the index in the streamed API message (thinking often
+/// occupies index zero). Reconcile within that message and preserve frame UUIDs
+/// for non-streamed/replayed blocks; never deduplicate separate messages by text.
+pub(in crate::agents) fn complete_message(entries: &mut Vec<Entry>, frame: &Value) {
+    let message = frame.get("message").unwrap_or(&Value::Null);
+    let message_id = message
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let uuid = frame.get("uuid").and_then(Value::as_str);
+    if let Some(blocks) = message.get("content").and_then(Value::as_array) {
+        let mut matched = std::collections::HashSet::new();
+        for (index, block) in blocks.iter().enumerate() {
+            let content = block
+                .get("text")
+                .or_else(|| block.get("thinking"))
+                .and_then(Value::as_str);
+            let existing = entries
+                .iter()
+                .find(|e| {
+                    !matched.contains(&e.id)
+                        && e.kind == kind(block)
+                        && (uuid.is_some_and(|uuid| {
+                            e.data.get("difuClaudeFrame").and_then(Value::as_str) == Some(uuid)
+                                && e.data.get("difuClaudeFrameIndex").and_then(Value::as_u64)
+                                    == Some(index as u64)
+                        }) || (e.data.get("difuClaudeFrame").is_none()
+                            && e.data.get("difuClaudeMessage").and_then(Value::as_str)
+                                == Some(message_id)
+                            && content.is_some_and(|text| e.text.as_str() == text)))
+                })
+                .map(|e| {
+                    (
+                        e.id.clone(),
+                        e.data
+                            .get("difuClaudeMessage")
+                            .and_then(Value::as_str)
+                            .unwrap_or(message_id)
+                            .to_owned(),
+                        e.data
+                            .get("difuClaudeIndex")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(index as u64),
+                    )
+                });
+            let key = uuid.map_or_else(
+                || message_id.to_owned(),
+                |uuid| format!("{message_id}-{uuid}"),
+            );
+            let (_, key, block_index) =
+                existing.unwrap_or_else(|| (String::new(), key, index as u64));
+            let id = block_entry(entries, &key, block_index, block, true);
+            matched.insert(id.clone());
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id)
+                && let Some(data) = entry.data.as_object_mut()
+                && let Some(uuid) = uuid
+            {
+                data.insert("difuClaudeFrame".into(), json!(uuid));
+                data.insert("difuClaudeFrameIndex".into(), json!(index));
+            }
+        }
+    }
 }
 impl Decoder {
     pub fn interrupting(&mut self, session: &Session, send_next: bool) {
@@ -170,6 +239,10 @@ impl Decoder {
         session.finish_steering_wait();
     }
     pub fn apply(&mut self, session: &mut Session, frame: &Value) {
+        if super::super::subagents::claude_event(session, frame) {
+            session.touch();
+            return;
+        }
         let now = chrono::Utc::now().timestamp_millis();
         if frame.get("parent_tool_use_id").is_none_or(Value::is_null)
             && matches!(
@@ -252,7 +325,13 @@ impl Decoder {
                     }
                     Some("content_block_start") => {
                         if let Some(block) = event.get("content_block") {
-                            let id = block_entry(session, &self.message, index, block, false);
+                            let id = block_entry(
+                                &mut session.entries,
+                                &self.message,
+                                index,
+                                block,
+                                false,
+                            );
                             self.blocks.insert(index, id);
                         }
                     }
@@ -299,16 +378,7 @@ impl Decoder {
                     self.result_received = false;
                     self.result_outcome = None;
                 }
-                let message = frame.get("message").unwrap_or(&Value::Null);
-                let message_id = message
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                if let Some(blocks) = message.get("content").and_then(Value::as_array) {
-                    for (index, block) in blocks.iter().enumerate() {
-                        block_entry(session, message_id, index as u64, block, true);
-                    }
-                }
+                complete_message(&mut session.entries, frame);
             }
             Some("user") => {
                 let uuid = frame.get("uuid").and_then(Value::as_str);
@@ -526,6 +596,52 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn completed_claude_blocks_reconcile_stream_indexes_and_replays() {
+        let mut s = session();
+        let mut decoder = Decoder::default();
+        decoder.apply(
+            &mut s,
+            &json!({"type":"stream_event","event":{"type":"message_start","message":{"id":"m"}}}),
+        );
+        for (index, block) in [
+            (0, json!({"type":"thinking","thinking":"Checking the plan"})),
+            (1, json!({"type":"text","text":"I will open the PR"})),
+        ] {
+            decoder.apply(&mut s, &json!({"type":"stream_event","event":{"type":"content_block_start","index":index,"content_block":block}}));
+            decoder.apply(
+                &mut s,
+                &json!({"type":"stream_event","event":{"type":"content_block_stop","index":index}}),
+            );
+            let frame = json!({"type":"assistant","uuid":format!("frame-{index}"),"message":{"id":"m","content":[block]}});
+            decoder.apply(&mut s, &frame);
+            decoder.apply(&mut s, &frame);
+        }
+        assert_eq!(s.entries.len(), 2);
+        assert_eq!(
+            s.entries
+                .iter()
+                .filter(|e| e.kind == "agentMessage" && e.text.as_str() == "I will open the PR")
+                .count(),
+            1
+        );
+        assert_eq!(
+            s.entries
+                .iter()
+                .filter(|e| e.kind == "reasoning" && e.text.as_str() == "Checking the plan")
+                .count(),
+            1
+        );
+        // A later message with the same text is legitimate, and stays visible.
+        decoder.apply(&mut s, &json!({"type":"assistant","uuid":"later","message":{"id":"m2","content":[{"type":"text","text":"I will open the PR"}]}}));
+        assert_eq!(
+            s.entries
+                .iter()
+                .filter(|e| e.text.as_str() == "I will open the PR")
+                .count(),
+            2
+        );
+    }
     fn session() -> Session {
         let mut session = Session::new(
             "claude".into(),

@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 
 pub(super) enum View {
+    Subagent(Box<super::subagents::View>),
     PullRequest {
         app: Box<crate::app::App>,
     },
@@ -79,6 +80,11 @@ impl Ui {
                 || self
                     .selected
                     .as_ref()
+                    .and_then(|id| self.sessions.get(id))
+                    .is_some_and(|s| !s.subagents.is_empty())
+                || self
+                    .selected
+                    .as_ref()
                     .is_some_and(|id| !self.prs.all(id).is_empty()),
         )
     }
@@ -118,6 +124,15 @@ impl Ui {
                     crate::ui::option_style(self.focus == focus),
                 ));
             }
+        }
+        if let Some(session) = self.selected.as_ref().and_then(|id| self.sessions.get(id))
+            && !session.subagents.is_empty()
+        {
+            items.push((
+                format!(" subagents {} ", session.subagents.len()),
+                Focus::Subagents,
+                crate::ui::option_style(self.focus == Focus::Subagents),
+            ));
         }
         items
     }
@@ -179,6 +194,7 @@ impl Ui {
             }
             let action = match focus {
                 Focus::Resources(artifacts) => Action::Resources(artifacts),
+                Focus::Subagents => Action::Subagents,
                 Focus::PullRequest(index) => Action::PullRequest(index),
                 _ => continue,
             };
@@ -255,6 +271,7 @@ impl Ui {
             browser.tick();
         }
         self.tick_terminal(visible);
+        self.tick_subagent(visible);
         if visible
             && self.panels.error.is_none()
             && !self.panels.loading
@@ -635,6 +652,9 @@ impl Ui {
             app.key_event(key);
             return true;
         }
+        if self.subagent_key(key) {
+            return true;
+        }
         if matches!(
             shortcut,
             Some(NAVIGATION_NEXT_FOCUS | NAVIGATION_PREVIOUS_FOCUS)
@@ -667,6 +687,9 @@ impl Ui {
         }
         if !inside {
             return false;
+        }
+        if self.subagent_mouse(event) {
+            return true;
         }
         if let Some(View::Artifact {
             browser: Some(browser),
@@ -791,6 +814,9 @@ impl Ui {
     pub(super) fn resource_key(&mut self, key: KeyEvent) -> bool {
         use crate::shortcuts::ids::*;
         let shortcut = self.shortcut(key);
+        if self.subagent_picker_key(key) {
+            return true;
+        }
         if self.modal.is_none() && !self.panels.focused && self.drilled {
             let visible = self
                 .footer_items()
@@ -804,7 +830,10 @@ impl Ui {
                 self.focus = *first;
                 return true;
             }
-            if matches!(self.focus, Focus::Resources(_) | Focus::PullRequest(_)) {
+            if matches!(
+                self.focus,
+                Focus::Resources(_) | Focus::Subagents | Focus::PullRequest(_)
+            ) {
                 if visible.is_empty() {
                     self.focus = Focus::Composer;
                     return false;
@@ -825,6 +854,7 @@ impl Ui {
                     Some(NAVIGATION_ACTIVATE) => match self.focus {
                         Focus::PullRequest(index) => self.open_pr_panel(index),
                         Focus::Resources(a) => self.open_resources(a),
+                        Focus::Subagents => self.open_subagents(),
                         _ => {}
                     },
                     Some(NAVIGATION_NEXT_FOCUS | NAVIGATION_PREVIOUS_FOCUS) => {
@@ -882,6 +912,7 @@ impl Ui {
     }
     pub(super) fn draw_panel(&mut self, frame: &mut Frame, area: Rect) {
         let title = match &self.panels.view {
+            Some(View::Subagent(_)) => "Sub-agent · read only",
             Some(View::PullRequest { .. }) => "Pull request",
             Some(View::Shell { .. }) => "Shell output",
             Some(View::Terminal(_)) => "Shared shell",
@@ -938,6 +969,7 @@ impl Ui {
             self.panels.rect = inner;
         }
         match &mut self.panels.view {
+            Some(View::Subagent(_)) => self.draw_subagent(frame, inner),
             Some(View::Terminal(terminal)) => {
                 terminal.draw(frame, inner, self.panels.focused && self.modal.is_none())
             }

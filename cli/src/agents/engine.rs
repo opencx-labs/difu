@@ -139,6 +139,49 @@ impl Connection {
     }
 }
 
+pub(super) fn read_subagent(store: &Store, id: &str, agent: &str, cancel: &Cancel) -> Result<()> {
+    let session = store.get(id)?;
+    let mut rpc = Connection::open(
+        session.workspace.as_deref().unwrap_or(session.job.root()),
+        cancel,
+    )?;
+    rpc.initialize(cancel)?;
+    read_subagent_with(&mut rpc, store, id, agent, cancel)
+}
+
+fn read_subagent_with(
+    rpc: &mut Connection,
+    store: &Store,
+    id: &str,
+    agent: &str,
+    cancel: &Cancel,
+) -> Result<()> {
+    let session = store.get(id)?;
+    let child = session
+        .subagents
+        .iter()
+        .find(|a| a.id == agent && a.provider == super::provider::Provider::Codex)
+        .context("Unknown Codex sub-agent")?;
+    let native_id = child.native_id.clone();
+    let response = rpc.call(
+        "thread/read",
+        json!({"threadId":native_id,"includeTurns":true}),
+        cancel,
+        |v| event(store, id, v),
+    )?;
+    let thread = response
+        .get("thread")
+        .context("Missing sub-agent history")?;
+    ensure!(
+        thread.get("id").and_then(Value::as_str) == Some(&native_id),
+        "Sub-agent history belongs to another thread"
+    );
+    store.update(id, |s| {
+        super::subagents::codex_history(s, &native_id, thread)
+    })?;
+    store.save(id)
+}
+
 pub(super) fn usage(session: &Session, cancel: &Cancel) -> Result<Value> {
     let cwd = session.workspace.as_deref().unwrap_or(session.job.root());
     let mut rpc = Connection::open(cwd, cancel)?;
@@ -204,7 +247,7 @@ pub fn defaults(cwd: &Path) -> Result<Reply> {
     })
 }
 
-fn item_text(item: &Value) -> String {
+pub(super) fn item_text(item: &Value) -> String {
     let kind = item
         .get("type")
         .and_then(Value::as_str)
@@ -277,6 +320,9 @@ fn string(value: &Value, key: &str) -> String {
 }
 
 pub(crate) fn apply_event(session: &mut Session, event: &Value) {
+    if event.get("id").is_none() && super::subagents::codex_event(session, event) {
+        return;
+    }
     let method = event
         .get("method")
         .and_then(Value::as_str)
@@ -398,6 +444,7 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                 responded: false,
             };
             super::elicitation::normalize(&mut pending);
+            super::questions::attach_context(&session.entries, &mut pending);
             session.pending.push(pending);
         }
         session.status = Status::Waiting;
@@ -980,6 +1027,9 @@ fn command(
             let snapshot =
                 mcp_control::execute(rpc, store, id, action, cancel).map_err(|e| format!("{e:#}"));
             let _ = response.send(snapshot);
+        }
+        Control::ReadSubagent { agent } => {
+            read_subagent_with(rpc, store, id, &agent, cancel)?;
         }
         Control::ReadUsage => {
             let usage = usage_with(rpc, &session, cancel, |v| event(store, id, v))?;
@@ -1846,6 +1896,7 @@ pub fn run(
                 let read_only = matches!(
                     command_request.control,
                     Control::RefreshShells
+                        | Control::ReadSubagent { .. }
                         | Control::CloseShell { .. }
                         | Control::ReadUsage
                         | Control::Mcp { .. }
