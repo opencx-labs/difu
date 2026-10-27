@@ -876,7 +876,8 @@ mod tests {
         until(&store, || {
             Ok(store.get("one")?.entries.iter().any(|entry| {
                 entry.id == first
-                    && entry.text.contains("first-streamed\n")
+                    && entry.data.get("aggregatedOutput").and_then(Value::as_str)
+                        == Some("first-streamed")
                     && entry.finished_at.is_none()
             }))
         })?;
