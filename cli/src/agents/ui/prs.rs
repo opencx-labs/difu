@@ -356,6 +356,7 @@ impl Ui {
             .cache
             .get(&id)
             .and_then(|links| links.iter().find(|link| link.pr.key == key))
+            .filter(|link| !link.attached)
             .map(|c| c.workspace.clone())
             .filter(|p| p.is_dir())
             && let Some(review) = app.reviews.get_mut(&key.id())
@@ -427,7 +428,8 @@ mod tests {
         ui.focus = Focus::ChangeTree;
         let first = pr();
         let mut second = pr();
-        second.key.number = 43;
+        second.key.owner = "zother".into();
+        second.key.repo = "repository".into();
         let patch = "diff --git a/published.rs b/published.rs\n--- a/published.rs\n+++ b/published.rs\n@@ -1 +1 @@\n-old\n+published\n";
         crate::github::store::diff(&storage, &first.key, patch)?;
         ui.prs.receive(Update {
@@ -438,6 +440,7 @@ mod tests {
             result: Ok(vec![first.clone(), second.clone()]
                 .into_iter()
                 .map(|pr| Cached {
+                    attached: pr.key == second.key,
                     workspace_revision: 0,
                     workspace: temp.path().into(),
                     pr,
@@ -492,7 +495,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(screen.contains("example/project#42") && screen.contains("example/project#43"));
+        assert!(screen.contains("example/project#42") && screen.contains("zother/repository#42"));
         assert!(screen.contains("cached diff may be stale"));
         assert!(
             ui.hits
@@ -540,6 +543,7 @@ mod tests {
             branch: None,
             revision: 0,
             result: Ok(vec![Cached {
+                attached: false,
                 workspace_revision: 0,
                 workspace: temp.path().into(),
                 pr: badge,
@@ -604,6 +608,7 @@ mod tests {
             branch: None,
             revision: 0,
             result: Ok(vec![Cached {
+                attached: false,
                 workspace_revision: 0,
                 workspace: temp.path().into(),
                 pr: pr(),
@@ -746,6 +751,7 @@ mod tests {
                     let mut pr = pr();
                     pr.key.number = number;
                     Cached {
+                        attached: false,
                         workspace_revision: 0,
                         workspace: temp.path().into(),
                         pr,

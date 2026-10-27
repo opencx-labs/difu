@@ -92,8 +92,8 @@ impl Ui {
                     let focus = Focus::PullRequest(index);
                     items.push((
                         format!(
-                            " PR #{} · {}{} ",
-                            pr.key.number,
+                            " {} · {}{} ",
+                            link.badge(),
                             pr.label(),
                             if self.prs.stale(id) { " · stale" } else { "" },
                         ),

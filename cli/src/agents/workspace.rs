@@ -1095,6 +1095,7 @@ mod tests {
         assert_eq!(statistics(&session, &storage, &cancel)?.added, 4);
         assert!(changes(&session, &storage, &cancel)?.contains("+committed"));
         let mut link = SessionLink {
+            attached: false,
             workspace_revision: 0,
             workspace: workspace.clone(),
             pr: SessionPr {

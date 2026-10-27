@@ -38,6 +38,15 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Attach a GitHub pull request to a session, including another repository.
+    AttachPr {
+        /// Full GitHub pull request URL.
+        #[arg(value_parser = PrKey::from_url)]
+        url: PrKey,
+        /// Difu session ID to receive the PR badge and diff tab.
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        session: String,
+    },
     /// Open the pull request associated with the current Git branch.
     Pr {
         /// Use the repository and branch in the current directory.
@@ -67,6 +76,23 @@ fn main() -> Result<()> {
         } else {
             difu::agents::server::run(storage)
         };
+    }
+    if let Some(Commands::AttachPr { url, session }) = &args.command {
+        let storage = Storage::discover()?;
+        difu::agents::client::ensure_running(&storage)?;
+        let reply = difu::agents::client::request(
+            &storage,
+            difu::agents::Request::AttachPr {
+                id: session.clone(),
+                url: url.url(),
+            },
+        )?;
+        anyhow::ensure!(
+            matches!(reply, difu::agents::Reply::Ok),
+            "Unexpected PR attachment reply: {reply:?}"
+        );
+        println!("Attached {} to session {session}", url.url());
+        return Ok(());
     }
     anyhow::ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
@@ -228,6 +254,28 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn attachment_requires_a_full_pr_url_and_explicit_session() -> Result<()> {
+        let url = "https://github.com/other/repo/pull/42";
+        let args = Args::try_parse_from(["difu", "attach-pr", url, "--session", "one"])?;
+        assert!(
+            matches!(args.command, Some(Commands::AttachPr { url, session })
+            if url.id() == "other/repo#42" && session == "one")
+        );
+        assert!(Args::try_parse_from(["difu", "attach-pr", url]).is_err());
+        assert!(Args::try_parse_from(["difu", "attach-pr", url, "--session", ""]).is_err());
+        for value in [
+            "42",
+            "other/repo#42",
+            "https://github.com/other/repo/issues/42",
+        ] {
+            assert!(
+                Args::try_parse_from(["difu", "attach-pr", value, "--session", "one"]).is_err()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn accepts_current_branch_command_and_preserves_existing_launch_forms() -> Result<()> {

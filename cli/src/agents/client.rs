@@ -48,6 +48,7 @@ pub fn request(storage: &Storage, request: Request) -> Result<Reply> {
             format!("change workspace for {id}")
         }
         Request::Usage { id } => format!("read usage for {id}"),
+        Request::AttachPr { id, .. } => format!("attach PR to session {id}"),
         Request::Launch { .. } | Request::NewAgent { .. } => "create session".into(),
         _ => "request session service data".into(),
     };

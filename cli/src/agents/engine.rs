@@ -352,6 +352,19 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
             return;
         }
 
+        if session.pr_tools
+            && method == "item/tool/call"
+            && params.get("tool").and_then(Value::as_str) == Some(super::pr_attachments::TOOL)
+        {
+            session.pr_requests.push(Pending {
+                id: id.clone(),
+                method: method.into(),
+                params: params.clone(),
+                responded: false,
+            });
+            return;
+        }
+
         if !session.native_setup
             && session.deferred_workspace
             && method == "item/tool/call"
@@ -1520,6 +1533,14 @@ fn instructions(session: &Session) -> String {
     } else {
         base
     };
+    let base = if session.pr_tools {
+        format!("{base}\n\n{}", super::pr_attachments::INSTRUCTIONS)
+    } else {
+        format!(
+            "{base}\n\n{}",
+            super::pr_attachments::command_instructions(&session.id)
+        )
+    };
     if session.artifact_tools {
         format!("{base}\n\n{}", super::artifacts::INSTRUCTIONS)
     } else {
@@ -1532,6 +1553,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
     if store.get(id)?.thread_id.is_none() {
         store.update(id, |s| {
             s.artifact_tools = true;
+            s.pr_tools = true;
             s.registration_tools = true;
             s.question_tools = true;
             s.peer_tools = true;
@@ -1620,6 +1642,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
             }
             store.update(id, |s| {
                 s.artifact_tools = true;
+                s.pr_tools = true;
                 s.registration_tools = true;
                 s.question_tools = true;
                 s.peer_tools = true;
@@ -1917,6 +1940,38 @@ pub fn run(
                 rpc.write(json!({"id":request.id,"result":{"success":result.is_ok(),"contentItems":[{"type":"inputText","text":text}]}}))?;
             }
         }
+        let requests = store.inspect(id, |s| s.pr_requests.clone())?;
+        if !requests.is_empty() {
+            store.update(id, |s| s.pr_requests.clear())?;
+            for request in requests {
+                let result = (|| -> Result<Value> {
+                    let session = store.get(id)?;
+                    ensure!(
+                        request.params.get("threadId").and_then(Value::as_str)
+                            == session.thread_id.as_deref()
+                            && request.params.get("turnId").and_then(Value::as_str)
+                                == session.turn_id.as_deref(),
+                        "PR attachment belongs to another turn"
+                    );
+                    let args = request
+                        .params
+                        .get("arguments")
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let args = if let Some(text) = args.as_str() {
+                        serde_json::from_str(text)?
+                    } else {
+                        args
+                    };
+                    super::pr_attachments::handle(store, id, &args, cancel)
+                })();
+                let text = match &result {
+                    Ok(value) => value.to_string(),
+                    Err(error) => format!("{error:#}"),
+                };
+                rpc.write(json!({"id":request.id,"result":{"success":result.is_ok(),"contentItems":[{"type":"inputText","text":text}]}}))?;
+            }
+        }
         let requests = store.inspect(id, |s| s.artifact_requests.clone())?;
         if !requests.is_empty() {
             store.update(id, |s| s.artifact_requests.clear())?;
@@ -2019,6 +2074,7 @@ mod tests {
         );
         session.repository_rules = "Use the repository service layer.".into();
         session.artifact_tools = true;
+        session.pr_tools = true;
         session.registration_tools = true;
         session.question_tools = true;
         session.peer_tools = true;
@@ -2036,6 +2092,7 @@ mod tests {
             assert!(prompt.contains("This conversation is difu session policy."));
             for tool in [
                 "difu_present_artifact",
+                "difu_attach_pr",
                 "difu_remove_questions",
                 "difu_register_worktree",
                 "difu_delete_session",
@@ -2048,6 +2105,15 @@ mod tests {
             assert!(!prompt.contains("Current repository:"));
         }
         assert!(!super::super::registration::continuation(&restored).contains("PR CI"));
+        assert!(!instructions(&restored).contains("difu attach-pr"));
+
+        let mut resumed = restored.clone();
+        resumed.pr_tools = false;
+        resumed.thread_id = Some("existing-codex-thread".into());
+        let prompt = instructions(&resumed);
+        assert!(prompt.contains("difu attach-pr <URL> --session 'policy'"));
+        assert!(!prompt.contains("difu_attach_pr"));
+        assert!(super::super::claude::instructions(&resumed).contains("difu_attach_pr"));
 
         let mut old = saved;
         old.as_object_mut()

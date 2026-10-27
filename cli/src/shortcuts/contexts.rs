@@ -1,4 +1,8 @@
 use super::Context;
+pub const AGENT_INBOX: Context = Context("AgentInbox");
+pub const AGENT_INBOX_QUESTION: Context = Context("AgentInboxQuestion");
+pub const AGENT_INBOX_NOTE: Context = Context("AgentInboxNote");
+pub const AGENT_INBOX_APPROVAL: Context = Context("AgentInboxApproval");
 pub const AGENT_LIST: Context = Context("AgentList");
 pub const AGENT_COMPOSER: Context = Context("AgentComposer");
 pub const AGENT_COMPOSER_PANES: Context = Context("AgentComposerPanes");
@@ -93,6 +97,10 @@ pub const SETTINGS_CONFIRM: Context = Context("SettingsConfirm");
 pub const SHORTCUT_CAPTURE: Context = Context("ShortcutCapture");
 pub const SHORTCUT_TEST: Context = Context("ShortcutTest");
 pub const ALL: &[Context] = &[
+    AGENT_INBOX,
+    AGENT_INBOX_QUESTION,
+    AGENT_INBOX_NOTE,
+    AGENT_INBOX_APPROVAL,
     AGENT_LIST,
     AGENT_COMPOSER,
     AGENT_COMPOSER_PANES,

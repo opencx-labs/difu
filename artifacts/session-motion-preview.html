@@ -63,11 +63,7 @@
     const c=states[type].color;
     let art='';
     if(type==='working') art=runnerFrames.map(r=>`<g class="runner-frame">${pixels(r,c)}</g>`).join('');
-    if(type==='ready') art=[[0,'#803c3c','',.55],[8,'#806e32','',.55],[16,c,'signal-light',1]].map(([top,color,cls,opacity])=>
-      `<g class="${cls}" opacity="${opacity}">${[3,5,7,7,7,5,3].map((width,row)=>
-        `<rect x="${12-Math.floor(width/2)}" y="${top+row}" width="${width}" height="1" fill="${color}"/>`
-      ).join('')}</g>`
-    ).join('');
+    if(type==='ready') art=`<g class="signal-light">${[6,10,12,14,14,16,16,16,16,16,16,14,14,12,10,6].map((width,row)=>`<rect x="${12-width/2}" y="${4+row}" width="${width}" height="1" fill="${c}"/>`).join('')}</g>`;
     if(type==='interrupted') art=`<path class="warning-glow" d="M10 2h4v3h2v3h2v4h2v4h2v6H2v-6h2v-4h2V8h2V5h2z" fill="${c}"/><path d="M11 7h2v7h-2zm0 10h2v2h-2z" fill="#160809"/>`;
     if(type==='waiting') art=pixels(['000001000000','000101010000','000101010100','000101010100','000111110100','000111111100','010111111100','011111111100','001111111000','000111110000','000111100000','000111100000'],c)+'<rect class="waiting-dot" x="20" y="0" width="3" height="3" fill="#edc36a"/>';
     if(type==='starting') art=`<g class="starting-hourglass"><path d="M5 2h14v3h-2v3h-2v3h-2v2h2v3h2v3h2v3H5v-3h2v-3h2v-3h2v-2H9V8H7V5H5z" fill="${c}"/><path d="M8 5h8v2h-2v3h-4V7H8zm2 10h4v3h2v1H8v-1h2z" fill="#101211"/></g>`;

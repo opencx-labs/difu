@@ -177,6 +177,9 @@ impl Ui {
     }
     /// Highlights a folder card; no session is selected meanwhile.
     pub(super) fn focus_folder(&mut self, id: String) {
+        if self.inbox.visible {
+            self.close_questions_inbox();
+        }
         if self.selected.is_some() && self.inline_question() {
             self.remember_answers();
             self.modal = None;
@@ -190,6 +193,9 @@ impl Ui {
         self.changes_at = None;
     }
     pub(super) fn open_folder(&mut self, id: String) {
+        if self.inbox.visible {
+            self.close_questions_inbox();
+        }
         if !self.session_folders.iter().any(|f| f.id == id) {
             return;
         }

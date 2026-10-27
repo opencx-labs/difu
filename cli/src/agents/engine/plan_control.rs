@@ -72,7 +72,8 @@ fn fresh_context(
     proposal: &Proposal,
     cancel: &Cancel,
 ) -> Result<()> {
-    let session = store.get(id)?;
+    let mut session = store.get(id)?;
+    session.pr_tools = true;
     let cwd = session
         .workspace
         .as_deref()
@@ -139,6 +140,7 @@ fn fresh_context(
     // remains untouched. Replacing a native context never replaces its worktree.
     store.update(id,|s| {
         s.thread_id=Some(thread.clone());
+        s.pr_tools=true;
         s.provider_context=None;
         s.permission_state.mode=Some("default".into());
         s.permission_state.pending_mode=None;

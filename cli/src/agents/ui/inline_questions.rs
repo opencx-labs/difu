@@ -478,7 +478,7 @@ impl Ui {
         self.remember_answers();
         let tweaks = self.preferences.motion.tweaks(self.tweaks);
         let clear = tweaks.capped(tweaks.input_clear_ms);
-        if clear > 0 && !self.question_flip.drawn.is_empty() {
+        if !self.inbox.visible && clear > 0 && !self.question_flip.drawn.is_empty() {
             self.question_flip.leaving = Some(Leaving {
                 session: id.clone(),
                 rows: self.question_flip.drawn.clone(),
@@ -528,7 +528,8 @@ impl Ui {
                 }),
                 true,
             ));
-        } else if self.selected.as_deref() == Some(id)
+        } else if !self.inbox.visible
+            && self.selected.as_deref() == Some(id)
             && matches!(&self.modal, Some(Modal::Approval {pending,field,..}) if pending.id == request && pending.params.get("questions").and_then(Value::as_array).and_then(|q|q.get(*field)).and_then(|q|q.get("id")).and_then(Value::as_str) == Some(question.as_str()))
         {
             let count = self.question_slots().len();
@@ -555,24 +556,44 @@ impl Ui {
             .unwrap_or(0)
     }
     fn question_lines(&self, width: u16) -> Option<QuestionLines> {
-        let Some(Modal::Approval {
-            pending,
-            field,
-            selected,
-            answers,
-            ..
-        }) = &self.modal
-        else {
+        let Some(Modal::Approval { pending, field, .. }) = &self.modal else {
             return None;
         };
-        if !self.inline_question() {
-            return None;
-        }
-        let question = pending
-            .params
-            .get("questions")
-            .and_then(Value::as_array)?
-            .get(*field)?;
+        self.inbox_question_lines(self.selected.as_deref()?, pending, *field, width)
+    }
+    pub(super) fn inbox_question_lines(
+        &self,
+        id: &str,
+        pending: &Pending,
+        field: usize,
+        width: u16,
+    ) -> Option<QuestionLines> {
+        let questions = pending.params.get("questions")?.as_array()?;
+        let question = questions.get(field)?;
+        let position = self.positions.get(id);
+        let request = pending.id.to_string();
+        let active = self.selected.as_deref() == Some(id)
+            && matches!(&self.modal, Some(Modal::Approval { pending: shown, field: shown_field, .. })
+                if shown.id == pending.id && *shown_field == field);
+        let saved = position.and_then(|p| p.answers.get(&request));
+        let (answers, choice) = match &self.modal {
+            Some(Modal::Approval {
+                answers, selected, ..
+            }) if active => (answers.clone(), *selected),
+            _ => (
+                saved
+                    .map(|draft| draft.answers.clone())
+                    .unwrap_or_else(|| vec![Editor::default(); questions.len()]),
+                position
+                    .and_then(|p| p.question_choices.get(&(request.clone(), field)))
+                    .copied()
+                    .unwrap_or(0),
+            ),
+        };
+        let checks = position.and_then(|p| p.question_checks.get(&(request.clone(), field)));
+        let note = position.and_then(|p| p.question_notes.get(&(request, field, choice)));
+        let field = &field;
+        let selected = &choice;
         let mut lines: Vec<_> = wrapped(
             question
                 .get("question")
@@ -590,8 +611,7 @@ impl Ui {
             ))
         })
         .collect();
-        let multi = self.multi_select_key().is_some();
-        let checks = self.question_checks();
+        let multi = question.get("multiSelect").and_then(Value::as_bool) == Some(true);
         if multi {
             lines.push(Line::from(Span::styled(
                 "Choose one or more",
@@ -647,7 +667,7 @@ impl Ui {
             }
             hits.push((start, lines.len() - start, Action::QuestionChoice(index)));
             if index == *selected
-                && let Some(note) = self.question_note()
+                && let Some(note) = note
             {
                 let start = lines.len();
                 let prefix = "     Note: ";
@@ -660,7 +680,7 @@ impl Ui {
                     usize::from(width).saturating_sub(indent).max(1),
                     Style::default().bg(ACCENT).fg(crate::ui::INK),
                 );
-                if self.question_note_focused {
+                if active && self.question_note_focused {
                     cursor = Some((indent + x, start + y));
                 }
                 for (row_index, mut row) in rows.into_iter().enumerate() {
@@ -749,7 +769,7 @@ impl Ui {
             lines.len().saturating_sub(start),
             Action::QuestionChoice(options.len()),
         ));
-        Some((lines, cursor, hits))
+        Some((lines, cursor.filter(|_| active), hits))
     }
     pub(super) fn draw_question_tabs(&mut self, frame: &mut Frame, area: Rect) {
         if !self.inline_question() {

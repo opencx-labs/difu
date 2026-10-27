@@ -35,6 +35,7 @@ pub(super) fn tools(session: &Session) -> Vec<Value> {
     } else {
         vec![
             super::artifacts::tool(),
+            super::pr_attachments::tool(),
             super::registration::tool(),
             super::management::tool(),
             super::questions::tool(),

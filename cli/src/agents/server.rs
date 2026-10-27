@@ -407,6 +407,7 @@ impl Service {
             | Request::Repository { id, .. }
             | Request::Clear { id }
             | Request::RegisterWorktree { id, .. }
+            | Request::AttachPr { id, .. }
             | Request::Permissions { id, .. }
             | Request::Usage { id }
             | Request::Rename { id, .. } => Some(id.clone()),
@@ -464,6 +465,15 @@ impl Service {
                 version: env!("CARGO_PKG_VERSION").into(),
             }),
             Request::List => Ok(Reply::Sessions(self.store.list()?)),
+            Request::AttachPr { id, url } => {
+                super::pr_attachments::handle(
+                    &self.store,
+                    &id,
+                    &serde_json::json!({"url": url}),
+                    &Cancel::default(),
+                )?;
+                Ok(Reply::Ok)
+            }
             Request::Watch { .. } => anyhow::bail!("Watch requires a streaming connection"),
             Request::Read { id, version } => self.store.inspect(&id, |session| {
                 if version == Some(session.version) {
@@ -1261,6 +1271,7 @@ fn reset_workspace(s: &mut Session, candidate: Session, revision: u64) {
     s.workspace_requests.clear();
     s.registration_requests.clear();
     s.artifact_requests.clear();
+    s.pr_requests.clear();
     s.question_requests.clear();
     s.deletion_requests.clear();
     s.job = candidate.job;
@@ -1302,6 +1313,7 @@ fn clear_conversation(s: &mut Session) {
     s.permissions = Value::Null;
     s.inherited_permissions = Value::Null;
     s.artifact_tools = false;
+    s.pr_tools = false;
     s.registration_tools = false;
     s.question_tools = false;
     s.peer_tools = false;
@@ -2061,6 +2073,7 @@ mod clear_tests {
             let store = Arc::new(Store::fixture(home.clone(), vec![session.clone()]));
             fs::create_dir_all(&store.storage.cache)?;
             let link = SessionLink {
+                attached: false,
                 workspace: tree.clone(),
                 workspace_revision: 0,
                 pr: SessionPr {

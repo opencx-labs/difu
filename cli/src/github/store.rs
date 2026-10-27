@@ -404,6 +404,7 @@ mod tests {
         let links = crate::agents::pr_cache::SessionLinks::from([(
             "session".into(),
             vec![crate::agents::pr_cache::SessionLink {
+                attached: false,
                 workspace: dir.path().into(),
                 pr: linked,
                 workspace_revision: 0,

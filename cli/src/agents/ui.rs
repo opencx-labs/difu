@@ -8,6 +8,7 @@ mod commands;
 mod defaults;
 mod flap;
 mod folders;
+mod inbox;
 mod inline_questions;
 mod mcp_panel;
 mod media;
@@ -168,6 +169,8 @@ pub struct Position {
 }
 #[derive(Clone)]
 enum Action {
+    InboxOpen,
+    InboxItem(inbox::Key, Option<Box<Action>>),
     McpSelect(usize),
     PermissionTab(usize),
     PermissionItem(usize),
@@ -336,6 +339,8 @@ enum Task {
     DecidePlan(String, String),
     List,
     Read(String),
+    InboxRead(String),
+    InboxRespond(inbox::Key),
     Changes(changes::Source, u64),
     ChangesContext(changes::Source, u64, String),
     Statistics(String, u64),
@@ -364,6 +369,7 @@ pub struct Ui {
     pub(crate) settings_requested: Option<crate::settings::Category>,
     panels: panels::Panels,
     prs: prs::State,
+    inbox: inbox::State,
     pub defaults: crate::storage::AgentDefaults,
     pub selected: Option<String>,
     pub summaries: Vec<Summary>,
@@ -456,6 +462,7 @@ pub struct Ui {
 impl Ui {
     pub(crate) fn notification_viewed_session(&self) -> Option<String> {
         if self.modal.is_some()
+            || self.inbox.visible
             || (self.drilled && self.changes_visible)
             || (self.panels.visible() && !self.panels.right)
         {
@@ -475,6 +482,7 @@ impl Ui {
                     != crate::settings::HelperPlacement::Main,
             ),
             prs: prs::State::load(&storage),
+            inbox: inbox::State::default(),
             defaults: config.agent_defaults.clone(),
             selected: None,
             summaries: Vec::new(),
@@ -575,6 +583,7 @@ impl Ui {
             && (self.voice_active()
                 || self.session_switched.is_some()
                 || self.question_flip.animating(Instant::now())
+                || self.inbox.animating()
                 || !self.sidebar_highlights.is_empty()
                 || self
                     .sidebar_boards
@@ -657,6 +666,10 @@ impl Ui {
             if !unchanged {
                 crate::repaint::request();
             }
+            if let Task::InboxRespond(key) = &message.kind {
+                self.inbox_response(key.clone(), message.result);
+                continue;
+            }
             if let Task::DecidePlan(id, plan_id) = &message.kind {
                 self.finish_plan_choice(id, plan_id, message.result);
                 continue;
@@ -682,7 +695,10 @@ impl Ui {
                     self.listing = false;
                     self.refreshed = Some(Instant::now());
                 }
-                Task::Read(_) => {}
+                Task::Read(_) | Task::InboxRespond(_) => {}
+                Task::InboxRead(id) => {
+                    self.inbox.reads.remove(id);
+                }
                 Task::Changes(..) | Task::ChangesContext(..) => {}
                 Task::Launch
                 | Task::Repository(_)
@@ -884,7 +900,10 @@ impl Ui {
                         }
                         self.replaced_workspace(id, *session);
                     }
-                    (Task::Read(id) | Task::Worktree(id), Reply::Session(session)) => {
+                    (
+                        Task::Read(id) | Task::InboxRead(id) | Task::Worktree(id),
+                        Reply::Session(session),
+                    ) => {
                         if self
                             .sessions
                             .get(&id)
@@ -1021,6 +1040,7 @@ impl Ui {
                 },
             }
         }
+        self.tick_inbox(visible);
         if visible
             && !self.listing
             && self
@@ -1122,6 +1142,9 @@ impl Ui {
         sessions
     }
     fn open_orchestrator_list(&mut self) {
+        if self.inbox.visible {
+            self.close_questions_inbox();
+        }
         self.orchestrator_list = true;
         self.drilled = false;
         self.focus = Focus::List;
@@ -1216,6 +1239,9 @@ impl Ui {
         self.refreshed = None;
     }
     fn ensure_selected(&mut self) {
+        if self.inbox.visible {
+            return;
+        }
         let rows = self.selectable_rows();
         if let Some(cursor) = self.folder_cursor.as_deref() {
             if rows
@@ -1238,6 +1264,9 @@ impl Ui {
         }
     }
     fn select(&mut self, id: String) {
+        if self.inbox.visible {
+            self.close_questions_inbox();
+        }
         if self.deleting.contains(&id) {
             return;
         }
@@ -1603,7 +1632,7 @@ impl Ui {
             .and_then(|s| s.pending.get(index))
             .cloned()
         {
-            if pending.params.get("difuClaudePlan").is_some() {
+            if pending.params.get("difuClaudePlan").is_some() && !self.inbox.visible {
                 self.open_plan_prompt();
                 return;
             }
@@ -1635,6 +1664,14 @@ impl Ui {
         }
     }
     fn respond(&mut self, choice: usize) {
+        if self.inbox.visible
+            && matches!(&self.modal, Some(Modal::Approval { pending, .. }) if pending.params.get("difuClaudePlan").is_some())
+        {
+            self.close_questions_inbox();
+            self.changes_visible = false;
+            self.open_plan_prompt();
+            return;
+        }
         let Some(Modal::Approval {
             pending, answers, ..
         }) = &self.modal
@@ -1676,10 +1713,12 @@ impl Ui {
                 return;
             }
         };
-        self.control(Control::Respond {
-            request: pending.id.clone(),
-            response,
-        });
+        let request = pending.id.clone();
+        if self.inbox.visible {
+            self.respond_inbox(request, response);
+        } else {
+            self.control(Control::Respond { request, response });
+        }
     }
     fn focused_editor(&self) -> Option<&Editor> {
         if self.question_note_focused
@@ -1720,7 +1759,7 @@ impl Ui {
                 field,
                 ..
             }) if pending.method == "item/tool/requestUserInput" => answers.get(*field),
-            None if self.focus == Focus::Composer && self.drilled => self
+            None if !self.inbox.visible && self.focus == Focus::Composer && self.drilled => self
                 .selected
                 .as_ref()
                 .and_then(|id| self.positions.get(id))
@@ -1749,6 +1788,9 @@ impl Ui {
             return;
         }
         use crate::shortcuts::ids::*;
+        if self.inbox_key(key) {
+            return;
+        }
         if self.shortcut_context() == crate::shortcuts::contexts::AGENT_CHANGES
             && matches!(self.shortcut(key), Some(NAVIGATION_FIRST | NAVIGATION_LAST))
             && let Some(document) = self
@@ -2378,6 +2420,9 @@ impl Ui {
         }
     }
     pub fn paste(&mut self, text: &str) {
+        if self.inbox.visible && self.modal.is_none() {
+            return;
+        }
         if self.modal.is_none()
             && self.panels.focused
             && let Some(panels::View::PullRequest { app }) = &mut self.panels.view
@@ -2753,6 +2798,8 @@ impl Ui {
     }
     fn action(&mut self, action: Action) {
         match action {
+            Action::InboxOpen => self.open_questions_inbox(),
+            Action::InboxItem(key, action) => self.inbox_item_action(key, action),
             Action::DismissNotice => self.notice = None,
             Action::ModelField(index) => self.model_field(index),
             Action::ModelOption(index) => self.model_option(index),
@@ -3003,6 +3050,9 @@ impl Ui {
             }
             return;
         }
+        if self.inbox_mouse(event) {
+            return;
+        }
         if self.footer_mouse(event) {
             return;
         }
@@ -3058,6 +3108,21 @@ impl Ui {
             }
             _ => {}
         }
+    }
+}
+
+fn approval_choices(pending: &Pending) -> Vec<&'static str> {
+    if pending.params.get("difuClaudePlan").is_some() {
+        return vec!["Review plan"];
+    }
+    match pending.method.as_str() {
+        "item/permissions/requestApproval" => {
+            vec!["Allow requested permissions for this turn", "Deny"]
+        }
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            vec!["Allow once", "Allow for session", "Decline", "Cancel"]
+        }
+        _ => vec!["Stop request · ask the agent to use questions"],
     }
 }
 
@@ -3266,17 +3331,22 @@ impl Ui {
             frame.render_widget(Paragraph::new("Resize to at least 40 × 12"), area);
             return;
         }
-        let panel = self.panels.visible();
-        let conversation_visible =
-            (!panel || self.panels.right) && !(self.drilled && self.changes_visible);
-        if self.drawn_session != self.selected {
+        let panel = self.panels.visible() && !self.inbox.visible;
+        let conversation_visible = self.inbox.visible
+            || ((!panel || self.panels.right) && !(self.drilled && self.changes_visible));
+        let shown = if self.inbox.visible {
+            Some("difu-questions-inbox".into())
+        } else {
+            self.selected.clone()
+        };
+        if self.drawn_session != shown {
             self.session_switched = (self.drawn_session.is_some()
                 && self.selected.is_some()
                 && conversation_visible
                 && self.preferences.motion.screen()
                 && self.tweaks.agent_reply_cps > 0)
                 .then(Instant::now);
-            self.drawn_session.clone_from(&self.selected);
+            self.drawn_session = shown;
         }
         if !conversation_visible
             || !self.preferences.motion.screen()
@@ -3346,7 +3416,9 @@ impl Ui {
         if list_width > 0 {
             self.draw_list(frame, list);
         }
-        if panel && !self.panels.right {
+        if self.inbox.visible {
+            self.draw_inbox(frame, conversation);
+        } else if panel && !self.panels.right {
             self.draw_panel(frame, conversation);
         } else if self.drilled && self.changes_visible {
             self.draw_changes(frame, conversation);
@@ -3447,11 +3519,20 @@ impl Ui {
                 },
             ));
         }
+        let top = if self.orchestrator_list || folder.is_some() {
+            1
+        } else {
+            self.draw_inbox_card(
+                frame,
+                Rect::new(area.x, area.y, area.width, area.height.min(3)),
+            );
+            4
+        };
         let items = Rect::new(
             area.x,
-            area.y.saturating_add(1),
+            area.y.saturating_add(top),
             area.width,
-            area.height.saturating_sub(1),
+            area.height.saturating_sub(top),
         );
         let rows = self.rows();
         let heights = rows
@@ -3464,7 +3545,11 @@ impl Ui {
                 }
             })
             .collect::<Vec<_>>();
-        let cursor = self.cursor();
+        let cursor = if self.inbox.visible {
+            None
+        } else {
+            self.cursor()
+        };
         let selected = rows
             .iter()
             .position(|row| Some(row.key()) == cursor)
@@ -3551,7 +3636,7 @@ impl Ui {
                 }
                 folders::Row::Session(session) => session,
             };
-            let selected = Some(&session.id) == self.selected.as_ref();
+            let selected = !self.inbox.visible && Some(&session.id) == self.selected.as_ref();
             let deleting = self.deleting.contains(&session.id);
             let row = Rect::new(
                 items.x,
@@ -3656,8 +3741,8 @@ impl Ui {
                 let pr = &link.pr;
                 lines.push(Line::from(Span::styled(
                     format!(
-                        "     PR #{} · {}{}",
-                        pr.key.number,
+                        "     {} · {}{}",
+                        link.badge(),
                         pr.label(),
                         if self.prs.stale(&session.id) {
                             " · stale"
@@ -4187,6 +4272,7 @@ impl Ui {
     fn draw_modal(&mut self, frame: &mut Frame) {
         if self.modal.is_none()
             || self.inline_question()
+            || (self.inbox.visible && matches!(self.modal, Some(Modal::Approval { .. })))
             || matches!(self.modal, Some(Modal::Commands { .. }))
         {
             return;
@@ -4730,13 +4816,7 @@ impl Ui {
                         ),
                         Rect::new(area.x, area.y, area.width, height),
                     );
-                    let choices = if pending.method == "item/permissions/requestApproval" {
-                        vec!["Allow requested permissions for this turn", "Deny"]
-                    } else if unsupported {
-                        vec!["Stop request · ask the agent to use questions"]
-                    } else {
-                        vec!["Allow once", "Allow for session", "Decline", "Cancel"]
-                    };
+                    let choices = approval_choices(pending);
                     for (index, label) in choices.iter().enumerate() {
                         deferred.push((
                             Rect::new(

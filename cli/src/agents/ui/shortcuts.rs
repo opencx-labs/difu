@@ -17,6 +17,19 @@ impl Ui {
     }
 
     pub(crate) fn shortcut_context(&self) -> Context {
+        if self.inbox.visible && matches!(self.modal, None | Some(Modal::Approval { .. })) {
+            return if self.inline_question() {
+                if self.question_note_focused {
+                    AGENT_INBOX_NOTE
+                } else {
+                    AGENT_INBOX_QUESTION
+                }
+            } else if self.modal.is_some() {
+                AGENT_INBOX_APPROVAL
+            } else {
+                AGENT_INBOX
+            };
+        }
         if self.inline_question() {
             return if self.question_note_focused {
                 AGENT_QUESTION_NOTE

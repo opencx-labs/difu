@@ -52,6 +52,8 @@ pub struct NativeSession {
     pub inherited_permissions: Value,
     pub artifact_tools: bool,
     #[serde(default)]
+    pub pr_tools: bool,
+    #[serde(default)]
     pub registration_tools: bool,
     #[serde(default)]
     pub question_tools: bool,
@@ -97,6 +99,7 @@ pub fn switch(
             permissions: session.permissions.clone(),
             inherited_permissions: session.inherited_permissions.clone(),
             artifact_tools: session.artifact_tools,
+            pr_tools: session.pr_tools,
             registration_tools: session.registration_tools,
             question_tools: session.question_tools,
             peer_tools: session.peer_tools,
@@ -130,6 +133,7 @@ pub fn switch(
     session.permissions = target.permissions;
     session.inherited_permissions = target.inherited_permissions;
     session.artifact_tools = target.artifact_tools;
+    session.pr_tools = target.pr_tools;
     session.registration_tools = target.registration_tools;
     session.question_tools = target.question_tools;
     session.peer_tools = target.peer_tools;
@@ -180,6 +184,7 @@ mod tests {
     fn an_unused_provider_still_receives_full_context_on_return() -> Result<()> {
         let mut session = session();
         session.question_tools = true;
+        session.pr_tools = true;
         session.permission_state.mode = Some("plan".into());
         session.permission_state.pending_preset =
             Some(super::super::permissions::CodexPreset::Auto);
@@ -198,6 +203,7 @@ mod tests {
         )?;
         assert!(session.thread_id.is_none());
         assert!(!session.question_tools);
+        assert!(!session.pr_tools);
         assert!(session.permission_state.mode.is_none());
         assert!(session.permission_state.permission_events.is_empty());
         switch(
@@ -208,6 +214,7 @@ mod tests {
         )?;
         assert_eq!(session.thread_id.as_deref(), Some("codex-thread"));
         assert!(session.question_tools);
+        assert!(session.pr_tools);
         assert_eq!(session.permission_state.mode.as_deref(), Some("plan"));
         assert_eq!(session.permission_state.permission_events.len(), 1);
         assert_eq!(
