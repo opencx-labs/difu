@@ -234,7 +234,13 @@ impl<'a> Bindings<'a> {
         // opaque terminal modifiers only for this default semantic action; they
         // remain unsupported by shortcut capture and persisted custom chords.
         if action == ids::QUESTION_SUBMIT
-            && [contexts::AGENT_QUESTION, contexts::AGENT_QUESTION_NOTE].contains(&context)
+            && [
+                contexts::AGENT_QUESTION,
+                contexts::AGENT_QUESTION_NOTE,
+                contexts::AGENT_INBOX_QUESTION,
+                contexts::AGENT_INBOX_NOTE,
+            ]
+            .contains(&context)
             && !self
                 .config
                 .preferences

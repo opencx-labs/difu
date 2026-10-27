@@ -479,7 +479,7 @@ pub(super) fn build() -> Vec<ActionSpec> {
             }
             entry.contexts.push(main);
             for binding in &mut entry.defaults {
-                if binding.contexts.contains(&base) {
+                if binding.contexts.contains(&base) && !binding.contexts.contains(&inbox) {
                     binding.contexts.push(main);
                 }
             }
@@ -783,6 +783,25 @@ pub(super) fn build() -> Vec<ActionSpec> {
                     chord: key(BindingKey::Character('c'), flags),
                     contexts,
                 });
+            }
+        }
+    }
+    // The inbox keeps native question/approval editing, with session navigation
+    // scoped to its own contexts so ordinary chat shortcuts remain unchanged.
+    for (base, inbox) in [
+        (contexts::AGENT_PENDING, contexts::AGENT_INBOX),
+        (contexts::AGENT_QUESTION, contexts::AGENT_INBOX_QUESTION),
+        (contexts::AGENT_QUESTION_NOTE, contexts::AGENT_INBOX_NOTE),
+        (contexts::AGENT_APPROVAL, contexts::AGENT_INBOX_APPROVAL),
+    ] {
+        for action in &mut entries {
+            if action.contexts.contains(&base) && !action.contexts.contains(&inbox) {
+                action.contexts.push(inbox);
+            }
+            for binding in &mut action.defaults {
+                if binding.contexts.contains(&base) && !binding.contexts.contains(&inbox) {
+                    binding.contexts.push(inbox);
+                }
             }
         }
     }

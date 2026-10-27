@@ -192,3 +192,7 @@ pub const RULES_REPOSITORY_NEXT: ActionId = ActionId("rules.repository_next");
 pub const SEND: ActionId = COMPOSER_SEND;
 pub const NEWLINE: ActionId = COMPOSER_NEWLINE;
 pub const QUEUE: ActionId = COMPOSER_QUEUE;
+
+pub const INBOX_OPEN: ActionId = ActionId("questions_inbox.open");
+pub const INBOX_PREVIOUS_SESSION: ActionId = ActionId("questions_inbox.previous_session");
+pub const INBOX_NEXT_SESSION: ActionId = ActionId("questions_inbox.next_session");

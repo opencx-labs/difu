@@ -89,6 +89,8 @@ fn reserved(context: Context, chord: &KeyChord) -> bool {
         AGENT_COMPOSER_PANES,
         AGENT_QUESTION,
         AGENT_QUESTION_NOTE,
+        AGENT_INBOX_QUESTION,
+        AGENT_INBOX_NOTE,
         AGENT_QUEUE_EDITOR,
         AGENT_PLAN_FEEDBACK,
         AGENT_COMMANDS,

@@ -2,6 +2,50 @@ use super::*;
 pub(super) fn entries() -> Vec<ActionSpec> {
     vec![
         entry(
+            ids::INBOX_OPEN,
+            "Open questions & requests",
+            &[
+                contexts::AGENT_LIST,
+                contexts::AGENT_COMPOSER,
+                contexts::AGENT_COMPOSER_PANES,
+                contexts::AGENT_CONVERSATION,
+                contexts::AGENT_CHANGES,
+                contexts::AGENT_CHANGE_TREE,
+                contexts::AGENT_RESOURCES,
+                contexts::AGENT_HELPER,
+                contexts::AGENT_HELPER_MAIN,
+                contexts::AGENT_BROWSER,
+                contexts::AGENT_BROWSER_MAIN,
+                contexts::AGENT_QUESTION,
+                contexts::AGENT_QUESTION_NOTE,
+                contexts::AGENT_APPROVAL,
+                contexts::AGENT_PENDING,
+            ],
+            &[key(BindingKey::Character('q'), 2)],
+        ),
+        entry(
+            ids::INBOX_PREVIOUS_SESSION,
+            "Previous session in questions & requests",
+            &[
+                contexts::AGENT_INBOX,
+                contexts::AGENT_INBOX_QUESTION,
+                contexts::AGENT_INBOX_NOTE,
+                contexts::AGENT_INBOX_APPROVAL,
+            ],
+            &[key(BindingKey::Up, 8)],
+        ),
+        entry(
+            ids::INBOX_NEXT_SESSION,
+            "Next session in questions & requests",
+            &[
+                contexts::AGENT_INBOX,
+                contexts::AGENT_INBOX_QUESTION,
+                contexts::AGENT_INBOX_NOTE,
+                contexts::AGENT_INBOX_APPROVAL,
+            ],
+            &[key(BindingKey::Down, 8)],
+        ),
+        entry(
             ids::SESSION_NEW,
             "Create session",
             &[
@@ -310,13 +354,23 @@ pub(super) fn entries() -> Vec<ActionSpec> {
         entry(
             ids::QUESTION_NEXT_FIELD,
             "Next question field",
-            &[contexts::AGENT_QUESTION, contexts::AGENT_QUESTION_NOTE],
+            &[
+                contexts::AGENT_QUESTION,
+                contexts::AGENT_QUESTION_NOTE,
+                contexts::AGENT_INBOX,
+                contexts::AGENT_INBOX_APPROVAL,
+            ],
             &[key(BindingKey::Tab, 0)],
         ),
         entry(
             ids::QUESTION_PREVIOUS_FIELD,
             "Previous question field",
-            &[contexts::AGENT_QUESTION, contexts::AGENT_QUESTION_NOTE],
+            &[
+                contexts::AGENT_QUESTION,
+                contexts::AGENT_QUESTION_NOTE,
+                contexts::AGENT_INBOX,
+                contexts::AGENT_INBOX_APPROVAL,
+            ],
             &[key(BindingKey::Tab, 4)],
         ),
         entry(

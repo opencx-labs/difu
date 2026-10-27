@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>difu · Questions & requests</title>
+<style>
+:root{color-scheme:dark;--bg:#101211;--panel:#080b09;--line:#2b342e;--text:#dce5df;--muted:#8b9b91;--green:#00ff63;--amber:#f3ca76;--red:#f88b8b;--mono:"SFMono-Regular",Consolas,"Liberation Mono",monospace;--sans:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);-webkit-font-smoothing:antialiased}button,input,textarea{font:inherit}button{cursor:pointer;color:inherit}button:disabled{cursor:default}button:focus-visible,input:focus-visible,textarea:focus-visible,a:focus-visible{outline:2px solid var(--green);outline-offset:3px}::selection{background:#215c35}button svg{pointer-events:none}kbd{font:11px var(--mono);color:#b8c8be;white-space:nowrap}.page{max-width:1510px;margin:auto;padding:25px 36px 32px}.masthead{display:flex;justify-content:space-between;align-items:center;color:var(--muted);font:10px var(--mono);letter-spacing:.09em}.brand{font-size:21px;font-weight:700;color:var(--green);letter-spacing:-1px}.masthead-left{display:flex;align-items:center;gap:19px}.masthead-left i{height:17px;width:1px;background:#3a453e}.preview-tag{display:flex;align-items:center;gap:8px}.preview-tag:before{content:"";width:5px;height:5px;background:var(--amber);border-radius:50%}.intro{display:flex;align-items:flex-end;justify-content:space-between;gap:24px;margin:28px 0 24px}h1{font-size:clamp(28px,3.1vw,42px);font-weight:500;letter-spacing:-1.5px;margin:0 0 9px}.intro p{font-size:14px;color:var(--muted);line-height:1.65;margin:0}.intro-note{font:10px var(--mono);color:#788e80;white-space:nowrap;padding-bottom:4px}.toolbar{display:flex;align-items:center;justify-content:space-between;gap:20px;margin-bottom:12px;font:11px var(--mono);color:var(--muted)}.try strong{font-weight:400;color:var(--amber);margin-right:8px}.controls{display:flex;align-items:center;gap:20px}.controls label{display:flex;align-items:center;gap:7px;white-space:nowrap}.controls input{accent-color:var(--green)}.reset{border:1px solid #3b4a40;background:#18221c;padding:7px 10px;border-radius:4px;font:11px var(--mono)}.reset:hover{border-color:var(--green)}
+.terminal{border:1px solid #3a473e;border-radius:7px;overflow:hidden;background:var(--panel);box-shadow:0 20px 70px #0004;font:12px/1.6 var(--mono)}.window{height:39px;display:flex;align-items:center;gap:8px;background:#181e1a;border-bottom:1px solid var(--line);padding:0 15px;font-size:10px;color:#91a297}.dot{width:7px;height:7px;border-radius:50%;background:#46534b}.window-title{margin-left:12px}.window-note{margin-left:auto;color:#728579}.tabs{height:44px;display:flex;align-items:center;gap:26px;padding:0 20px;border-bottom:1px solid #28362d;font-size:12px;color:#869b8e}.tab-active{color:var(--green)}.tabs small{font:10px var(--mono);opacity:.5;margin-left:6px}.tabs .right{margin-left:auto;font-size:10px;color:#698171}.workspace{display:grid;grid-template-columns:280px minmax(0,1fr);gap:10px;padding:10px;height:718px}.sidebar{border:1px solid #334338;display:flex;flex-direction:column;min-height:0;overflow:hidden}.sidebar-label{display:flex;justify-content:space-between;padding:9px 12px;color:#8fa394;font-size:10px}.session-list{padding:0 5px;overflow:auto;scrollbar-width:thin;scrollbar-color:#35513e transparent}.session{display:block;position:relative;width:100%;padding:11px 10px;text-align:left;background:transparent;border:1px solid transparent;margin-bottom:4px;min-width:0}.session:hover{background:#142019}.session[aria-pressed=true]{border-color:#477c50;background:#14271b}.session[aria-pressed=true]:before{content:"";position:absolute;top:-1px;bottom:-1px;left:-1px;width:2px;background:var(--green)}.session.inbox{border:1px solid #66532c;background:#242013;margin-bottom:12px}.session.inbox[aria-pressed=true]{border-color:var(--amber);background:#2c2616}.session.inbox[aria-pressed=true]:before{background:var(--amber)}.session-heading{display:flex;gap:9px;align-items:center;min-width:0}.session-name{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#d1dfd6}.inbox .session-name{color:var(--amber);font-size:11px}.session-heading kbd{margin-left:auto;font-size:10px;color:#c7ad75}.session-meta,.session-status{padding-left:31px;font-size:10px;color:#809588;margin-top:3px}.session-status{margin-top:1px;color:#b3c5b9}.inbox .session-meta{color:#bfab7d}.orchestrator{border-bottom:1px solid #293b30;margin-bottom:9px;padding-bottom:15px}.sidebar-footer{padding:13px;margin-top:auto;border-top:1px solid #293b30;color:#688170;font-size:10px}.sidebar-footer b{font-weight:400;color:#97ae9e}.status-icon{display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;flex:0 0 22px}.status-icon svg{width:22px;height:22px;shape-rendering:crispEdges}.hand{color:var(--amber)}.hand-dot{animation:pulse 1.8s steps(1,end) infinite}.ready-green{animation:pulse 2.4s ease-in-out infinite}.runner{color:var(--green)}@keyframes pulse{0%,100%{opacity:.55}50%{opacity:1}}
+.main-panel{border:1px solid var(--amber);position:relative;display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden}.panel-header{padding:12px 17px 11px;border-bottom:1px solid #42391f}.panel-title-row{display:flex;align-items:center;gap:8px}.panel-title{color:var(--amber);font-size:14px;font-weight:400;margin:0}.pending-label{margin-left:auto;color:var(--amber);font-size:11px;white-space:nowrap}.panel-subtitle{color:var(--muted);font-size:10px;padding-left:30px;margin-top:3px}.panel-tools{display:flex;align-items:center;justify-content:space-between;gap:10px;border-bottom:1px solid #28362e;padding:8px 17px;font-size:10px;color:#8da395;background:#0f1712}.jump{display:flex;gap:6px;align-items:center}.jump button{background:#18241c;border:1px solid #36483b;padding:3px 7px;color:#c8d9ce;font:10px var(--mono)}.jump button:hover{border-color:var(--amber)}.jump button:disabled{opacity:.35}.sections{padding:14px;overflow:auto;min-height:0;flex:1;scrollbar-color:#425d49 transparent;scrollbar-width:thin;scroll-behavior:smooth}.group{border:1px solid #314237;margin-bottom:12px;background:#0e1510;scroll-margin-top:14px}.group.active{border-color:#a48948;background:#131b13;box-shadow:inset 2px 0 var(--amber)}.group-header{display:flex;align-items:center;gap:8px;padding:9px 13px;border-bottom:1px solid #2e3b2f}.group-toggle{display:flex;align-items:center;gap:8px;text-align:left;border:0;background:none;padding:0;min-width:0;flex:1}.group-arrow{font-size:17px;color:#627b68;width:9px}.active .group-arrow{color:var(--amber)}.group-name{font-size:12px;color:#d7e5dc}.group-project{color:#758c7c;font-size:10px;margin-left:6px}.group-count{font-size:10px;color:#aebf99;white-space:nowrap}.active .group-count{color:var(--amber)}.group-body{overflow:hidden}.question{padding:12px 16px 14px}.question+.question{border-top:1px dashed #304333}.question-top{display:flex;align-items:center;gap:8px;color:#819889;font-size:9px;letter-spacing:.04em;margin-bottom:7px}.question-top .type{color:#b3c6b8}.question-top .request-type{color:var(--amber)}.question-top time{margin-left:auto;color:#6d8476}.question h3{font-size:12px;line-height:1.7;font-weight:400;margin:0 0 9px;color:#e1ede5}.options{display:flex;flex-direction:column;gap:2px;margin:6px 0 10px}.option{display:flex;align-items:flex-start;gap:9px;padding:6px 8px;border:1px solid transparent;cursor:pointer;max-width:630px}.option:has(input:checked){color:var(--green);border-color:#2d5c39;background:#122d1c}.option input{margin:3px 0 0;accent-color:var(--green);width:12px;height:12px;flex:0 0 12px}.option-title{font-size:11px}.option small{font-size:10px;display:block;color:#80978a;line-height:1.65}.question textarea{width:100%;height:46px;resize:vertical;display:block;border:1px solid #394e3e;border-radius:0;background:#0b120d;padding:8px 10px;color:#dae8df;font:11px/1.6 var(--mono);margin:8px 0 10px}.question textarea::placeholder{color:#6f8978}.answer-actions{display:flex;align-items:center;gap:10px}.submit,.allow{border:1px solid #42794b;background:#173923;color:#a9f2bc;font:10px var(--mono);padding:5px 10px}.submit:hover,.allow:hover{background:#205130;border-color:var(--green)}.decline{border:1px solid #604643;background:#261a18;color:#f1b3aa;font:10px var(--mono);padding:5px 10px}.hint{font-size:9px;color:#698271}.command{margin:8px 0 10px;padding:8px 10px;border-left:2px solid #756133;background:#1e2114;color:#cfbc8f;font:10px/1.65 var(--mono);overflow-wrap:anywhere}.request-note{font-size:10px;color:#8da18f;margin:0 0 10px;line-height:1.7}.answered{display:flex;gap:9px;align-items:center;padding:10px 16px;color:#7b9c85;font-size:10px}.answered .check{color:var(--green)}.answer-title{color:#8da994}.answer-value{color:#bfd5c6;margin-left:auto;max-width:50%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.group.complete{border-color:#2b4132;box-shadow:none;background:#0d1510}.group.complete .group-header{border-bottom:0}.group.complete .group-arrow{color:var(--green);font-size:12px}.group.complete .group-name{color:#89a891}.group.complete .group-count{color:#7fa78a}.group.complete .group-project{color:#547660}.group.collapsing{border-color:#426b4d}.glyph{white-space:pre}.glyph.dim{color:#65806e}.glyph.glow{color:var(--green)}.panel-footer{display:flex;gap:9px;align-items:center;padding:9px 17px;border-top:1px solid #304132;font-size:10px;color:#819a88;min-height:37px}.panel-footer .live-dot{height:4px;width:4px;background:var(--amber);border-radius:50%}.panel-footer .footer-right{margin-left:auto;color:#617b6a;font-size:9px}.all-clear{text-align:center;padding:38px 20px 31px}.all-clear .large-check{display:inline-block;color:var(--green);font-size:26px;margin-bottom:9px}.all-clear h3{font-size:15px;font-weight:400;color:#cde9d5;margin:0 0 6px}.all-clear p{font-size:11px;color:#819b8b;margin:0}.normal-panel{border-color:var(--green)}.normal-panel .panel-title{color:var(--green)}.normal-panel .panel-header{border-color:#284130}.chat-content{flex:1;padding:24px;overflow:auto}.chat-message{max-width:670px;margin-bottom:27px;font-size:12px;line-height:1.9}.chat-message .role{display:block;font-size:11px;color:var(--green);margin-bottom:6px}.chat-message p{margin:0;color:#b2c6ba}.chat-message.user{padding:12px 14px;background:#10281a;border-left:2px solid #3d8d52}.open-inbox{background:#302816;border:1px solid #7b6538;padding:8px 12px;color:var(--amber);font:11px var(--mono)}.composer{border-top:1px solid var(--green);padding:13px 17px;color:#71887b}.composer .placeholder{font-size:14px;margin-bottom:7px}.composer .footer{font-size:10px}.composer .footer b{font-weight:400;color:var(--green)}
+.notes{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:25px;margin-top:22px;padding-top:18px;border-top:1px solid #2c3730}.note{font-size:12px;color:#8fa296;line-height:1.7}.note strong{display:block;color:#c2d2c8;font-weight:500;font-size:12px;margin-bottom:3px}.note .number{font:10px var(--mono);color:#627e6b;margin-right:7px}.page-foot{display:flex;justify-content:space-between;gap:20px;margin-top:20px;color:#617c6b;font:10px/1.7 var(--mono)}.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}[hidden]{display:none!important}body.reduce *{animation:none!important;scroll-behavior:auto!important}
+@media(prefers-reduced-motion:reduce){*{animation:none!important;scroll-behavior:auto!important}}
+@media(max-width:1100px){.page{padding:24px}.workspace{grid-template-columns:240px minmax(0,1fr)}.session-name{font-size:11px}.inbox .session-name{font-size:10px}.intro-note{display:none}.group-project{display:none}.panel-footer .footer-right{display:none}}
+@media(max-width:720px){.page{padding:20px 12px}.masthead{font-size:8px}.masthead-left{gap:12px}.intro{margin:24px 0 20px}.intro p{font-size:12px}.toolbar{flex-direction:column;align-items:flex-start;gap:10px;font-size:10px}.controls{width:100%;justify-content:space-between}.workspace{display:flex;flex-direction:column;height:auto;padding:7px}.sidebar{border:0}.sidebar-label,.sidebar-footer,.session-meta,.session-status{display:none}.session-list{display:flex;gap:5px;padding:0;overflow-x:auto}.session{flex:0 0 190px;margin-bottom:5px!important;padding:8px!important;border:1px solid #304335}.session.inbox{flex-basis:230px}.orchestrator{border-bottom:1px solid #304335}.main-panel{height:680px}.panel-header{padding:11px}.panel-title{font-size:12px}.panel-subtitle{font-size:9px;padding-left:0}.pending-label{font-size:10px}.panel-tools{padding:7px 10px;font-size:9px}.panel-tools .nav-label{display:none}.sections{padding:8px}.group-header{padding:8px}.group-name{font-size:11px}.group-count{font-size:9px}.question{padding:11px}.question h3{font-size:11px}.answer-title{max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.answer-value{max-width:35%}.notes{grid-template-columns:1fr;gap:14px;margin-top:20px}.note{font-size:11px}.page-foot{flex-direction:column;gap:5px;font-size:9px}.window-note,.tabs .right{display:none}.window-title{font-size:9px}.window{height:35px}.hint{font-size:8px}.intro h1{font-size:29px}}
+</style>
+</head>
+<body>
+<main class="page">
+  <header class="masthead"><div class="masthead-left"><span class="brand">difu</span><i></i><span>INTERACTION STUDY / 002</span></div><span class="preview-tag">DESIGN PREVIEW</span></header>
+  <div class="intro"><div><h1>One place for every answer.</h1><p>Questions and requests from your sessions, together. Clear one session, move to the next.</p></div><div class="intro-note">QUESTIONS & REQUESTS / SESSION INBOX</div></div>
+  <div class="toolbar"><span class="try"><strong>↳ Try it</strong> Answer both items in a session to watch it fold away.</span><div class="controls"><label><input type="checkbox" id="reduced"> Reduced motion</label><button class="reset" id="reset">↻ Reset demo</button></div></div>
+  <section class="terminal" aria-label="Interactive questions and requests preview">
+    <div class="window"><span class="dot"></span><span class="dot"></span><span class="dot"></span><span class="window-title">difu — ~/projects/difu</span><span class="window-note">SAMPLE CONTENT · LOCAL INTERACTIONS</span></div>
+    <div class="tabs"><span class="tab-active">Agents <small>1</small></span><span>Reviews <small>2</small></span><span class="right">4 sessions</span></div>
+    <div class="workspace"><aside class="sidebar" aria-label="Sessions"><div class="sidebar-label"><span>Sessions</span><span>⌥ ↑ ↓</span></div><div class="session-list" id="session-list"></div><div class="sidebar-footer"><b>~/projects/difu</b><br>4 sessions · 1 workspace</div></aside><section class="main-panel" id="main-panel" aria-label="Questions and requests"></section></div>
+  </section>
+  <div class="notes"><div class="note"><strong><span class="number">01</span> Always in reach</strong>A session-shaped card above the orchestrator. Open it with <kbd>⌥ Q</kbd> from any session.</div><div class="note"><strong><span class="number">02</span> Move by session</strong><kbd>⌘ ↑</kbd> and <kbd>⌘ ↓</kbd> jump between session sections. Each answer stays with its original session.</div><div class="note"><strong><span class="number">03</span> Clear, then collapse</strong>After the last answer, the section flips away from the bottom up, leaving a small completed row.</div></div>
+  <footer class="page-foot"><span>Interactive proposal · sample answers and permissions stay in this page.</span><span>Click controls if your browser reserves a keyboard shortcut.</span></footer>
+  <div class="sr-only" id="announcement" role="status" aria-live="polite"></div>
+</main>
+<script>
+(() => {
+  'use strict';
+  const $ = (selector, root = document) => root.querySelector(selector);
+  const $$ = (selector, root = document) => [...root.querySelectorAll(selector)];
+  const escape = text => String(text).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+  const sample = [
+    {id:'motion', name:'Session motion & status', project:'difu', agent:'Codex', items:[
+      {id:'speed', type:'question', title:'Which animation speed feels best?', options:[['Smooth (Recommended)','A little breathing room between each flip.'],['Snappy','A quicker transition between sessions.']]},
+      {id:'notes', type:'question', title:'Any final notes on the session motion?', placeholder:'Write a note, or “Looks good” to continue.'}
+    ]},
+    {id:'release', name:'Release checks', project:'difu', agent:'Codex', items:[
+      {id:'smoke', type:'request', title:'Allow the agent to run the release smoke test?', command:'python3 cli/scripts/smoke-release.py /tmp/difu-package aarch64-apple-darwin 0.27.2', note:'Verify the downloaded package starts correctly on this Mac.'},
+      {id:'release-notes', type:'question', title:'Which release note should lead?', options:[['Clearer Ready icon (Recommended)','Lead with the visible change.'],['Session polish','Lead with a broader summary.']]}
+    ]},
+    {id:'composer', name:'Polish the composer', project:'difu', agent:'Claude Code', items:[
+      {id:'pill', type:'question', title:'How much detail should the PR pill show?', options:[['Number + status (Recommended)','Show the PR number and whether it is open or merged.'],['Number only','Keep the footer as compact as possible.']]},
+      {id:'screenshot', type:'request', title:'Allow a screenshot of the local preview?', command:'Capture the local composer preview', note:'Use the screenshot to check the footer spacing.'}
+    ]}
+  ];
+  let sessions, active = 'motion', view = 'inbox', reduced;
+  const motion = matchMedia('(prefers-reduced-motion: reduce)');
+  const animations = new Set();
+  const drafts = new Map();
+  const pixels = (rows, color) => rows.flatMap((row,y) => [...row].map((v,x) => v === '1' ? `<rect x="${x*2}" y="${y*2}" width="2" height="2" fill="${color}"/>` : '')).join('');
+  function icon(type = 'waiting') {
+    let drawing = '';
+    if (type === 'waiting') drawing = pixels(['000001000000','000101010000','000101010100','000101010100','000111110100','000111111100','010111111100','011111111100','001111111000','000111110000','000111100000','000111100000'],'#f3ca76') + '<rect class="hand-dot" x="21" y="0" width="3" height="3" fill="#f3ca76"/>';
+    if (type === 'ready') drawing = `<g class="ready-green">${[6,10,12,14,14,16,16,16,16,16,16,14,14,12,10,6].map((w,y)=>`<rect x="${12-w/2}" y="${4+y}" width="${w}" height="1" fill="#00ff63"/>`).join('')}</g>`;
+    if (type === 'done') drawing = '<path d="M3 12h3v3h3v3h3v-3h3v-3h3V9h3V5h-3v3h-3v3h-3v3H9v-3H6V8H3z" fill="#00ff63"/>';
+    return `<span class="status-icon" aria-hidden="true"><svg viewBox="0 0 24 24">${drawing}</svg></span>`;
+  }
+  const pending = s => s.items.filter(i => !i.answer).length;
+  const total = () => sessions.reduce((n,s) => n + pending(s), 0);
+  const openSessions = () => sessions.filter(s => pending(s));
+  const announce = text => { $('#announcement').textContent = text; };
+  function sidebar() {
+    const count = total(), countSessions = openSessions().length;
+    $('#session-list').innerHTML = `<button class="session inbox" data-view="inbox" aria-pressed="${view==='inbox'}"><span class="session-heading">${icon(count?'waiting':'done')}<span class="session-name">Questions & requests</span><kbd>⌥ Q</kbd></span><div class="session-meta">${count ? `${count} pending · ${countSessions} sessions` : 'All caught up'}</div></button><button class="session orchestrator" data-view="orchestrator" aria-pressed="${view==='orchestrator'}"><span class="session-heading">${icon('ready')}<span class="session-name">difu orchestrator</span></span><div class="session-meta">difu · Codex</div><div class="session-status">Ready</div></button>${sessions.map(s => `<button class="session" data-view="${s.id}" aria-pressed="${view===s.id}"><span class="session-heading">${icon(pending(s)?'waiting':'ready')}<span class="session-name">${s.name}</span></span><div class="session-meta">${s.project} · ${s.agent}</div><div class="session-status">${pending(s)?`${pending(s)} pending · needs input`:'Ready'}</div></button>`).join('')}`;
+  }
+  function answered(item) {
+    return `<div class="answered" data-item="${item.id}"><span class="check">✓</span><span class="answer-title">${escape(item.title)}</span><span class="answer-value" title="${escape(item.answer)}">${escape(item.answer)}</span></div>`;
+  }
+  function question(item, session, index) {
+    if (item.answer) return answered(item);
+    const request = item.type === 'request';
+    const draft = drafts.get(item.id) || {choice:'0', text:''};
+    const time = new Intl.DateTimeFormat(undefined,{hour:'2-digit',minute:'2-digit',hour12:false}).format(new Date(Date.now() - (9-index*2)*60000));
+    return `<form class="question" data-item="${item.id}" data-session="${session.id}"><div class="question-top"><span class="type ${request?'request-type':''}">${request?'PERMISSION REQUEST':'QUESTION'}</span><span>· ${session.agent}</span><time>${time}</time></div><h3 id="title-${item.id}">${escape(item.title)}</h3>${request?`<div class="command">${escape(item.command)}</div><p class="request-note">${escape(item.note)}</p><div class="answer-actions"><button class="allow" type="button" data-answer="Allowed once">Allow once</button><button class="decline" type="button" data-answer="Declined">Decline</button><span class="hint">This request only</span></div>`:`${item.options?`<div class="options" role="radiogroup" aria-labelledby="title-${item.id}">${item.options.map(([label,description],i)=>`<label class="option"><input type="radio" name="choice-${item.id}" value="${i}" ${draft.choice===String(i)?'checked':''}><span><span class="option-title">${i+1}. ${escape(label)}</span><small>${escape(description)}</small></span></label>`).join('')}<label class="option"><input type="radio" name="choice-${item.id}" value="custom" ${draft.choice==='custom'?'checked':''}><span class="option-title">Write a different answer</span></label></div>`:''}<textarea aria-label="Answer: ${escape(item.title)}" placeholder="${escape(item.placeholder||'Your answer…')}" ${item.options&&draft.choice!=='custom'?'hidden':''}>${escape(draft.text)}</textarea><div class="answer-actions"><button class="submit" type="submit">Send answer ↵</button><span class="hint">Sent to ${escape(session.name)}</span></div>`}</form>`;
+  }
+  function group(s) {
+    const count = pending(s);
+    return `<section class="group ${s.id===active?'active':''} ${count?'':'complete'}" id="group-${s.id}" data-group="${s.id}" aria-label="${s.name}"><header class="group-header"><button class="group-toggle" data-group-focus="${s.id}" ${count?'':'disabled'}><span class="group-arrow">${count?'›':'✓'}</span><span class="group-name">${s.name}</span><span class="group-project">${s.project}</span></button><span class="group-count">${count?`${count} pending`:`All ${s.items.length} answered`}</span></header><div class="group-body">${count?s.items.map((item,i)=>question(item,s,i)).join(''):''}</div></section>`;
+  }
+  function updateSummary() {
+    sidebar();
+    if (view !== 'inbox') return;
+    const count = total(), open = openSessions(), idx = open.findIndex(s => s.id === active);
+    $('.panel-title-row .status-icon').outerHTML = icon(count?'waiting':'done');
+    $('#pending-label').textContent = count ? `${count} pending` : 'All clear';
+    $('#panel-subtitle').textContent = count ? `${count} questions & requests across ${open.length} sessions` : 'Every session has the input it needs.';
+    $('#position').textContent = open.length ? `Session ${Math.max(0,idx)+1} of ${open.length}` : 'No pending sessions';
+    $('#previous').disabled = idx <= 0;
+    $('#next').disabled = idx < 0 || idx >= open.length-1;
+    $('#footer-label').textContent = count ? 'Answers go directly to their session' : 'All caught up · your sessions can continue';
+  }
+  function renderInbox(animate = false) {
+    $('#main-panel').classList.remove('normal-panel');
+    $('#main-panel').setAttribute('aria-label','Questions and requests');
+    $('#main-panel').innerHTML = `<header class="panel-header"><div class="panel-title-row">${icon(total()?'waiting':'done')}<h2 class="panel-title">Questions & requests</h2><span class="pending-label" id="pending-label"></span></div><div class="panel-subtitle" id="panel-subtitle"></div></header><div class="panel-tools"><span id="position"></span><div class="jump"><span class="nav-label">Jump session</span><button id="previous" aria-label="Previous pending session">⌘ ↑</button><button id="next" aria-label="Next pending session">⌘ ↓</button></div></div><div class="sections" id="sections">${sessions.map(group).join('')}${total()?'':empty()}</div><footer class="panel-footer"><span class="live-dot"></span><span id="footer-label"></span><span class="footer-right">⌥ Q · Questions & requests</span></footer>`;
+    updateSummary();
+    if (animate) flip($('#main-panel'));
+  }
+  function empty(){return '<div class="all-clear"><span class="large-check">✓</span><h3>All caught up.</h3><p>New questions and requests will appear here.</p></div>';}
+  function showView(id) {
+    stopAnimations(); view = id;
+    if (id === 'inbox') {if(!openSessions().some(s=>s.id===active))active=openSessions()[0]?.id||'';renderInbox(true);return;}
+    const s = sessions.find(s=>s.id===id), title = s?.name || 'difu orchestrator';
+    $('#main-panel').classList.add('normal-panel');
+    $('#main-panel').setAttribute('aria-label',title);
+    $('#main-panel').innerHTML = `<header class="panel-header"><div class="panel-title-row">${icon(s&&pending(s)?'waiting':'ready')}<h2 class="panel-title">${title}</h2></div><div class="panel-subtitle">Coding · ${s?.agent||'Codex'} · difu</div></header><div class="chat-content"><div class="chat-message user"><span class="role">You</span><p>${s?'Continue with the session.':'Keep an eye on my active sessions.'}</p></div><div class="chat-message"><span class="role">${s?.agent||'Codex'}</span><p>${s&&pending(s)?`I have ${pending(s)} items waiting for your input. You can answer them from Questions & requests alongside your other sessions.`:s?'Thanks, I have your answers. Ready to continue.':`${total()} questions and requests are waiting across ${openSessions().length} sessions.`}</p></div><button class="open-inbox" data-view="inbox">Open Questions & requests <kbd>⌥ Q</kbd></button></div><div class="composer"><div class="placeholder">Ask anything…</div><div class="footer"><b>Regular</b> · Approve for me · ${s&&pending(s)?'Needs input':'Ready'}</div></div>`;
+    sidebar(); flip($('#main-panel'));
+  }
+  function focusSession(id, scroll=true) {
+    if (!openSessions().some(s=>s.id===id)) return;
+    active = id;
+    $$('.group').forEach(g=>g.classList.toggle('active',g.dataset.group===id));
+    updateSummary();
+    const group = $(`#group-${id}`);
+    if(scroll)group?.scrollIntoView({behavior:reduced?'instant':'smooth',block:'start'});
+    $('[data-group-focus]',group)?.focus({preventScroll:true});
+    announce(`${sessions.find(s=>s.id===id).name}, ${pending(sessions.find(s=>s.id===id))} pending.`);
+  }
+  function jump(direction) {
+    const open = openSessions(), index = open.findIndex(s=>s.id===active);
+    const next = open[Math.max(0,Math.min(open.length-1,index+direction))];
+    if(next)focusSession(next.id);
+  }
+  function stopAnimations(){[...animations].forEach(stop=>stop());}
+  function flip(root, vanish=false, finish=()=>{}) {
+    if(reduced){finish();return;}
+    const nodes=[], walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT,{acceptNode:n=>n.textContent.trim()&&!n.parentElement.closest('svg,textarea,input,[hidden],.sr-only')?NodeFilter.FILTER_ACCEPT:NodeFilter.FILTER_REJECT});
+    while(walker.nextNode())nodes.push(walker.currentNode);
+    const cells=[], originals=[];
+    nodes.forEach(node=>{
+      const holder=document.createElement('span'), accessible=document.createElement('span');
+      holder.setAttribute('aria-hidden','true');accessible.className='sr-only';accessible.textContent=node.textContent;
+      [...node.textContent].forEach(char=>{if(/\s/.test(char)){holder.append(document.createTextNode(char));return;}const cell=document.createElement('span');cell.className='glyph';cell.textContent=char;holder.append(cell);cells.push({cell,char});});
+      node.replaceWith(holder);holder.before(accessible);originals.push({holder,node,accessible});
+    });
+    const start=performance.now(), height=root.getBoundingClientRect().height;
+    let raf, done=false;
+    const stop=()=>{if(done)return;done=true;cancelAnimationFrame(raf);originals.forEach(({holder,node,accessible})=>{holder.replaceWith(node);accessible.remove();});root.style.height='';root.style.overflow='';animations.delete(stop);finish();};
+    animations.add(stop);
+    if(vanish){root.style.height=`${height}px`;root.style.overflow='hidden';}
+    const sampleText='questionsrequestsanswered';
+    function frame(now){
+      const elapsed=now-start;
+      cells.forEach(({cell,char},i)=>{
+        const age=elapsed-((vanish?cells.length-1-i:i)/Math.max(1,cells.length))*675;
+        if(vanish){cell.textContent=age<0?char:age>180?'\u00a0':/[a-z\d]/i.test(char)?sampleText[(i*7+Math.floor(elapsed/45)*11)%sampleText.length]:char;cell.className=age>=0?'glyph dim':'glyph';}
+        else{cell.textContent=age<40?'\u00a0':age<180&&/[a-z\d]/i.test(char)?sampleText[(i*7+Math.floor(elapsed/45)*11)%sampleText.length]:char;cell.className=age<180?'glyph dim':age<315?'glyph glow':'glyph';}
+      });
+      if(vanish)root.style.height=`${height*(1-Math.max(0,Math.min(1,(elapsed-180)/675)))}px`;
+      if(elapsed<990)raf=requestAnimationFrame(frame);else stop();
+    }
+    raf=requestAnimationFrame(frame);
+  }
+  function answer(form, value) {
+    stopAnimations();
+    const s=sessions.find(s=>s.id===form.dataset.session), item=s.items.find(i=>i.id===form.dataset.item);
+    if(item.answer||!value.trim())return;
+    item.answer=value.trim();drafts.delete(item.id);
+    updateSummary();
+    const section=$(`#group-${s.id}`), label=$('.group-count',section);
+    if(pending(s)){
+      form.outerHTML=answered(item);label.textContent=`${pending(s)} pending`;
+      $('.question input, .question textarea, .question button',section)?.focus({preventScroll:true});
+      announce(`Answer sent to ${s.name}. ${pending(s)} remaining.`);
+    } else {
+      label.textContent='All answered · clearing';section.classList.add('collapsing');
+      $$('button,input,textarea',section).forEach(el=>el.disabled=true);
+      flip($('.group-body',section),true,()=>{
+        section.outerHTML=group(s);
+        const next=openSessions().find(candidate=>sessions.indexOf(candidate)>sessions.indexOf(s))||openSessions()[0];
+        if(next)focusSession(next.id);
+        else {active='';$('#sections').insertAdjacentHTML('beforeend',empty());$('#sections').scrollTo({top:0,behavior:reduced?'instant':'smooth'});$('#reset').focus({preventScroll:true});}
+        updateSummary();announce(`${s.name} cleared. ${total()?`${total()} items remaining.`:'All caught up.'}`);
+      });
+    }
+  }
+  document.addEventListener('submit',event=>{
+    const form=event.target.closest('.question');if(!form)return;event.preventDefault();
+    const s=sessions.find(s=>s.id===form.dataset.session), item=s.items.find(i=>i.id===form.dataset.item);
+    const choice=$('input:checked',form)?.value;
+    const value=choice&&choice!=='custom'?item.options[Number(choice)][0]:$('textarea',form).value;
+    if(!value.trim()){$('textarea',form).focus();return;}answer(form,value);
+  });
+  document.addEventListener('click',event=>{
+    const target=event.target.closest('[data-view],[data-answer],[data-group-focus]');
+    if(target?.dataset.view){showView(target.dataset.view);return;}
+    if(target?.dataset.answer){answer(target.closest('form'),target.dataset.answer);return;}
+    if(target?.dataset.groupFocus){focusSession(target.dataset.groupFocus);return;}
+    if(event.target.closest('#previous'))jump(-1);
+    if(event.target.closest('#next'))jump(1);
+  });
+  document.addEventListener('focusin',event=>{
+    const form=event.target.closest('.question');
+    if(form&&view==='inbox'&&active!==form.dataset.session){active=form.dataset.session;$$('.group').forEach(g=>g.classList.toggle('active',g.dataset.group===active));updateSummary();}
+  });
+  document.addEventListener('input',event=>{
+    const form=event.target.closest('.question');if(!form)return;
+    const choice=$('input:checked',form)?.value, textarea=$('textarea',form);
+    drafts.set(form.dataset.item,{choice:choice||'custom',text:textarea?.value||''});
+    if(event.target.matches('input[type=radio]')){textarea.hidden=choice!=='custom';if(choice==='custom')textarea.focus();}
+  });
+  document.addEventListener('keydown',event=>{
+    if(event.altKey&&event.code==='KeyQ'){event.preventDefault();showView('inbox');return;}
+    if(view==='inbox'&&event.metaKey&&['ArrowUp','ArrowDown'].includes(event.key)){event.preventDefault();jump(event.key==='ArrowDown'?1:-1);}
+    if(event.key==='Enter'&&!event.shiftKey&&event.target.matches('.question textarea')){event.preventDefault();event.target.closest('form').requestSubmit();}
+  });
+  function setReduced(value){reduced=value;$('#reduced').checked=value;document.body.classList.toggle('reduce',value);if(value)stopAnimations();}
+  $('#reduced').addEventListener('change',event=>setReduced(event.target.checked));
+  motion.addEventListener('change',event=>setReduced(event.matches));
+  function reset(){stopAnimations();sessions=structuredClone(sample);drafts.clear();active='motion';view='inbox';renderInbox();announce('Demo reset. Six pending items across three sessions.');}
+  $('#reset').addEventListener('click',reset);
+  setReduced(motion.matches);reset();
+})();
+</script>
+</body>
+</html>

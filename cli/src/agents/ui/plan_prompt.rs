@@ -144,7 +144,13 @@ impl Ui {
                 self.modal = None;
             }
         }
-        if !visible || !self.drilled || self.modal.is_some() || self.busy || self.voice_active() {
+        if !visible
+            || self.inbox.visible
+            || !self.drilled
+            || self.modal.is_some()
+            || self.busy
+            || self.voice_active()
+        {
             return;
         }
         let Some(id) = self.selected.as_ref() else {
