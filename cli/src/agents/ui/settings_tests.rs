@@ -436,14 +436,20 @@ fn new_entry_timestamps_are_recorded_and_legacy_times_stay_absent() -> anyhow::R
     session.entries.first_mut().context("entry")?.timestamp = Some(1_609_459_261_000);
     session.entries.push(legacy);
     let drawn = native_frame(&mut ui, 100, 30)?;
-    assert_eq!(drawn.matches("UTC").count(), 1);
-    assert!(
-        drawn.contains("00:01:01 UTC"),
-        "render the stored receipt time, not the current clock"
+    let local_time = chrono::DateTime::from_timestamp_millis(1_609_459_261_000)
+        .context("stored receipt timestamp")?
+        .with_timezone(&chrono::Local)
+        .format("%H:%M:%S")
+        .to_string();
+    assert_eq!(
+        drawn.matches(&local_time).count(),
+        1,
+        "only the new entry has a stored receipt time, displayed in the viewer's timezone"
     );
+    assert!(!drawn.contains("UTC"));
     config.preferences.conversation.timestamps = false;
     ui.preview_visual_settings(&config);
-    assert!(!native_frame(&mut ui, 100, 30)?.contains("UTC"));
+    assert!(!native_frame(&mut ui, 100, 30)?.contains(&local_time));
     Ok(())
 }
 #[test]
@@ -737,7 +743,10 @@ fn selected_layout_input_and_scroll_samples_use_native_consumers() {
     config.preferences.conversation.reasoning_expanded = true;
     assert!(text(preview.render(&config, 80, now, false)).contains("Unique reasoning detail"));
     config.preferences.conversation.timestamps = true;
-    assert!(text(preview.render(&config, 80, now, false)).contains("UTC"));
+    let with_timestamps = text(preview.render(&config, 80, now, false));
+    assert!(!with_timestamps.contains("UTC"));
+    config.preferences.conversation.timestamps = false;
+    assert!(with_timestamps.len() > text(preview.render(&config, 80, now, false)).len());
     config.preferences.layout.session_sort = crate::settings::SessionSort::ActiveFirst;
     let active = text(preview.render_control(&config, 160, now, &SettingId::SessionSort));
     assert!(active.find("Active session") < active.find("Recent session"));

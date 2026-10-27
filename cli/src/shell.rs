@@ -409,7 +409,10 @@ impl Shell {
             .as_ref()
             .map(|panel| panel.preview_config().clone());
         self.reviews.preview_diff_settings(diff_visual.as_ref());
-        self.agents.configure_pr_images(&self.reviews.images);
+        self.agents.configure_images(
+            &self.reviews.images,
+            self.palette.is_some() || self.settings.is_some() || self.settings_action_open,
+        );
         if self.agents_active {
             self.agents.draw(frame);
         } else {
