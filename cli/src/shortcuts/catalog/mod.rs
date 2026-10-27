@@ -797,7 +797,7 @@ pub(super) fn build() -> Vec<ActionSpec> {
         for action in &mut entries {
             if matches!(
                 action.id,
-                ids::QUESTION_NEXT_FIELD | ids::QUESTION_PREVIOUS_FIELD
+                ids::QUESTION_NEXT_FIELD | ids::QUESTION_PREVIOUS_FIELD | ids::QUESTION_OPEN
             ) {
                 continue;
             }

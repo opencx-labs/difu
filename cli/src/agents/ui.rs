@@ -5614,7 +5614,7 @@ mod tests {
                     .map_err(|_| anyhow::anyhow!("Fixture panicked"))??;
                 assert!(ui.deleting.is_empty());
                 assert!(ui.busy && matches!(ui.modal, Some(Modal::Help(_))));
-                assert_eq!(ui.drilled, with_other_session);
+                assert!(ui.drilled);
                 assert_eq!(ui.sessions.contains_key("one"), fails);
                 assert_eq!(ui.summaries.iter().any(|s| s.id == "one"), fails);
                 if with_other_session {
@@ -5880,8 +5880,21 @@ mod tests {
         // Moving the selection flips the highlight off one card and onto the
         // other, a flap at a time.
         ui.select("two".into());
-        let (screen, _) = draw(&mut ui, 120, 40)?;
+        draw(&mut ui, 120, 40)?;
         assert_eq!(ui.sidebar_highlights.len(), 2);
+        // The status icon now occupies the first cells. Sample after the
+        // highlight has advanced into the text instead of under that icon.
+        ui.sidebar_highlights.insert(
+            "two".into(),
+            flap::Highlight::start(
+                true,
+                false,
+                Instant::now() - Duration::from_millis(40),
+                ui.tweaks,
+            )
+            .context("selection animation")?,
+        );
+        let (screen, _) = draw(&mut ui, 120, 40)?;
         assert!(screen.contains('▀'));
         let (screen, _) = draw_settled(&mut ui, 120, 40)?;
         assert!(!screen.contains('▀'));
@@ -5923,11 +5936,11 @@ mod tests {
                     matches!(action, Action::Focus(Focus::Conversation)).then_some(*rect)
                 })
                 .context("conversation box")?;
-            for rect in [sidebar, chat] {
+            for (rect, inset) in [(sidebar, 0), (chat, 2)] {
                 let icon = terminal
                     .backend()
                     .buffer()
-                    .cell((rect.x + 2, rect.y))
+                    .cell((rect.x + inset, rect.y))
                     .context("status icon")?;
                 assert_eq!(icon.symbol(), expected);
                 if expected.starts_with('✋') {
