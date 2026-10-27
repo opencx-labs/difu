@@ -68,8 +68,18 @@ pub(in crate::agents) fn handle(
                 .unwrap_or_default()
                 .to_lowercase();
             let limit = limit(args)?;
+            let folders = store.storage.load_config()?.session_folders;
+            let only = match args.get("folder").and_then(Value::as_str) {
+                Some(key) => Some(
+                    super::super::folders::index(&folders, key)
+                        .and_then(|index| folders.get(index))
+                        .with_context(|| format!("No folder named {key:?}"))?,
+                ),
+                None => None,
+            };
             let mut matches = sessions.into_iter().filter(|s| {
                 s.kind != "Orchestrator"
+                    && only.is_none_or(|folder| folder.sessions.contains(&s.id))
                     && s.id.as_str() > after
                     && (query.is_empty()
                         || s.title.to_lowercase().contains(&query)
@@ -78,7 +88,8 @@ pub(in crate::agents) fn handle(
                             .to_lowercase()
                             .contains(&query))
             });
-            let items:Vec<_>=matches.by_ref().take(limit).map(|s|json!({"id":s.id,"title":short(&s.title,512),"repository":s.repository,"status":s.status,"archived":s.archived,"version":s.version,"pending":s.pending,"queued":s.queued})).collect();
+            let items:Vec<_>=matches.by_ref().take(limit).map(|s|json!({"id":s.id,"title":short(&s.title,512),"repository":s.repository,"status":s.status,"archived":s.archived,"version":s.version,"pending":s.pending,"queued":s.queued,
+                "folder":super::super::folders::home(&folders,&s.id).map(|f|&f.name)})).collect();
             let next = matches
                 .next()
                 .and_then(|_| items.last()?.get("id").cloned());

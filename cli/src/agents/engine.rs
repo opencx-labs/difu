@@ -214,7 +214,7 @@ fn item_text(item: &Value) -> String {
         "dynamicToolCall"
             if matches!(
                 item.get("tool").and_then(Value::as_str),
-                Some(super::orchestrator::TOOL | super::peers::TOOL)
+                Some(super::orchestrator::TOOL | super::peers::TOOL | super::folders::TOOL)
             ) =>
         {
             format!(
@@ -291,7 +291,8 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
         let tool = params.get("tool").and_then(Value::as_str);
         if method == "item/tool/call"
             && (session.orchestrator && tool == Some(super::orchestrator::TOOL)
-                || session.peer_tools && tool == Some(super::peers::TOOL))
+                || session.peer_tools && tool == Some(super::peers::TOOL)
+                || session.folder_tools && tool == Some(super::folders::TOOL))
         {
             session.orchestrator_requests.push(Pending {
                 id: id.clone(),
@@ -1517,6 +1518,11 @@ fn instructions(session: &Session) -> String {
     } else {
         base
     };
+    let base = if session.folder_tools {
+        format!("{base}\n\n{}", super::folders::INSTRUCTIONS)
+    } else {
+        base
+    };
     let base = if session.question_tools {
         format!("{base}\n\n{}", super::questions::INSTRUCTIONS)
     } else {
@@ -1548,6 +1554,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
             s.registration_tools = true;
             s.question_tools = true;
             s.peer_tools = true;
+            s.folder_tools = true;
         })?;
     }
     let session = store.get(id)?;
@@ -1636,6 +1643,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
                 s.registration_tools = true;
                 s.question_tools = true;
                 s.peer_tools = true;
+                s.folder_tools = true;
             })?;
             let fresh = store.get(id)?;
             put(
@@ -1845,10 +1853,11 @@ pub fn run(
                     } else {
                         args
                     };
-                    if request.params.get("tool").and_then(Value::as_str)
-                        == Some(super::peers::TOOL)
-                    {
+                    let tool = request.params.get("tool").and_then(Value::as_str);
+                    if tool == Some(super::peers::TOOL) {
                         super::peers::handle(store, id, &args)
+                    } else if tool == Some(super::folders::TOOL) {
+                        super::folders::handle_tool(store, id, &args)
                     } else {
                         super::orchestrator::handle(store, id, &args)
                     }

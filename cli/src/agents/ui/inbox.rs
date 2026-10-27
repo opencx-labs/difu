@@ -97,6 +97,8 @@ impl Ui {
         self.inbox.active = None;
         self.inbox.scroll = 0;
         self.orchestrator_list = false;
+        self.folder_view = None;
+        self.folder_cursor = None;
         self.archived = false;
         self.list_scroll = 0;
         self.drilled = true;

@@ -140,6 +140,9 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                     super::pr_attachments::handle(store, id, args, &Cancel::default())
                         .map(|value| value.to_string())
                 }
+                super::folders::TOOL => {
+                    super::folders::handle_tool(store, id, args).map(|value| value.to_string())
+                }
                 super::artifacts::TOOL => super::artifacts::register(&mut session, args)
                     .map(|()| "Artifact registered in difu".to_owned()),
                 super::management::TOOL => (|| {
@@ -177,6 +180,7 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                     super::questions::TOOL,
                     super::peers::TOOL,
                     super::pr_attachments::TOOL,
+                    super::folders::TOOL,
                 ]
                 .contains(&name)
             {
@@ -709,13 +713,14 @@ pub(super) fn instructions(session: &Session) -> String {
         );
     }
     let instructions = format!(
-        "{}\n\n{}\n\n{}\n\n{QUESTIONS}\n\n{}\n\n{}\n\n{}",
+        "{}\n\n{}\n\n{}\n\n{QUESTIONS}\n\n{}\n\n{}\n\n{}\n\n{}",
         super::artifacts::INSTRUCTIONS,
         super::registration::INSTRUCTIONS,
         super::management::INSTRUCTIONS,
         super::questions::INSTRUCTIONS,
         super::peers::INSTRUCTIONS,
-        super::pr_attachments::INSTRUCTIONS
+        super::pr_attachments::INSTRUCTIONS,
+        super::folders::INSTRUCTIONS
     );
     let instructions = if session.native_setup {
         instructions
@@ -846,6 +851,7 @@ fn connect_once(
         s.registration_tools = true;
         s.question_tools = true;
         s.peer_tools = true;
+        s.folder_tools = true;
     })?;
     Ok(rpc)
 }
