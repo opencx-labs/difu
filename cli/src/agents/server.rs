@@ -469,7 +469,7 @@ impl Service {
                 super::pr_attachments::handle(
                     &self.store,
                     &id,
-                    &json!({"url": url}),
+                    &serde_json::json!({"url": url}),
                     &Cancel::default(),
                 )?;
                 Ok(Reply::Ok)
