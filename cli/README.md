@@ -351,6 +351,16 @@ its full GitHub URL. Attached PRs appear in the session list, input footer, and
 **Option+D** diff tabs, labeled with their repository. Attaching a URL neither
 switches workspaces nor treats that PR as owning the current checkout. The tool
 is available in new Codex conversations and in Claude sessions.
+Existing Codex conversations keep their original tool catalog and can use this
+noninteractive command instead, without resetting the conversation:
+
+```sh
+difu attach-pr https://github.com/owner/repo/pull/123 --session SESSION_ID
+```
+
+The session ID is included in the agent's difu instructions. Both paths verify
+the PR through GitHub before attaching it; mentioning a URL in chat does not
+automatically attach it.
 
 The session diff pane shows the selected PR's published diff whenever the session
 has linked PRs, including when its worktree has been removed. Multiple PRs appear

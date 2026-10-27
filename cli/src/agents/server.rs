@@ -407,6 +407,7 @@ impl Service {
             | Request::Repository { id, .. }
             | Request::Clear { id }
             | Request::RegisterWorktree { id, .. }
+            | Request::AttachPr { id, .. }
             | Request::Permissions { id, .. }
             | Request::Usage { id }
             | Request::Rename { id, .. } => Some(id.clone()),
@@ -464,6 +465,15 @@ impl Service {
                 version: env!("CARGO_PKG_VERSION").into(),
             }),
             Request::List => Ok(Reply::Sessions(self.store.list()?)),
+            Request::AttachPr { id, url } => {
+                super::pr_attachments::handle(
+                    &self.store,
+                    &id,
+                    &json!({"url": url}),
+                    &Cancel::default(),
+                )?;
+                Ok(Reply::Ok)
+            }
             Request::Watch { .. } => anyhow::bail!("Watch requires a streaming connection"),
             Request::Read { id, version } => self.store.inspect(&id, |session| {
                 if version == Some(session.version) {

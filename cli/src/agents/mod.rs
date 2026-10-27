@@ -837,6 +837,10 @@ pub enum Request {
         id: String,
         version: Option<u64>,
     },
+    AttachPr {
+        id: String,
+        url: String,
+    },
     Launch {
         job: Box<Job>,
     },

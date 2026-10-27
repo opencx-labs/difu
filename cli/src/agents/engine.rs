@@ -1536,7 +1536,10 @@ fn instructions(session: &Session) -> String {
     let base = if session.pr_tools {
         format!("{base}\n\n{}", super::pr_attachments::INSTRUCTIONS)
     } else {
-        base
+        format!(
+            "{base}\n\n{}",
+            super::pr_attachments::command_instructions(&session.id)
+        )
     };
     if session.artifact_tools {
         format!("{base}\n\n{}", super::artifacts::INSTRUCTIONS)
@@ -2102,6 +2105,15 @@ mod tests {
             assert!(!prompt.contains("Current repository:"));
         }
         assert!(!super::super::registration::continuation(&restored).contains("PR CI"));
+        assert!(!instructions(&restored).contains("difu attach-pr"));
+
+        let mut resumed = restored.clone();
+        resumed.pr_tools = false;
+        resumed.thread_id = Some("existing-codex-thread".into());
+        let prompt = instructions(&resumed);
+        assert!(prompt.contains("difu attach-pr <URL> --session 'policy'"));
+        assert!(!prompt.contains("difu_attach_pr"));
+        assert!(super::super::claude::instructions(&resumed).contains("difu_attach_pr"));
 
         let mut old = saved;
         old.as_object_mut()

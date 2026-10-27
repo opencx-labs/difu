@@ -7,6 +7,13 @@ use serde_json::{Value, json};
 pub(super) const TOOL: &str = "difu_attach_pr";
 pub(super) const INSTRUCTIONS: &str = "After creating a pull request, call difu_attach_pr with its full GitHub URL to attach it to this session, including PRs in other repositories. Attached PRs appear in the session list, chat footer, and Option+D diff selector. Attach only PRs created or worked on for this session, not every PR mentioned in conversation.";
 
+pub(super) fn command_instructions(id: &str) -> String {
+    let id = id.replace('\'', "'\\''");
+    format!(
+        "After creating a pull request, run `difu attach-pr <URL> --session '{id}'` with its full GitHub URL to attach it to this session, including PRs in other repositories. This command works without an interactive terminal. Attached PRs appear in the session list, chat footer, and Option+D diff selector. Attach only PRs created or worked on for this session, not every PR mentioned in conversation."
+    )
+}
+
 pub(super) fn tool() -> Value {
     json!({"type":"function","name":TOOL,"description":"Attach a pull request to this session using its full GitHub URL, including PRs in another repository. Makes its badge and published diff available in difu. Does not modify the PR or switch workspaces.","inputSchema":{"type":"object","properties":{"url":{"type":"string"}},"required":["url"],"additionalProperties":false}})
 }
