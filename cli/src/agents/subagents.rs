@@ -779,8 +779,8 @@ mod tests {
         s.status = super::super::Status::Running;
         s
     }
-    fn activity(id: &str, path: &str, kind: &str) -> Value {
-        json!({"method":"item/completed","params":{"threadId":"parent-thread","item":{
+    fn activity(parent: &str, id: &str, path: &str, kind: &str) -> Value {
+        json!({"method":"item/completed","params":{"threadId":parent,"item":{
             "type":"subAgentActivity","id":format!("{id}-{kind}"),"kind":kind,
             "agentThreadId":id,"agentPath":path,"model":null,"reasoningEffort":null
         }}})
@@ -788,7 +788,7 @@ mod tests {
     #[test]
     fn subagent_activity_tracks_lifecycle_without_finishing_the_parent() {
         let mut s = session();
-        let started = activity("badge", "/root/badge_check", "started");
+        let started = activity("parent-thread", "badge", "/root/badge_check", "started");
         super::super::engine::apply_event(&mut s, &started);
         super::super::engine::apply_event(&mut s, &started);
         assert_eq!(s.subagents.len(), 1);
@@ -800,18 +800,16 @@ mod tests {
         ] {
             super::super::engine::apply_event(
                 &mut s,
-                &activity("badge", "/root/badge_check", kind),
+                &activity("parent-thread", "badge", "/root/badge_check", kind),
             );
             assert_eq!(s.subagents.first().map(|a| a.state), Some(expected));
             assert_eq!(s.status, super::super::Status::Running);
             assert_eq!(s.turn_id.as_deref(), Some("parent-turn"));
         }
-        let mut foreign = activity("foreign", "/root/foreign", "started");
-        foreign["params"]["threadId"] = json!("unrelated-thread");
+        let foreign = activity("unrelated-thread", "foreign", "/root/foreign", "started");
         super::super::engine::apply_event(&mut s, &foreign);
         assert_eq!(s.subagents.len(), 1);
-        let mut nested = activity("nested", "/root/badge_check/nested", "started");
-        nested["params"]["threadId"] = json!("badge");
+        let nested = activity("badge", "nested", "/root/badge_check/nested", "started");
         super::super::engine::apply_event(&mut s, &nested);
         assert_eq!(s.subagents.len(), 2);
         assert_eq!(
@@ -827,7 +825,10 @@ mod tests {
             ("transcript", "/root/transcript_check"),
         ] {
             for kind in ["started", "completed"] {
-                super::super::engine::apply_event(&mut s, &activity(id, path, kind));
+                super::super::engine::apply_event(
+                    &mut s,
+                    &activity("parent-thread", id, path, kind),
+                );
             }
         }
         // v0.32.0 saved these items but did not add them to its child list.
@@ -837,8 +838,10 @@ mod tests {
         s.entries.push(Entry {
             id: "old-existing-start".into(),
             kind: "subAgentActivity".into(),
-            data: activity("existing", "/root/existing", "started")["params"]["item"]
-                .clone()
+            data: activity("parent-thread", "existing", "/root/existing", "started")
+                .pointer("/params/item")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing activity fixture item"))?
                 .into(),
             ..Entry::default()
         });
