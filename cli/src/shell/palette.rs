@@ -876,7 +876,7 @@ impl Shell {
             let title = format!(
                 "{}{}{}  {}",
                 if selected { "› " } else { "  " },
-                if item.pinned { "◆ " } else { "" },
+                if item.pinned { "📌 " } else { "" },
                 item.category,
                 item.title
             );
