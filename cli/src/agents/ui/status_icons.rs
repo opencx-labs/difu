@@ -416,21 +416,18 @@ fn sprite(status: Status, phase: usize, [r, g, b]: [u8; 3]) -> RgbaImage {
             };
         }
         Status::Idle => {
-            for (top, color) in [
-                (0, Rgba([128, 60, 60, 140])),
-                (8, Rgba([128, 110, 50, 140])),
-                (16, Rgba([r, g, b, alpha])),
-            ] {
-                for (row, width) in [3, 5, 7, 7, 7, 5, 3].into_iter().enumerate() {
-                    rect(
-                        &mut image,
-                        12 - width / 2,
-                        top + row as u32,
-                        width,
-                        1,
-                        color,
-                    );
-                }
+            for (row, width) in [6, 10, 12, 14, 14, 16, 16, 16, 16, 16, 16, 14, 14, 12, 10, 6]
+                .into_iter()
+                .enumerate()
+            {
+                rect(
+                    &mut image,
+                    12 - width / 2,
+                    4 + row as u32,
+                    width,
+                    1,
+                    Rgba([r, g, b, alpha]),
+                );
             }
         }
         Status::Completed => bitmap(&mut image, &CHECK, ink),
