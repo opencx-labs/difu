@@ -1247,6 +1247,54 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
         difu::agents::server::home(&storage)?.join(format!("{artifact}.json")),
     )?)?;
     assert_eq!(durable.artifacts.len(), 1);
+    // A voice conversation survives completed coding replies. The native stop
+    // tool closes only its own voice connection and leaves both chats usable.
+    for id in [&artifact, &removal] {
+        assert!(matches!(client::request(&storage, Request::Voice {
+            id: id.clone(), action: difu::agents::VoiceAction::Start { offer: "fixture-offer".into() },
+        })?, Reply::Voice(Some(answer)) if answer == "fixture-answer"));
+        wait(&storage, id, |s| s.voice)?;
+    }
+    let prior = session(&storage, &artifact)?.completed_turn;
+    control(
+        &storage,
+        &artifact,
+        Control::Message {
+            text: "a second spoken exchange".into(),
+            queue: false,
+            skills: vec![],
+            attachments: vec![],
+        },
+    )?;
+    let current = wait(&storage, &artifact, |s| {
+        s.status == Status::Idle && s.completed_turn != prior
+    })?;
+    assert!(current.voice);
+    let prior = current.completed_turn;
+    control(
+        &storage,
+        &artifact,
+        Control::Message {
+            text: "end voice using tool".into(),
+            queue: false,
+            skills: vec![],
+            attachments: vec![],
+        },
+    )?;
+    let current = wait(&storage, &artifact, |s| {
+        s.status == Status::Idle && s.completed_turn != prior && !s.voice
+    })?;
+    assert!(current.pending.is_empty());
+    assert!(current.workspace.as_ref().is_some_and(|path| path.exists()));
+    assert!(session(&storage, &removal)?.voice);
+    client::request(
+        &storage,
+        Request::Voice {
+            id: removal.clone(),
+            action: difu::agents::VoiceAction::Stop,
+        },
+    )?;
+    wait(&storage, &removal, |s| !s.voice)?;
     let Reply::Launched(existing) = client::request(
         &storage,
         Request::Launch {

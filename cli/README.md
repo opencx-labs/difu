@@ -708,25 +708,27 @@ no API key, and it needs a Codex install that ships its voice helper (Codex CLI
 microphone and the WebRTC connection; difu receives only levels and text and
 writes no audio to disk. Your terminal needs microphone permission.
 
-Tap Space to type a space; hold it to talk. Above the composer, Codex's voice strip
+Tap Space to type a space; hold it to start voice. Above the composer, Codex's voice strip
 shows the state (connecting, listening, speaking…) with live meters for your
-microphone and the voice. Terminals without key-release reporting end a hold when
-key repeats stop.
+microphone and the voice.
 
 In a Codex session that has started, holding Space talks to that session's agent,
 like Codex's `/voice` on the same thread. Your words and the voice's spoken replies
 appear in the chat as you speak, in Codex's split-flap reveal, and stay in the
 session's history. The voice can hand work to the agent; that turn runs in the
-session as usual and shows what was asked. Releasing Space mutes the microphone; the
-voice finishes its reply, waits while work it handed off is running (up to two
-minutes) so it can tell you the result, then disconnects. Hold Space again before
-then to reply at once. Esc ends the conversation. The composer stays usable while the
-voice replies.
+session as usual and shows what was asked. Once voice starts, release Space and
+keep talking: the microphone stays live between replies and while the agent works.
+Key-repeat gaps and pauses do not disconnect it. Esc or asking the agent to end
+voice closes the voice connection while keeping the chat and coding work.
+Leaving the chat/composer or disabling voice also closes it. The composer stays
+usable during voice. Existing Codex threads use `difu stop-voice --session <id>`
+for agent-requested shutdown; new threads have the `difu_stop_voice` tool.
 
 Claude sessions, and Codex sessions that have not started yet, take dictation
 instead: your words appear above the composer as you speak, and releasing Space
 inserts them at the cursor without sending. Esc cancels; failures keep the draft
 unchanged. Press Enter to send.
+Terminals without key-release reporting end dictation when key repeats stop.
 
 A private local service owns sessions and review jobs. Closing difu or its terminal
 leaves them running, including pending approvals. Reopen difu to reconnect. There

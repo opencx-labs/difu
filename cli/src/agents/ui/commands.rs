@@ -12,7 +12,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     (
         "voice",
-        "Turn hold-to-talk voice on or off; uses your Codex login",
+        "Enable or disable voice; hold Space to start, Esc to end",
     ),
     (
         "tweaks",

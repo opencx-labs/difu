@@ -335,6 +335,18 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
     }
     if let Some(id) = event.get("id") {
         let tool = params.get("tool").and_then(Value::as_str);
+        if session.voice_tools
+            && method == "item/tool/call"
+            && tool == Some(super::voice_control::TOOL)
+        {
+            session.voice_requests.push(Pending {
+                id: id.clone(),
+                method: method.into(),
+                params: params.clone(),
+                responded: false,
+            });
+            return;
+        }
         if method == "item/tool/call"
             && (session.orchestrator && tool == Some(super::orchestrator::TOOL)
                 || session.peer_tools && tool == Some(super::peers::TOOL)
@@ -1454,18 +1466,17 @@ fn voice(
         "version": "v3",
         "clientManagedHandoffs": false,
         "includeStartupContext": false,
+        "initialItems": [{"role":"assistant", "text":super::voice_control::FRONTEND}],
         "transport": {"type": "webrtc", "sdp": offer},
     });
-    if let Some(context) = &session.provider_context {
-        // A session that just switched to Codex has not received its earlier
-        // conversation yet; give the agent its recent part before it takes
-        // spoken requests. The next typed message still carries all of it.
-        put(
-            &mut params,
-            "realtimeStartInstructions",
-            json!(voice_handoff(context)),
-        )?;
-    }
+    // Preserve Codex's executor instructions and any provider-switch handoff,
+    // and make spoken shutdown available even on older provider threads.
+    let start = format!(
+        "{}\n\n{}",
+        voice_handoff(session.provider_context.as_deref().unwrap_or_default()),
+        super::voice_control::instructions(session)
+    );
+    put(&mut params, "realtimeStartInstructions", json!(start))?;
     let mut answer = None;
     rpc.call("thread/realtime/start", params, cancel, |value| {
         answer = answer.take().or_else(|| outcome(&value));
@@ -1624,7 +1635,11 @@ fn instructions(session: &Session) -> String {
             super::pr_attachments::command_instructions(&session.id)
         )
     };
-    let base = format!("{base}\n\n{}", super::shells::instructions(session));
+    let base = format!(
+        "{base}\n\n{}\n\n{}",
+        super::shells::instructions(session),
+        super::voice_control::instructions(session)
+    );
     if session.artifact_tools {
         format!("{base}\n\n{}", super::artifacts::INSTRUCTIONS)
     } else {
@@ -1643,6 +1658,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
             s.question_tools = true;
             s.peer_tools = true;
             s.folder_tools = true;
+            s.voice_tools = !s.orchestrator;
         })?;
     }
     let session = store.get(id)?;
@@ -1693,6 +1709,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
         )?;
     }
     if !resuming {
+        store.update(id, |s| s.voice_tools = !s.orchestrator)?;
         let mut tools = super::orchestrator::tools(&session);
         if !session.native_setup && session.deferred_workspace && launch.isolated {
             tools.extend(isolation::tools().as_array().cloned().unwrap_or_default());
@@ -1733,6 +1750,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
                 s.question_tools = true;
                 s.peer_tools = true;
                 s.folder_tools = true;
+                s.voice_tools = !s.orchestrator;
             })?;
             let fresh = store.get(id)?;
             put(
@@ -1920,6 +1938,30 @@ pub fn run(
             cancel.wake().wait();
             housekeeping_due = true;
             continue;
+        }
+        let requests = store.inspect(id, |s| s.voice_requests.clone())?;
+        if !requests.is_empty() {
+            store.update(id, |s| s.voice_requests.clear())?;
+            for request in requests {
+                let result = (|| -> Result<()> {
+                    let session = store.get(id)?;
+                    super::voice_control::validate(&session, &request)?;
+                    voice(
+                        &mut rpc,
+                        store,
+                        id,
+                        &session,
+                        super::VoiceAction::Stop,
+                        cancel,
+                    )?;
+                    Ok(())
+                })();
+                let text = match &result {
+                    Ok(()) => "Voice ended. The chat and coding work remain open.".to_owned(),
+                    Err(error) => format!("{error:#}"),
+                };
+                rpc.write(json!({"id":request.id,"result":{"success":result.is_ok(),"contentItems":[{"type":"inputText","text":text}]}}))?;
+            }
         }
         let requests = store.inspect(id, |s| s.orchestrator_requests.clone())?;
         if !requests.is_empty() {

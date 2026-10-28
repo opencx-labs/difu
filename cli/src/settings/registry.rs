@@ -795,7 +795,7 @@ pub fn registry() -> Vec<SettingSpec> {
             id: SettingId::VoiceEnabled,
             category: Category::Input,
             label: "Enable voice",
-            description: "Hold Space to speak. Ready Codex sessions support conversation; dictation inserts text on release and Enter sends. Repeated keys support terminals without key-release reporting.",
+            description: "Hold Space to start continuous voice in ready Codex sessions; release it and keep talking. Esc or a spoken request ends voice. Other sessions take dictation: release to insert, Enter to send.",
             aliases: &["microphone", "dictation", "hold space", "voice behavior"],
             kind: SettingKind::Bool,
             choices: vec![],

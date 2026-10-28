@@ -46,6 +46,17 @@ for line in sys.stdin:
     params = request.get('params',{})
     if method == 'initialize': reply(request, {'userAgent':'fixture'})
     elif method == 'initialized': pass
+    elif method == 'thread/realtime/start':
+        assert params['threadId'] == thread_id
+        assert 'difu_stop_voice' in params['realtimeStartInstructions'] or 'difu stop-voice' in params['realtimeStartInstructions']
+        assert params['initialItems'][0]['role'] == 'assistant'
+        reply(request, {})
+        event('thread/realtime/started', {'threadId':thread_id, 'version':'v3'})
+        event('thread/realtime/sdp', {'threadId':thread_id, 'sdp':'fixture-answer'})
+    elif method == 'thread/realtime/stop':
+        assert params['threadId'] == thread_id
+        event('thread/realtime/closed', {'threadId':thread_id, 'reason':'user'})
+        reply(request, {})
     elif method == 'account/rateLimits/read':
         if active is not None and (root/'finish-deferred-plan').exists():
             (root/'finish-deferred-plan').unlink()
@@ -176,6 +187,8 @@ for line in sys.stdin:
             emit({'id':900+turn,'method':'item/tool/call','params':{'threadId':thread_id,'turnId':active,'callId':'workspace','tool':'difu_begin_editing','arguments':{}}})
         elif text.startswith('register worktree: '):
             emit({'id':900+turn,'method':'item/tool/call','params':{'threadId':thread_id,'turnId':active,'tool':'difu_register_worktree','arguments':{'path':text.split(': ',1)[1]}}})
+        elif text == 'end voice using tool':
+            emit({'id':900+turn,'method':'item/tool/call','params':{'threadId':thread_id,'turnId':active,'tool':'difu_stop_voice','arguments':{}}})
         elif text == 'delete this session':
             pathlib.Path('discard.txt').write_text('dirty self-deletion fixture')
             emit({'id':900+turn,'method':'item/tool/call','params':{'threadId':thread_id,'turnId':active,'tool':'difu_delete_session','arguments':{}}})
@@ -254,6 +267,9 @@ for line in sys.stdin:
         if request['result'].get('decision') in ('accept','acceptForSession') or 'answers' in request['result']:
             pathlib.Path('approved.txt').write_text('approved change\n')
         if any(item.get('text') == 'Artifact registered in difu' for item in request['result'].get('contentItems', [])):
+            complete()
+        elif any(item.get('text') == 'Voice ended. The chat and coding work remain open.' for item in request['result'].get('contentItems', [])):
+            assert request['result']['success']
             complete()
         elif any('remaining_questions' in item.get('text', '') for item in request['result'].get('contentItems', [])):
             assert request['result']['success']

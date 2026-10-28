@@ -33,7 +33,7 @@ pub(super) fn tools(session: &Session) -> Vec<Value> {
     if session.orchestrator {
         vec![tool(), super::questions::tool()]
     } else {
-        vec![
+        let mut tools = vec![
             super::artifacts::tool(),
             super::pr_attachments::tool(),
             super::shells::tool(),
@@ -42,7 +42,11 @@ pub(super) fn tools(session: &Session) -> Vec<Value> {
             super::questions::tool(),
             super::peers::tool(),
             super::folders::tool(),
-        ]
+        ];
+        if session.provider == super::provider::Provider::Codex {
+            tools.push(super::voice_control::tool());
+        }
+        tools
     }
 }
 fn tool() -> Value {

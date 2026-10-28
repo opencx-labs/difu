@@ -242,6 +242,12 @@ impl Browser {
     fn send(&mut self, value: Value) {
         self.output.extend(value.to_string().as_bytes());
         self.output.push(b'\n');
+        // Interactive input must reach the browser before drawing or maintenance.
+        // A nonblocking partial write stays queued in order for the next tick.
+        if let Err(error) = self.flush() {
+            crate::repaint::request();
+            self.error = Some(format!("{error:#}"));
+        }
     }
     fn size(&self, kind: &str) -> Value {
         json!({"type":kind,"cols":self.area.width,"rows":self.area.height,
@@ -346,6 +352,9 @@ impl Browser {
                 _ => {}
             }
         }
+        self.flush()
+    }
+    fn flush(&mut self) -> Result<()> {
         if self.initialized
             && let Some(stream) = &mut self.stream
         {
@@ -410,6 +419,9 @@ impl Browser {
         }
     }
     pub fn key(&mut self, key: KeyEvent) {
+        if key.kind == crossterm::event::KeyEventKind::Release {
+            return;
+        }
         let name = match key.code {
             KeyCode::Char(c) => c.to_string(),
             KeyCode::Enter => "enter".into(),
@@ -667,22 +679,25 @@ mod tests {
             row: 7,
             modifiers: KeyModifiers::NONE,
         });
-        browser.poll()?;
+        // Input arrives without any intervening UI poll/draw.
         line.clear();
         reader.read_line(&mut line)?;
         let click: Value = serde_json::from_str(&line)?;
         assert_eq!(click.get("x"), Some(&json!(25)));
         assert_eq!(click.get("y"), Some(&json!(70)));
         browser.paste("line one\nline two");
-        browser.poll()?;
         line.clear();
         reader.read_line(&mut line)?;
         let paste: Value = serde_json::from_str(&line)?;
         assert_eq!(paste.get("type"), Some(&json!("paste")));
         assert_eq!(paste.get("text"), Some(&json!("line one\nline two")));
+        browser.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        line.clear();
+        reader.read_line(&mut line)?;
+        let key: Value = serde_json::from_str(&line)?;
+        assert_eq!(key.get("text"), Some(&json!("x")));
         terminal.draw(|frame| browser.draw(frame, Rect::new(1, 1, 50, 20)))?;
         assert!(browser.grid.is_none());
-        browser.poll()?;
         line.clear();
         reader.read_line(&mut line)?;
         let resize: Value = serde_json::from_str(&line)?;
