@@ -32,6 +32,7 @@ mod suggestions;
 mod title;
 mod transport;
 pub mod ui;
+mod voice_control;
 mod workspace;
 
 use crate::{
@@ -370,6 +371,10 @@ pub struct Session {
     /// The provider thread was given difu_folders.
     #[serde(default)]
     pub folder_tools: bool,
+    #[serde(default)]
+    pub voice_tools: bool,
+    #[serde(skip)]
+    pub voice_requests: Vec<Pending>,
     #[serde(skip)]
     pub artifact_requests: Vec<Pending>,
     #[serde(skip)]
@@ -464,6 +469,8 @@ impl Session {
             question_tools: false,
             peer_tools: false,
             folder_tools: false,
+            voice_tools: false,
+            voice_requests: Vec::new(),
             artifact_requests: Vec::new(),
             pr_requests: Vec::new(),
             shell_requests: Vec::new(),

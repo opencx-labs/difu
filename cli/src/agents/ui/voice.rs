@@ -1,4 +1,4 @@
-//! Hold Space to talk. Codex sessions get a spoken conversation with their own
+//! Hold Space to start voice. Codex sessions get a continuous conversation with their own
 //! agent; other sessions get dictation into the composer. Both reuse Codex's
 //! voice strip and split-flap transcript reveal.
 use super::flap::{self, Flap};
@@ -11,7 +11,7 @@ use std::collections::VecDeque;
 
 /// Holding Space this long turns a press into talking instead of typing.
 const HOLD: Duration = Duration::from_millis(300);
-/// Without key-release reporting, a hold ends when key repeats stop.
+/// Without key-release reporting, dictation ends when key repeats stop.
 const REPEAT_GAP: Duration = Duration::from_millis(180);
 const METER_FRAMES: usize = 12;
 const METER_NOISE_FLOOR: u16 = 512;
@@ -21,11 +21,6 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const PREVIEW_ROWS: usize = 4;
 /// Speech keeps the speaker "active" this long, bridging gaps between words.
 const SPEAKER_HOLD: Duration = Duration::from_millis(800);
-/// After release, a conversation ends once nothing has happened for this long:
-/// your last words are transcribed, the reply finished, and the agent idle.
-const QUIET: Duration = Duration::from_millis(2500);
-/// A conversation waits at most this long after release for work it handed off.
-const WORK_LIMIT: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Mode {
@@ -39,8 +34,7 @@ enum Mode {
 enum Phase {
     Connecting,
     Listening,
-    /// Space was released: the microphone is muted while dictation finishes
-    /// or the voice replies.
+    /// Space was released: the microphone is muted while dictation finishes.
     Released,
 }
 
@@ -51,6 +45,7 @@ pub(super) struct Hold {
     before: Editor,
     started: Instant,
     last: Instant,
+    activation_held: bool,
     voice: Option<Voice>,
     /// When talking began, in Unix ms, to recognise turns the voice started.
     began: i64,
@@ -59,8 +54,6 @@ pub(super) struct Hold {
     /// Microphone and speaker intensity per 100 ms sample, newest last.
     levels: VecDeque<(u8, u8)>,
     speaking: Option<Instant>,
-    released: Option<Instant>,
-    busy: Instant,
     working: bool,
     connected: bool,
     segments: Vec<String>,
@@ -77,14 +70,13 @@ impl Hold {
             before,
             started: now,
             last: now,
+            activation_held: true,
             voice: None,
             began: chrono::Utc::now().timestamp_millis(),
             phase: Phase::Connecting,
             phase_started: now,
             levels: VecDeque::new(),
             speaking: None,
-            released: None,
-            busy: now,
             working: false,
             connected: false,
             segments: Vec::new(),
@@ -107,9 +99,6 @@ impl Hold {
             self.phase = phase;
             self.phase_started = Instant::now();
         }
-        let now = Instant::now();
-        self.released = (phase == Phase::Released).then_some(now);
-        self.busy = now;
     }
     fn speaking(&self) -> bool {
         self.speaking.is_some_and(|at| at.elapsed() < SPEAKER_HOLD)
@@ -202,7 +191,8 @@ impl Ui {
                     self.voice.hold = None;
                     return true;
                 };
-                if hold.phase != Phase::Released {
+                hold.activation_held = false;
+                if hold.mode == Mode::Dictate && hold.phase != Phase::Released {
                     voice.release();
                     hold.set_phase(Phase::Released);
                 }
@@ -210,7 +200,7 @@ impl Ui {
             return true;
         }
         if let Some(hold) = &mut self.voice.hold
-            && let Some(voice) = &hold.voice
+            && hold.voice.is_some()
         {
             if key.code == KeyCode::Esc {
                 let mode = hold.mode;
@@ -224,17 +214,12 @@ impl Ui {
                 ));
                 return true;
             }
-            if space {
+            if space && (hold.mode == Mode::Dictate || hold.activation_held) {
                 hold.last = Instant::now();
-                // Holding Space while a conversation is still connected talks again at once.
-                if hold.mode == Mode::Converse && hold.phase == Phase::Released {
-                    voice.resume();
-                    hold.set_phase(Phase::Listening);
-                }
                 return true;
             }
-            // While the voice replies or the agent works, the composer stays usable.
-            return !(hold.mode == Mode::Converse && hold.phase == Phase::Released);
+            // Once voice starts, the composer stays usable throughout the conversation.
+            return hold.mode != Mode::Converse;
         }
         if !space {
             self.voice.hold = None;
@@ -308,8 +293,13 @@ impl Ui {
             }
             return;
         };
-        // Legacy terminal protocols have no key-up events. Cessation of repeat ends the hold.
-        let released = hold.phase != Phase::Released && hold.last.elapsed() > REPEAT_GAP;
+        // A delayed repeat is not a reason to mute or disconnect a conversation.
+        // Only dictation still depends on the hold after activation.
+        if hold.last.elapsed() > REPEAT_GAP {
+            hold.activation_held = false;
+        }
+        let released =
+            hold.mode == Mode::Dictate && hold.phase != Phase::Released && !hold.activation_held;
         if released {
             voice.release();
         }
@@ -404,9 +394,8 @@ impl Ui {
             }
         });
     }
-    /// A conversation ends once, after release, nothing has happened for a
-    /// moment: your words are transcribed, the reply has been spoken, and any
-    /// work the voice handed to the agent is done.
+    /// Keep listening between replies and while delegated work runs. Escape,
+    /// leaving the composer, or the provider closing voice ends the connection.
     fn tick_conversation(&mut self, outcome: Option<Result<(), String>>) {
         let Some(hold) = &mut self.voice.hold else {
             return;
@@ -428,22 +417,10 @@ impl Ui {
             self.notice = Some(("The voice connection closed".into(), false));
             return;
         }
-        let transcribing = session
-            .entries
-            .iter()
-            .any(|entry| flap::voice_role(entry).is_some() && entry.finished_at.is_none());
         hold.working = session.status.active()
             && session
                 .turn_started_at
                 .is_some_and(|started| started >= hold.began);
-        if transcribing || hold.working || hold.speaking() {
-            hold.busy = Instant::now();
-        }
-        if let Some(released) = hold.released
-            && (hold.busy.elapsed() >= QUIET || released.elapsed() >= WORK_LIMIT)
-        {
-            self.voice.hold = None;
-        }
     }
     /// Rows the voice strip (and live dictation) need above the composer.
     fn voice_preview(&self, hold: &Hold, width: u16, now: Instant) -> Vec<Line<'static>> {
@@ -502,22 +479,18 @@ impl Ui {
         let dim = Style::default().fg(DIM);
         let (marker, activity) = match (hold.phase, hold.mode) {
             (Phase::Connecting, _) => (Span::styled(spinner(), live), "connecting"),
+            (Phase::Listening, Mode::Converse) if hold.speaking() => {
+                (Span::styled("●", live), "listening · speaking")
+            }
+            (Phase::Listening, Mode::Converse) if hold.working => {
+                (Span::styled("●", live), "listening · agent working")
+            }
             (Phase::Listening, _) => (Span::styled("●", live), "listening"),
             (Phase::Released, Mode::Dictate) => (
                 Span::styled(spinner(), Style::default().fg(ACCENT)),
                 "transcribing",
             ),
-            (Phase::Released, Mode::Converse) if hold.speaking() => {
-                (Span::styled("◌", dim), "speaking")
-            }
-            (Phase::Released, Mode::Converse) if hold.working => (
-                Span::styled(spinner(), Style::default().fg(ACCENT)),
-                "agent working",
-            ),
-            (Phase::Released, Mode::Converse) => (
-                Span::styled(spinner(), Style::default().fg(ACCENT)),
-                "thinking",
-            ),
+            (Phase::Released, Mode::Converse) => (Span::styled("●", live), "listening"),
         };
         let key = Style::default().fg(TEXT).add_modifier(Modifier::BOLD);
         let mut status = vec![
@@ -543,8 +516,10 @@ impl Ui {
             (Phase::Released, Mode::Dictate) => {
                 vec![Span::styled("esc", key), Span::styled(" cancel", dim)]
             }
-            (Phase::Released, Mode::Converse) => hint("hold ", " to reply   ", " end"),
-            (_, Mode::Converse) => hint("release ", " to stop talking   ", " end"),
+            (_, Mode::Converse) => vec![
+                Span::styled("esc", key),
+                Span::styled(" or say ‘end voice’ to stop", dim),
+            ],
             (_, Mode::Dictate) => hint("release ", " to insert   ", " cancel"),
         };
         let short = vec![
@@ -1061,7 +1036,7 @@ pub(crate) mod tests {
         Ok(())
     }
     #[test]
-    fn conversation_waits_for_the_reply_then_ends_and_never_edits_the_draft() -> Result<()> {
+    fn conversation_keeps_listening_after_release_replies_and_long_repeat_gaps() -> Result<()> {
         let (mut ui, _tmp) = fixture()?;
         ui.list_visible = false;
         let mut session = coding();
@@ -1079,23 +1054,39 @@ pub(crate) mod tests {
         let listening = screen(&mut ui, 100)?;
         assert!(listening.contains("● listening"), "{listening}");
         assert!(listening.contains("codex ▁▁▁▁▁█"), "{listening}");
-        assert!(listening.contains("release space to stop talking"));
+        assert!(listening.contains("say ‘end voice’ to stop"));
         release(&mut ui);
         // The voice is still answering: the session stays open.
         ui.tick_voice(true);
         let replying = screen(&mut ui, 100)?;
         assert!(replying.contains("speaking"), "{replying}");
-        assert!(replying.contains("hold space to reply"));
+        assert!(replying.contains("listening"));
+        assert!(
+            ui.voice
+                .hold
+                .as_ref()
+                .and_then(|h| h.voice.as_ref())
+                .is_some_and(Voice::microphone_live)
+        );
         // Typing works while the voice replies.
         ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-        assert_eq!(draft(&ui)?, "keep this draftx");
+        ui.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(draft(&ui)?, "keep this draftx ");
         let hold = ui.voice.hold.as_mut().context("hold")?;
         hold.speaking = None;
-        hold.busy = Instant::now() - QUIET;
+        hold.last = Instant::now() - Duration::from_secs(180);
         ui.tick_voice(true);
-        assert!(ui.voice.hold.is_none(), "quiet after the reply ends it");
-        assert_eq!(draft(&ui)?, "keep this draftx");
-        drop(tx);
+        assert!(
+            ui.voice.hold.as_ref().is_some_and(|hold| {
+                hold.phase == Phase::Listening
+                    && hold.voice.as_ref().is_some_and(Voice::microphone_live)
+            }),
+            "silence, release and delayed repeats must never close or mute voice"
+        );
+        assert_eq!(draft(&ui)?, "keep this draftx ");
+        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(ui.voice.hold.is_none());
+        assert!(tx.send(Event::Listening).is_err());
         Ok(())
     }
     #[test]
@@ -1105,16 +1096,17 @@ pub(crate) mod tests {
         session.thread_id = Some("thread".into());
         session.voice = true;
         ui.sessions.insert(session.id.clone(), session.clone());
-        let _tx = talking(&mut ui, Mode::Converse)?;
+        let tx = talking(&mut ui, Mode::Converse)?;
+        tx.send(Event::Listening)?;
         release(&mut ui);
         session.status = Status::Running;
         session.turn_started_at = Some(chrono::Utc::now().timestamp_millis() + 1);
         ui.sessions.insert(session.id.clone(), session.clone());
-        ui.voice.hold.as_mut().context("hold")?.busy = Instant::now() - QUIET;
+        ui.voice.hold.as_mut().context("hold")?.last = Instant::now() - Duration::from_secs(180);
         ui.tick_voice(true);
         assert!(ui.voice.hold.as_ref().is_some_and(|hold| hold.working));
         assert!(screen(&mut ui, 100)?.contains("agent working"));
-        // A new hold talks again on the same connection.
+        // Input still works on the same live connection while the agent works.
         ui.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
         assert!(
             ui.voice
@@ -1127,6 +1119,29 @@ pub(crate) mod tests {
         ui.sessions.insert(session.id.clone(), session);
         ui.tick_voice(true);
         assert!(ui.voice.hold.is_none());
+        Ok(())
+    }
+    #[test]
+    fn conversation_release_during_connection_and_missing_key_up_do_not_mute() -> Result<()> {
+        for explicit_release in [false, true] {
+            let (mut ui, _tmp) = fixture()?;
+            let mut session = coding();
+            session.voice = true;
+            ui.sessions.insert(session.id.clone(), session);
+            let tx = talking(&mut ui, Mode::Converse)?;
+            if explicit_release {
+                release(&mut ui);
+            }
+            ui.voice.hold.as_mut().context("hold")?.last =
+                Instant::now() - Duration::from_secs(180);
+            ui.tick_voice(true);
+            tx.send(Event::Listening)?;
+            ui.tick_voice(true);
+            let hold = ui.voice.hold.as_ref().context("conversation")?;
+            assert!(hold.phase == Phase::Listening);
+            assert!(hold.voice.as_ref().is_some_and(Voice::microphone_live));
+            assert_eq!(draft(&ui)?, "keep this draft");
+        }
         Ok(())
     }
     #[test]

@@ -58,11 +58,9 @@ impl Session {
             .control
             .compare_exchange(LIVE, RELEASED, Ordering::AcqRel, Ordering::Acquire);
     }
-    /// Unmutes the microphone of a conversation that is still connected.
-    pub fn resume(&self) {
-        let _ = self
-            .control
-            .compare_exchange(RELEASED, LIVE, Ordering::AcqRel, Ordering::Acquire);
+    #[cfg(test)]
+    pub(crate) fn microphone_live(&self) -> bool {
+        self.control.load(Ordering::Acquire) == LIVE
     }
 }
 impl Drop for Session {
@@ -121,29 +119,28 @@ fn converse_with(
     }
     let result = start(&offer).and_then(|answer| {
         host.answer(&answer)?;
+        if control.load(Ordering::Acquire) == CANCELLED {
+            return Ok(());
+        }
         host.open_devices()?;
-        let mut muted = false;
-        host.controls(muted, false)?;
+        host.controls(false, false)?;
         let _ = events.send(Event::Listening);
         loop {
             let state = control.load(Ordering::Acquire);
             if state == CANCELLED {
                 return Ok(());
             }
-            if muted != (state == RELEASED) {
-                muted = state == RELEASED;
-                host.controls(muted, false)?;
-            }
             let (microphone, speaker) = host.peaks()?;
             let _ = events.send(Event::Levels {
-                microphone: if muted { 0 } else { microphone },
+                microphone,
                 speaker,
             });
             thread::sleep(SAMPLE);
         }
     });
-    stop();
+    // Close local audio before waiting for the service to acknowledge shutdown.
     host.close();
+    stop();
     result
 }
 

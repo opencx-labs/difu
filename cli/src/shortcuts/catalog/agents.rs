@@ -214,7 +214,7 @@ pub(super) fn entries() -> Vec<ActionSpec> {
         ),
         entry(
             ids::VOICE_HOLD,
-            "Hold to speak",
+            "Hold to start voice or dictate",
             &[contexts::AGENT_COMPOSER, contexts::AGENT_COMPOSER_PANES],
             &[key(BindingKey::Character(' '), 0)],
         ),

@@ -38,6 +38,11 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// End a session's voice connection, keeping its chat and coding work.
+    StopVoice {
+        #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        session: String,
+    },
     /// Inspect a session's shared shells using difu_shell action JSON.
     Shell {
         #[arg(long, value_parser = clap::builder::NonEmptyStringValueParser::new())]
@@ -88,6 +93,20 @@ fn main() -> Result<()> {
         } else {
             difu::agents::server::run(storage)
         };
+    }
+    if let Some(Commands::StopVoice { session }) = &args.command {
+        let storage = Storage::discover()?;
+        match difu::agents::client::request(
+            &storage,
+            difu::agents::Request::Voice {
+                id: session.clone(),
+                action: difu::agents::VoiceAction::Stop,
+            },
+        )? {
+            difu::agents::Reply::Voice(None) => println!("Voice ended"),
+            other => anyhow::bail!("Unexpected voice reply: {other:?}"),
+        }
+        return Ok(());
     }
     if let Some(Commands::Shell { session, action }) = &args.command {
         let storage = Storage::discover()?;
@@ -283,6 +302,15 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn voice_stop_requires_an_explicit_session() -> Result<()> {
+        let args = Args::try_parse_from(["difu", "stop-voice", "--session", "one"])?;
+        assert!(matches!(args.command, Some(Commands::StopVoice { session }) if session == "one"));
+        assert!(Args::try_parse_from(["difu", "stop-voice"]).is_err());
+        assert!(Args::try_parse_from(["difu", "stop-voice", "--session", ""]).is_err());
+        Ok(())
+    }
 
     #[test]
     fn attachment_requires_a_full_pr_url_and_explicit_session() -> Result<()> {
