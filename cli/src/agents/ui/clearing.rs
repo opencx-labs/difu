@@ -88,6 +88,7 @@ fn pulse(buffer: &mut Buffer, area: Rect, elapsed: Duration, animated: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::{Context, Result};
 
     #[test]
     fn pulse_keeps_text_backgrounds_and_surrounding_ui_intact() -> Result<()> {

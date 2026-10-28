@@ -5904,7 +5904,7 @@ mod tests {
             ui.positions.get("one").context("draft")?.draft.text(),
             "Next task"
         );
-        assert!(ui.send_queues.is_empty() && ui.voice.hold.is_none());
+        assert!(ui.send_queues.is_empty() && !ui.voice_active());
         assert!(ui.focused_editor().is_none());
         still(&mut ui);
         let (screen, _) = draw(&mut ui, 120, 30)?;
