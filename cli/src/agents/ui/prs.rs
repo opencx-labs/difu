@@ -675,15 +675,16 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             controls.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
-            ["artifacts", "pr", "shells"]
+            ["artifacts", "shells", "pr"]
         );
         assert!(controls.iter().all(|(_, rect)| rect.y == pill.y));
         ui.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(ui.focus, Focus::Resources(true));
         ui.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
-        assert_eq!(ui.focus, Focus::PullRequest(0));
-        ui.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         assert_eq!(ui.focus, Focus::Resources(false));
+        ui.key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(ui.focus, Focus::PullRequest(0));
+        ui.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
         let mut narrow = ratatui::Terminal::new(ratatui::backend::TestBackend::new(48, 20))?;
         narrow.draw(|f| ui.draw(f))?;
         let shell = ui
