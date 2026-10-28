@@ -1069,57 +1069,69 @@ impl Service {
                 Ok(Reply::Session(Box::new(self.store.get(&id)?)))
             }
             Request::Clear { id } => {
-                let mut candidate = self.store.get(&id)?;
                 ensure!(
-                    !candidate.archived,
-                    "Unarchive the session before clearing it"
+                    !self.store.get(&id)?.clearing,
+                    "This session is already clearing"
                 );
-                ensure!(
-                    !candidate.workspace_removed,
-                    "This worktree was explicitly removed. Launch a new session from its retained branch to continue coding."
-                );
-                ensure!(
-                    !candidate.orchestrator
-                        && matches!(&candidate.job, Job::Coding(launch) if launch.isolated),
-                    "Only worktree coding sessions can be cleared"
-                );
-                candidate.baseline = None;
-                super::workspace::inspect(&mut candidate, &Cancel::default())?;
-                super::rules::capture(&self.store.storage, &mut candidate)?;
-                let owned = self.store.home.join("worktrees").join(&id);
-                if owned.try_exists()? {
+                self.store.update(&id, |s| s.clearing = true)?;
+                let result = (|| -> Result<Reply> {
+                    let mut candidate = self.store.get(&id)?;
                     ensure!(
-                        !candidate.job.root().starts_with(owned.canonicalize()?),
-                        "The session repository is inside the worktree being discarded"
+                        !candidate.archived,
+                        "Unarchive the session before clearing it"
                     );
+                    ensure!(
+                        !candidate.workspace_removed,
+                        "This worktree was explicitly removed. Launch a new session from its retained branch to continue coding."
+                    );
+                    ensure!(
+                        !candidate.orchestrator
+                            && matches!(&candidate.job, Job::Coding(launch) if launch.isolated),
+                        "Only worktree coding sessions can be cleared"
+                    );
+                    candidate.baseline = None;
+                    super::workspace::inspect(&mut candidate, &Cancel::default())?;
+                    super::rules::capture(&self.store.storage, &mut candidate)?;
+                    let owned = self.store.home.join("worktrees").join(&id);
+                    if owned.try_exists()? {
+                        ensure!(
+                            !candidate.job.root().starts_with(owned.canonicalize()?),
+                            "The session repository is inside the worktree being discarded"
+                        );
+                    }
+                    // Validate first so a missing repository leaves the session intact.
+                    self.stop_worker(&id)?;
+                    let _shell_lifecycle = self
+                        .store
+                        .shells
+                        .lifecycle
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
+                    self.store.shells.stop_session(&self.store, &id)?;
+                    let previous = self.store.get(&id)?;
+                    super::workspace::discard(&previous, &self.store.home, &Cancel::default())?;
+                    let revision = previous.workspace_revision.saturating_add(1);
+                    super::pr_cache::disconnect(&self.store.storage, &id, revision)?;
+                    self.store.update(&id, |s| {
+                        reset_workspace(s, candidate, revision);
+                        clear_conversation(s);
+                        s.status = Status::Starting;
+                        s.note(
+                            "system",
+                            "Session cleared. Preparing a fresh worktree from the latest origin/main.",
+                        );
+                    })?;
+                    self.store.save(&id)?;
+                    // The empty-session path fetches origin/main and prepares the worktree
+                    // without starting a provider until the next message.
+                    self.start(&id, None)?;
+                    Ok(Reply::Session(Box::new(self.store.get(&id)?)))
+                })();
+                if result.is_err() {
+                    self.store.update(&id, |s| s.clearing = false)?;
+                    self.store.save(&id)?;
                 }
-                // Validate first so a missing repository leaves the session intact.
-                self.stop_worker(&id)?;
-                let _shell_lifecycle = self
-                    .store
-                    .shells
-                    .lifecycle
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
-                self.store.shells.stop_session(&self.store, &id)?;
-                let previous = self.store.get(&id)?;
-                super::workspace::discard(&previous, &self.store.home, &Cancel::default())?;
-                let revision = previous.workspace_revision.saturating_add(1);
-                super::pr_cache::disconnect(&self.store.storage, &id, revision)?;
-                self.store.update(&id, |s| {
-                    reset_workspace(s, candidate, revision);
-                    clear_conversation(s);
-                    s.status = Status::Starting;
-                    s.note(
-                        "system",
-                        "Session cleared. Preparing a fresh worktree from the latest origin/main.",
-                    );
-                })?;
-                self.store.save(&id)?;
-                // The empty-session path fetches origin/main and prepares the worktree
-                // without starting a provider until the next message.
-                self.start(&id, None)?;
-                Ok(Reply::Session(Box::new(self.store.get(&id)?)))
+                result
             }
             Request::Rename { id, title } => {
                 ensure!(!title.trim().is_empty(), "Session name cannot be empty");
@@ -1529,6 +1541,7 @@ pub fn run(storage: Storage) -> Result<()> {
         let mut session: Session = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("Cannot restore session {}", path.display()))?;
         session.deletion_progress = None;
+        session.clearing = false;
         ensure!(
             path.file_stem().and_then(|s| s.to_str()) == Some(&session.id),
             "Invalid session storage identity"
@@ -2214,15 +2227,37 @@ mod clear_tests {
             fs::write(origin.join("tracked.txt"), "fresh remote main\n")?;
             git(&origin, &["commit", "-am", "advance main"])?;
             let fresh = git(&origin, &["rev-parse", "HEAD"])?;
-            let service = Service {
+            let service = Arc::new(Service {
                 remote: super::remote::Remote::start(store.storage.clone()),
                 store: store.clone(),
                 workers: Mutex::new(BTreeMap::new()),
                 action_locks: Mutex::new(BTreeMap::new()),
                 launch_lock: Mutex::new(()),
-            };
+            });
 
-            let Reply::Session(_) = service.handle(Request::Clear { id: "one".into() })? else {
+            // Pause cleanup to observe progress before the clear request returns.
+            let lifecycle = store
+                .shells
+                .lifecycle
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Shell lock failed"))?;
+            let clearing_service = service.clone();
+            let clearing =
+                thread::spawn(move || clearing_service.handle(Request::Clear { id: "one".into() }));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !store.get("one")?.clearing {
+                ensure!(
+                    Instant::now() < deadline,
+                    "clearing status was not published"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(store.get("one")?.summary().clearing);
+            drop(lifecycle);
+            let Reply::Session(_) = clearing
+                .join()
+                .map_err(|_| anyhow::anyhow!("Clear worker failed"))??
+            else {
                 anyhow::bail!("clear returned no session")
             };
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -2240,6 +2275,13 @@ mod clear_tests {
                 thread::sleep(Duration::from_millis(50));
             };
             service.stop_worker("one")?;
+            assert!(!cleared.clearing && !cleared.summary().clearing);
+            store.update("one", |s| s.archived = true)?;
+            assert!(service.handle(Request::Clear { id: "one".into() }).is_err());
+            assert!(
+                !store.get("one")?.clearing,
+                "failed validation must unlock the session"
+            );
 
             assert_eq!(cleared.workspace.as_deref(), Some(tree.as_path()));
             assert_eq!(cleared.baseline.as_deref(), Some(fresh.as_str()));

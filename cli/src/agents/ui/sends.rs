@@ -17,6 +17,9 @@ impl Ui {
         );
     }
     pub(super) fn send(&mut self, queue: bool) {
+        if self.clearing_selected() {
+            return;
+        }
         if self.run_shell_command() {
             return;
         }

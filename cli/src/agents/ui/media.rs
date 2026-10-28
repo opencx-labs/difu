@@ -67,7 +67,7 @@ impl Ui {
     }
 
     pub(super) fn attach(&mut self, paths: Option<Vec<std::path::PathBuf>>) {
-        if self.media_pending.is_some() {
+        if self.media_pending.is_some() || self.clearing_selected() {
             return;
         }
         let Some(id) = self.selected.clone() else {

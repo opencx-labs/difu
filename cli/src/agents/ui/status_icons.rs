@@ -215,7 +215,7 @@ impl Icons {
     }
 }
 
-fn rgb(color: Color) -> [u8; 3] {
+pub(super) fn rgb(color: Color) -> [u8; 3] {
     match color {
         Color::Rgb(r, g, b) => [r, g, b],
         Color::Indexed(index) => match index {

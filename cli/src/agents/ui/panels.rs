@@ -140,6 +140,14 @@ impl Ui {
         self.draw_footer(frame, area, Line::default());
     }
     pub(super) fn draw_composer_footer(&mut self, frame: &mut Frame, area: Rect) {
+        if self.clearing_selected() {
+            frame.render_widget(
+                Paragraph::new("Clearing session… Input temporarily disabled")
+                    .style(Style::default().fg(ACCENT)),
+                area,
+            );
+            return;
+        }
         let status = self
             .selected
             .as_ref()

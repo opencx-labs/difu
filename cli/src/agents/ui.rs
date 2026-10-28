@@ -3,6 +3,7 @@ use super::*;
 mod browser;
 mod cache_io;
 mod changes;
+mod clearing;
 mod codex_plan_picker;
 mod commands;
 mod defaults;
@@ -424,6 +425,7 @@ pub struct Ui {
     send_queues: HashMap<String, VecDeque<(u64, Control)>>,
     interrupting: HashSet<String>,
     deleting: HashSet<String>,
+    clearing: clearing::State,
     question_send: Option<(String, Value, String, usize)>,
     plans: plan_prompt::State,
     question_reveal: bool,
@@ -536,6 +538,7 @@ impl Ui {
             send_queues: HashMap::new(),
             interrupting: HashSet::new(),
             deleting: HashSet::new(),
+            clearing: Default::default(),
             question_send: None,
             plans: Default::default(),
             question_reveal: true,
@@ -600,6 +603,7 @@ impl Ui {
         }
         if self.preferences.motion.level == crate::settings::Motion::Full
             && (self.voice_active()
+                || self.clearing_selected()
                 || self.session_switched.is_some()
                 || self.question_flip.animating(Instant::now())
                 || self.inbox.animating()
@@ -739,11 +743,12 @@ impl Ui {
                     self.inbox.reads.remove(id);
                 }
                 Task::Changes(..) | Task::ChangesContext(..) => {}
-                Task::Launch
-                | Task::Repository(_)
-                | Task::Clear(_)
-                | Task::Worktree(_)
-                | Task::Action => self.busy = false,
+                Task::Launch | Task::Repository(_) | Task::Worktree(_) | Task::Action => {
+                    self.busy = false
+                }
+                Task::Clear(id) => {
+                    self.clearing.requests.remove(id);
+                }
                 Task::Delete(id) => {
                     self.deleting.remove(id);
                 }
@@ -926,6 +931,14 @@ impl Ui {
                         self.replaced_workspace(id, *session);
                     }
                     (Task::Clear(id), Reply::Session(session)) => {
+                        // Preparation can finish through the subscription before
+                        // the clear request's earlier snapshot reaches the UI.
+                        let session = self
+                            .sessions
+                            .get(&id)
+                            .filter(|current| current.version > session.version)
+                            .cloned()
+                            .unwrap_or(*session);
                         if let Some(position) = self.positions.get_mut(&id) {
                             // Keep the composer; the old transcript, questions and
                             // change selections no longer exist.
@@ -941,7 +954,9 @@ impl Ui {
                                 ..Position::default()
                             };
                         }
-                        self.replaced_workspace(id, *session);
+                        let modal = self.modal.take();
+                        self.replaced_workspace(id, session);
+                        self.modal = modal;
                     }
                     (
                         Task::Read(id) | Task::InboxRead(id) | Task::Worktree(id),
@@ -1277,7 +1292,9 @@ impl Ui {
         if let Err(error) = self.prs.forget(&id, &self.storage, &self.cache_writer) {
             self.notice = Some((format!("Cannot clear cached PR: {error:#}"), true));
         }
-        self.panels = panels::Panels::new(self.panels.right);
+        if self.selected.as_ref() == Some(&id) {
+            self.panels = panels::Panels::new(self.panels.right);
+        }
         self.summaries.retain(|s| s.id != id);
         self.summaries.push(session.summary());
         self.sessions.insert(id, session);
@@ -1820,11 +1837,16 @@ impl Ui {
                 field,
                 ..
             }) if pending.method == "item/tool/requestUserInput" => answers.get(*field),
-            None if !self.inbox.visible && self.focus == Focus::Composer && self.drilled => self
-                .selected
-                .as_ref()
-                .and_then(|id| self.positions.get(id))
-                .map(|p| &p.draft),
+            None if !self.inbox.visible
+                && self.focus == Focus::Composer
+                && self.drilled
+                && !self.clearing_selected() =>
+            {
+                self.selected
+                    .as_ref()
+                    .and_then(|id| self.positions.get(id))
+                    .map(|p| &p.draft)
+            }
             _ => None,
         }
     }
@@ -2004,6 +2026,7 @@ impl Ui {
         }
         if shortcut == Some(CONVERSATION_INTERRUPT)
             && self.drilled
+            && !self.clearing_selected()
             && matches!(self.focus, Focus::Composer | Focus::Conversation)
             && let Some(session) = self.selected.as_ref().and_then(|id| self.sessions.get(id))
         {
@@ -2065,6 +2088,23 @@ impl Ui {
             }
         }
         if self.focus == Focus::Composer && self.drilled {
+            if self.clearing_selected() {
+                match shortcut {
+                    Some(CONVERSATION_INTERRUPT) => {
+                        self.drilled = false;
+                        self.focus = Focus::List;
+                    }
+                    Some(
+                        NAVIGATION_NEXT_FOCUS
+                        | NAVIGATION_NEXT_FOCUS_COMPOSER
+                        | NAVIGATION_PREVIOUS_FOCUS,
+                    ) => {
+                        self.cycle_focus(shortcut == Some(NAVIGATION_PREVIOUS_FOCUS));
+                    }
+                    _ => {}
+                }
+                return;
+            }
             if shortcut == Some(COMPOSER_PERMISSION_MODE)
                 && !self.changes_visible
                 && !self.panels.focused
@@ -2482,6 +2522,9 @@ impl Ui {
         }
     }
     pub fn paste(&mut self, text: &str) {
+        if self.modal.is_none() && self.clearing_selected() && !self.panels.focused {
+            return;
+        }
         if self.terminal_input() {
             self.terminal_paste(text);
             return;
@@ -2783,8 +2826,10 @@ impl Ui {
             Some(Modal::Clear) if shortcut == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) => {
                 if !self.busy
                     && let Some(id) = self.selected.clone()
+                    && !self.is_clearing(&id)
                 {
-                    self.busy = true;
+                    self.clearing.requests.insert(id.clone());
+                    self.cancel_voice();
                     self.modal = None;
                     self.task(Task::Clear(id.clone()), Request::Clear { id }, false);
                 }
@@ -3532,6 +3577,15 @@ impl Ui {
                 self.session_switched = None;
             }
         }
+        self.draw_clearing(
+            frame,
+            Rect::new(
+                conversation.x,
+                content.y,
+                content.width.saturating_sub(list_width),
+                content.height.saturating_add(footer_height),
+            ),
+        );
         self.draw_modal(frame);
         self.draw_toast(frame);
     }
@@ -3718,6 +3772,7 @@ impl Ui {
             };
             let selected = !self.inbox.visible && Some(&session.id) == self.selected.as_ref();
             let deleting = self.deleting.contains(&session.id);
+            let clearing = self.is_clearing(&session.id);
             let row = Rect::new(
                 items.x,
                 items.y.saturating_add(offset as u16),
@@ -3728,6 +3783,8 @@ impl Ui {
             visible_pr_sessions.push(session.id.clone());
             let color = if deleting {
                 DIM
+            } else if clearing {
+                ACCENT
             } else {
                 status_icons::color(session.status)
             };
@@ -3750,6 +3807,8 @@ impl Ui {
             };
             let status = if deleting {
                 "Being deleted…".into()
+            } else if clearing {
+                "Clearing…".into()
             } else {
                 format!(
                     "{}{}{}",
@@ -3851,13 +3910,20 @@ impl Ui {
                 highlight.apply(frame.buffer_mut(), row, background, BG, now);
             }
             if !deleting {
-                self.status_icons.draw(
-                    frame,
-                    Rect::new(row.x, row.y, status_icons::WIDTH, 1).intersection(row),
-                    status_icons::display_status(session.status, session.pending > 0),
-                    self.preferences.motion.sidebar() && self.tweaks.agent_reply_cps > 0,
-                    self.modal.is_none() && self.notice.is_none(),
-                );
+                if clearing {
+                    clearing::icon(
+                        frame,
+                        Rect::new(row.x, row.y, status_icons::WIDTH, 1).intersection(row),
+                    );
+                } else {
+                    self.status_icons.draw(
+                        frame,
+                        Rect::new(row.x, row.y, status_icons::WIDTH, 1).intersection(row),
+                        status_icons::display_status(session.status, session.pending > 0),
+                        self.preferences.motion.sidebar() && self.tweaks.agent_reply_cps > 0,
+                        self.modal.is_none() && self.notice.is_none(),
+                    );
+                }
                 self.hits.push((row, Action::Select(session.id.clone())));
             }
         }
@@ -3890,7 +3956,11 @@ impl Ui {
                     "{} {} · {}",
                     " ".repeat(usize::from(status_icons::WIDTH)),
                     s.title,
-                    s.status.label()
+                    if self.is_clearing(&s.id) {
+                        "Clearing…"
+                    } else {
+                        s.status.label()
+                    }
                 )
             })
             .unwrap_or_else(|| "Conversation".into());
@@ -3914,15 +3984,23 @@ impl Ui {
                 )
             })
         {
-            self.status_icons.draw(
-                frame,
-                Rect::new(rect.x.saturating_add(2), rect.y, status_icons::WIDTH, 1)
-                    .intersection(rect),
-                status,
-                self.preferences.motion.level == crate::settings::Motion::Full
-                    && self.tweaks.agent_reply_cps > 0,
-                self.modal.is_none() && self.notice.is_none(),
-            );
+            if self.clearing_selected() {
+                clearing::icon(
+                    frame,
+                    Rect::new(rect.x.saturating_add(2), rect.y, status_icons::WIDTH, 1)
+                        .intersection(rect),
+                );
+            } else {
+                self.status_icons.draw(
+                    frame,
+                    Rect::new(rect.x.saturating_add(2), rect.y, status_icons::WIDTH, 1)
+                        .intersection(rect),
+                    status,
+                    self.preferences.motion.level == crate::settings::Motion::Full
+                        && self.tweaks.agent_reply_cps > 0,
+                    self.modal.is_none() && self.notice.is_none(),
+                );
+            }
         }
         self.hits.push((rect, Action::Focus(Focus::Conversation)));
         let composer_footer = self.drilled
@@ -4342,14 +4420,17 @@ impl Ui {
             } else {
                 composer
             };
+            let disabled = self.is_clearing(&id);
             let placeholder = self
                 .composer_suggestion()
                 .unwrap_or("Ask anything…")
                 .to_owned();
             let position = self.positions.entry(id.clone()).or_default();
             let now = Instant::now();
-            let focused =
-                self.focus == Focus::Composer && !self.panels.focused && self.modal.is_none();
+            let focused = !disabled
+                && self.focus == Focus::Composer
+                && !self.panels.focused
+                && self.modal.is_none();
             let input_area = if let Some(clearing) = reveal::clearing(position, now) {
                 composer_editor(
                     frame,
@@ -4368,7 +4449,9 @@ impl Ui {
                     input_area,
                 );
             }
-            self.hits.push((composer, Action::Focus(Focus::Composer)));
+            if !disabled {
+                self.hits.push((composer, Action::Focus(Focus::Composer)));
+            }
         } else if !self.drilled {
             self.button(
                 frame,
@@ -5784,6 +5867,7 @@ mod tests {
         cleared.title = "New session".into();
         cleared.note("system", "Session cleared");
         let reply = cleared.clone();
+        let (release, wait) = mpsc::channel();
         let worker = thread::spawn(move || -> Result<()> {
             let (mut stream, _) = listener.accept()?;
             let mut line = String::new();
@@ -5791,6 +5875,7 @@ mod tests {
             assert!(
                 matches!(serde_json::from_str::<Request>(&line)?, Request::Clear { id } if id == "one")
             );
+            wait.recv_timeout(Duration::from_secs(5))?;
             serde_json::to_writer(&mut stream, &Reply::Session(Box::new(reply)))?;
             stream.write_all(b"\n")?;
             Ok(())
@@ -5809,7 +5894,28 @@ mod tests {
         assert!(ui.modal.is_none() && !ui.busy, "Esc must not clear");
         ui.run_palette_command("/clear", "/clear");
         ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(ui.modal.is_none() && ui.busy);
+        assert!(ui.modal.is_none() && !ui.busy && ui.is_clearing("one"));
+        ui.focus = Focus::Composer;
+        ui.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        ui.key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        ui.paste("must not be inserted");
+        ui.send(false);
+        assert_eq!(
+            ui.positions.get("one").context("draft")?.draft.text(),
+            "Next task"
+        );
+        assert!(ui.send_queues.is_empty() && !ui.voice_active());
+        assert!(ui.focused_editor().is_none());
+        still(&mut ui);
+        let (screen, _) = draw(&mut ui, 120, 30)?;
+        assert!(screen.contains("Clearing…") && screen.contains("🧹"));
+        assert!(screen.contains("Input temporarily disabled"));
+        assert!(
+            !ui.hits
+                .iter()
+                .any(|(_, action)| matches!(action, Action::Focus(Focus::Composer)))
+        );
+        release.send(())?;
         let response = ui.receiver.recv_timeout(Duration::from_secs(5))?;
         ui.sender.send(response)?;
         ui.tick(false);
@@ -5817,6 +5923,7 @@ mod tests {
             .join()
             .map_err(|_| anyhow::anyhow!("Fixture panicked"))??;
         assert!(!ui.busy);
+        assert!(!ui.is_clearing("one"));
         let session = ui.sessions.get("one").context("cleared session")?;
         assert_eq!(session.entries.len(), 1);
         assert!(
@@ -5827,6 +5934,80 @@ mod tests {
         let position = ui.positions.get("one").context("position")?;
         assert_eq!(position.draft.text(), "Next task");
         assert!(position.follow && position.conversation == 0 && position.expanded.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn clearing_tracks_preparation_and_late_replies_leave_other_sessions_usable() -> Result<()> {
+        for fails in [false, true] {
+            let dir = tempfile::tempdir()?;
+            let mut ui = state(Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().join("cache"),
+            });
+            let mut preparing = ui.sessions.get("one").context("session")?.clone();
+            preparing.clearing = true;
+            preparing.status = Status::Starting;
+            preparing.touch();
+            // A service update also locks input in a UI that did not request the clear.
+            ui.summaries = vec![preparing.summary()];
+            assert!(ui.is_clearing("one"));
+            ui.open_session("one".into());
+            ui.paste("blocked during preparation");
+            assert!(
+                ui.positions
+                    .get("one")
+                    .context("draft")?
+                    .draft
+                    .text()
+                    .is_empty()
+            );
+            let mut ready = preparing.clone();
+            ready.clearing = false;
+            ready.status = Status::Idle;
+            ready.workspace_ready = true;
+            ready.touch();
+            ui.sessions.insert("one".into(), ready.clone());
+            assert!(
+                !ui.is_clearing("one"),
+                "newer session overrides an old summary"
+            );
+            ui.clearing.requests.insert("one".into());
+            let mut other = ready;
+            other.id = "two".into();
+            ui.summaries.push(other.summary());
+            ui.sessions.insert("two".into(), other);
+            ui.open_session("two".into());
+            ui.paste("Continue other work");
+            ui.panels.view = Some(panels::View::Shell {
+                id: "other-shell".into(),
+                command: "pwd".into(),
+            });
+            ui.modal = Some(Modal::Help(Default::default()));
+            ui.busy = true;
+            ui.sender.send(ResultMessage {
+                kind: Task::Clear("one".into()),
+                result: if fails {
+                    Err("Cannot prepare worktree".into())
+                } else {
+                    Ok(Reply::Session(Box::new(preparing)))
+                },
+            })?;
+            ui.tick(false);
+            assert!(
+                !ui.is_clearing("one"),
+                "late clear reply must not restore the lock"
+            );
+            assert!(ui.busy && matches!(ui.modal, Some(Modal::Help(_))));
+            assert!(
+                matches!(&ui.panels.view, Some(panels::View::Shell { id, .. }) if id == "other-shell")
+            );
+            assert_eq!(ui.selected.as_deref(), Some("two"));
+            assert_eq!(
+                ui.positions.get("two").context("draft")?.draft.text(),
+                "Continue other work"
+            );
+        }
         Ok(())
     }
 

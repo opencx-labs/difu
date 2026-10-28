@@ -300,6 +300,9 @@ pub struct Session {
     pub archived: bool,
     #[serde(default)]
     pub deletion_progress: Option<DeletionStage>,
+    /// Clearing includes discarding the old worktree and preparing its replacement.
+    #[serde(default)]
+    pub clearing: bool,
     pub updated: i64,
     pub version: u64,
     pub workspace: Option<PathBuf>,
@@ -430,6 +433,7 @@ impl Session {
             status: Status::Starting,
             archived: false,
             deletion_progress: None,
+            clearing: false,
             updated: chrono::Utc::now().timestamp_millis(),
             version: 0,
             workspace: None,
@@ -603,6 +607,7 @@ impl Session {
             }
             .into(),
             status: self.status,
+            clearing: self.clearing,
             archived: self.archived,
             updated: self.updated,
             version: self.version,
@@ -639,6 +644,8 @@ pub struct Summary {
     pub title: String,
     pub kind: String,
     pub status: Status,
+    #[serde(default)]
+    pub clearing: bool,
     pub archived: bool,
     pub updated: i64,
     pub version: u64,
