@@ -419,6 +419,7 @@ impl Shell {
         self.agents.configure_images(
             &self.reviews.images,
             self.palette.is_some() || self.settings.is_some() || self.settings_action_open,
+            frame.area(),
         );
         if self.agents_active {
             self.agents.draw(frame);
@@ -472,6 +473,81 @@ impl Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_icons_retransmit_after_terminal_resize_even_in_reviews() -> anyhow::Result<()> {
+        use crate::agents::{Job, Launch, Session, Status};
+        use ratatui::{Terminal, backend::TestBackend};
+        use ratatui_image::picker::{Picker, ProtocolType};
+
+        let dir = tempfile::tempdir()?;
+        let mut config = Config::default();
+        config.preferences.motion.level = crate::settings::Motion::Off;
+        let mut shell = Shell::new(
+            Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().join("cache"),
+            },
+            config,
+            None,
+        );
+        let mut session = Session::new(
+            "one".into(),
+            Job::Coding(Launch {
+                repository: dir.path().into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: "Resize fixture".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.status = Status::Completed;
+        shell.agents.summaries.push(session.summary());
+        shell.agents.selected = Some(session.id.clone());
+        shell.agents.sessions.insert(session.id.clone(), session);
+        let mut picker = Picker::halfblocks();
+        picker.set_protocol_type(ProtocolType::Kitty);
+        shell.reviews.images.picker = Some(picker);
+        let mut terminal = Terminal::new(TestBackend::new(120, 40))?;
+        let draw =
+            |shell: &mut Shell, terminal: &mut Terminal<TestBackend>| -> anyhow::Result<bool> {
+                let mut transmitted = false;
+                terminal.draw(|frame| {
+                    shell.draw(frame);
+                    transmitted = frame
+                        .buffer_mut()
+                        .content
+                        .iter()
+                        .any(|cell| cell.symbol().contains("\x1b_G"));
+                })?;
+                Ok(transmitted)
+            };
+        assert!(draw(&mut shell, &mut terminal)?);
+        assert!(
+            !draw(&mut shell, &mut terminal)?,
+            "ordinary frames reuse their images"
+        );
+        for (width, height) in [(80, 24), (140, 40), (140, 30)] {
+            terminal.backend_mut().resize(width, height);
+            assert!(
+                draw(&mut shell, &mut terminal)?,
+                "resize must resend icon pixels"
+            );
+            assert!(!draw(&mut shell, &mut terminal)?);
+        }
+        // Resizing away and back while Agents is hidden must also invalidate
+        // its images: the terminal clears them even when Reviews is active.
+        shell.agents_active = false;
+        for (width, height) in [(100, 24), (140, 30)] {
+            terminal.backend_mut().resize(width, height);
+            assert!(!draw(&mut shell, &mut terminal)?);
+        }
+        shell.agents_active = true;
+        assert!(draw(&mut shell, &mut terminal)?);
+        assert!(!draw(&mut shell, &mut terminal)?);
+        Ok(())
+    }
 
     #[test]
     fn switching_tabs_persists_choice_without_overwriting_settings() -> anyhow::Result<()> {

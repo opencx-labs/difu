@@ -133,7 +133,13 @@ pub(super) fn color(pr: &SessionPr) -> ratatui::style::Color {
     }
 }
 impl Ui {
-    pub(crate) fn configure_images(&mut self, images: &crate::images::State, obscured: bool) {
+    pub(crate) fn configure_images(
+        &mut self,
+        images: &crate::images::State,
+        obscured: bool,
+        area: Rect,
+    ) {
+        self.status_icons.resize(area);
         self.status_icons
             .configure(images.picker.as_ref(), obscured);
         if let Some(panels::View::PullRequest { app }) = &mut self.panels.view
@@ -817,7 +823,7 @@ mod tests {
         ui.panels.focused = true;
         let mut reviews = App::new(storage.clone(), Config::default());
         reviews.images.picker = Some(ratatui_image::picker::Picker::halfblocks());
-        ui.configure_images(&reviews.images, false);
+        ui.configure_images(&reviews.images, false, Rect::new(0, 0, 180, 45));
         let Some(panels::View::PullRequest { app }) = &ui.panels.view else {
             anyhow::bail!("Missing embedded PR");
         };
