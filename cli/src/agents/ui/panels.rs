@@ -88,31 +88,11 @@ impl Ui {
                     .is_some_and(|id| !self.prs.all(id).is_empty()),
         )
     }
-    /// Controls share one ordered list for drawing and keyboard traversal.
+    /// Controls share one ordered list for drawing and keyboard traversal, with PRs last.
     fn footer_items(&self) -> Vec<(String, Focus, Style)> {
         let resources = self.visible_resources();
         let mut items = Vec::new();
         for artifacts in [true, false] {
-            if !artifacts && let Some(id) = &self.selected {
-                for (index, link) in self.prs.all(id).iter().enumerate() {
-                    let pr = &link.pr;
-                    let focus = Focus::PullRequest(index);
-                    items.push((
-                        format!(
-                            " {} · {}{} ",
-                            link.badge(),
-                            pr.label(),
-                            if self.prs.stale(id) { " · stale" } else { "" },
-                        ),
-                        focus,
-                        if self.focus == focus {
-                            Style::default().bg(prs::color(pr)).fg(crate::ui::INK)
-                        } else {
-                            Style::default().fg(prs::color(pr)).bg(BG)
-                        },
-                    ));
-                }
-            }
             if let Some((_, count)) = resources.iter().find(|(kind, _)| *kind == artifacts) {
                 let focus = Focus::Resources(artifacts);
                 items.push((
@@ -133,6 +113,26 @@ impl Ui {
                 Focus::Subagents,
                 crate::ui::option_style(self.focus == Focus::Subagents),
             ));
+        }
+        if let Some(id) = &self.selected {
+            for (index, link) in self.prs.all(id).iter().enumerate() {
+                let pr = &link.pr;
+                let focus = Focus::PullRequest(index);
+                items.push((
+                    format!(
+                        " {} · {}{} ",
+                        link.badge(),
+                        pr.label(),
+                        if self.prs.stale(id) { " · stale" } else { "" },
+                    ),
+                    focus,
+                    if self.focus == focus {
+                        Style::default().bg(prs::color(pr)).fg(crate::ui::INK)
+                    } else {
+                        Style::default().fg(prs::color(pr)).bg(BG)
+                    },
+                ));
+            }
         }
         items
     }
