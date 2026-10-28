@@ -687,15 +687,11 @@ impl Ui {
         let (status, color) = card.status(self.empty_folder_hint());
         // Line up with session cards: the folder glyph sits in their status
         // light column and the detail lines share their indent.
-        let inset = " ".repeat(usize::from(super::status_icons::WIDTH) + 3);
+        let inset = " ".repeat(usize::from(super::status_icons::WIDTH) + 1);
         let title_width = usize::from(row.width).saturating_sub(inset.len());
         let mut lines = vec![
             Line::from(Span::styled(
-                format!(
-                    "{} 📁 {}",
-                    if selected { "›" } else { " " },
-                    crate::ui::crop(&card.name, 0, title_width)
-                ),
+                format!("📁 {}", crate::ui::crop(&card.name, 0, title_width)),
                 Style::default().fg(if selected { ACCENT } else { TEXT }),
             )),
             Line::from(Span::styled(
@@ -820,7 +816,8 @@ mod tests {
         assert!(ui.selected.is_none());
         let shown = screen(&mut ui)?;
         // The test buffer pads the wide folder glyph with a blank cell.
-        assert!(shown.contains("› 📁  Widget"));
+        assert!(shown.contains("📁  Widget"));
+        assert!(!shown.contains('›'));
         assert!(shown.contains("2 sessions · project"));
         assert!(shown.contains("1 needs input · 1 working"));
         assert!(shown.contains("Widget · Folder"));

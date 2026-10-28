@@ -90,6 +90,7 @@ fn phase(status: Status, elapsed: Duration, animated: bool) -> (usize, Option<Du
 
 pub(super) struct Icons {
     picker: Option<Picker>,
+    viewport: Rect,
     obscured: bool,
     frames: HashMap<(u8, usize), Option<Protocol>>,
     palette: [Color; 7],
@@ -103,6 +104,7 @@ impl Default for Icons {
         let now = Instant::now();
         Self {
             picker: None,
+            viewport: Rect::default(),
             obscured: false,
             frames: HashMap::new(),
             palette: STATUSES.map(|status| crate::theme::resolve(color(status))),
@@ -114,6 +116,15 @@ impl Default for Icons {
 }
 
 impl Icons {
+    /// A terminal resize clears graphics as well as text. Track its full area
+    /// even while Agents is hidden, so the next visible icons resend pixels.
+    pub(super) fn resize(&mut self, area: Rect) {
+        if self.viewport != area {
+            self.frames.clear();
+            self.viewport = area;
+        }
+    }
+
     pub(super) fn configure(&mut self, picker: Option<&Picker>, obscured: bool) {
         self.obscured = obscured;
         let picker = picker.filter(|p| {

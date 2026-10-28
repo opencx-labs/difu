@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "difu"
-version = "0.32.2"
+version = "0.32.3"
 dependencies = [
  "anyhow",
  "arboard",
