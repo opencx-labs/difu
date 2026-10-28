@@ -594,7 +594,9 @@ impl Ui {
     }
     pub fn redraw_interval(&self) -> Option<Duration> {
         if self.panels.visible() && matches!(self.panels.view, Some(panels::View::Terminal(_))) {
-            return Some(Duration::from_millis(50));
+            return Some(terminals::poll_interval(
+                self.panels.focused && self.modal.is_none(),
+            ));
         }
         if self.preferences.motion.level == crate::settings::Motion::Full
             && (self.voice_active()
@@ -1081,6 +1083,9 @@ impl Ui {
                 },
             }
         }
+        // Consume the preceding snapshot before scheduling the next one, so a
+        // completed shell poll does not cost an extra UI frame.
+        self.tick_terminal(visible);
         self.tick_inbox(visible);
         if visible
             && !self.listing
@@ -1594,6 +1599,7 @@ impl Ui {
             .is_some_and(|s| s.archived);
         self.select(id);
         self.tick_panels(false);
+        self.tick_terminal(false);
         self.panels.focused = false;
         self.changes_visible = false;
         self.modal = None;

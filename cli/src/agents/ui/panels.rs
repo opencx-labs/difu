@@ -270,7 +270,6 @@ impl Ui {
             browser.focus(visible && self.panels.focused && self.modal.is_none());
             browser.tick();
         }
-        self.tick_terminal(visible);
         self.tick_subagent(visible);
         if visible
             && self.panels.error.is_none()

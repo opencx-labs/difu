@@ -9,6 +9,13 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 static CLIENT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+pub(super) fn poll_interval(focused: bool) -> Duration {
+    if focused {
+        crate::repaint::FRAME_INTERVAL
+    } else {
+        Duration::from_millis(50)
+    }
+}
 enum Human {
     Focus(bool),
     Input(String),
@@ -400,11 +407,14 @@ impl Ui {
         if terminal.loading
             || terminal
                 .checked
-                .is_some_and(|time| time.elapsed() < Duration::from_millis(50))
+                .is_some_and(|time| time.elapsed() < poll_interval(focused))
         {
             return;
         }
         terminal.loading = true;
+        // Measure from dispatch, not receipt: slow replies must not add a
+        // second cooldown, nor erase an input-triggered refresh request.
+        terminal.checked = Some(Instant::now());
         let shell = terminal.id.clone();
         let action = shells::Action::Exchange {
             shell: shell.clone(),
@@ -478,7 +488,6 @@ impl Ui {
                 && terminal.id == *shell
             {
                 terminal.loading = false;
-                terminal.checked = Some(Instant::now());
                 match result {
                     Ok(Reply::Shell(value)) => {
                         if let Err(error) = terminal.receive(&value) {
@@ -628,6 +637,42 @@ mod tests {
             anyhow::bail!("Expected terminal task")
         };
         ui.finish_terminal(&id, operation, message.result);
+        Ok(())
+    }
+    #[test]
+    fn a_completed_snapshot_does_not_delay_input_or_restart_its_cooldown() -> Result<()> {
+        for checked in [None, Some(Instant::now() - Duration::from_secs(1))] {
+            let (_temp, mut ui) = fixture()?;
+            let (requests, worker) = server(&ui, 1)?;
+            let (input, _receive) = mpsc::channel();
+            let mut terminal = Terminal::new("shared".into());
+            terminal.input = Some(input);
+            terminal.focused = true;
+            terminal.renewed = Some(Instant::now());
+            terminal.loading = true;
+            terminal.checked = checked;
+            ui.panels.view = Some(panels::View::Terminal(Box::new(terminal)));
+            ui.panels.focused = true;
+            ui.preferences.motion.level = crate::settings::Motion::Off;
+            assert_eq!(ui.redraw_interval(), Some(crate::repaint::FRAME_INTERVAL));
+            ui.finish_terminal(
+                "one",
+                Operation::Poll("shared".into()),
+                Ok(Reply::Shell(json!({"rows":1,"cols":1,"screen":""}))),
+            );
+            ui.tick_terminal(true);
+            assert!(matches!(
+                requests.recv_timeout(Duration::from_secs(2))?,
+                Request::Shell {
+                    action: shells::Action::Exchange { .. },
+                    ..
+                }
+            ));
+            finish(&mut ui)?;
+            worker
+                .join()
+                .map_err(|_| anyhow::anyhow!("Fixture server failed"))??;
+        }
         Ok(())
     }
     #[test]
