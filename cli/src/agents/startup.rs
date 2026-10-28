@@ -14,20 +14,32 @@ pub(super) fn prepare(
     cancel: &Cancel,
 ) -> Result<Option<Control>> {
     let mut session = store.get(id)?;
-    super::workspace::prepare(&mut session, &store.home, cancel, |prepared| {
+    let prepared = (|| -> Result<()> {
+        super::workspace::prepare(&mut session, &store.home, cancel, |prepared| {
+            store.update(id, |s| {
+                s.job = prepared.job.clone();
+                s.workspace = prepared.workspace.clone();
+                s.workspace_ready = prepared.workspace_ready;
+                s.baseline = prepared.baseline.clone();
+                s.branch = prepared.branch.clone();
+            })?;
+            store.save(id)
+        })
+        .context("Cannot prepare worktree")?;
+        cancel.check()?;
         store.update(id, |s| {
-            s.job = prepared.job.clone();
-            s.workspace = prepared.workspace.clone();
-            s.workspace_ready = prepared.workspace_ready;
-            s.baseline = prepared.baseline.clone();
-            s.branch = prepared.branch.clone();
+            s.status = Status::Idle;
+            if session.clearing {
+                s.clearing = false;
+            }
         })?;
-        store.save(id)
-    })
-    .context("Cannot prepare worktree")?;
-    cancel.check()?;
-    store.update(id, |s| s.status = Status::Idle)?;
-    store.save(id)?;
+        store.save(id)?;
+        Ok(())
+    })();
+    if prepared.is_err() && session.clearing {
+        store.update(id, |s| s.clearing = false)?;
+    }
+    prepared?;
 
     // Keep ownership of the control channel until handing it to the provider.
     // No provider process starts for an empty session until the first message.
@@ -84,5 +96,33 @@ pub(super) fn prepare(
             )),
         };
         let _ = command.reply.send(result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agents::{Launch, Session};
+
+    #[test]
+    fn failed_preparation_releases_the_clearing_input_lock() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut session = Session::new(
+            "one".into(),
+            Job::Coding(Launch {
+                repository: temp.path().join("missing-repository"),
+                isolated: true,
+                base: "origin/main".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.clearing = true;
+        let store = Store::fixture(temp.path().join("home"), vec![session]);
+        let (_send, receive) = mpsc::channel();
+        assert!(prepare(&store, "one", &receive, &Cancel::default()).is_err());
+        assert!(!store.get("one")?.clearing);
+        Ok(())
     }
 }

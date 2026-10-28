@@ -174,6 +174,10 @@ impl Ui {
     }
     pub(super) fn voice_key(&mut self, key: KeyEvent) -> bool {
         use crate::shortcuts::{Bindings, contexts, ids};
+        if self.clearing_selected() {
+            self.cancel_voice();
+            return false;
+        }
         if !self.voice.enabled {
             self.cancel_voice();
             return false;
@@ -276,6 +280,7 @@ impl Ui {
     }
     pub(super) fn tick_voice(&mut self, visible: bool) {
         if !visible
+            || self.clearing_selected()
             || !self.voice.enabled
             || self.focus != Focus::Composer
             || self.modal.is_some()
