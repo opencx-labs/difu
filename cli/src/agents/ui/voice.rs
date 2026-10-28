@@ -214,7 +214,11 @@ impl Ui {
                 ));
                 return true;
             }
-            if space && (hold.mode == Mode::Dictate || hold.activation_held) {
+            if space
+                && (hold.mode == Mode::Dictate
+                    || hold.activation_held
+                    || key.kind == KeyEventKind::Repeat)
+            {
                 hold.last = Instant::now();
                 return true;
             }
@@ -1140,6 +1144,11 @@ pub(crate) mod tests {
             let hold = ui.voice.hold.as_ref().context("conversation")?;
             assert!(hold.phase == Phase::Listening);
             assert!(hold.voice.as_ref().is_some_and(Voice::microphone_live));
+            ui.key(KeyEvent::new_with_kind(
+                KeyCode::Char(' '),
+                KeyModifiers::NONE,
+                KeyEventKind::Repeat,
+            ));
             assert_eq!(draft(&ui)?, "keep this draft");
         }
         Ok(())
