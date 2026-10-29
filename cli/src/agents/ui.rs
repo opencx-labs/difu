@@ -9922,7 +9922,7 @@ mod tests {
             session.note(
                 "agentMessage",
                 (0..80)
-                    .map(|i| format!("Stable chat row {i}\n"))
+                    .map(|i| format!("Stable chat row {i}\n\n"))
                     .collect::<String>(),
             );
             session.pending.push(Pending { id:serde_json::json!("stable"),method:"item/tool/requestUserInput".into(),responded:false,params:serde_json::json!({"questions":[{"id":"q","question":"Choose scope","options":[{"label":"Small"},{"label":"Large"}]},{"id":"q2","question":"Anything else?","options":[]}]}) });
@@ -9997,7 +9997,7 @@ mod tests {
         session.note(
             "agentMessage",
             (0..80)
-                .map(|i| format!("Chat row {i}\n"))
+                .map(|i| format!("Chat row {i}\n\n"))
                 .collect::<String>(),
         );
         session.pending.push(Pending {
