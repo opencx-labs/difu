@@ -106,32 +106,35 @@ impl Ui {
     pub(super) fn reconcile_question_space(&mut self, id: &str, open: bool, height: u16) -> u16 {
         let position = self.positions.entry(id.to_owned()).or_default();
         position.question_scroll = false;
-        if open {
-            position.question_height = Some(height);
+        let remaining = if open {
+            let changed = position.question_height.replace(height) != Some(height);
             position.question_reflow = None;
-            return 0;
-        }
-        if let Some(previous) = position.question_height.take() {
-            position.question_reflow = Some(Reflow {
-                rows: previous.saturating_sub(height),
-                started: Instant::now(),
-                duration: Duration::from_millis(u64::from(self.tweaks.capped(220))),
-            });
-        }
-        let Some(reflow) = &position.question_reflow else {
-            return 0;
-        };
-        let remaining = if self.preferences.motion.level == crate::settings::Motion::Full
-            && self.tweaks.agent_reply_cps > 0
-        {
-            reflow.remaining(Instant::now())
-        } else {
+            if !changed {
+                return 0;
+            }
             0
+        } else {
+            if let Some(previous) = position.question_height.take() {
+                position.question_reflow = Some(Reflow {
+                    rows: previous.saturating_sub(height),
+                    started: Instant::now(),
+                    duration: Duration::from_millis(u64::from(self.tweaks.capped(220))),
+                });
+            }
+            let Some(reflow) = &position.question_reflow else {
+                return 0;
+            };
+            if self.preferences.motion.level == crate::settings::Motion::Full
+                && self.tweaks.agent_reply_cps > 0
+            {
+                reflow.remaining(Instant::now())
+            } else {
+                0
+            }
         };
+        // Opening or resizing a question moves the latest chat with its upper
+        // edge. Unchanged frames leave manual conversation scrolling alone.
         position.question_scroll = true;
-        position.follow = true;
-        position.keep_transcript_position = false;
-        position.scroll_anchor = None;
         if remaining == 0 {
             position.question_reflow = None;
         }
