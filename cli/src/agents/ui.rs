@@ -4150,11 +4150,19 @@ impl Ui {
         self.conversation_height = usize::from(body.height);
         let position = self.positions.entry(id.clone()).or_default();
         if let Some((old_width, old_height, version)) = position.transcript_viewport {
+            if question_open && (old_width != body.width || old_height != body.height) {
+                position.question_scroll = true;
+            }
             if position.question_scroll || old_width != body.width || version != session.version {
                 position.keep_transcript_position = false;
             } else if old_height != body.height {
                 position.keep_transcript_position = true;
             }
+        }
+        if position.question_scroll {
+            position.follow = true;
+            position.keep_transcript_position = false;
+            position.scroll_anchor = None;
         }
         position.transcript_viewport = Some((body.width, body.height, session.version));
         let before_measure = position.conversation;
@@ -9894,7 +9902,89 @@ mod tests {
         Ok(())
     }
     #[test]
-    fn question_panel_resize_keeps_chat_rows_fixed_until_new_output_or_navigation() -> Result<()> {
+    fn question_panel_resize_keeps_latest_chat_visible_above_it() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        for auto_scroll in [
+            crate::settings::AutoScroll::WhenAtBottom,
+            crate::settings::AutoScroll::Always,
+            crate::settings::AutoScroll::Manual,
+        ] {
+            let mut ui = state(Storage {
+                config: temp.path().join("config.json"),
+                cache: temp.path().join("cache"),
+            });
+            still(&mut ui);
+            ui.preferences.conversation.auto_scroll = auto_scroll;
+            ui.drilled = true;
+            ui.focus = Focus::Composer;
+            let session = ui.sessions.get_mut("one").context("session")?;
+            session.entries.clear();
+            session.note(
+                "agentMessage",
+                (0..80)
+                    .map(|i| format!("Stable chat row {i}\n"))
+                    .collect::<String>(),
+            );
+            session.pending.push(Pending { id:serde_json::json!("stable"),method:"item/tool/requestUserInput".into(),responded:false,params:serde_json::json!({"questions":[{"id":"q","question":"Choose scope","options":[{"label":"Small"},{"label":"Large"}]},{"id":"q2","question":"Anything else?","options":[]}]}) });
+            ui.positions.get_mut("one").context("position")?.follow = true;
+            draw(&mut ui, 120, 35)?;
+            let latest_row = |ui: &mut Ui, width, height| -> Result<usize> {
+                let mut terminal = Terminal::new(TestBackend::new(width, height))?;
+                terminal.draw(|frame| ui.draw(frame))?;
+                let row = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .chunks(usize::from(width))
+                    .position(|cells| {
+                        cells
+                            .iter()
+                            .map(|cell| cell.symbol())
+                            .collect::<String>()
+                            .contains("Stable chat row 79")
+                    })
+                    .context("latest chat must remain visible")?;
+                let questions = ui
+                    .hits
+                    .iter()
+                    .find_map(|(rect, action)| matches!(action, Action::Pending).then_some(rect.y))
+                    .context("questions header")?;
+                assert!(row < usize::from(questions));
+                assert_eq!(
+                    ui.positions.get("one").context("position")?.conversation,
+                    ui.conversation_lines.saturating_sub(ui.conversation_height),
+                    "question resizing must anchor the end of the chat"
+                );
+                Ok(row)
+            };
+
+            // Opening, switching to a shorter question, and growing its answer
+            // move the chat with the panel without waiting for new agent output.
+            ui.open_question(0);
+            let tall = latest_row(&mut ui, 120, 35)?;
+            assert_eq!(latest_row(&mut ui, 120, 35)?, tall);
+            ui.open_question(1);
+            let short = latest_row(&mut ui, 120, 35)?;
+            assert!(short > tall, "shorter questions move the chat down");
+            ui.paste(
+                "First answer line\nSecond answer line\nThird answer line\nFourth answer line",
+            );
+            let grown = latest_row(&mut ui, 120, 35)?;
+            assert!(grown < short, "growing answers move the chat up");
+
+            // A panel that reaches the height cap still leaves the latest chat
+            // visible, including after wrapping at a narrower terminal width.
+            latest_row(&mut ui, 40, 20)?;
+            ui.paste(&"\nAnother answer line".repeat(30));
+            latest_row(&mut ui, 40, 20)?;
+            latest_row(&mut ui, 120, 35)?;
+            ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(latest_row(&mut ui, 120, 35)? > grown);
+        }
+        Ok(())
+    }
+    #[test]
+    fn unchanged_question_panel_preserves_manual_chat_scrolling() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut ui = state(Storage {
             config: temp.path().join("config.json"),
@@ -9904,71 +9994,29 @@ mod tests {
         ui.drilled = true;
         ui.focus = Focus::Composer;
         let session = ui.sessions.get_mut("one").context("session")?;
-        session.entries.clear();
         session.note(
             "agentMessage",
             (0..80)
-                .map(|i| format!("Stable chat row {i}\n"))
+                .map(|i| format!("Chat row {i}\n"))
                 .collect::<String>(),
         );
-        session.pending.push(Pending { id:serde_json::json!("stable"),method:"item/tool/requestUserInput".into(),responded:false,params:serde_json::json!({"questions":[{"id":"q","question":"Choose scope","options":[{"label":"Small"},{"label":"Large"}]},{"id":"q2","question":"Anything else?","options":[]}]}) });
-        ui.positions.get_mut("one").context("position")?.follow = true;
-        let (original, _) = draw(&mut ui, 120, 35)?;
-        let text_offset = original.find("Stable chat row").context("visible chat")?;
-        let text = original
-            .get(text_offset..)
-            .and_then(|s| s.split('│').next())
-            .context("chat row")?
-            .trim()
-            .to_owned();
+        session.pending.push(Pending {
+            id: serde_json::json!("reading"),
+            method: "item/tool/requestUserInput".into(),
+            responded: false,
+            params: serde_json::json!({"questions":[{"id":"q","question":"Anything else?","options":[]}]}),
+        });
+        ui.open_question(0);
+        draw(&mut ui, 120, 35)?;
+        ui.scroll(-5, false);
+        let (scrolled, _) = draw(&mut ui, 120, 35)?;
         let offset = ui.positions.get("one").context("position")?.conversation;
-        ui.open_question(0);
-        for _ in 0..2 {
-            let (screen, _) = draw(&mut ui, 120, 35)?;
-            assert_eq!(
-                screen.get(text_offset..text_offset + text.len()),
-                Some(text.as_str())
-            );
-            assert_eq!(
-                ui.positions.get("one").context("position")?.conversation,
-                offset
-            );
-        }
-        ui.open_question(1);
-        let (screen, _) = draw(&mut ui, 120, 35)?;
-        assert_eq!(
-            screen.get(text_offset..text_offset + text.len()),
-            Some(text.as_str())
-        );
-        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        let (screen, _) = draw(&mut ui, 120, 35)?;
-        assert_eq!(
-            screen.get(text_offset..text_offset + text.len()),
-            Some(text.as_str())
-        );
-        ui.open_question(0);
-        draw(&mut ui, 120, 35)?;
-        ui.sessions
-            .get_mut("one")
-            .context("session")?
-            .note("agentMessage", "New streamed output");
-        let (screen, _) = draw(&mut ui, 120, 35)?;
-        assert!(screen.contains("New streamed output"));
-        ui.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        draw(&mut ui, 120, 35)?;
+        assert!(offset < ui.conversation_lines.saturating_sub(ui.conversation_height));
+        let (again, _) = draw(&mut ui, 120, 35)?;
+        assert_eq!(again, scrolled);
         assert_eq!(
             ui.positions.get("one").context("position")?.conversation,
-            ui.conversation_lines.saturating_sub(ui.conversation_height),
-            "closing questions must reclaim their space and bring the last message to the bottom"
-        );
-        ui.focus = Focus::Conversation;
-        ui.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
-        draw(&mut ui, 120, 35)?;
-        assert!(
-            !ui.positions
-                .get("one")
-                .context("position")?
-                .keep_transcript_position
+            offset
         );
         Ok(())
     }
