@@ -863,22 +863,11 @@ pub(super) fn render_entries_with_preferences(
                 };
                 let shown = output;
                 let rows = if entry.kind == "commandExecution" {
-                    shown
-                        .lines()
-                        .flat_map(|line| {
-                            let rows = crate::markdown::wrap(
-                                crate::ui::syntax_spans(
-                                    &crate::model::clean(line).replace('\t', "    "),
-                                ),
-                                usize::from(width.saturating_sub(4)).max(1),
-                            );
-                            if rows.is_empty() {
-                                vec![Line::default()]
-                            } else {
-                                rows.into_iter().map(|row| Line::from(row.spans)).collect()
-                            }
-                        })
-                        .collect::<Vec<_>>()
+                    super::tool_content::output(&shown, width.saturating_sub(4))
+                } else if let Some(rows) =
+                    super::tool_content::claude(entry, width.saturating_sub(4))
+                {
+                    rows
                 } else {
                     let (rows, targets) = prose_links(&shown, width.saturating_sub(4));
                     links.extend(targets.into_iter().map(|mut link| {
@@ -888,17 +877,15 @@ pub(super) fn render_entries_with_preferences(
                     }));
                     rows
                 };
-                if !shown.is_empty() {
-                    for (index, mut row) in rows.into_iter().enumerate() {
-                        row.spans.insert(
-                            0,
-                            Span::styled(
-                                if index == 0 { "  └ " } else { "    " },
-                                Style::default().fg(DIM),
-                            ),
-                        );
-                        lines.push(row);
-                    }
+                for (index, mut row) in rows.into_iter().enumerate() {
+                    row.spans.insert(
+                        0,
+                        Span::styled(
+                            if index == 0 { "  └ " } else { "    " },
+                            Style::default().fg(DIM),
+                        ),
+                    );
+                    lines.push(row);
                 }
             }
         }

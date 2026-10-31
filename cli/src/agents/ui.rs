@@ -45,6 +45,7 @@ mod subagents;
 mod terminals;
 mod themes;
 pub(crate) mod toast;
+mod tool_content;
 pub(in crate::agents) mod transcript;
 mod transcript_window;
 mod tweaks;
@@ -256,7 +257,12 @@ pub enum Modal {
         scroll: usize,
         rows: Vec<Line<'static>>,
         links: Vec<transcript::Link>,
-        layout: Option<(u16, u64)>,
+        layout: Option<(
+            u16,
+            u64,
+            crate::settings::Appearance,
+            crate::settings::Conversation,
+        )>,
         height: usize,
     },
     InstallBrowser {
@@ -4632,17 +4638,24 @@ impl Ui {
         }) = &mut self.modal
         {
             if let Some(session) = self.selected.as_ref().and_then(|id| self.sessions.get(id)) {
-                let key = (area.width, session.version);
-                if *layout != Some(key) {
+                let key = (
+                    area.width,
+                    session.version,
+                    self.preferences.appearance.clone(),
+                    self.preferences.conversation.clone(),
+                );
+                if layout.as_ref() != Some(&key) {
                     if let Some(source) = session.entries.iter().find(|e| e.id == *entry) {
                         let mut position = Position::default();
                         position.expanded.insert(entry.clone());
-                        let (rendered, _, targets) = transcript::render_entries(
+                        let (rendered, _, targets) = transcript::render_entries_with_preferences(
                             session,
                             std::slice::from_ref(source),
                             &position,
                             area.width,
                             false,
+                            &self.preferences.appearance,
+                            &self.preferences.conversation,
                         );
                         *rows = rendered;
                         *links = targets;
@@ -7494,6 +7507,75 @@ mod tests {
                 }
                 previous = Some(rows);
             }
+        }
+        Ok(())
+    }
+    #[test]
+    fn expanded_message_uses_chat_formatting_and_refreshes_preferences() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        still(&mut ui);
+        ui.drilled = true;
+        ui.sessions.get_mut("one").context("session")?.entries.push(Entry {
+            id: "formatted".into(),
+            kind: "agentMessage".into(),
+            text: "## Result\n\n- Kept the layout\n\n[Details](https://example.com/details)\n\n```rust\nlet value: Option<String> = None;\n```".into(),
+            timestamp: Some(1_700_000_000_000),
+            ..Default::default()
+        });
+        ui.action(Action::ToggleEntry("formatted".into()));
+        for (width, timestamps, separators) in
+            [(100, false, false), (100, true, true), (50, false, false)]
+        {
+            ui.preferences.conversation.timestamps = timestamps;
+            ui.preferences.appearance.message_separators = separators;
+            draw(&mut ui, width, 35)?;
+            let Some(Modal::Transcript {
+                rows,
+                links,
+                layout: Some((content_width, ..)),
+                ..
+            }) = &ui.modal
+            else {
+                anyhow::bail!("expanded message");
+            };
+            let session = ui.sessions.get("one").context("session")?;
+            let source = session
+                .entries
+                .iter()
+                .find(|entry| entry.id == "formatted")
+                .context("entry")?;
+            let mut position = Position::default();
+            position.expanded.insert(source.id.clone());
+            let (chat, _, targets) = transcript::render_entries_with_preferences(
+                session,
+                std::slice::from_ref(source),
+                &position,
+                *content_width,
+                false,
+                &ui.preferences.appearance,
+                &ui.preferences.conversation,
+            );
+            assert_eq!(
+                *rows, chat,
+                "modal must match the chat, including cached preference changes"
+            );
+            assert_eq!(links.len(), targets.len());
+            assert!(
+                links
+                    .iter()
+                    .any(|link| link.url == "https://example.com/details")
+            );
+            let text = rows
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("Option<String>"));
+            assert!(text.contains('─')); // Code blocks retain their frame.
         }
         Ok(())
     }
