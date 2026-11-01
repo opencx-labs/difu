@@ -2343,6 +2343,76 @@ mod tests {
         assert_eq!(params, json!({}));
         Ok(())
     }
+    #[test]
+    fn server_sessions_replace_local_validation_before_repository_rules() -> Result<()> {
+        use super::super::{SERVER_VALIDATION_RULE, claude, registration, validation};
+        let mut session = Session::new(
+            "server".into(),
+            Job::Coding(super::super::Launch {
+                repository: ".".into(),
+                isolated: true,
+                base: "HEAD".into(),
+                prompt: "task".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.repository_rules = "Run cargo test -p core only.".into();
+        session.server_mode = true;
+        let native: Session = serde_json::from_value(serde_json::to_value(&session)?)?;
+        let mut legacy = native.clone();
+        legacy.native_setup = false;
+        let mut waiting = legacy.clone();
+        waiting.deferred_workspace = true;
+        assert!(waiting.waiting_for_workspace());
+        for prompt in [
+            instructions(&native),
+            claude::instructions(&native),
+            instructions(&legacy),
+            claude::instructions(&legacy),
+            instructions(&waiting),
+        ] {
+            assert!(!prompt.contains("Do not run local"));
+            assert_eq!(prompt.matches(SERVER_VALIDATION_RULE).count(), 1);
+            let guidance = prompt.find(SERVER_VALIDATION_RULE).context("guidance")?;
+            let rules = prompt
+                .find("Repository rules:\nRun cargo test -p core only.")
+                .context("rules")?;
+            assert!(guidance < rules);
+        }
+        assert!(
+            claude::instructions(&legacy).contains("Normal source editing tools remain available.")
+        );
+        for continuation in [
+            registration::continuation(&native),
+            registration::continuation(&legacy),
+        ] {
+            assert!(!continuation.contains("PR CI"));
+        }
+        assert!(registration::continuation(&legacy).contains("Run only the tests relevant"));
+        for text in [
+            super::super::LOCAL_VALIDATION_RULE,
+            super::super::WORKTREE_INSTRUCTIONS,
+            isolation::INSTRUCTIONS,
+        ] {
+            let replaced = validation(&native, text);
+            assert!(
+                !replaced.contains("Do not run local") && replaced.contains(SERVER_VALIDATION_RULE)
+            );
+        }
+
+        let mut local = legacy;
+        local.server_mode = false;
+        assert!(instructions(&local).contains(super::super::WORKTREE_INSTRUCTIONS));
+        assert!(registration::continuation(&local).contains("PR CI"));
+        let mut local = native;
+        local.server_mode = false;
+        for prompt in [instructions(&local), claude::instructions(&local)] {
+            assert!(!prompt.contains(SERVER_VALIDATION_RULE));
+            assert!(prompt.contains("Repository rules:\nRun cargo test -p core only."));
+        }
+        Ok(())
+    }
 
     #[test]
     fn delayed_user_echoes_preserve_prompt_order_and_do_not_duplicate() -> Result<()> {

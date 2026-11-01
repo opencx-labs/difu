@@ -48,6 +48,37 @@ use std::path::PathBuf;
 pub const LOCAL_VALIDATION_RULE: &str = "Do not run local tests, linting, typechecks, builds, CI scripts, or validation suites, including through wrappers or delegated agents. Rely on pull-request CI for project validation. Git inspection and git diff checks are allowed.";
 // Retained only for sessions saved before native provider setup.
 pub const WORKTREE_INSTRUCTIONS: &str = "This is a difu-managed worktree. Do not run local tests, linting, typechecks, builds, CI scripts, or other validation suites, including through wrappers or delegated agents. Rely on pull-request CI for all project validation. Git inspection and git diff checks are allowed. Normal source editing tools remain available. Do not commit, push, open a PR, or otherwise publish work unless explicitly requested by the user's task. Finishing a task is not publication authorization.";
+/// Replaces the local validation rule in coding sessions on a difu cloud server.
+pub const SERVER_VALIDATION_RULE: &str = "You are running on a difu cloud server inside an isolated sandbox. You may run builds, linters and tests, but run only the tests relevant to your change (the affected package, module or test file). In large repositories do not run the whole test suite when it would take a long time; leave full validation to pull-request CI. Repository rules take precedence over this guidance.";
+/// The local "leave validation to pull-request CI" wording in current and
+/// legacy instructions, and what replaces it on a server.
+const SERVER_VALIDATION: [(&str, &str); 4] = [
+    (LOCAL_VALIDATION_RULE, SERVER_VALIDATION_RULE),
+    (
+        "Do not run local tests, linting, typechecks, builds, CI scripts, or other validation suites, including through wrappers or delegated agents. Rely on pull-request CI for all project validation. Git inspection and git diff checks are allowed.",
+        SERVER_VALIDATION_RULE,
+    ),
+    (
+        "Do not run local tests, linting, typechecks, builds, CI scripts, or validation suites; rely on PR CI. Git inspection and git diff checks are allowed.",
+        SERVER_VALIDATION_RULE,
+    ),
+    (
+        "Do not run local validation suites; rely on PR CI.",
+        "Run only the tests relevant to your change.",
+    ),
+];
+/// `text` for where the session runs: unchanged locally; on a server the local
+/// validation wording becomes the server guidance.
+fn validation(session: &Session, text: &str) -> String {
+    if !session.server_mode {
+        return text.to_owned();
+    }
+    SERVER_VALIDATION
+        .iter()
+        .fold(text.to_owned(), |text, (local, server)| {
+            text.replace(local, server)
+        })
+}
 pub const CODING_INSTRUCTIONS: &str = "Do not commit, push, open a PR, or otherwise publish work unless explicitly requested by the user's task. Finishing a task is not publication authorization.";
 
 /// Tells a coding session's agent where it runs and how it is identified.
@@ -294,6 +325,10 @@ pub struct Session {
     pub provider_context: Option<String>,
     #[serde(default)]
     pub repository_rules: String,
+    /// Captured with the rules: started on a difu cloud server, so
+    /// `SERVER_VALIDATION_RULE` applies.
+    #[serde(default)]
+    pub server_mode: bool,
     /// New sessions inherit provider policy; missing fields preserve legacy setup.
     #[serde(default)]
     pub native_setup: bool,
@@ -429,6 +464,7 @@ impl Session {
             provider_threads: Default::default(),
             provider_context: None,
             repository_rules: String::new(),
+            server_mode: false,
             native_setup: true,
             job,
             status: Status::Starting,

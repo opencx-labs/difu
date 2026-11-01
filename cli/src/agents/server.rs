@@ -1402,6 +1402,7 @@ fn reset_workspace(s: &mut Session, candidate: Session, revision: u64) {
     s.deletion_requests.clear();
     s.job = candidate.job;
     s.repository_rules = candidate.repository_rules;
+    s.server_mode = candidate.server_mode;
     s.workspace = candidate.workspace;
     s.baseline = candidate.baseline;
     s.workspace_ready = false;
