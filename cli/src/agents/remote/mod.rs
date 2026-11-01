@@ -1,8 +1,11 @@
-//! Wi-Fi remote control for the difu iOS app. The agent service listens on the
-//! local network only while enabled. A phone pairs once by scanning a short-lived,
-//! single-use QR code; afterwards it authenticates with its own device token.
-//! TLS uses a self-signed certificate whose fingerprint travels in the QR code,
-//! so the phone pins this Mac without trusting any certificate authority.
+//! Remote control for the difu iOS app on the same Wi-Fi and, on a cloud server
+//! (`difu serve`), for any paired phone or computer. The agent service listens
+//! only while enabled. A device pairs once by scanning a short-lived, single-use
+//! QR code or with the server password; afterwards it authenticates with its own
+//! device token. TLS uses a self-signed certificate whose fingerprint travels in
+//! the QR code (or is bound by the password proof), so clients pin this machine
+//! without trusting any certificate authority. See docs/remote-protocol.md and
+//! docs/cloud-agents.md.
 mod api;
 mod identity;
 mod listener;
@@ -11,7 +14,10 @@ mod reviews;
 mod server_api;
 mod view;
 
-use crate::storage::{self, Storage};
+use crate::{
+    cloud::password::Verifier,
+    storage::{self, Storage},
+};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -35,6 +41,31 @@ pub enum Command {
     Forget {
         device: String,
     },
+    /// Store the server password's verifier, or turn password pairing off.
+    Password {
+        verifier: Option<Verifier>,
+    },
+    /// Add advertised hosts (after clearing them, if asked) and change the port.
+    Configure {
+        hosts: Vec<String>,
+        clear_hosts: bool,
+        port: Option<u16>,
+    },
+}
+
+/// `standard` devices use the phone API; `full` devices may also use `rpc`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    #[default]
+    Standard,
+    Full,
+}
+
+impl Access {
+    fn is_standard(&self) -> bool {
+        *self == Self::Standard
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -49,6 +80,15 @@ pub struct Status {
     pub pairing_expires: Option<i64>,
     pub devices: Vec<DeviceStatus>,
     pub error: Option<String>,
+    /// Hosts from `difu remote config`, advertised ahead of discovered ones.
+    #[serde(default)]
+    pub configured_hosts: Vec<String>,
+    /// A server password is set, so password pairing is on.
+    #[serde(default)]
+    pub password: bool,
+    /// Server mode (`difu serve`).
+    #[serde(default)]
+    pub server: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -58,6 +98,8 @@ pub struct DeviceStatus {
     pub paired: i64,
     pub seen: Option<i64>,
     pub connected: bool,
+    #[serde(default)]
+    pub access: Access,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -66,17 +108,33 @@ struct Settings {
     enabled: bool,
     port: u16,
     devices: Vec<Device>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    hosts: Vec<String>,
+    /// The server password's verifier; never the password itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    password: Option<Verifier>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Device {
     id: String,
     name: String,
-    /// SHA-256 of the device token; the token itself is only on the phone.
+    /// SHA-256 of the device token; the token itself is only on the device.
     token: String,
     paired: i64,
     #[serde(default)]
     seen: Option<i64>,
+    #[serde(default, skip_serializing_if = "Access::is_standard")]
+    access: Access,
+}
+
+/// A device that just paired, as announced to the other connected devices.
+struct Enrolled {
+    id: String,
+    name: String,
+    token: String,
+    paired: i64,
+    access: Access,
 }
 
 struct Pairing {
@@ -94,17 +152,22 @@ struct State {
 pub struct Remote {
     storage: Storage,
     home: PathBuf,
+    /// Listen only on this address; tests bind loopback.
+    bind: Option<String>,
     identity: Mutex<Option<Arc<identity::Identity>>>,
     state: Mutex<State>,
     peers: listener::Peers,
+    guard: listener::Guard,
 }
 
 impl Remote {
     /// Restore the saved setting; an enabled remote starts listening right away.
     pub fn start(storage: Storage) -> Arc<Self> {
-        let home = super::server::home(&storage)
-            .map(|home| home.join("remote"))
-            .unwrap_or_else(|_| storage.cache.join("remote"));
+        Self::open(storage, std::env::var("DIFU_REMOTE_BIND").ok())
+    }
+
+    fn open(storage: Storage, bind: Option<String>) -> Arc<Self> {
+        let home = home(&storage);
         let mut error = None;
         let settings = load(&home).unwrap_or_else(|e| {
             error = Some(format!("{e:#}"));
@@ -113,6 +176,7 @@ impl Remote {
         let remote = Arc::new(Self {
             storage,
             home,
+            bind,
             identity: Mutex::new(None),
             state: Mutex::new(State {
                 settings,
@@ -121,11 +185,24 @@ impl Remote {
                 error,
             }),
             peers: listener::Peers::default(),
+            guard: listener::Guard::default(),
         });
         if remote.lock().map(|s| s.settings.enabled).unwrap_or(false)
             && let Err(error) = remote.listen()
         {
             eprintln!("Remote control: {error:#}");
+            // A server has no one to press "retry"; keep trying while the port is busy.
+            if remote.server_mode() {
+                let remote = remote.clone();
+                let _ = std::thread::Builder::new()
+                    .name("difu-remote-retry".into())
+                    .spawn(move || {
+                        while remote.enabled() && !remote.listening() {
+                            std::thread::sleep(Duration::from_secs(5));
+                            let _ = remote.listen();
+                        }
+                    });
+            }
         }
         remote
     }
@@ -170,14 +247,93 @@ impl Remote {
                 self.peers.close_all();
             }
             Command::Forget { device } => {
-                let mut state = self.lock()?;
-                state.settings.devices.retain(|d| d.id != device);
-                save(&self.home, &state.settings)?;
-                drop(state);
-                self.peers.close_device(&device);
+                self.forget(&device, true)?;
             }
+            Command::Password { verifier } => {
+                let mut state = self.lock()?;
+                state.settings.password = verifier;
+                save(&self.home, &state.settings)?;
+            }
+            Command::Configure {
+                hosts,
+                clear_hosts,
+                port,
+            } => self.configure(hosts, clear_hosts, port)?,
         }
         self.status()
+    }
+
+    fn configure(
+        self: &Arc<Self>,
+        hosts: Vec<String>,
+        clear_hosts: bool,
+        port: Option<u16>,
+    ) -> Result<()> {
+        let hosts = hosts
+            .iter()
+            .map(|host| advertised_host(host))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(port != Some(0), "Choose a port between 1 and 65535");
+        let moved = {
+            let state = self.lock()?;
+            port.filter(|port| {
+                *port != state.settings.port
+                    && state.server.as_ref().is_some_and(listener::Server::running)
+            })
+        };
+        // Bind the new port before letting go of the old one.
+        let replacement = match moved {
+            Some(port) => Some(listener::Server::bind(
+                self.clone(),
+                self.identity()?,
+                port,
+                true,
+            )?),
+            None => None,
+        };
+        let previous = {
+            let mut state = self.lock()?;
+            if clear_hosts {
+                state.settings.hosts.clear();
+            }
+            for host in hosts {
+                if !state.settings.hosts.contains(&host) {
+                    state.settings.hosts.push(host);
+                }
+            }
+            if let Some(port) = port {
+                state.settings.port = port;
+            }
+            let previous = match replacement {
+                Some((server, port)) => {
+                    state.settings.port = port;
+                    if self.server_mode() {
+                        eprintln!("Remote control listening on port {port}");
+                    }
+                    state.server.replace(server)
+                }
+                None => None,
+            };
+            save(&self.home, &state.settings)?;
+            previous
+        };
+        if let Some(server) = previous {
+            server.stop();
+        }
+        Ok(())
+    }
+
+    /// Revoke a device. Its other connections notice within a second; `close`
+    /// also drops them right away (not wanted while answering its own request).
+    fn forget(&self, device: &str, close: bool) -> Result<()> {
+        let mut state = self.lock()?;
+        state.settings.devices.retain(|d| d.id != device);
+        save(&self.home, &state.settings)?;
+        drop(state);
+        if close {
+            self.peers.close_device(device);
+        }
+        Ok(())
     }
 
     pub fn status(&self) -> Result<Status> {
@@ -189,7 +345,7 @@ impl Remote {
         }
         let listening = state.server.as_ref().is_some_and(listener::Server::running);
         let hosts = if listening {
-            network::hosts()
+            self.advertised(&state.settings.hosts)
         } else {
             Vec::new()
         };
@@ -226,10 +382,51 @@ impl Remote {
                     paired: d.paired,
                     seen: d.seen,
                     connected: connected.contains(&d.id),
+                    access: d.access,
                 })
                 .collect(),
             error: state.error.clone(),
+            configured_hosts: state.settings.hosts.clone(),
+            password: state.settings.password.is_some(),
+            server: self.server_mode(),
         })
+    }
+
+    /// Configured hosts first, then the addresses discovered on this machine.
+    fn hosts(&self) -> Vec<String> {
+        let configured = self
+            .lock()
+            .map(|s| s.settings.hosts.clone())
+            .unwrap_or_default();
+        self.advertised(&configured)
+    }
+
+    fn advertised(&self, configured: &[String]) -> Vec<String> {
+        let discovered = match &self.bind {
+            Some(bind) => vec![bind.clone()],
+            None => network::hosts(),
+        };
+        let mut hosts = configured.to_vec();
+        for host in discovered {
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+        hosts
+    }
+
+    /// `difu serve` turned server mode on in this installation's settings.
+    fn server_mode(&self) -> bool {
+        api::config(&self.storage).server.enabled
+    }
+
+    fn verifier(&self) -> Option<Verifier> {
+        self.lock().ok().and_then(|s| s.settings.password.clone())
+    }
+
+    fn listening(&self) -> bool {
+        self.lock()
+            .is_ok_and(|s| s.server.as_ref().is_some_and(listener::Server::running))
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, State>> {
@@ -263,7 +460,10 @@ impl Remote {
             }
             let identity = self.identity()?;
             let preferred = self.lock()?.settings.port;
-            let (server, port) = listener::Server::bind(self.clone(), identity, preferred)?;
+            // Clients of a server expect its fixed port; a computer may move.
+            let server_mode = self.server_mode();
+            let (server, port) =
+                listener::Server::bind(self.clone(), identity, preferred, server_mode)?;
             let mut state = self.lock()?;
             if state.settings.port != port {
                 state.settings.port = port;
@@ -271,6 +471,9 @@ impl Remote {
             }
             state.server = Some(server);
             state.error = None;
+            if server_mode {
+                eprintln!("Remote control listening on port {port}");
+            }
             Ok(())
         })();
         if let Err(error) = &result
@@ -282,7 +485,7 @@ impl Remote {
     }
 
     /// Exchange the QR code for a long-lived device token. The code works once.
-    fn pair(&self, code: &str, id: &str, name: &str) -> Result<(String, String)> {
+    fn pair(&self, code: &str, id: &str, name: &str, access: Access) -> Result<Enrolled> {
         let mut state = self.lock()?;
         let now = chrono::Utc::now().timestamp_millis();
         let valid = state
@@ -291,9 +494,29 @@ impl Remote {
             .is_some_and(|p| p.expires > now && identity::same(&p.code, code));
         ensure!(
             valid,
-            "This pairing code expired or was already used. Open /remote-control on your Mac for a new code."
+            "{}",
+            if self.server_mode() {
+                "This pairing code expired or was already used. Run `difu remote pair` on the server for a new code."
+            } else {
+                "This pairing code expired or was already used. Open /remote-control on your Mac for a new code."
+            }
         );
         state.pairing = None;
+        self.enroll(&mut state, id, name, access)
+    }
+
+    /// Pair a device whose password proof the listener already checked.
+    fn pair_with_password(&self, id: &str, name: &str, access: Access) -> Result<Enrolled> {
+        let mut state = self.lock()?;
+        ensure!(
+            state.settings.password.is_some(),
+            "Password pairing is off on this server"
+        );
+        self.enroll(&mut state, id, name, access)
+    }
+
+    fn enroll(&self, state: &mut State, id: &str, name: &str, access: Access) -> Result<Enrolled> {
+        let now = chrono::Utc::now().timestamp_millis();
         let id = if valid_device_id(id) {
             id.to_owned()
         } else {
@@ -301,23 +524,31 @@ impl Remote {
         };
         let token = identity::random_token(32)?;
         let name: String = name.trim().chars().take(80).collect();
+        let name = if name.is_empty() {
+            "iPhone".into()
+        } else {
+            name
+        };
         state.settings.devices.retain(|d| d.id != id);
         state.settings.devices.push(Device {
             id: id.clone(),
-            name: if name.is_empty() {
-                "iPhone".into()
-            } else {
-                name
-            },
+            name: name.clone(),
             token: storage::hash(&token),
             paired: now,
             seen: Some(now),
+            access,
         });
         save(&self.home, &state.settings)?;
-        Ok((id, token))
+        Ok(Enrolled {
+            id,
+            name,
+            token,
+            paired: now,
+            access,
+        })
     }
 
-    fn authenticate(&self, token: &str) -> Result<String> {
+    fn authenticate(&self, token: &str) -> Result<(String, Access)> {
         let hash = storage::hash(token);
         let mut state = self.lock()?;
         let device = state
@@ -325,13 +556,17 @@ impl Remote {
             .devices
             .iter_mut()
             .find(|d| identity::same(&d.token, &hash))
-            .context(
-                "This phone is no longer paired. Scan the QR code in /remote-control again.",
-            )?;
+            .with_context(|| {
+                if self.server_mode() {
+                    "This device is no longer paired with this server. Pair it again."
+                } else {
+                    "This phone is no longer paired. Scan the QR code in /remote-control again."
+                }
+            })?;
         device.seen = Some(chrono::Utc::now().timestamp_millis());
-        let id = device.id.clone();
+        let found = (device.id.clone(), device.access);
         save(&self.home, &state.settings)?;
-        Ok(id)
+        Ok(found)
     }
 
     fn paired(&self, device: &str) -> bool {
@@ -342,6 +577,48 @@ impl Remote {
     fn enabled(&self) -> bool {
         self.lock().is_ok_and(|s| s.settings.enabled)
     }
+}
+
+/// `difu serve`: remote control on, at the port from the flag, the saved
+/// settings or the default, in that order. Runs before the service starts.
+pub fn prepare_server(storage: &Storage, port: Option<u16>) -> Result<u16> {
+    let home = home(storage);
+    let mut settings = load(&home)?;
+    settings.enabled = true;
+    settings.port = port
+        .filter(|port| *port != 0)
+        .or(Some(settings.port).filter(|port| *port != 0))
+        .unwrap_or(crate::cloud::DEFAULT_PORT);
+    save(&home, &settings)?;
+    Ok(settings.port)
+}
+
+fn home(storage: &Storage) -> PathBuf {
+    super::server::home(storage)
+        .map(|home| home.join("remote"))
+        .unwrap_or_else(|_| storage.cache.join("remote"))
+}
+
+/// A host name or IP address for pairing links; the port is separate.
+fn advertised_host(host: &str) -> Result<String> {
+    let host = host.trim();
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    ensure!(
+        !host.is_empty()
+            && host.len() <= 253
+            && host
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':')),
+        "`{host}` is not a host name or IP address"
+    );
+    ensure!(
+        host.matches(':').count() != 1,
+        "Give only the host in `{host}`; set the port with --port"
+    );
+    Ok(host.to_owned())
 }
 
 fn valid_device_id(id: &str) -> bool {
@@ -401,6 +678,7 @@ mod tests {
                 cache: temp.path().join("cache"),
             },
             home: temp.path().join("remote"),
+            bind: Some("127.0.0.1".into()),
             identity: Mutex::new(None),
             state: Mutex::new(State {
                 settings: Settings::default(),
@@ -409,6 +687,7 @@ mod tests {
                 error: None,
             }),
             peers: listener::Peers::default(),
+            guard: listener::Guard::default(),
         })
     }
 
@@ -420,11 +699,24 @@ mod tests {
             code: "code".into(),
             expires: chrono::Utc::now().timestamp_millis() + 60_000,
         });
-        assert!(remote.pair("wrong", "phone-0001", "Phone").is_err());
-        let (device, token) = remote.pair("code", "phone-0001", "Phone")?;
+        assert!(
+            remote
+                .pair("wrong", "phone-0001", "Phone", Access::Standard)
+                .is_err()
+        );
+        let Enrolled {
+            id: device, token, ..
+        } = remote.pair("code", "phone-0001", "Phone", Access::Standard)?;
         assert_eq!(device, "phone-0001");
-        assert!(remote.pair("code", "phone-0002", "Other").is_err());
-        assert_eq!(remote.authenticate(&token)?, "phone-0001");
+        assert!(
+            remote
+                .pair("code", "phone-0002", "Other", Access::Full)
+                .is_err()
+        );
+        assert_eq!(
+            remote.authenticate(&token)?,
+            ("phone-0001".into(), Access::Standard)
+        );
         assert!(remote.authenticate("guess").is_err());
         let saved = fs::read_to_string(temp.path().join("remote/remote.json"))?;
         assert!(!saved.contains(&token));
@@ -444,7 +736,67 @@ mod tests {
             code: "code".into(),
             expires: chrono::Utc::now().timestamp_millis() - 1,
         });
-        assert!(remote.pair("code", "phone-0001", "Phone").is_err());
+        assert!(
+            remote
+                .pair("code", "phone-0001", "Phone", Access::Standard)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_devices_are_standard_and_ordinary_settings_keep_their_shape() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let home = temp.path().join("remote");
+        fs::create_dir_all(&home)?;
+        fs::write(
+            home.join("remote.json"),
+            r#"{"enabled":true,"port":50000,"devices":[{"id":"phone-0001","name":"Phone","token":"abc","paired":1}]}"#,
+        )?;
+        let settings = load(&home)?;
+        assert_eq!(
+            settings.devices.first().map(|d| d.access),
+            Some(Access::Standard)
+        );
+        save(&home, &settings)?;
+        let saved = fs::read_to_string(home.join("remote.json"))?;
+        assert!(!saved.contains("access") && !saved.contains("hosts"));
+        assert!(!saved.contains("password"));
+        Ok(())
+    }
+
+    #[test]
+    fn advertised_hosts_are_plain_names_or_addresses() {
+        let host = |text: &str| advertised_host(text).ok();
+        assert_eq!(host(" 203.0.113.4 ").as_deref(), Some("203.0.113.4"));
+        assert_eq!(host("[2001:db8::1]").as_deref(), Some("2001:db8::1"));
+        assert_eq!(
+            host("box.tail1.ts.net").as_deref(),
+            Some("box.tail1.ts.net")
+        );
+        assert!(host("box.example.com:3438").is_none());
+        assert!(host("a,b").is_none());
+        assert!(host("").is_none());
+    }
+
+    #[test]
+    fn changing_the_port_moves_the_listener() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let remote = remote(&temp);
+        let first = remote.command(Command::Open)?.port;
+        let free = std::net::TcpListener::bind("127.0.0.1:0")?
+            .local_addr()?
+            .port();
+        let status = remote.command(Command::Configure {
+            hosts: Vec::new(),
+            clear_hosts: false,
+            port: Some(free),
+        })?;
+        assert!(status.listening);
+        assert_eq!(status.port, free);
+        assert_eq!(load(&remote.home)?.port, free);
+        assert!(std::net::TcpStream::connect(("127.0.0.1", first)).is_err());
+        remote.command(Command::Disable)?;
         Ok(())
     }
 

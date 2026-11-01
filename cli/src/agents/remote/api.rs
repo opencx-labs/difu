@@ -1,8 +1,9 @@
-//! JSON-RPC for one phone connection. Every request runs on its own thread and
-//! replies through the connection's queue; subscriptions push events the same way.
+//! JSON-RPC for one device connection. Every request runs on its own thread and
+//! replies through the connection's queue; subscriptions push events the same
+//! way. `full` devices may also tunnel the service protocol (`rpc`, `rpc.watch`).
 use super::{
     super::{Control, Reply, Request, Session, client, media, server, transport},
-    reviews,
+    Access, Remote, reviews,
     view::{self, EntryView, SessionSummary, SessionView},
 };
 use crate::storage::{AgentDefaults, Config, Storage};
@@ -17,7 +18,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::SyncSender,
     },
     thread,
@@ -25,6 +26,8 @@ use std::{
 };
 
 const MODELS_TTL: Duration = Duration::from_secs(10 * 60);
+/// `rpc.watch` streams one connection may hold open.
+const MAX_STREAMS: usize = 64;
 
 /// The terminal's config without its one-time migration write: the service
 /// must never race the terminal app's own saves.
@@ -38,13 +41,32 @@ pub fn config(storage: &Storage) -> Config {
 pub struct Connection(Arc<Inner>);
 
 struct Inner {
+    remote: Arc<Remote>,
     storage: Storage,
+    device: String,
+    access: Access,
     port: u16,
     sender: SyncSender<String>,
     closed: AtomicBool,
+    /// The device revoked itself; the listener hangs up after the reply.
+    revoked: AtomicBool,
     watches: Mutex<BTreeMap<String, Arc<AtomicBool>>>,
+    streams: Mutex<BTreeMap<u64, Stream>>,
+    next_stream: AtomicU64,
     listing: AtomicBool,
     models: Mutex<Option<(Instant, Value)>>,
+}
+
+/// One `rpc.watch`: a service subscription forwarded as events.
+struct Stream {
+    stop: Arc<AtomicBool>,
+    socket: UnixStream,
+}
+impl Stream {
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.socket.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 #[derive(Deserialize)]
@@ -56,13 +78,25 @@ struct Call {
 }
 
 impl Connection {
-    pub fn new(storage: Storage, port: u16, sender: SyncSender<String>) -> Self {
+    pub fn new(
+        remote: Arc<Remote>,
+        device: String,
+        access: Access,
+        port: u16,
+        sender: SyncSender<String>,
+    ) -> Self {
         Self(Arc::new(Inner {
-            storage,
+            storage: remote.storage.clone(),
+            remote,
+            device,
+            access,
             port,
             sender,
             closed: AtomicBool::new(false),
+            revoked: AtomicBool::new(false),
             watches: Mutex::new(BTreeMap::new()),
+            streams: Mutex::new(BTreeMap::new()),
+            next_stream: AtomicU64::new(1),
             listing: AtomicBool::new(false),
             models: Mutex::new(None),
         }))
@@ -77,16 +111,41 @@ impl Connection {
                 return;
             }
         };
+        // Answered on the socket thread, so the reply leaves before it hangs up.
+        if let Some(result) = self.revoke(&call) {
+            self.0.push(&response(call.id, result));
+            return;
+        }
         let inner = self.0.clone();
         let _ = thread::Builder::new()
             .name("difu-remote-call".into())
             .spawn(move || {
-                let reply = match dispatch(&inner, &call.method, &call.params) {
-                    Ok(result) => json!({"id": call.id, "result": result}),
-                    Err(error) => json!({"id": call.id, "error": format!("{error:#}")}),
-                };
+                if call.method == "rpc.watch" {
+                    return rpc_watch(&inner, call.id, &call.params);
+                }
+                let reply = response(call.id, dispatch(&inner, &call.method, &call.params));
                 inner.push(&reply);
             });
+    }
+
+    /// `device.unpair`, or forgetting this very device.
+    fn revoke(&self, call: &Call) -> Option<Result<Value>> {
+        let own = match call.method.as_str() {
+            "device.unpair" => true,
+            "server.devices.forget" => {
+                call.params.get("device").and_then(Value::as_str) == Some(self.0.device.as_str())
+            }
+            _ => false,
+        };
+        own.then(|| {
+            self.0.remote.forget(&self.0.device, false)?;
+            self.0.revoked.store(true, Ordering::Relaxed);
+            Ok(json!({}))
+        })
+    }
+
+    pub fn revoked(&self) -> bool {
+        self.0.revoked.load(Ordering::Relaxed)
     }
 
     pub fn close(&self) {
@@ -96,6 +155,18 @@ impl Connection {
                 stop.store(true, Ordering::Relaxed);
             }
         }
+        if let Ok(streams) = self.0.streams.lock() {
+            for stream in streams.values() {
+                stream.stop();
+            }
+        }
+    }
+}
+
+fn response(id: Value, result: Result<Value>) -> Value {
+    match result {
+        Ok(result) => json!({"id": id, "result": result}),
+        Err(error) => json!({"id": id, "error": format!("{error:#}")}),
     }
 }
 
@@ -121,6 +192,13 @@ impl Inner {
             Reply::Session(session) => Ok(*session),
             _ => anyhow::bail!("Unexpected session reply"),
         }
+    }
+    fn full(&self) -> Result<()> {
+        ensure!(
+            self.access == Access::Full,
+            "This device has standard access; `rpc` needs a device paired with full access"
+        );
+        Ok(())
     }
     fn summaries(&self) -> Result<Vec<SessionSummary>> {
         let Reply::Sessions(list) = self.request(Request::List)? else {
@@ -155,9 +233,38 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
         "server.info" => Ok(json!({
             "name": super::network::name(),
             "version": env!("CARGO_PKG_VERSION"),
-            "hosts": super::network::hosts(),
+            "hosts": inner.remote.hosts(),
             "port": inner.port,
         })),
+        "server.devices" => Ok(json!({"devices": devices(inner)?})),
+        "server.devices.forget" => {
+            inner
+                .remote
+                .forget(&param::<String>(params, "device")?, true)?;
+            Ok(json!({}))
+        }
+        "rpc" => {
+            inner.full()?;
+            let request: Request = param(params, "request")?;
+            ensure!(
+                !matches!(request, Request::Watch { .. }),
+                "Use `rpc.watch` to follow a session"
+            );
+            Ok(json!({"reply": inner.request(request)?}))
+        }
+        "rpc.unwatch" => {
+            inner.full()?;
+            let stream: u64 = param(params, "stream")?;
+            if let Some(stream) = inner
+                .streams
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Watch lock failed"))?
+                .remove(&stream)
+            {
+                stream.stop();
+            }
+            Ok(json!({}))
+        }
         "sessions.list" => Ok(json!({"sessions": inner.summaries()?})),
         "sessions.subscribe" => {
             let sessions = inner.summaries()?;
@@ -346,6 +453,97 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
 #[derive(Deserialize)]
 struct Upload {
     data: String,
+}
+
+fn devices(inner: &Inner) -> Result<Vec<Value>> {
+    Ok(inner
+        .remote
+        .status()?
+        .devices
+        .into_iter()
+        .map(|d| {
+            json!({
+                "id": d.id,
+                "name": d.name,
+                "access": d.access,
+                "paired": d.paired,
+                "seen": d.seen,
+                "connected": d.connected,
+                "current": d.id == inner.device,
+            })
+        })
+        .collect())
+}
+
+/// Answer with the stream number, then forward every service reply for the
+/// session until `rpc.unwatch`, a closed connection, or the service ending it.
+fn rpc_watch(inner: &Arc<Inner>, id: Value, params: &Value) {
+    let opened = (|| -> Result<(u64, Arc<AtomicBool>, BufReader<UnixStream>)> {
+        inner.full()?;
+        let session: String = param(params, "id")?;
+        let version: Option<u64> = optional(params, "version")?;
+        let mut streams = inner
+            .streams
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Watch lock failed"))?;
+        ensure!(streams.len() < MAX_STREAMS, "Too many watched sessions");
+        let mut socket = UnixStream::connect(server::socket(&inner.storage)?)
+            .context("Agent service is disconnected")?;
+        socket.set_read_timeout(Some(Duration::from_secs(30)))?;
+        socket.set_write_timeout(Some(Duration::from_secs(10)))?;
+        serde_json::to_writer(
+            &mut socket,
+            &Request::Watch {
+                id: session,
+                version,
+            },
+        )?;
+        socket.write_all(b"\n")?;
+        let number = inner.next_stream.fetch_add(1, Ordering::Relaxed);
+        let stop = Arc::new(AtomicBool::new(false));
+        streams.insert(
+            number,
+            Stream {
+                stop: stop.clone(),
+                socket: socket.try_clone()?,
+            },
+        );
+        Ok((number, stop, BufReader::new(socket)))
+    })();
+    let (number, stop, mut reader) = match opened {
+        Ok(opened) => opened,
+        Err(error) => {
+            inner.push(&response(id, Err(error)));
+            return;
+        }
+    };
+    inner.push(&response(id, Ok(json!({"stream": number}))));
+    let mut message = None;
+    while !stop.load(Ordering::Relaxed) && !inner.closed.load(Ordering::Relaxed) {
+        match transport::read_reply(&mut reader) {
+            Ok(reply) => {
+                if let Reply::Error(error) = &reply {
+                    message = Some(error.clone());
+                }
+                if !inner.event("rpc.watch", json!({"stream": number, "reply": reply})) {
+                    break;
+                }
+            }
+            Err(error) => {
+                message.get_or_insert_with(|| format!("{error:#}"));
+                break;
+            }
+        }
+    }
+    if let Ok(mut streams) = inner.streams.lock() {
+        streams.remove(&number);
+    }
+    if !stop.load(Ordering::Relaxed) && !inner.closed.load(Ordering::Relaxed) {
+        inner.event(
+            "rpc.watch.closed",
+            json!({"stream": number, "message": message.unwrap_or_else(|| "Watch ended".into())}),
+        );
+    }
 }
 
 fn new_session(inner: &Inner, params: &Value) -> Result<Value> {
