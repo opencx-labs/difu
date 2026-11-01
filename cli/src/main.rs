@@ -105,6 +105,11 @@ fn parse_shell_action(text: &str) -> Result<serde_json::Value, serde_json::Error
 }
 
 fn main() -> Result<()> {
+    // `difu server add` runs difu as ssh's askpass helper; answer before
+    // anything else. Inert unless DIFU_ASKPASS_SECRET_FILE is set.
+    if let Some(answered) = difu::cloud::onboard::answer_askpass() {
+        return answered;
+    }
     let args = Args::parse();
     if args.agent_service || args.refresh_agent_service {
         if args.agent_service {

@@ -1,0 +1,21 @@
+# Installed by `difu server add`; @UID@ and @HOME@ are the difu user's.
+[Unit]
+Description=difu agent service
+Documentation=https://github.com/opencx-labs/difu/blob/main/docs/cloud-agents.md
+Wants=network-online.target user@@UID@.service
+After=network-online.target user@@UID@.service
+
+[Service]
+Type=simple
+User=difu
+WorkingDirectory=@HOME@
+Environment=XDG_RUNTIME_DIR=/run/user/@UID@
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
+Environment=PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=-@HOME@/.config/difu/server.env
+ExecStart=/usr/local/bin/difu serve
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
