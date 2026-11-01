@@ -4,6 +4,7 @@
 pub mod cli;
 pub mod client;
 pub mod federation;
+pub mod logins;
 pub mod onboard;
 pub mod password;
 pub mod repos;
