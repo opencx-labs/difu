@@ -248,6 +248,39 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn cpu_snapshot_round_trips_through_service_transport() -> Result<()> {
+        use crate::cpu::{Cost, Cursor, Sample, Snapshot};
+        let snapshot = Snapshot {
+            cursor: Some(Cursor {
+                pid: 12,
+                started_ms: 1000,
+                sequence: 2,
+            }),
+            samples: vec![Sample {
+                sequence: 2,
+                at_ms: 2000,
+                seconds: 1.0,
+                percent: Some(35.0),
+                areas: [Cost {
+                    cpu_ns: 1000,
+                    calls: 1,
+                }; 5],
+                frames: 60,
+            }],
+            error: None,
+        };
+        let mut wire = Vec::new();
+        write_reply(&mut wire, &Reply::Cpu(snapshot.clone()))?;
+        let Reply::Cpu(decoded) = read_reply(&mut io::Cursor::new(wire))? else {
+            anyhow::bail!("Expected CPU snapshot");
+        };
+        assert_eq!(
+            serde_json::to_value(decoded)?,
+            serde_json::to_value(snapshot)?
+        );
+        Ok(())
+    }
+    #[test]
     fn truncated_transfer_is_an_error_and_small_replies_stay_compatible() -> Result<()> {
         let mut wire = Vec::new();
         write_reply(&mut wire, &Reply::Ok)?;

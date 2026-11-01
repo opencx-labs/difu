@@ -133,21 +133,12 @@ fn service_restart_duplicate_samples_and_stale_data_are_handled() -> Result<()> 
     Ok(())
 }
 #[test]
-fn wire_round_trip_and_combined_cpu_exclude_missing_service() -> Result<()> {
+fn combined_cpu_requires_fresh_samples_from_both_processes() {
     let start = Instant::now();
     let mut history = History::new(1, 0);
     record(&mut history, start, 0, 0);
     record(&mut history, start, 1, 150);
     let snapshot = history.snapshot(None);
-    let reply = crate::agents::Reply::Cpu(snapshot.clone());
-    let mut wire = Vec::new();
-    crate::agents::transport::write_reply(&mut wire, &reply)?;
-    let crate::agents::Reply::Cpu(decoded) =
-        crate::agents::transport::read_reply(&mut std::io::Cursor::new(wire))?
-    else {
-        anyhow::bail!("CPU reply");
-    };
-    assert_eq!(decoded.cursor, snapshot.cursor);
     let mut overview = Overview {
         at_ms: 1000,
         ..Default::default()
@@ -158,7 +149,6 @@ fn wire_round_trip_and_combined_cpu_exclude_missing_service() -> Result<()> {
     assert_eq!(overview.combined(), Some(30.0));
     overview.service.error = Some("disconnected".into());
     assert!(overview.combined().is_none());
-    Ok(())
 }
 #[test]
 fn native_cpu_clocks_and_nested_scopes_record_cpu_once() -> Result<()> {

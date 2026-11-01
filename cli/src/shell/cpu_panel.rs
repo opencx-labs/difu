@@ -393,8 +393,10 @@ mod tests {
     }
     #[test]
     fn diagnostics_handles_small_terminals_and_unavailable_samples_without_zero() -> Result<()> {
-        let mut panel = Panel::default();
-        panel.open = true;
+        let mut panel = Panel {
+            open: true,
+            ..Default::default()
+        };
         panel.data.service.error = Some("Service disconnected".into());
         let mut terminal = Terminal::new(TestBackend::new(70, 20))?;
         terminal.draw(|frame| panel.draw(frame))?;
