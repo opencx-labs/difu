@@ -29,21 +29,32 @@ public enum CertificateFingerprint {
     }
 }
 
-/// Accepts the server only when its leaf certificate matches the pinned
-/// fingerprint; system trust is never consulted (the certificate is self-signed).
+/// Decides which server certificates to accept. System trust is never
+/// consulted (difu's certificates are self-signed).
+///
+/// * Pinned: accept only the leaf whose fingerprint matches the pin.
+/// * First use (`pinned == nil`, password pairing only): accept the presented
+///   certificate and record its fingerprint; the password proofs then bind the
+///   pairing to it, and that fingerprint becomes the pin.
 final class PinningDelegate: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
-    let pinned: String
+    let pinned: String?
     private let lock = NSLock()
     private var seen: String?
+    private var accepted: String?
     private var rejected = false
 
-    init(pinned: String) {
+    init(pinned: String?) {
         self.pinned = pinned
     }
 
     /// The fingerprint the server presented, if it was rejected.
     var mismatch: String? {
         lock.withLock { rejected ? seen : nil }
+    }
+
+    /// The fingerprint of the certificate this connection accepted.
+    var presented: String? {
+        lock.withLock { accepted }
     }
 
     func urlSession(
@@ -75,13 +86,21 @@ final class PinningDelegate: NSObject, URLSessionWebSocketDelegate, @unchecked S
             completionHandler(.cancelAuthenticationChallenge, nil)
             return
         }
-        if CertificateFingerprint.matches(actual, pinned: pinned) {
+        let accept: Bool = lock.withLock {
+            seen = actual
+            // On first use, only the first certificate is trusted: a second
+            // handshake on the same session must present the same one.
+            let expected = pinned ?? accepted
+            if let expected, !CertificateFingerprint.matches(actual, pinned: expected) {
+                rejected = true
+                return false
+            }
+            accepted = actual
+            return true
+        }
+        if accept {
             completionHandler(.useCredential, URLCredential(trust: trust))
         } else {
-            lock.withLock {
-                seen = actual
-                rejected = true
-            }
             completionHandler(.cancelAuthenticationChallenge, nil)
         }
     }

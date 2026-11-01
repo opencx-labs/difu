@@ -15,6 +15,8 @@ public enum RemoteError: Error, Equatable, Sendable {
     case invalidPairingLink(String)
     case unsupportedProtocol(Int)
     case invalidHost(String)
+    /// A typed server address couldn't be parsed; the message is user-facing.
+    case invalidAddress(String)
     /// The server's certificate isn't the one in the QR code.
     case pinMismatch(host: String, expected: String, actual: String)
     case tls(host: String, message: String)
@@ -24,6 +26,8 @@ public enum RemoteError: Error, Equatable, Sendable {
     case unreachableComputer(name: String, failures: [HostFailure])
     /// The server refused `pair` / `auth`; the message is user-facing.
     case denied(String)
+    /// Password pairing: the server didn't prove it knows the password.
+    case untrustedServer(String)
     /// An RPC returned `{"error": ...}`.
     case server(String)
     case requestTimedOut(method: String)
@@ -42,6 +46,8 @@ extension RemoteError: LocalizedError {
             "This computer uses remote-control protocol v\(version). Update the difu app."
         case .invalidHost(let host):
             "Invalid host name “\(host)”."
+        case .invalidAddress(let message):
+            message
         case .pinMismatch(let host, let expected, let actual):
             "\(host) presented a different certificate than the paired computer "
                 + "(expected \(expected.prefix(12))…, got \(actual.prefix(12))…). "
@@ -59,6 +65,8 @@ extension RemoteError: LocalizedError {
                     + failures.map { "• \($0.error.localizedDescription)" }.joined(separator: "\n")
         case .denied(let message):
             message
+        case .untrustedServer(let message):
+            message
         case .server(let message):
             message
         case .requestTimedOut(let method):
@@ -68,7 +76,7 @@ extension RemoteError: LocalizedError {
         case .notConnected:
             "Not connected to your computer."
         case .notPaired:
-            "This phone isn't paired with a computer."
+            "This phone isn't paired with this computer or server."
         case .protocolError(let message):
             "Unexpected reply from the computer: \(message)"
         }
