@@ -1617,6 +1617,14 @@ pub fn run(storage: Storage) -> Result<()> {
         signal_hook::flag::register(signal, stopped.clone())?;
     }
     super::slack::start(service.store.clone(), stopped.clone());
+    if service
+        .store
+        .storage
+        .load_config()
+        .is_ok_and(|config| config.server.enabled)
+    {
+        crate::cloud::repos::start(service.store.storage.clone(), stopped.clone());
+    }
     let mut saved = BTreeMap::new();
     let mut flushed = Instant::now();
     while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
