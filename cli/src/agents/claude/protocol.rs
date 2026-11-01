@@ -1,7 +1,10 @@
 //! Claude CLI wire compatibility boundary. No session policy belongs in this file.
 //! Reference: anthropics/claude-agent-sdk-python, _internal/query.py and
 //! _internal/transport/subprocess_cli.py. Keep protocol fixtures alongside changes.
-use crate::process::{Cancel, ChildGroup};
+use crate::{
+    agents::sandbox::{Container, Role, Sandbox},
+    process::{Cancel, ChildGroup},
+};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -24,6 +27,8 @@ pub(super) struct Options<'a> {
     pub permission_mode: Option<&'a str>,
     pub allow_bypass: bool,
     pub settings: Option<&'a Value>,
+    /// Session processes on a sandboxing server run in the session's pod.
+    pub sandbox: Option<Sandbox>,
 }
 pub(super) enum Mode {
     /// A difu session, with difu's MCP tools.
@@ -89,6 +94,8 @@ impl std::fmt::Display for MissingConversation {
 impl std::error::Error for MissingConversation {}
 pub(super) struct Connection {
     _child: ChildGroup,
+    /// Declared after `_child`, so the container is removed after the process.
+    container: Option<Container>,
     input: ChildStdin,
     output: mpsc::Receiver<Result<Value, String>>,
     backlog: VecDeque<Value>,
@@ -99,7 +106,11 @@ pub(super) struct Connection {
 }
 impl Connection {
     pub fn stop(&mut self) -> Result<()> {
-        self._child.stop()
+        let stopped = self._child.stop();
+        if let Some(container) = &mut self.container {
+            container.remove();
+        }
+        stopped
     }
     pub fn open(options: Options<'_>, cancel: &Cancel) -> Result<Self> {
         let mut command = Command::new("claude");
@@ -118,10 +129,8 @@ impl Connection {
             ])
             .env("CLAUDE_CODE_SDK_READS_SESSION_STATE", "1")
             .env("CLAUDE_CODE_FORWARD_SUBAGENT_TEXT", "1")
-            .current_dir(options.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .envs(crate::cloud::logins::agent_env())
+            .current_dir(options.cwd);
         if let Some(mode) = options.permission_mode {
             command.arg("--permission-mode").arg(mode);
         }
@@ -171,6 +180,17 @@ impl Connection {
                 ]);
             }
         }
+        let (mut command, container) = match &options.sandbox {
+            Some(sandbox) => {
+                let (command, container) = sandbox.command(Role::Claude, &command)?;
+                (command, Some(container))
+            }
+            None => (command, None),
+        };
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = ChildGroup::spawn_tree(&mut command)
             .context("Cannot start Claude Code; install and authenticate the claude CLI")?;
         let input = child.child.stdin.take().context("Missing Claude stdin")?;
@@ -221,6 +241,7 @@ impl Connection {
         });
         Ok(Self {
             _child: child,
+            container,
             input,
             output: receiver,
             backlog: VecDeque::new(),

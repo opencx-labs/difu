@@ -1137,6 +1137,7 @@ impl Service {
                         .lock()
                         .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
                     self.store.shells.stop_session(&self.store, &id)?;
+                    super::sandbox::remove_pod(&self.store.storage, &id);
                     let previous = self.store.get(&id)?;
                     super::workspace::discard(&previous, &self.store.home, &Cancel::default())?;
                     let revision = previous.workspace_revision.saturating_add(1);
@@ -1258,6 +1259,7 @@ impl Service {
                         .lock()
                         .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
                     self.store.shells.stop_session(&self.store, &id)?;
+                    super::sandbox::remove_pod(&self.store.storage, &id);
                     self.store.update(&id, |s| {
                         if s.status.active() {
                             s.status = Status::Interrupted;
@@ -1328,6 +1330,7 @@ impl Service {
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
                 self.store.shells.stop_session(&self.store, &id)?;
+                super::sandbox::remove_pod(&self.store.storage, &id);
                 super::workspace::cleanup(&session, &self.store.home, &Cancel::default())?;
                 self.store.update(&id, |s| {
                     s.archived = true;
@@ -1571,6 +1574,8 @@ pub fn run(storage: Storage) -> Result<()> {
         UnixListener::bind(&path).context("Cannot bind the private agent service socket")?;
     fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
+    // Before any session starts: no sandbox container can belong to it yet.
+    super::sandbox::sweep(&storage);
     let mut sessions = BTreeMap::new();
     for entry in fs::read_dir(&home)? {
         let path = entry?.path();
