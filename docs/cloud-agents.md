@@ -66,7 +66,10 @@ Server side (run on the server, usually over SSH):
    (`SSH_ASKPASS_REQUIRE=force`, difu itself acting as the askpass helper with the
    secret in a 0600 temp file). No `sshpass`, no SSH library.
 2. Generate a per-server ed25519 key on the Mac and install it for `root` and a
-   new `difu` user (no password, no sudo).
+   new `difu` user (no password, no sudo). Host keys are pinned in a per-server
+   `known_hosts` under `<config>/servers/<name>/` (`HostKeyAlias`, so the pin
+   survives a move to the Tailscale address), and difu checks that its key works
+   before turning password logins off.
 3. Harden: `PasswordAuthentication no`, `PermitRootLogin prohibit-password`,
    firewall allowing only SSH and difu's port (or only Tailscale with
    `--tailscale`), automatic security updates.
@@ -74,8 +77,9 @@ Server side (run on the server, usually over SSH):
    Claude Code CLIs; build the sandbox image; install and start
    `difu-agent.service` (`difu serve` as `difu`, lingering enabled for rootless
    Podman).
-5. Replace the root password with a random one saved in the Mac's Keychain (for
-   the provider's web console).
+5. Replace the root password (when the root account has one) with a random one
+   saved in the Mac's Keychain as service `app.difu.server.<name>`, account
+   `root`, for the provider's web console.
 6. Guided logins on the server, interactive over `ssh -t`: `gh auth login`,
    `codex login --device-auth`, and a Claude Code token (`claude setup-token`
    pasted into the server's 0600 `server.env`).
@@ -94,6 +98,8 @@ Server side (run on the server, usually over SSH):
   `server.repos.refresh` method. Base clones never auto-prune.
 * Sessions use normal difu worktrees from the base clone, so they start without a
   network clone. Launching on an unlisted `owner/name` adds and clones it first.
+  Sessions start from `origin/main`, as on a Mac; choosing another base branch is
+  not supported yet.
 * Repository rules keep their existing storage (`config.repository_rules`, keyed
   by the repository root). On a server the root is the base clone, so rules are
   effectively keyed by `owner/name`, live on the server, and every connected
@@ -119,17 +125,24 @@ Permission prompts are unchanged.
   agent and its shells share one network namespace (their own ports) while
   staying isolated from other sessions.
 * Each agent process or shell runs as `podman run --rm -i --pod difu-<id>` (shells
-  with a TTY) in the sandbox image, with:
+  with a TTY) in the sandbox image, as container root (rootless Podman maps it to
+  the `difu` user), with:
   * the session worktree and its base repository's `.git` mounted at the same
     absolute paths (worktree metadata keeps working; commits and pushes happen in
     the sandbox);
   * the server's logins mounted (`~/.codex`, `~/.claude`, `~/.claude.json`,
-    `~/.config/gh`) and the host's CLI binaries (`~/.local/bin`, Claude's
-    versions directory) mounted read-only;
-  * per-session CPU and memory limits from `config.server.sandbox`.
+    `~/.config/gh`), and `~/.gitconfig` plus the host's CLI binaries
+    (`~/.local/bin`, Claude's versions directory) mounted read-only;
+  * secrets passed by variable name only, so they never appear in `ps`.
+* CPU and memory limits from `config.server.sandbox` apply to the whole pod, one
+  budget per session.
+* Codex starts with `sandbox_mode="danger-full-access"` inside a sandbox: the
+  container is the sandbox, and Codex's own bubblewrap sandbox cannot work under
+  rootless Podman's AppArmor profile. Approval policy is unchanged.
 * A guard removes the container when difu stops the process (difu kills process
   groups with SIGKILL, which `podman run` cannot forward). Deleting, clearing or
-  cleaning up a session removes its pod.
+  cleaning up a session removes its pod, and leftover containers are swept when
+  the service starts.
 * `difu sandbox build` builds `localhost/difu-sandbox:latest` from a bundled
   Containerfile (Ubuntu LTS with git, gh, build tools, Python, Node, ripgrep).
 * Known v1 limit: sandboxes share the base clone's object store and refs, so a
@@ -203,9 +216,11 @@ nor complete pairing.
    The client must verify `proof` before trusting the server, then pins `F` and
    stores the token. A wrong password gets `denied`.
 
-Rate limits: failed password attempts are limited per client IP and globally;
-while limited, password attempts are denied without checking (token
-authentication is unaffected). The server stores only the verifier
+Rate limits: failed pairing attempts (QR code or password) are limited per client
+address (IPv6 per /64) and wrong passwords globally; while limited, pairing is
+denied without checking. Token authentication is never blocked, and invalid
+tokens do not count, so a forgotten phone retrying its old token cannot lock its
+owner out. The server stores only the verifier
 `{salt, iterations, key}`, never the password. Passwords must be at least 12
 characters.
 
@@ -238,9 +253,12 @@ servers by `server.id`.
 | `server.login.token` | `{"tool":"claude","token"}` | `{}`; stores a `claude setup-token` token for the service. |
 | `server.logout` | `{"tool"}` | `{}` |
 
-`agents.repositories` on a server returns the server repositories (`name` is
-`owner/name`). `agents.new` accepts `repository` as a path or `owner/name` (an
-unlisted name is added and cloned first) and an optional `base` branch.
+`server.repos*` and `server.login*`/`server.logout*` require server mode, so a
+phone paired with a Mac cannot change the Mac's logins; `server.rules.*` work
+everywhere. `agents.repositories` on a server returns the server repositories
+(`name` is `owner/name`). `agents.new` accepts `repository` as a path or
+`owner/name` (an unlisted name is added and cloned first); `base` is reserved and
+currently ignored.
 
 Event to every other connected device after a pairing:
 
@@ -260,9 +278,10 @@ feature without a second API.
 | `rpc.watch` | `{"id","version"?}` | `{"stream": n}`, then events `{"event":"rpc.watch","data":{"stream":n,"reply":Reply}}` until `rpc.unwatch` or `{"event":"rpc.watch.closed","data":{"stream":n,"message":"..."}}` |
 | `rpc.unwatch` | `{"stream"}` | `{}` |
 
-`standard` devices get an error for these. Clients must check that the server's
-`version` equals their own before using `rpc` (`difu server upgrade` fixes a
-mismatch).
+`standard` devices get an error for these. A service error comes back as the
+call's `error`; `Request::Watch` must use `rpc.watch`. Clients must check that the
+server's `version` equals their own before using `rpc` (`difu server upgrade`
+fixes a mismatch).
 
 ## Clients
 
@@ -277,9 +296,11 @@ mismatch).
   with `rpc.watch`.
 * The new-session flow offers a server picker (This Mac + saved servers);
   repositories come from the chosen server.
-* Features that need the session's files on this machine (open in editor, local
-  artifact previews, pasting local file paths) say they are unavailable for
-  server sessions.
+* Features that need the session's files on this machine (attachments, local
+  file paths, HTML artifact previews) say they are unavailable for server
+  sessions.
+* The phone API of a Mac hides relayed server sessions, because phones connect to
+  servers directly.
 
 ### iPhone
 

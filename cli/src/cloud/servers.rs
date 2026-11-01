@@ -308,7 +308,7 @@ pub fn list(storage: &Storage) -> Result<()> {
     ]];
     let mut warnings = Vec::new();
     for (server, check) in servers.iter().zip(checks) {
-        let hosts = format!("{} :{}", server.hosts.join(", "), server.port);
+        let hosts = format!("{} (port {})", server.hosts.join(", "), server.port);
         let (version, status) = match check.recv_timeout(CONNECT_TIMEOUT) {
             Ok(Ok(welcome)) => {
                 if let Some(warning) = version_warning(&server.name, &welcome.version) {

@@ -1,8 +1,8 @@
 import DifuKit
 import SwiftUI
 
-/// Starts a session: server (when several are saved), repository, optional
-/// base branch, model and effort, first message.
+/// Starts a session: server (when several are saved), repository, model and
+/// effort, first message.
 struct NewSessionSheet: View {
     var onCreated: (SessionRef) -> Void
 
@@ -13,7 +13,6 @@ struct NewSessionSheet: View {
     @State private var repositoriesError: String?
     @State private var repository: String?
     @State private var otherRepository = ""
-    @State private var base = ""
     @State private var models: [AgentModel]?
     @State private var modelsError: String?
     @State private var model: String?
@@ -109,10 +108,6 @@ struct NewSessionSheet: View {
                         .font(.monoBody)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                    TextField("Base branch (default branch)", text: $base)
-                        .font(.monoBody)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled()
                 }
             } else if let repositoriesError {
                 Label(repositoriesError, systemImage: "exclamationmark.triangle")
@@ -176,7 +171,7 @@ struct NewSessionSheet: View {
             do {
                 let id = try await server.api.newSession(
                     repository: other.isEmpty || !isServer ? repository : other,
-                    base: isServer ? base : nil, model: model, effort: effort, text: message)
+                    model: model, effort: effort, text: message)
                 Haptics.send()
                 dismiss()
                 onCreated(SessionRef(server: server.id, session: id))

@@ -201,9 +201,11 @@ impl Inner {
         Ok(())
     }
     fn summaries(&self) -> Result<Vec<SessionSummary>> {
-        let Reply::Sessions(list) = self.request(Request::List)? else {
+        let Reply::Sessions(mut list) = self.request(Request::List)? else {
             anyhow::bail!("Unexpected session list reply");
         };
+        // Phones connect to cloud servers directly; relayed copies would repeat them.
+        list.retain(|summary| summary.server.is_none());
         let config = config(&self.storage);
         Ok(view::summaries(
             &list,
