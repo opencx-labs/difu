@@ -3,222 +3,227 @@ import Observation
 import SwiftUI
 import UIKit
 
-/// Root app state: the paired computer, the live connection and its
-/// lifecycle (connect when active, disconnect in the background, reconnect
-/// with backoff), plus the agents and reviews stores.
+/// A session on one of the saved servers.
+struct SessionRef: Hashable {
+    let server: String
+    let session: String
+}
+
+/// A row of the combined agents list.
+struct ServerSession: Identifiable {
+    let server: ServerConnection
+    let summary: SessionSummary
+
+    var id: SessionRef { SessionRef(server: server.id, session: summary.id) }
+}
+
+/// "New device paired" banner contents.
+struct PairedDeviceNotice: Identifiable, Equatable {
+    let id = UUID()
+    let serverID: String
+    let serverName: String
+    let device: PairedDevice
+}
+
+/// Root app state: the saved computers and servers (one connection each, all
+/// connected while the app is active), pairing, the app lock and banners.
 @MainActor
 @Observable
 final class AppModel {
-    enum ConnectionState: Equatable {
-        /// Not trying (unpaired or in the background).
-        case idle
-        /// Trying to connect; `failures` counts consecutive failed attempts.
-        case connecting(failures: Int, lastError: String?)
-        case connected(host: String)
-    }
-
     enum PairingState: Equatable {
         case idle
-        case pairing(computer: String)
+        case pairing(String)
         case failed(String)
     }
 
-    private(set) var credential: Credential?
-    private(set) var connection: ConnectionState = .idle
-    private(set) var server: ServerInfo?
-    /// Increments every time a connection is established, so screens can reload.
-    private(set) var generation = 0
+    private(set) var servers: [ServerConnection] = []
     var pairing: PairingState = .idle
-    /// Shown on the welcome screen, e.g. after the computer revoked this phone.
+    /// Shown on the welcome screen or in an alert, e.g. after a server revoked this phone.
     var notice: String?
     /// A `difu://pair` link opened while already paired, awaiting confirmation.
     var pendingLink: PairingLink?
+    /// `device.paired` events not dismissed yet, oldest first.
+    private(set) var pairedDevices: [PairedDeviceNotice] = []
+    /// The server the Reviews tab uses (nil: the first one).
+    var reviewsServerID: String?
 
-    let sessions = SessionStore()
-    let reviews = ReviewsStore()
+    let lock: AppLock
 
-    @ObservationIgnored private let store: CredentialStore
-    @ObservationIgnored private var socket: RemoteConnection?
-    @ObservationIgnored private var loop: Task<Void, Never>?
-    @ObservationIgnored private var retryRequested = false
+    @ObservationIgnored private let store: ServerStore
+    @ObservationIgnored private var isActive = false
 
-    init(store: CredentialStore = KeychainCredentialStore()) {
+    init(store: ServerStore = SavedServerStore.keychain()) {
         self.store = store
-        credential = try? store.load()
-        sessions.api = api
-        reviews.api = api
+        let saved = (try? store.load()) ?? []
+        lock = AppLock(hasServers: !saved.isEmpty)
+        servers = saved.map(makeConnection)
     }
 
-    var isPaired: Bool { credential != nil }
+    var isPaired: Bool { !servers.isEmpty }
 
-    var isConnected: Bool {
-        if case .connected = connection { return true }
-        return false
+    /// Server badges are only useful with more than one server.
+    var showsServerBadges: Bool { servers.count > 1 }
+
+    var isAnyConnected: Bool { servers.contains(where: \.isConnected) }
+
+    func server(_ id: String?) -> ServerConnection? {
+        guard let id else { return nil }
+        return servers.first { $0.id == id }
     }
 
-    var computerName: String {
-        credential?.computerName ?? server?.name ?? "your computer"
+    /// "Ali's MacBook Pro", or "your servers" when there are several.
+    var serversLabel: String {
+        servers.count == 1 ? servers[0].name : "your servers"
     }
 
-    /// API bound to whichever connection is current; calls made while
-    /// reconnecting wait briefly for the connection.
-    var api: DifuAPI {
-        DifuAPI { [weak self] method, params in
-            guard let self else { throw RemoteError.notConnected }
-            let socket = try await self.connectedSocket()
-            return try await socket.call(method, params)
+    var reviewsServer: ServerConnection? {
+        server(reviewsServerID) ?? servers.first
+    }
+
+    // MARK: Sessions
+
+    /// Every server's sessions in one list. With one server this is the
+    /// server's own order; with several, pinned rows (and orchestrators) come
+    /// first, then the rest by last update.
+    var sessions: [ServerSession] {
+        let rows = servers.flatMap { server in
+            server.sessions.summaries.map { ServerSession(server: server, summary: $0) }
+        }
+        guard servers.count > 1 else { return rows }
+        let top = rows.filter { $0.summary.orchestrator || $0.summary.pinned }
+        let rest = rows.filter { !$0.summary.orchestrator && !$0.summary.pinned }
+            .enumerated()
+            .sorted { a, b in
+                let (left, right) = (a.element.summary.updated ?? 0, b.element.summary.updated ?? 0)
+                return left != right ? left > right : a.offset < b.offset
+            }
+            .map(\.element)
+        return top + rest
+    }
+
+    var sessionsLoaded: Bool { servers.contains { $0.sessions.loaded } }
+
+    var sessionsError: String? {
+        servers.lazy.compactMap(\.sessions.error).first
+    }
+
+    func refreshSessions() async {
+        await withTaskGroup(of: Void.self) { group in
+            for server in servers where server.isConnected {
+                group.addTask { await server.sessions.refresh() }
+            }
         }
     }
 
     // MARK: Lifecycle
 
-    /// Starts connecting (scene became active).
+    /// Connects to every saved server (scene became active).
     func activate() {
-        guard credential != nil, loop == nil else { return }
-        loop = Task { await run(initial: nil) }
+        isActive = true
+        servers.forEach { $0.start() }
     }
 
-    /// Disconnects (scene went to the background).
+    /// Disconnects everything (scene went to the background).
     func deactivate() {
-        loop?.cancel()
-        loop = nil
-        socket?.close()
-        socket = nil
-        if credential != nil { connection = .idle }
+        isActive = false
+        servers.forEach { $0.stop() }
     }
 
-    /// Skips the current backoff delay.
-    func retryNow() {
-        if loop == nil {
-            activate()
-        } else {
-            retryRequested = true
-        }
+    /// Skips every server's backoff delay.
+    func retryAll() {
+        servers.forEach { $0.retryNow() }
     }
 
-    private func run(initial: (RemoteConnection, Credential)?) async {
-        var failures = 0
-        var handoff = initial
-        while !Task.isCancelled, let credential {
-            let opened: (RemoteConnection, Credential)
-            if let ready = handoff {
-                opened = ready
-                handoff = nil
-            } else {
-                connection = .connecting(failures: failures, lastError: lastError)
-                do {
-                    opened = try await RemoteConnector.connect(credential)
-                } catch let error as RemoteError where error.isDenied {
-                    revoked(error.localizedDescription)
-                    return
-                } catch {
-                    if Task.isCancelled { return }
-                    failures += 1
-                    lastError = error.localizedDescription
-                    connection = .connecting(failures: failures, lastError: lastError)
-                    await backoff(failures)
-                    continue
-                }
-            }
-            let (socket, updated) = opened
-            guard !Task.isCancelled else {
-                socket.close()
-                return
-            }
-            failures = 0
-            lastError = nil
-            save(updated)
-            self.socket = socket
-            server = socket.welcome.server
-            connection = .connected(host: socket.host)
-            generation += 1
-            Task { await sessions.connected() }
-
-            for await event in socket.events {
-                handle(event)
-            }
-
-            self.socket = nil
-            if Task.isCancelled { return }
-            lastError = socket.closeReason?.localizedDescription
-            connection = .connecting(failures: 0, lastError: lastError)
-            try? await Task.sleep(for: .milliseconds(400))
-        }
+    private func makeConnection(_ credential: Credential) -> ServerConnection {
+        let server = ServerConnection(credential: credential)
+        server.onCredentialChange = { [weak self] _ in self?.persist() }
+        server.onRevoked = { [weak self] server, message in self?.revoked(server, message: message) }
+        server.onEvent = { [weak self] server, event in self?.handle(event, from: server) }
+        return server
     }
 
-    @ObservationIgnored private var lastError: String?
-
-    private func backoff(_ failures: Int) async {
-        let seconds = min(30, 0.5 * pow(2, Double(min(failures, 6)))) + .random(in: 0...0.5)
-        let deadline = ContinuousClock.now + .seconds(seconds)
-        while ContinuousClock.now < deadline, !retryRequested, !Task.isCancelled {
-            try? await Task.sleep(for: .milliseconds(200))
-        }
-        retryRequested = false
+    private func persist() {
+        try? store.save(servers.map(\.credential))
     }
 
-    private func connectedSocket() async throws -> RemoteConnection {
-        if let socket { return socket }
-        guard credential != nil else { throw RemoteError.notPaired }
-        let deadline = ContinuousClock.now + .seconds(8)
-        while ContinuousClock.now < deadline, loop != nil {
-            try await Task.sleep(for: .milliseconds(150))
-            if let socket { return socket }
-        }
-        throw RemoteError.notConnected
+    private func handle(_ event: RemoteEvent, from server: ServerConnection) {
+        guard case .devicePaired(let device) = event, !device.current else { return }
+        pairedDevices.append(
+            PairedDeviceNotice(serverID: server.id, serverName: server.name, device: device))
     }
 
-    private func handle(_ event: RemoteEvent) {
-        switch event {
-        case .sessions(let list): sessions.receive(list)
-        case .session(let view): sessions.receive(view)
-        case .sessionDelta(let delta): sessions.apply(delta)
-        case .sessionClosed(let id, let message): sessions.closed(id, message: message)
-        case .unknown: break
-        }
+    func dismiss(_ notice: PairedDeviceNotice) {
+        pairedDevices.removeAll { $0.id == notice.id }
     }
 
-    private func save(_ updated: Credential) {
-        guard updated != credential else { return }
-        credential = updated
-        try? store.save(updated)
+    /// The server no longer accepts this phone: forget it and explain why.
+    private func revoked(_ server: ServerConnection, message: String) {
+        guard !server.isForgetting, servers.contains(where: { $0 === server }) else { return }
+        remove(server)
+        notice = servers.isEmpty ? message : "\(server.name): \(message)"
     }
 
-    /// The computer no longer accepts this phone: forget it and explain why.
-    private func revoked(_ message: String) {
-        loop = nil
-        forgetLocally()
-        notice = message
+    private func remove(_ server: ServerConnection) {
+        server.stop()
+        server.sessions.reset()
+        server.reviews.reset()
+        servers.removeAll { $0 === server }
+        pairedDevices.removeAll { $0.serverID == server.id }
+        if reviewsServerID == server.id { reviewsServerID = nil }
+        lock.serversChanged(hasServers: !servers.isEmpty)
+        persist()
     }
 
-    // MARK: Pairing
+    // MARK: Adding servers
 
-    /// Pairs with the computer in `link`, replacing any current pairing.
-    func pair(_ link: PairingLink) async {
-        pairing = .pairing(computer: link.name)
-        let deviceId = credential?.deviceId ?? DeviceIdentity.newId()
+    /// Pairs with the computer or server in `link`. Pairing again with a saved
+    /// server replaces its credential; anything else is added.
+    @discardableResult
+    func pair(_ link: PairingLink) async -> Bool {
+        pairing = .pairing(link.name)
         do {
             let (socket, credential) = try await RemoteConnector.pair(
-                link, deviceId: deviceId, deviceName: UIDevice.current.name)
-            deactivate()
-            sessions.reset()
-            reviews.reset()
-            self.credential = credential
-            try? store.save(credential)
-            notice = nil
-            pairing = .idle
-            loop = Task { await run(initial: (socket, credential)) }
+                link, deviceId: deviceId(reusing: savedServer(for: link)),
+                deviceName: UIDevice.current.name)
+            add(credential, connection: socket)
+            return true
         } catch {
             pairing = .failed(Self.pairingMessage(for: error))
+            return false
         }
     }
 
     /// Parses and pairs with a scanned or pasted link.
-    func pair(text: String) async {
+    @discardableResult
+    func pair(text: String) async -> Bool {
         do {
-            await pair(try PairingLink(text))
+            return await pair(try PairingLink(text))
         } catch {
             pairing = .failed(error.localizedDescription)
+            return false
+        }
+    }
+
+    /// Pairs with a server using its address and server password.
+    @discardableResult
+    func join(address text: String, password: String) async -> Bool {
+        let address: ServerAddress
+        do {
+            address = try ServerAddress(parsing: text)
+        } catch {
+            pairing = .failed(error.localizedDescription)
+            return false
+        }
+        pairing = .pairing(address.display)
+        do {
+            let (socket, credential) = try await RemoteConnector.join(
+                address, password: password, deviceId: deviceId(reusing: nil),
+                deviceName: UIDevice.current.name)
+            add(credential, connection: socket)
+            return true
+        } catch {
+            pairing = .failed(Self.pairingMessage(for: error))
+            return false
         }
     }
 
@@ -233,19 +238,65 @@ final class AppModel {
         }
     }
 
-    func forget() {
-        forgetLocally()
-        notice = nil
+    /// The saved server `link` would pair with again, if any.
+    func savedServer(for link: PairingLink) -> ServerConnection? {
+        servers.first { CertificateFingerprint.matches($0.credential.fingerprint, pinned: link.fingerprint) }
     }
 
-    private func forgetLocally() {
-        deactivate()
-        try? store.delete()
-        credential = nil
-        server = nil
-        connection = .idle
-        sessions.reset()
-        reviews.reset()
+    private func add(_ credential: Credential, connection: RemoteConnection) {
+        notice = nil
+        pairing = .idle
+        if let existing = servers.first(where: { $0.credential.isSameServer(as: credential) }) {
+            existing.replace(credential, connection: connection)
+        } else {
+            let server = makeConnection(credential)
+            servers.append(server)
+            if isActive {
+                server.start(handoff: connection)
+            } else {
+                connection.close()
+            }
+        }
+        lock.serversChanged(hasServers: true)
+        persist()
+    }
+
+    /// One device id per phone, shared by its pairings.
+    private func deviceId(reusing existing: ServerConnection?) -> String {
+        existing?.credential.deviceId ?? servers.first?.credential.deviceId ?? DeviceIdentity.newId()
+    }
+
+    // MARK: Forgetting
+
+    /// Revokes this phone on the server (`device.unpair`), then deletes the
+    /// credential. Returns a warning when the server couldn't be told.
+    func forget(_ server: ServerConnection) async -> String? {
+        server.isForgetting = true
+        var warning: String?
+        do {
+            try await Self.withTimeout(seconds: 10) { try await server.api.unpair() }
+        } catch RemoteError.connectionLost {
+            // The server closes the socket right after revoking.
+        } catch {
+            warning = "Couldn't reach \(server.name) to revoke this phone, so it's still listed there. "
+                + "Remove it on the server with `difu remote forget`, or in /remote-control on a Mac."
+        }
+        remove(server)
+        return warning
+    }
+
+    private static func withTimeout(
+        seconds: Double, _ operation: @escaping @Sendable () async throws -> Void
+    ) async throws {
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            group.addTask { try await operation() }
+            group.addTask {
+                try await Task.sleep(for: .seconds(seconds))
+                throw RemoteError.requestTimedOut(method: "device.unpair")
+            }
+            defer { group.cancelAll() }
+            try await group.next()
+        }
     }
 
     private static func pairingMessage(for error: Error) -> String {
@@ -253,8 +304,9 @@ final class AppModel {
         switch remote {
         case .unreachableComputer(let name, let failures):
             let details = failures.map { "• \($0.error.localizedDescription)" }.joined(separator: "\n")
-            return "Can't reach \(name). Make sure your phone is on the same Wi-Fi and "
-                + "allowed to use the local network.\n\(details)"
+            return "Can't reach \(name). Check that it's online and reachable from this phone; "
+                + "for a computer on your local network, also check the Wi-Fi and the Local "
+                + "Network permission.\n\(details)"
         default:
             return remote.localizedDescription
         }

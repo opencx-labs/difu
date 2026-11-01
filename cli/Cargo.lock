@@ -779,7 +779,7 @@ dependencies = [
 
 [[package]]
 name = "difu"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -804,6 +804,7 @@ dependencies = [
  "ratatui",
  "ratatui-image",
  "rcgen",
+ "ring",
  "rustls",
  "scraper",
  "security-framework",

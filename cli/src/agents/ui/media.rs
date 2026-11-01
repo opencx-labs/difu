@@ -36,6 +36,10 @@ impl Ui {
             return;
         }
         p.media_loaded = true;
+        // Attachment drafts are files on this computer; server sessions have none.
+        if servers::is_server_session(id) {
+            return;
+        }
         match super::super::media::load_draft(&self.storage, id) {
             Ok(attachments) => {
                 for a in &attachments {
@@ -73,6 +77,9 @@ impl Ui {
         let Some(id) = self.selected.clone() else {
             return;
         };
+        if self.unavailable_for_server(&id) {
+            return;
+        }
         self.restore_media(&id);
         let Some(session) = self.sessions.get(&id) else {
             return;
@@ -98,7 +105,10 @@ impl Ui {
         // Keep metadata for undo in memory, but persist/send only tokens still in the draft.
         for (id, position) in &mut self.positions {
             let active = position.active_attachments();
-            if position.media_loaded && active != position.saved_attachments {
+            if position.media_loaded
+                && active != position.saved_attachments
+                && !servers::is_server_session(id)
+            {
                 match save_draft(&self.cache_writer, &self.storage, id, &active) {
                     Ok(()) => position.saved_attachments = active,
                     Err(error) => {

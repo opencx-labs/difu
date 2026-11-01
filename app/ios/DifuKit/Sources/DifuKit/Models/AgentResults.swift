@@ -69,13 +69,25 @@ public struct ServerInfo: Hashable, Sendable, Decodable {
     public var hosts: [String]
     public var port: Int?
     public var fingerprint: String?
+    /// The server id clients key saved servers by (the certificate fingerprint).
+    public var id: String?
+    /// `server` for `difu serve`, `computer` otherwise; nil from older computers.
+    public var mode: ServerMode?
+    /// Whether new clients can pair with the server password.
+    public var passwordPairing: Bool?
 
-    public init(name: String, version: String?, hosts: [String], port: Int?, fingerprint: String?) {
+    public init(
+        name: String, version: String?, hosts: [String], port: Int?, fingerprint: String?,
+        id: String? = nil, mode: ServerMode? = nil, passwordPairing: Bool? = nil
+    ) {
         self.name = name
         self.version = version
         self.hosts = hosts
         self.port = port
         self.fingerprint = fingerprint
+        self.id = id
+        self.mode = mode
+        self.passwordPairing = passwordPairing
     }
 
     public init(from decoder: Decoder) throws {
@@ -85,6 +97,9 @@ public struct ServerInfo: Hashable, Sendable, Decodable {
         hosts = f.strings("hosts")
         port = f.int("port")
         fingerprint = f.string("fingerprint")
+        id = f.string("id").flatMap { $0.isEmpty ? nil : $0 }
+        mode = f.string("mode").map { ServerMode(lenient: $0) }
+        passwordPairing = f.bool("passwordPairing")
     }
 }
 

@@ -63,6 +63,26 @@ it is long-lived until the user forgets the device in `/remote-control` (the
 server then disconnects it and later `auth` attempts are denied). Refresh the
 stored hosts/port from every `welcome`.
 
+## Cloud servers
+
+The same protocol serves difu running on a Linux server (`difu serve`, port
+**3438** by default). Those additions are backwards compatible and specified in
+[cloud-agents.md](cloud-agents.md#wire-protocol-additions):
+
+* `access` (`standard` or `full`) in the `pair` message and in `welcome`;
+  devices paired before it are `standard`.
+* Password pairing (`password` → `challenge` → `proof` → `welcome` with the
+  server's `proof`) for clients that know only the address and server password.
+* `welcome.server` gains `id` (the fingerprint), `mode` (`server` or `computer`)
+  and `passwordPairing`. Hosts set with `difu remote config` come first in the
+  QR code, `welcome` and `server.info`.
+* Methods for every device: `device.unpair`, `server.devices`,
+  `server.devices.forget`, `server.repos*`, `server.rules.*`, `server.login*`,
+  `server.logout`; the `device.paired` event; and `rpc`, `rpc.watch`,
+  `rpc.unwatch` for `full` devices only.
+* Failed pairing attempts are rate-limited per client address, and wrong
+  passwords also globally; token authentication is never limited.
+
 ## Requests, responses, and events
 
 Client → server:

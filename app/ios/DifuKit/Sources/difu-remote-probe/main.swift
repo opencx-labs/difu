@@ -1,6 +1,7 @@
 // difu-remote-probe: exercises the remote-control protocol against a real difu.
 //
 //   difu-remote-probe pair '<difu://pair?...>'
+//   difu-remote-probe join <host[:port]>      (password from DIFU_PROBE_PASSWORD or a prompt)
 //   difu-remote-probe info | sessions | inbox [--refresh]
 //   difu-remote-probe watch <session-id> [seconds]
 //   difu-remote-probe send <session-id> <text...> [--queue]
@@ -200,6 +201,30 @@ func pair(_ text: String) async throws {
     print("  saved to \(storePath)")
 }
 
+func join(_ text: String) async throws {
+    let address = try ServerAddress(parsing: text)
+    let password: String
+    if let value = ProcessInfo.processInfo.environment["DIFU_PROBE_PASSWORD"], !value.isEmpty {
+        password = value
+    } else if let typed = getpass("Server password for \(address.display): ") {
+        password = String(cString: typed)
+    } else {
+        throw ProbeError(description: "No password given.")
+    }
+    log("Joining \(address.display) with the server password…")
+    let deviceId = (try? store.load())?.deviceId ?? DeviceIdentity.newId()
+    let (connection, credential) = try await RemoteConnector.join(
+        address, password: password, deviceId: deviceId, deviceName: deviceName()
+    ) { host in log("  → trying \(host)") }
+    defer { connection.close() }
+    try store.save(credential)
+    print("Paired with \(credential.computerName) via \(connection.host) (server proof verified).")
+    print("  device id: \(credential.deviceId), access \(credential.access?.rawValue ?? "?")")
+    print("  pinned certificate: \(credential.fingerprint)")
+    print("  server: difu \(credential.serverVersion ?? "?"), mode \(credential.mode?.rawValue ?? "?"), hosts \(credential.hosts), port \(credential.port)")
+    print("  saved to \(storePath)")
+}
+
 func info() async throws {
     let connection = try await connect()
     defer { connection.close() }
@@ -332,7 +357,17 @@ func call(_ method: String, _ json: String?) async throws {
     printJSON(try await DifuAPI(connection).raw(method, params))
 }
 
-func forget() throws {
+func forget(revoke: Bool) async throws {
+    if revoke {
+        let connection = try await connect()
+        defer { connection.close() }
+        do {
+            try await DifuAPI(connection).unpair()
+        } catch RemoteError.connectionLost {
+            // The server closes the socket right after revoking.
+        }
+        print("Revoked this device on the server.")
+    }
     try store.delete()
     print("Forgot the paired computer (\(storePath)).")
 }
@@ -344,6 +379,9 @@ func run() async throws {
     case "pair":
         guard !rest.isEmpty else { throw Usage() }
         try await pair(rest.joined(separator: " "))
+    case "join":
+        guard let address = rest.first else { throw Usage() }
+        try await join(address)
     case "info":
         try await info()
     case "sessions":
@@ -366,7 +404,7 @@ func run() async throws {
         guard let method = rest.first else { throw Usage() }
         try await call(method, rest.count > 1 ? rest.dropFirst().joined(separator: " ") : nil)
     case "forget":
-        try forget()
+        try await forget(revoke: rest.contains("--revoke"))
     case "help", "-h", "--help":
         throw Usage()
     default:
@@ -379,6 +417,7 @@ let usage = """
     usage: difu-remote-probe [--store <path>] <command>
 
       pair '<difu://pair?...>'        pair using the /remote-control QR link
+      join <host[:port]>              pair with a server password (DIFU_PROBE_PASSWORD or prompt)
       info                            server.info
       sessions                        sessions.list
       watch <session-id> [seconds]    print session events (default 10 s)
@@ -386,7 +425,7 @@ let usage = """
       inbox [--refresh]               reviews.inbox
       overview <owner/repo> <number>  pr.overview
       call <method> ['<json params>'] any method; prints the raw result
-      forget                          delete the stored credential
+      forget [--revoke]               delete the stored credential (--revoke: device.unpair first)
     """
 
 do {

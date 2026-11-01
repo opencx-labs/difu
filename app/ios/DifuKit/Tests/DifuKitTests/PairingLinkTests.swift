@@ -121,8 +121,10 @@ final class PairingLinkTests: XCTestCase {
     func testHelloFrames() throws {
         let pair = try JSONDecoder().decode(
             JSONValue.self,
-            from: Data(Hello.pair(code: "c", deviceId: "d", deviceName: "Ali's iPhone").json.utf8))
-        XCTAssertEqual(pair, ["type": "pair", "code": "c", "device": ["id": "d", "name": "Ali's iPhone"]])
+            from: Data(Hello.pair(code: "c", deviceId: "d", deviceName: "Ali's iPhone", access: .standard).json.utf8))
+        XCTAssertEqual(
+            pair,
+            ["type": "pair", "code": "c", "device": ["id": "d", "name": "Ali's iPhone"], "access": "standard"])
         let auth = try JSONDecoder().decode(JSONValue.self, from: Data(Hello.auth(token: "t").json.utf8))
         XCTAssertEqual(auth, ["type": "auth", "token": "t"])
     }

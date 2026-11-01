@@ -31,6 +31,7 @@ pub(super) fn models(cancel: &Cancel) -> Result<Vec<ModelInfo>> {
             permission_mode: None,
             allow_bypass: false,
             settings: None,
+            sandbox: None,
         },
         cancel,
     )?;
@@ -82,6 +83,8 @@ pub(super) fn usage(store: &Store, id: &str, session: &Session, cancel: &Cancel)
                 .or(session.permission_state.mode.as_deref()),
             allow_bypass: session.permission_state.bypass_enabled,
             settings: Some(&session.permission_state.claude_settings),
+            // Resuming loads the repository's settings and hooks.
+            sandbox: super::sandbox::Sandbox::for_session(&store.storage, session)?,
         },
         cancel,
     )?;
@@ -822,6 +825,7 @@ fn connect_once(
             allow_bypass: session.permission_state.bypass_enabled
                 || session.permission_state.pending_mode.as_deref() == Some("bypassPermissions"),
             settings: Some(&session.permission_state.claude_settings),
+            sandbox: super::sandbox::Sandbox::for_session(&store.storage, session)?,
         },
         cancel,
     )?;
@@ -1070,6 +1074,7 @@ pub(super) fn skills(cwd: &std::path::Path) -> Result<Reply> {
             permission_mode: None,
             allow_bypass: false,
             settings: None,
+            sandbox: None,
         },
         &cancel,
     )?;

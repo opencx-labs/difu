@@ -4,6 +4,16 @@ use std::path::PathBuf;
 
 type Loaded = std::result::Result<(PathBuf, String), String>;
 
+/// Reads or replaces rules with `Request::RepositoryRules`; the agent service
+/// answers for this computer and forwards a saved server's to that server.
+fn request(storage: &Storage, request: Request) -> Loaded {
+    match client::request(storage, request) {
+        Ok(Reply::RepositoryRules { root, rules }) => Ok((root, rules)),
+        Ok(_) => Err("Unexpected repository rules reply".into()),
+        Err(error) => Err(format!("{error:#}")),
+    }
+}
+
 pub struct Settings {
     pub repository: Editor,
     pub text: Editor,
@@ -15,6 +25,9 @@ pub struct Settings {
     loading: Option<mpsc::Receiver<Loaded>>,
     error: Option<String>,
     return_to: Option<Box<defaults::Settings>>,
+    /// The saved cloud server whose rules these are; `None` is this computer.
+    server: Option<String>,
+    saving: Option<mpsc::Receiver<Loaded>>,
 }
 
 impl Settings {
@@ -39,10 +52,21 @@ impl Settings {
         self.loading = Some(rx);
         self.error = None;
         self.root = None;
+        let server = self.server.clone();
         std::thread::spawn(move || {
-            let result = super::super::rules::load(&storage, &path).map_err(|e| format!("{e:#}"));
+            let result = request(
+                &storage,
+                Request::RepositoryRules {
+                    server,
+                    repository: path,
+                    rules: None,
+                },
+            );
             let _ = tx.send(result);
         });
+    }
+    fn busy(&self) -> bool {
+        self.loading.is_some() || self.saving.is_some()
     }
 }
 
@@ -55,6 +79,12 @@ impl Ui {
                 return;
             }
         };
+        // Without a path, a server session's rules are its server's.
+        let server = path
+            .is_none()
+            .then(|| self.selected.as_deref().and_then(servers::server_name))
+            .flatten()
+            .map(str::to_owned);
         let path = path
             .or_else(|| {
                 self.selected
@@ -62,16 +92,35 @@ impl Ui {
                     .and_then(|id| self.sessions.get(id))
                     .map(|s| s.job.root().clone())
             })
-            .or_else(|| config.agent_defaults.repository.clone())
-            .or_else(|| std::env::current_dir().ok());
-        let mut candidates: Vec<_> = config
-            .repository_rules
-            .keys()
-            .cloned()
-            .chain(config.repositories.values().cloned())
-            .chain(config.agent_defaults.repository)
-            .chain(self.summaries.iter().filter_map(|s| s.repository.clone()))
-            .collect();
+            .or_else(|| {
+                server
+                    .is_none()
+                    .then(|| config.agent_defaults.repository.clone())
+                    .flatten()
+            })
+            .or_else(|| {
+                server
+                    .is_none()
+                    .then(|| std::env::current_dir().ok())
+                    .flatten()
+            });
+        let sessions = self
+            .summaries
+            .iter()
+            .filter(|s| s.server == server)
+            .filter_map(|s| s.repository.clone());
+        let mut candidates: Vec<_> = if server.is_some() {
+            sessions.collect()
+        } else {
+            config
+                .repository_rules
+                .keys()
+                .cloned()
+                .chain(config.repositories.values().cloned())
+                .chain(config.agent_defaults.repository)
+                .chain(sessions)
+                .collect()
+        };
         candidates.sort();
         candidates.dedup();
         let return_to = match self.modal.take() {
@@ -94,6 +143,8 @@ impl Ui {
             loading: None,
             error: None,
             return_to,
+            server,
+            saving: None,
         };
         if let Some(path) = path {
             form.load(self.storage.clone(), path);
@@ -104,6 +155,12 @@ impl Ui {
         let Some(Modal::RepositoryRules(form)) = &mut self.modal else {
             return;
         };
+        if let Some(result) = form.saving.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            crate::repaint::request();
+            form.saving = None;
+            self.rules_saved(result);
+            return;
+        }
         let Some(result) = form.loading.as_ref().and_then(|rx| rx.try_recv().ok()) else {
             return;
         };
@@ -138,20 +195,36 @@ impl Ui {
             ));
             return;
         }
-        let text = form.text.text();
-        let result = self.storage.update_config(|config| {
-            if text.trim().is_empty() {
-                config.repository_rules.remove(root);
-            } else {
-                config.repository_rules.insert(root.clone(), text);
-            }
+        if form.busy() {
+            return;
+        }
+        let change = Request::RepositoryRules {
+            server: form.server.clone(),
+            repository: root.clone(),
+            rules: Some(form.text.text()),
+        };
+        let (tx, rx) = mpsc::channel();
+        form.saving = Some(rx);
+        form.error = None;
+        let storage = self.storage.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(request(&storage, change));
         });
+    }
+    fn rules_saved(&mut self, result: Loaded) {
+        let Some(Modal::RepositoryRules(form)) = &mut self.modal else {
+            return;
+        };
         match result {
             Ok(_) => {
+                let notice = match &form.server {
+                    Some(server) => format!("Repository rules saved on {server} for new sessions"),
+                    None => "Repository rules saved for new sessions".into(),
+                };
                 self.close_rules();
-                self.notice = Some(("Repository rules saved for new sessions".into(), false));
+                self.notice = Some((notice, false));
             }
-            Err(error) => form.error = Some(format!("Cannot save rules: {error:#}")),
+            Err(error) => form.error = Some(format!("Cannot save rules: {error}")),
         }
     }
     pub(super) fn rules_option(&mut self, index: usize) {
@@ -163,7 +236,7 @@ impl Ui {
     }
     pub(super) fn rules_paste(&mut self, text: &str) {
         if let Some(Modal::RepositoryRules(form)) = &mut self.modal
-            && form.loading.is_none()
+            && !form.busy()
         {
             if form.field == 0 {
                 form.repository.insert(text);
@@ -186,7 +259,7 @@ impl Ui {
         let Some(Modal::RepositoryRules(form)) = &mut self.modal else {
             return;
         };
-        if form.loading.is_some() {
+        if form.busy() {
             return;
         }
         match action {
@@ -233,7 +306,11 @@ impl Ui {
         };
         let bindings = Bindings::new(&self.shortcut_config);
         let repository_label = format!(
-            "Repository · {}/{} select · {} opens",
+            "{} · {}/{} select · {} opens",
+            form.server
+                .as_ref()
+                .map(|server| format!("Repository on {server}"))
+                .unwrap_or_else(|| "Repository".into()),
             bindings.primary_hint_in(RULES_REPOSITORY_PREVIOUS, AGENT_RULES_REPOSITORY),
             bindings.primary_hint_in(RULES_REPOSITORY_NEXT, AGENT_RULES_REPOSITORY),
             bindings.primary_hint_in(NAVIGATION_ACTIVATE, AGENT_RULES_REPOSITORY)
@@ -286,9 +363,15 @@ impl Ui {
         self.hits.push((text, Action::RulesField(1)));
         let footer = area.bottom().saturating_sub(3);
         frame.render_widget(
-            Paragraph::new(
-                "Included in the initial instructions for new sessions in this repository.",
-            )
+            Paragraph::new(match &form.server {
+                Some(server) => format!(
+                    "Included in the initial instructions for new sessions in this repository on {server}."
+                ),
+                None => {
+                    "Included in the initial instructions for new sessions in this repository."
+                        .into()
+                }
+            })
             .style(Style::default().fg(DIM)),
             Rect::new(area.x, footer, area.width, 1),
         );
@@ -317,31 +400,161 @@ impl Ui {
                 Paragraph::new(error.as_str()).style(Style::default().fg(RED)),
                 Rect::new(area.x, footer + 2, area.width, 1),
             );
-        } else if form.loading.is_some() {
+        } else if form.busy() {
             frame.render_widget(
-                Paragraph::new("Loading repository rules…").style(Style::default().fg(DIM)),
+                Paragraph::new(if form.saving.is_some() {
+                    "Saving repository rules…"
+                } else {
+                    "Loading repository rules…"
+                })
+                .style(Style::default().fg(DIM)),
                 Rect::new(area.x, footer + 2, area.width, 1),
             );
         }
     }
 }
 
+/// A Git repository to keep rules for: saving resolves the repository root
+/// exactly like the service does.
+/// A stand-in agent service for the rules modal's requests.
+#[cfg(test)]
+pub(super) mod service {
+    use super::*;
+    use anyhow::Result;
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::{UnixListener, UnixStream},
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
+
+    /// A Git repository whose rules the real handler can resolve.
+    pub(in super::super) fn repository() -> Result<(tempfile::TempDir, PathBuf)> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("repository");
+        std::fs::create_dir(&root)?;
+        crate::process::checked(
+            crate::repo::git(&root).args(["init", "-q", "-b", "main"]),
+            &crate::process::Cancel::default(),
+        )?;
+        let root = root.canonicalize()?;
+        Ok((dir, root))
+    }
+
+    pub(in super::super) struct Service {
+        stop: Arc<AtomicBool>,
+        handle: Option<thread::JoinHandle<Vec<Request>>>,
+    }
+
+    impl Service {
+        /// Answers `Request::RepositoryRules` on the UI's socket: `real` uses
+        /// the agent service's handler, otherwise the rules are echoed back.
+        pub(in super::super) fn start(storage: &Storage, real: bool) -> Result<Self> {
+            let listener = UnixListener::bind(super::super::super::server::socket(storage)?)?;
+            listener.set_nonblocking(true)?;
+            let storage = storage.clone();
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopping = stop.clone();
+            let handle = thread::spawn(move || {
+                let mut requests = Vec::new();
+                while !stopping.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((stream, _)) => {
+                            if let Ok(request) = answer(&storage, real, stream) {
+                                requests.push(request);
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(1))
+                        }
+                        Err(_) => break,
+                    }
+                }
+                requests
+            });
+            Ok(Self {
+                stop,
+                handle: Some(handle),
+            })
+        }
+        pub(in super::super) fn requests(mut self) -> Result<Vec<Request>> {
+            self.stop.store(true, Ordering::Relaxed);
+            self.handle
+                .take()
+                .map(|handle| handle.join())
+                .transpose()
+                .map_err(|_| anyhow::anyhow!("rules service panicked"))
+                .map(Option::unwrap_or_default)
+        }
+    }
+
+    impl Drop for Service {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    fn answer(storage: &Storage, real: bool, mut stream: UnixStream) -> Result<Request> {
+        stream.set_nonblocking(false)?;
+        stream.set_read_timeout(Some(Duration::from_secs(3)))?;
+        let mut line = String::new();
+        BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+        let request: Request = serde_json::from_str(&line)?;
+        let reply = match &request {
+            Request::RepositoryRules {
+                repository, rules, ..
+            } if real => super::super::super::rules::request(storage, repository, rules.clone())
+                .unwrap_or_else(|error| Reply::Error(format!("{error:#}"))),
+            Request::RepositoryRules {
+                repository, rules, ..
+            } => Reply::RepositoryRules {
+                root: repository.clone(),
+                rules: rules.clone().unwrap_or_else(|| "server rule".into()),
+            },
+            _ => Reply::Error("Unexpected request".into()),
+        };
+        serde_json::to_writer(&mut stream, &reply)?;
+        stream.write_all(b"\n")?;
+        Ok(request)
+    }
+
+    /// Waits for the modal's pending load or save.
+    pub(in super::super) fn settle(ui: &mut Ui) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while let Some(Modal::RepositoryRules(form)) = &ui.modal
+            && form.busy()
+        {
+            ui.tick_rules();
+            anyhow::ensure!(Instant::now() < deadline, "rules request timed out");
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::service::{Service, repository, settle};
     use super::*;
     use anyhow::Result;
 
     #[test]
     fn multiline_rules_save_cancel_and_clear_without_changing_other_settings() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let root = dir.path().to_owned();
+        let (_repository, root) = repository()?;
         let storage = Storage {
-            config: root.join("config.json"),
-            cache: root.join("cache"),
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
         };
         let mut config = Config::default();
         config.pinned_sessions.insert("pinned".into());
         storage.save_config(&config)?;
+        let _service = Service::start(&storage, true)?;
         let mut ui = Ui::new(storage.clone(), &config);
         let form = |text: &str| {
             Modal::RepositoryRules(Box::new(Settings {
@@ -355,6 +568,8 @@ mod tests {
                 loading: None,
                 error: None,
                 return_to: None,
+                server: None,
+                saving: None,
             }))
         };
         ui.modal = Some(form(""));
@@ -362,6 +577,7 @@ mod tests {
         ui.rules_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         ui.rules_paste("Second rule");
         ui.rules_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SUPER));
+        settle(&mut ui)?;
         assert!(ui.modal.is_none());
         let config = storage.load_config()?;
         assert_eq!(
@@ -378,15 +594,130 @@ mod tests {
         );
         ui.modal = Some(form(""));
         ui.rules_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        settle(&mut ui)?;
         assert!(storage.load_config()?.repository_rules.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn a_server_sessions_rules_are_read_and_saved_on_its_server() -> Result<()> {
+        let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
+        let session = crate::cloud::federation::tests::session("hetzner:1");
+        let mut summary = session.summary();
+        summary.server = Some("hetzner".into());
+        ui.summaries.push(summary);
+        ui.sessions.insert(session.id.clone(), session);
+        ui.selected = Some("hetzner:1".into());
+        let service = Service::start(&ui.storage, false)?;
+        ui.open_rules(None);
+        settle(&mut ui)?;
+        let Some(Modal::RepositoryRules(form)) = &mut ui.modal else {
+            anyhow::bail!("rules");
+        };
+        assert_eq!(form.server.as_deref(), Some("hetzner"));
+        assert_eq!(form.text.text(), "server rule");
+        assert_eq!(
+            form.candidates,
+            vec![PathBuf::from("/srv/difu/repos/acme/api")],
+            "only that server's repositories"
+        );
+        form.text = Editor::from("Run only the affected tests");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 44))?;
+        terminal.draw(|frame| ui.draw(frame))?;
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Repository on hetzner"), "{text}");
+        ui.save_rules();
+        settle(&mut ui)?;
+        assert!(ui.modal.is_none());
+        assert_eq!(
+            ui.notice.as_ref().map(|(n, _)| n.as_str()),
+            Some("Repository rules saved on hetzner for new sessions")
+        );
+        let requests = service.requests()?;
+        let [load, save] = requests.as_slice() else {
+            anyhow::bail!("two requests: {requests:?}");
+        };
+        assert!(matches!(
+            load,
+            Request::RepositoryRules { server: Some(s), rules: None, repository }
+                if s == "hetzner" && repository == std::path::Path::new("/srv/difu/repos/acme/api")
+        ));
+        assert!(matches!(
+            save,
+            Request::RepositoryRules { server: Some(s), rules: Some(r), .. }
+                if s == "hetzner" && r == "Run only the affected tests"
+        ));
+        assert!(ui.storage.load_config()?.repository_rules.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn local_rules_are_read_and_saved_with_the_service_request() -> Result<()> {
+        let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
+        let (_repository, root) = repository()?;
+        ui.storage.update_config(|config| {
+            config
+                .repository_rules
+                .insert(root.clone(), "local rule".into());
+        })?;
+        let service = Service::start(&ui.storage, true)?;
+        ui.open_rules(Some(root.clone()));
+        settle(&mut ui)?;
+        let Some(Modal::RepositoryRules(form)) = &mut ui.modal else {
+            anyhow::bail!("rules");
+        };
+        assert_eq!(form.server, None);
+        assert_eq!(form.text.text(), "local rule");
+        form.text = Editor::default();
+        ui.save_rules();
+        settle(&mut ui)?;
+        assert!(ui.modal.is_none());
+        assert!(
+            !ui.storage
+                .load_config()?
+                .repository_rules
+                .contains_key(&root),
+            "empty rules remove the entry"
+        );
+        let requests = service.requests()?;
+        assert!(
+            requests
+                .iter()
+                .all(|r| matches!(r, Request::RepositoryRules { server: None, .. })),
+            "{requests:?}"
+        );
+        assert_eq!(requests.len(), 2);
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod shortcut_regressions {
+    use super::service::{Service, repository, settle};
     use super::*;
     use anyhow::{Context, Result};
+    /// The one save request a key press sent.
+    fn saved(service: Service, root: &std::path::Path) -> Result<()> {
+        let requests = service.requests()?;
+        let [
+            Request::RepositoryRules {
+                server: None,
+                repository,
+                rules: Some(rules),
+            },
+        ] = requests.as_slice()
+        else {
+            anyhow::bail!("expected one save: {requests:?}");
+        };
+        anyhow::ensure!(repository == root && rules == "saved rule", "{requests:?}");
+        Ok(())
+    }
     fn setup(ui: &mut Ui, root: &std::path::Path, field: usize) {
         ui.modal = Some(Modal::RepositoryRules(Box::new(Settings {
             repository: Editor::from(root.to_string_lossy().as_ref()),
@@ -399,6 +730,8 @@ mod shortcut_regressions {
             loading: None,
             error: None,
             return_to: None,
+            server: None,
+            saving: None,
         })));
     }
     fn form(ui: &Ui) -> Result<&Settings> {
@@ -491,7 +824,9 @@ mod shortcut_regressions {
                         continue;
                     }
                     let (mut ui, dir, _) = shortcut_tests::binding_fixture(RULES_SAVE, phase)?;
-                    setup(&mut ui, dir.path(), field);
+                    let root = dir.path();
+                    let service = Service::start(&ui.storage, false)?;
+                    setup(&mut ui, root, field);
                     let mut mods = KeyModifiers::NONE;
                     for (bit, modifier) in [
                         (1, KeyModifiers::CONTROL),
@@ -508,8 +843,8 @@ mod shortcut_regressions {
                     if custom {
                         ui.key(KeyEvent::new(KeyCode::Enter, mods));
                         assert!(ui.modal.is_some());
-                        assert!(ui.storage.load_config()?.repository_rules.is_empty());
-                        setup(&mut ui, dir.path(), field);
+                        assert!(form(&ui)?.saving.is_none(), "old binding saved");
+                        setup(&mut ui, root, field);
                     }
                     ui.key(KeyEvent::new(
                         if custom {
@@ -519,15 +854,9 @@ mod shortcut_regressions {
                         },
                         if custom { KeyModifiers::NONE } else { mods },
                     ));
+                    settle(&mut ui)?;
                     assert!(ui.modal.is_none(), "{field} {phase} {mods:?}");
-                    assert_eq!(
-                        ui.storage
-                            .load_config()?
-                            .repository_rules
-                            .get(dir.path())
-                            .map(String::as_str),
-                        Some("saved rule")
-                    );
+                    saved(service, root)?;
                 }
             }
         }
@@ -538,6 +867,7 @@ mod shortcut_regressions {
         for field in [0, 1, 2, 3] {
             for (phase, custom) in shortcut_tests::BINDING_PHASES {
                 let (mut ui, dir, _) = shortcut_tests::binding_fixture(NAVIGATION_ACTIVATE, phase)?;
+                let service = Service::start(&ui.storage, false)?;
                 setup(&mut ui, dir.path(), field);
                 if custom {
                     ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -562,7 +892,11 @@ mod shortcut_regressions {
                         );
                         assert!(ui.storage.load_config()?.repository_rules.is_empty());
                     }
-                    2 => assert!(ui.modal.is_none()),
+                    2 => {
+                        settle(&mut ui)?;
+                        assert!(ui.modal.is_none());
+                        saved(service, dir.path())?;
+                    }
                     3 => {
                         assert!(ui.modal.is_none());
                         assert!(ui.storage.load_config()?.repository_rules.is_empty());
@@ -609,9 +943,12 @@ mod shortcut_regressions {
     #[test]
     fn rules_save_failure_loading_and_escape_keep_native_safety() -> Result<()> {
         let (mut ui, dir, _) = shortcut_tests::fixture(Some(RULES_SAVE))?;
-        setup(&mut ui, dir.path(), 1);
+        let (_repository, root) = repository()?;
+        let _service = Service::start(&ui.storage, true)?;
+        setup(&mut ui, &root, 1);
         std::fs::write(&ui.storage.config, "{malformed")?;
         ui.key(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        settle(&mut ui)?;
         assert_eq!(form(&ui)?.text.text(), "saved rule");
         assert!(form(&ui)?.error.is_some());
         assert_eq!(std::fs::read_to_string(&ui.storage.config)?, "{malformed");
@@ -691,16 +1028,19 @@ mod shortcut_regressions {
     #[test]
     fn rules_visible_save_cancel_and_blank_targets_survive_activation_remap() -> Result<()> {
         for width in [40, 80, 160] {
-            let (mut ui, dir, _) = shortcut_tests::fixture(Some(RULES_SAVE))?;
-            setup(&mut ui, dir.path(), 1);
+            let (_repository, root) = repository()?;
+            let (mut ui, _dir, _) = shortcut_tests::fixture(Some(RULES_SAVE))?;
+            let _service = Service::start(&ui.storage, true)?;
+            setup(&mut ui, &root, 1);
             let click = shortcut_tests::native_target(&mut ui, width, "Save · F12")?;
             ui.mouse(click);
+            settle(&mut ui)?;
             assert!(ui.modal.is_none());
             assert_eq!(
                 ui.storage
                     .load_config()?
                     .repository_rules
-                    .get(dir.path())
+                    .get(&root)
                     .map(String::as_str),
                 Some("saved rule")
             );
@@ -735,6 +1075,7 @@ mod shortcut_regressions {
                     .repository_rules
                     .insert(root.clone(), "selected repository rules".into());
             })?;
+            let _service = Service::start(&ui.storage, true)?;
             setup(&mut ui, &root, 0);
             let Some(Modal::RepositoryRules(f)) = &mut ui.modal else {
                 anyhow::bail!("rules")

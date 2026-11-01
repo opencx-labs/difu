@@ -78,7 +78,7 @@ fn fresh_context(
         .workspace
         .as_deref()
         .context("Missing plan workspace")?;
-    let mut replacement = Connection::open(cwd, cancel)?;
+    let mut replacement = Connection::open_in(cwd, rpc.sandbox.clone(), cancel)?;
     replacement.initialize(cancel)?;
     replacement.inherited = rpc.inherited.clone();
     let mut tools = super::super::orchestrator::tools(&session);

@@ -37,6 +37,10 @@ struct PrScreen: View {
                 .toolbar {
                     ToolbarItem(placement: .primaryAction) { PrActionsMenu(model: model) }
                 }
+            } else if app.server(route.server) == nil {
+                ContentUnavailableView(
+                    "Server removed", systemImage: "server.rack",
+                    description: Text("This pull request's server is no longer saved on this phone."))
             } else {
                 ProgressView()
             }
@@ -44,7 +48,9 @@ struct PrScreen: View {
         .navigationTitle("\(route.repo.split(separator: "/").last.map(String.init) ?? route.repo) #\(route.number)")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
-            if model == nil { model = PrModel(repo: route.repo, number: route.number, api: app.api) }
+            if model == nil, let server = app.server(route.server) {
+                model = PrModel(repo: route.repo, number: route.number, api: server.api)
+            }
         }
     }
 }

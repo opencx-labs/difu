@@ -411,8 +411,10 @@ mod tests {
                 paired: 0,
                 seen: None,
                 connected: true,
+                access: Default::default(),
             }],
             error: None,
+            ..Default::default()
         });
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))?;
         terminal.draw(|frame| ui.draw_modal(frame))?;
@@ -451,6 +453,7 @@ mod shortcut_effect_tests {
                     paired: 0,
                     seen: None,
                     connected: false,
+                    access: Default::default(),
                 },
                 crate::agents::remote::DeviceStatus {
                     id: "second".into(),
@@ -458,6 +461,7 @@ mod shortcut_effect_tests {
                     paired: 0,
                     seen: None,
                     connected: false,
+                    access: Default::default(),
                 },
             ],
             ..Default::default()

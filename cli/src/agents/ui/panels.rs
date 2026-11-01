@@ -334,7 +334,11 @@ impl Ui {
         }
     }
     pub(super) fn select_resource(&mut self, artifacts: bool, index: usize) {
-        let id = self.selected.as_deref().unwrap_or_default();
+        let id = self.selected.clone().unwrap_or_default();
+        if artifacts && self.unavailable_for_server(&id) {
+            return;
+        }
+        let id = id.as_str();
         if artifacts {
             let Some(session) = self.sessions.get(id) else {
                 return;

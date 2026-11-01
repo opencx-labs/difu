@@ -152,9 +152,10 @@ pub(super) fn transition(
         rpc,
         store,
         id,
-        &Prompt::from(
+        &Prompt::from(super::super::validation(
+            &session,
             "The isolated editing worktree is ready and is now your working directory. Continue the user's task from the existing conversation. Re-read relevant files here before editing: the original checkout may contain unrelated local changes that were not copied. Do not edit the original repository. Do not run local validation suites; rely on PR CI. Do not repeat completed actions or publish unless the user requested it.",
-        ),
+        )),
         false,
         cancel,
         TurnKind::Internal,

@@ -145,6 +145,9 @@ pub struct Config {
     /// Colour theme id; None is the Default theme.
     #[serde(default)]
     pub theme: Option<String>,
+    /// Cloud server settings; only used where `difu serve` runs.
+    #[serde(default)]
+    pub server: crate::cloud::ServerSettings,
 }
 fn enabled() -> bool {
     true
@@ -174,6 +177,7 @@ impl Default for Config {
             voice_enabled: false,
             tweaks: Tweaks::default(),
             theme: None,
+            server: crate::cloud::ServerSettings::default(),
         }
     }
 }

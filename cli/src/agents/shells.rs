@@ -109,6 +109,9 @@ struct Terminal {
     pending_input: VecDeque<u8>,
     humans: BTreeMap<String, (u64, Option<Instant>)>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
+    /// Declared after `child`: removes the sandbox container `podman run`
+    /// leaves behind when the shell is killed.
+    container: Option<super::sandbox::Container>,
     parser: vt100::Parser,
     exit_code: Option<u32>,
     reader_done: bool,
@@ -276,6 +279,9 @@ impl Terminal {
                 Err(error) => return Err(error.into()),
             }
             self.exit_code = Some(self.child.wait()?.exit_code());
+            if let Some(container) = &mut self.container {
+                container.remove();
+            }
             self.finished_at = Some(chrono::Utc::now().timestamp_millis());
             self.revision += 1;
             descendants?;
@@ -424,6 +430,7 @@ impl Manager {
             .clone()
             .context("The session workspace is not ready")?;
         ensure!(cwd.is_dir(), "The session workspace no longer exists");
+        let sandbox = super::sandbox::Sandbox::for_session(&store.storage, session)?;
         let id = format!(
             "difu-shell-{}-{}",
             chrono::Utc::now().timestamp_millis(),
@@ -462,6 +469,13 @@ impl Manager {
             };
             process.cwd(&cwd);
             process.env("TERM", "xterm-256color");
+            let (process, container) = match &sandbox {
+                Some(sandbox) => {
+                    let (process, container) = sandbox.pty(&process)?;
+                    (process, Some(container))
+                }
+                None => (process, None),
+            };
             // The master stays owned while this non-owning descriptor is duplicated.
             struct Descriptor(std::os::fd::RawFd);
             impl filedescriptor::AsRawFileDescriptor for Descriptor {
@@ -489,6 +503,7 @@ impl Manager {
                 pending_input: VecDeque::new(),
                 humans: BTreeMap::new(),
                 child,
+                container,
                 parser: vt100::Parser::new(
                     dimension(dimensions.rows),
                     dimension(dimensions.cols),
@@ -555,6 +570,10 @@ impl Manager {
                 && let Some(status) = terminal.child.try_wait()?
             {
                 terminal.exit_code = Some(status.exit_code());
+                // Spare the service loop a Podman call when this terminal drops.
+                if let Some(container) = &mut terminal.container {
+                    container.exited();
+                }
                 terminal.finished_at = Some(chrono::Utc::now().timestamp_millis());
                 terminal.revision += 1;
             }

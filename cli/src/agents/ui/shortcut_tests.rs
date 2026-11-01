@@ -1499,7 +1499,7 @@ fn repository_dialog_activation_replaces_enter_and_sends_exact_existing_requests
                 );
             } else {
                 anyhow::ensure!(
-                    matches!(request,Request::NewAgent{defaults,cwd,remember_repository:true}if defaults.repository==Some(std::path::PathBuf::from("/temporary/repository"))&&cwd==std::env::current_dir()?),
+                    matches!(request,Request::NewAgent{defaults,cwd,remember_repository:true,server:None}if defaults.repository==Some(std::path::PathBuf::from("/temporary/repository"))&&cwd==std::env::current_dir()?),
                     "repository launch payload"
                 );
             }

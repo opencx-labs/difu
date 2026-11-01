@@ -7,7 +7,10 @@ use super::{
     Control, Entry, Job, Pending, Prompt, Reply, Session, Skill, Status,
     server::{Command as AgentCommand, Store},
 };
-use crate::process::{Cancel, ChildGroup};
+use crate::{
+    agents::sandbox::{Container, Role, Sandbox},
+    process::{Cancel, ChildGroup},
+};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
@@ -21,6 +24,10 @@ use std::{
 
 struct Connection {
     _child: ChildGroup,
+    /// Declared after `_child`, so the container is removed after the process.
+    _container: Option<Container>,
+    /// Replacement connections run in the same sandbox.
+    sandbox: Option<Sandbox>,
     input: ChildStdin,
     output: mpsc::Receiver<Result<Value, String>>,
     next: u64,
@@ -53,11 +60,21 @@ impl RpcError {
     }
 }
 impl Connection {
+    /// Catalog and history reads, which start no thread and run no tools.
     fn open(cwd: &Path, cancel: &Cancel) -> Result<Self> {
+        Self::open_in(cwd, None, cancel)
+    }
+    fn open_in(cwd: &Path, sandbox: Option<Sandbox>, cancel: &Cancel) -> Result<Self> {
+        let command = app_server(cwd, sandbox.is_some());
+        let (mut command, container) = match &sandbox {
+            Some(sandbox) => {
+                let (command, container) = sandbox.command(Role::Codex, &command)?;
+                (command, Some(container))
+            }
+            None => (command, None),
+        };
         let mut child = ChildGroup::spawn_tree(
-            Command::new("codex")
-                .arg("app-server")
-                .current_dir(cwd)
+            command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null()),
@@ -80,6 +97,8 @@ impl Connection {
         });
         Ok(Self {
             _child: child,
+            _container: container,
+            sandbox,
             input,
             output: receiver,
             next: 1,
@@ -137,6 +156,32 @@ impl Connection {
         self.call("initialize", json!({"clientInfo":{"name":"difu","title":"difu","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}), cancel, |_| Ok(()))?;
         self.write(json!({"method":"initialized","params":{}}))
     }
+}
+
+/// `codex app-server` in `cwd`, for both difu's own runs and sandboxed ones.
+///
+/// In a difu sandbox the container is the sandbox, so Codex starts with
+/// `sandbox_mode = "danger-full-access"`. Codex enforces its read-only and
+/// workspace-write modes on Linux with bubblewrap, which needs to create user
+/// namespaces and mount filesystems; a rootless Podman container normally
+/// denies the mounts (the container AppArmor profile, Ubuntu's restriction of
+/// unprivileged user namespaces), so every sandboxed command would fail or ask
+/// to run unsandboxed. Legacy Landlock is no alternative: current Codex
+/// rejects it for filesystem-restricted policies. Only the default changes:
+/// approvals still follow the server's Codex config, and a preset chosen in
+/// difu is still sent per thread; a restricted one then relies on bubblewrap
+/// working inside the container (the sandbox image ships it). Unsandboxed
+/// runs are unchanged.
+fn app_server(cwd: &Path, sandboxed: bool) -> Command {
+    let mut command = Command::new("codex");
+    command
+        .arg("app-server")
+        .current_dir(cwd)
+        .envs(crate::cloud::logins::agent_env());
+    if sandboxed {
+        command.args(["-c", "sandbox_mode=\"danger-full-access\""]);
+    }
+    command
 }
 
 pub(super) fn read_subagent(store: &Store, id: &str, agent: &str, cancel: &Cancel) -> Result<()> {
@@ -1666,7 +1711,11 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
         .workspace
         .as_deref()
         .context("Missing session workspace")?;
-    let mut rpc = Connection::open(cwd, cancel)?;
+    let mut rpc = Connection::open_in(
+        cwd,
+        super::sandbox::Sandbox::for_session(&store.storage, &session)?,
+        cancel,
+    )?;
     rpc.initialize(cancel)?;
     let effective = rpc.call(
         "config/read",
@@ -2222,6 +2271,20 @@ fn validate_response(pending: &Pending, response: &Value) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn only_sandboxed_codex_defaults_to_full_access_inside_its_container() {
+        let args = |sandboxed| {
+            app_server(Path::new("/srv/worktree"), sandboxed)
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(args(false), ["app-server"]);
+        assert_eq!(
+            args(true),
+            ["app-server", "-c", "sandbox_mode=\"danger-full-access\""]
+        );
+    }
+    #[test]
     fn completing_an_agent_turn_leaves_user_shell_commands_running() {
         let mut session = Session::new(
             "one".into(),
@@ -2341,6 +2404,76 @@ mod tests {
         let mut params = json!({});
         isolation::settings(&mut params, &session)?;
         assert_eq!(params, json!({}));
+        Ok(())
+    }
+    #[test]
+    fn server_sessions_replace_local_validation_before_repository_rules() -> Result<()> {
+        use super::super::{SERVER_VALIDATION_RULE, claude, registration, validation};
+        let mut session = Session::new(
+            "server".into(),
+            Job::Coding(super::super::Launch {
+                repository: ".".into(),
+                isolated: true,
+                base: "HEAD".into(),
+                prompt: "task".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.repository_rules = "Run cargo test -p core only.".into();
+        session.server_mode = true;
+        let native: Session = serde_json::from_value(serde_json::to_value(&session)?)?;
+        let mut legacy = native.clone();
+        legacy.native_setup = false;
+        let mut waiting = legacy.clone();
+        waiting.deferred_workspace = true;
+        assert!(waiting.waiting_for_workspace());
+        for prompt in [
+            instructions(&native),
+            claude::instructions(&native),
+            instructions(&legacy),
+            claude::instructions(&legacy),
+            instructions(&waiting),
+        ] {
+            assert!(!prompt.contains("Do not run local"));
+            assert_eq!(prompt.matches(SERVER_VALIDATION_RULE).count(), 1);
+            let guidance = prompt.find(SERVER_VALIDATION_RULE).context("guidance")?;
+            let rules = prompt
+                .find("Repository rules:\nRun cargo test -p core only.")
+                .context("rules")?;
+            assert!(guidance < rules);
+        }
+        assert!(
+            claude::instructions(&legacy).contains("Normal source editing tools remain available.")
+        );
+        for continuation in [
+            registration::continuation(&native),
+            registration::continuation(&legacy),
+        ] {
+            assert!(!continuation.contains("PR CI"));
+        }
+        assert!(registration::continuation(&legacy).contains("Run only the tests relevant"));
+        for text in [
+            super::super::LOCAL_VALIDATION_RULE,
+            super::super::WORKTREE_INSTRUCTIONS,
+            isolation::INSTRUCTIONS,
+        ] {
+            let replaced = validation(&native, text);
+            assert!(
+                !replaced.contains("Do not run local") && replaced.contains(SERVER_VALIDATION_RULE)
+            );
+        }
+
+        let mut local = legacy;
+        local.server_mode = false;
+        assert!(instructions(&local).contains(super::super::WORKTREE_INSTRUCTIONS));
+        assert!(registration::continuation(&local).contains("PR CI"));
+        let mut local = native;
+        local.server_mode = false;
+        for prompt in [instructions(&local), claude::instructions(&local)] {
+            assert!(!prompt.contains(SERVER_VALIDATION_RULE));
+            assert!(prompt.contains("Repository rules:\nRun cargo test -p core only."));
+        }
         Ok(())
     }
 

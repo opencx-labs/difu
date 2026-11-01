@@ -31,6 +31,7 @@ pub(crate) mod review_shortcut_tests;
 mod rules;
 mod selection;
 mod sends;
+mod servers;
 mod settings;
 pub(crate) mod settings_preview;
 #[cfg(test)]
@@ -243,6 +244,8 @@ enum Action {
     QuestionNote(usize),
     SubmitQuestion(bool),
     DismissNotice,
+    /// A machine or repository in the new-session server picker.
+    ServerChoice(usize),
 }
 pub enum Modal {
     Subagents {
@@ -346,6 +349,8 @@ pub enum Modal {
     Delete,
     Clear,
     Help(crate::help::State),
+    /// Where a new session runs when cloud servers are saved.
+    NewSession(Box<servers::Picker>),
 }
 struct ResultMessage {
     kind: Task,
@@ -684,6 +689,7 @@ impl Ui {
         self.tick_models();
         self.tick_defaults();
         self.tick_rules();
+        self.tick_new_session();
         self.tick_media();
         self.tick_voice(visible);
         self.tick_slack();
@@ -993,7 +999,10 @@ impl Ui {
                                 .outgoing
                                 .retain(|pending| !pending.observed(&session));
                         }
+                        // Provider defaults come from this computer's Codex
+                        // configuration, which does not describe a server.
                         if !self.sessions.contains_key(&id)
+                            && !servers::is_server_session(&id)
                             && session.thread_id.is_none()
                             && session.provider == provider::Provider::Codex
                         {
@@ -1418,7 +1427,13 @@ impl Ui {
         }
     }
     pub fn launch(&mut self) {
-        self.launch_in(None);
+        if self.busy {
+            return;
+        }
+        match crate::cloud::servers::load(&self.storage) {
+            Ok(saved) if !saved.is_empty() => self.open_new_session(saved),
+            _ => self.launch_in(None),
+        }
     }
     fn launch_in(&mut self, repository: Option<std::path::PathBuf>) {
         if self.busy {
@@ -1443,6 +1458,7 @@ impl Ui {
                 defaults,
                 cwd,
                 remember_repository,
+                server: None,
             },
             true,
         );
@@ -1822,6 +1838,7 @@ impl Ui {
                 _ => None,
             },
             Some(Modal::Menu { query, .. } | Modal::Commands { query, .. }) => Some(query),
+            Some(Modal::NewSession(picker)) if picker.choosing_repository() => Some(&picker.query),
             Some(Modal::Help(state)) => Some(&state.query),
             Some(Modal::Permissions(state)) => state.editor(),
             Some(Modal::Plan(state)) => state.editor(),
@@ -2573,6 +2590,7 @@ impl Ui {
             && let Some(cwd) = self
                 .selected
                 .as_ref()
+                .filter(|id| !servers::is_server_session(id))
                 .and_then(|id| self.sessions.get(id))
                 .and_then(|s| s.workspace.as_deref())
             && let Some(paths) = super::media::paths(text, cwd)
@@ -2585,6 +2603,7 @@ impl Ui {
             Some(Modal::Plan(state)) => state.paste(text),
             Some(Modal::Slack(_)) => self.slack_paste(text),
             Some(Modal::RepositoryRules(_)) => self.rules_paste(text),
+            Some(Modal::NewSession(_)) => self.new_session_paste(text),
             Some(Modal::AgentDefaults(form)) => {
                 if let Some(editor) = form.fields.get_mut(form.field) {
                     editor.insert(text);
@@ -2670,6 +2689,10 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::RepositoryRules(_))) {
             self.rules_key(key);
+            return;
+        }
+        if matches!(self.modal, Some(Modal::NewSession(_))) {
+            self.new_session_key(key);
             return;
         }
         if matches!(self.modal, Some(Modal::Tweaks { .. })) {
@@ -2941,6 +2964,7 @@ impl Ui {
             Action::RulesOption(index) => self.rules_option(index),
             Action::RulesSave => self.save_rules(),
             Action::RulesCancel => self.close_rules(),
+            Action::ServerChoice(index) => self.new_session_choice(index),
             Action::OrchestratorBack => self.close_orchestrator_list(),
             Action::OpenFolder(id) => self.open_folder(id),
             Action::FolderBack => self.close_folder(),
@@ -3851,27 +3875,41 @@ impl Ui {
                         TEXT
                     }),
                 )),
-                Line::from(Span::styled(
-                    format!(
-                        "   {}{}{}",
+                Line::from(vec![
+                    Span::styled("   ", Style::default().fg(DIM)),
+                    // Server sessions name their server, subtly, before the repository.
+                    Span::styled(
                         session
-                            .repository
+                            .server
                             .as_ref()
-                            .unwrap_or(&session.workspace)
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy(),
-                        if session.worktree { " 🌳" } else { "" },
-                        if session.pending > 0 {
-                            format!(" · {} requests", session.pending)
-                        } else if session.queued > 0 {
-                            format!(" · {} queued", session.queued)
-                        } else {
-                            String::new()
-                        }
+                            .map(|server| format!("{server} · "))
+                            .unwrap_or_default(),
+                        Style::default()
+                            .fg(DIM)
+                            .add_modifier(ratatui::style::Modifier::ITALIC),
                     ),
-                    Style::default().fg(DIM),
-                )),
+                    Span::styled(
+                        format!(
+                            "{}{}{}",
+                            session
+                                .repository
+                                .as_ref()
+                                .unwrap_or(&session.workspace)
+                                .file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy(),
+                            if session.worktree { " 🌳" } else { "" },
+                            if session.pending > 0 {
+                                format!(" · {} requests", session.pending)
+                            } else if session.queued > 0 {
+                                format!(" · {} queued", session.queued)
+                            } else {
+                                String::new()
+                            }
+                        ),
+                        Style::default().fg(DIM),
+                    ),
+                ]),
             ];
             if let Some(stats) = self.sidebar.counts.get(&session.id) {
                 lines.push(Line::from(vec![
@@ -3962,14 +4000,17 @@ impl Ui {
             .and_then(|id| self.sessions.get(id))
             .map(|s| {
                 format!(
-                    "{} {} · {}",
+                    "{} {} · {}{}",
                     " ".repeat(usize::from(status_icons::WIDTH)),
                     s.title,
                     if self.is_clearing(&s.id) {
                         "Clearing…"
                     } else {
                         s.status.label()
-                    }
+                    },
+                    servers::server_name(&s.id)
+                        .map(|server| format!(" · on {server}"))
+                        .unwrap_or_default()
                 )
             })
             .unwrap_or_else(|| "Conversation".into());
@@ -4535,6 +4576,7 @@ impl Ui {
             Some(Modal::InstallBrowser { .. }) => "Optional HTML preview · Esc cancels",
             Some(Modal::AgentDefaults(_)) => "New agent defaults",
             Some(Modal::RepositoryRules(_)) => "Repository rules",
+            Some(Modal::NewSession(_)) => "New session",
             Some(Modal::Slack(_)) => "Slack setup",
             Some(Modal::Tweaks { .. }) => "Tweaks · chat animations",
             Some(Modal::Theme { .. }) => "Theme",
@@ -4698,6 +4740,10 @@ impl Ui {
             self.draw_rules(frame, area);
             return;
         }
+        if matches!(self.modal, Some(Modal::NewSession(_))) {
+            self.draw_new_session(frame, area);
+            return;
+        }
         if matches!(self.modal, Some(Modal::Commands { .. })) {
             self.draw_commands(frame, area);
             return;
@@ -4775,6 +4821,12 @@ impl Ui {
             Some(Modal::FolderPicker { query, .. }) => self.folder_choices(&query.text()),
             _ => Vec::new(),
         };
+        let session_repository = self
+            .selected
+            .as_deref()
+            .and_then(servers::server_name)
+            .map(|server| format!("Repository on {server}"))
+            .unwrap_or_else(|| "Local repository".into());
         match &mut self.modal {
             Some(
                 Modal::Transcript { .. }
@@ -4786,7 +4838,7 @@ impl Ui {
             ) => {}
             Some(Modal::ChangeRepository(value)) => {
                 let input = Rect::new(area.x, area.y, area.width, area.height.min(3));
-                editor(frame, input, "Local repository", value, true);
+                editor(frame, input, &session_repository, value, true);
                 deferred.push((
                     Rect::new(area.x, area.y.saturating_add(4), area.width, 1).intersection(area),
                     format!("[ {activate_hint} · Change repository ]"),
@@ -5069,6 +5121,7 @@ impl Ui {
             Some(
                 Modal::AgentDefaults(_)
                 | Modal::RepositoryRules(_)
+                | Modal::NewSession(_)
                 | Modal::Slack(_)
                 | Modal::Tweaks { .. }
                 | Modal::Theme { .. }

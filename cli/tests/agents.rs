@@ -1390,6 +1390,7 @@ fn new_sessions_accept_input_while_worktrees_are_preparing() -> Result<()> {
                     },
                     cwd: root.into(),
                     remember_repository: false,
+                    server: None,
                 },
             )?
             else {
@@ -1691,6 +1692,7 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
             defaults: Default::default(),
             cwd: root.into(),
             remember_repository: false,
+            server: None,
         },
     )?
     else {
@@ -1706,6 +1708,7 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
             defaults: defaults.clone(),
             cwd: root.into(),
             remember_repository: true,
+            server: None,
         },
     )?
     else {
@@ -2350,6 +2353,7 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
             },
             cwd: root.into(),
             remember_repository: false,
+            server: None,
         },
     )?
     else {

@@ -142,15 +142,21 @@ extension DifuAPI {
         try await request("session.changes", ["id": .string(id)], as: FilesResult.self).files
     }
 
-    /// Starts a session and returns its id. `repository == nil` uses the default.
+    /// Starts a session and returns its id. `repository` is a path from
+    /// `repositories()`, an `owner/name` on a server (added and cloned first if
+    /// it isn't listed), or nil for the default. `base` picks the branch to
+    /// start from (servers only).
     public func newSession(
-        repository: String?, model: String?, effort: String?, text: String?
+        repository: String?, base: String? = nil, model: String?, effort: String?, text: String?
     ) async throws -> String {
         var params: [String: JSONValue] = [
             "repository": JSONValue(repository), "model": JSONValue(model),
             "effort": JSONValue(effort),
         ]
         if let text, !text.isEmpty { params["text"] = .string(text) }
+        if let base = base?.trimmingCharacters(in: .whitespacesAndNewlines), !base.isEmpty {
+            params["base"] = .string(base)
+        }
         return try await request("agents.new", params, as: IdResult.self).id
     }
 

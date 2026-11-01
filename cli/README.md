@@ -1284,6 +1284,36 @@ connect, check that both devices share a network that allows device-to-device
 traffic (guest and some office networks do not), allow incoming connections for
 difu if macOS asks, and allow **Local Network** access for difu in iOS Settings.
 
+## Cloud servers (experimental)
+
+difu can also run on a Linux server you rent, so agents keep working while your
+laptop is closed. Each server is self-contained (its own Codex, Claude Code and
+GitHub logins, repositories, repository rules and sessions), and your Mac and
+iPhone can each connect to several servers. The design and protocol are in
+[docs/cloud-agents.md](../docs/cloud-agents.md).
+
+Set up a fresh Debian or Ubuntu server from your Mac with its IP address and root
+password, which difu uses once:
+
+```sh
+difu server add 203.0.113.10
+```
+
+difu installs an SSH key, creates a `difu` user without sudo, turns off password
+logins, enables the firewall and automatic security updates, installs difu, git,
+gh, Podman and the Codex and Claude Code CLIs, and starts `difu serve` as a
+systemd service. It then walks you through the GitHub, Codex and Claude Code
+logins, asks for a **server password**, lets you pick repositories to keep
+cloned, pairs this Mac and shows a QR code for the iPhone app.
+
+Server sessions appear in the sidebar with the server's name. Another Mac joins
+with `difu server join <address>` and the server password; the iPhone app adds a
+server by QR code or by address and server password. On the server, every
+session's agent and shells run in their own rootless Podman container, and agents
+may run the tests relevant to their change. `difu server list|remove|ssh|pair|upgrade`
+manage saved servers; on the server, `difu repos` and `difu remote` manage
+repositories, pairing, devices and the password.
+
 ## Slack control (macOS)
 
 Open **Cmd+K → `/slack`** to connect your Slack app. Enter its bot token

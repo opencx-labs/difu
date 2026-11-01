@@ -8,6 +8,8 @@ import Foundation
 public final class RemoteConnection: @unchecked Sendable {
     public let host: String
     public let port: Int
+    /// The pinned (or, after password pairing, the presented) certificate fingerprint.
+    public let fingerprint: String
     public let welcome: Welcome
     public let events: AsyncStream<RemoteEvent>
 
@@ -25,11 +27,12 @@ public final class RemoteConnection: @unchecked Sendable {
     public static let maximumMessageSize = 64 << 20
 
     private init(
-        host: String, port: Int, welcome: Welcome, session: URLSession,
+        host: String, port: Int, fingerprint: String, welcome: Welcome, session: URLSession,
         task: URLSessionWebSocketTask
     ) {
         self.host = host
         self.port = port
+        self.fingerprint = fingerprint
         self.welcome = welcome
         self.session = session
         self.task = task
@@ -50,9 +53,19 @@ public final class RemoteConnection: @unchecked Sendable {
 
     // MARK: Opening
 
-    /// Connects to one host, sends `hello`, and waits for `welcome`.
+    /// How the client authenticates after the socket opens.
+    enum Handshake: Sendable {
+        /// `pair` or `auth`: one frame, then `welcome` or `denied`.
+        case hello(Hello)
+        /// Password pairing: `password` → `challenge` → `proof` → `welcome`.
+        case password(PasswordHandshake)
+    }
+
+    /// Connects to one host, authenticates and waits for `welcome`.
+    /// `fingerprint == nil` trusts the presented certificate on first use
+    /// (password pairing only, which proves the server by its password).
     static func open(
-        host: String, port: Int, fingerprint: String, hello: Hello, timeout: TimeInterval
+        host: String, port: Int, fingerprint: String?, handshake: Handshake, timeout: TimeInterval
     ) async throws -> RemoteConnection {
         guard let url = Endpoint.url(host: host, port: port) else {
             throw RemoteError.invalidHost(host)
@@ -74,7 +87,9 @@ public final class RemoteConnection: @unchecked Sendable {
             // socket itself is what unblocks the handshake on timeout/cancel.
             let welcome = try await withTaskCancellationHandler {
                 try await withThrowingTaskGroup(of: Welcome.self) { group in
-                    group.addTask { try await handshake(task, hello: hello) }
+                    group.addTask {
+                        try await authenticate(task, handshake: handshake, delegate: delegate)
+                    }
                     group.addTask {
                         try await Task.sleep(for: .seconds(timeout))
                         timedOut.set()
@@ -93,8 +108,12 @@ public final class RemoteConnection: @unchecked Sendable {
             guard welcome.protocolVersion <= remoteProtocolVersion else {
                 throw RemoteError.unsupportedProtocol(welcome.protocolVersion)
             }
+            guard let pinned = fingerprint ?? delegate.presented else {
+                throw RemoteError.protocolError("no server certificate")
+            }
             let connection = RemoteConnection(
-                host: host, port: port, welcome: welcome, session: session, task: task)
+                host: host, port: port, fingerprint: pinned, welcome: welcome, session: session,
+                task: task)
             connection.start()
             return connection
         } catch {
@@ -105,28 +124,40 @@ public final class RemoteConnection: @unchecked Sendable {
         }
     }
 
-    private static func handshake(_ task: URLSessionWebSocketTask, hello: Hello) async throws -> Welcome {
-        try await task.send(.string(hello.json))
-        let data: Data
+    private static func authenticate(
+        _ task: URLSessionWebSocketTask, handshake: Handshake, delegate: PinningDelegate
+    ) async throws -> Welcome {
+        switch handshake {
+        case .hello(let hello):
+            try await task.send(.string(hello.json))
+            let reply = try await receiveReply(task)
+            switch reply.type {
+            case "welcome":
+                guard let welcome = reply.welcome else { throw RemoteError.protocolError("empty welcome") }
+                return welcome
+            case "denied":
+                throw RemoteError.denied(reply.message ?? "The computer refused this phone.")
+            default:
+                throw RemoteError.protocolError("expected welcome, got “\(reply.type)”")
+            }
+        case .password(var exchange):
+            try await task.send(.string(exchange.hello.json))
+            let challenge = try await receiveReply(task)
+            // The TLS handshake is complete once the server has answered.
+            guard let fingerprint = delegate.presented else {
+                throw RemoteError.protocolError("no server certificate")
+            }
+            let proof = try exchange.proof(answering: challenge, fingerprint: fingerprint)
+            try await task.send(.string(proof))
+            return try exchange.finish(try await receiveReply(task), fingerprint: fingerprint)
+        }
+    }
+
+    private static func receiveReply(_ task: URLSessionWebSocketTask) async throws -> HelloReply {
         switch try await task.receive() {
-        case .string(let text): data = Data(text.utf8)
-        case .data(let bytes): data = bytes
-        @unknown default: throw RemoteError.protocolError("unsupported first frame")
-        }
-        let reply: HelloReply
-        do {
-            reply = try JSONDecoder().decode(HelloReply.self, from: data)
-        } catch {
-            throw RemoteError.protocolError("the first message wasn't JSON")
-        }
-        switch reply.type {
-        case "welcome":
-            guard let welcome = reply.welcome else { throw RemoteError.protocolError("empty welcome") }
-            return welcome
-        case "denied":
-            throw RemoteError.denied(reply.message ?? "The computer refused this phone.")
-        default:
-            throw RemoteError.protocolError("expected welcome, got “\(reply.type)”")
+        case .string(let text): return try HelloReply(Data(text.utf8))
+        case .data(let bytes): return try HelloReply(bytes)
+        @unknown default: throw RemoteError.protocolError("unsupported handshake frame")
         }
     }
 
@@ -135,7 +166,7 @@ public final class RemoteConnection: @unchecked Sendable {
         _ error: Error, host: String, delegate: PinningDelegate, timedOut: Bool
     ) -> RemoteError {
         if let actual = delegate.mismatch {
-            return .pinMismatch(host: host, expected: delegate.pinned, actual: actual)
+            return .pinMismatch(host: host, expected: delegate.pinned ?? "", actual: actual)
         }
         if let remote = error as? RemoteError { return remote }
         if timedOut { return .timeout(host: host) }
@@ -145,14 +176,14 @@ public final class RemoteConnection: @unchecked Sendable {
             case NSURLErrorTimedOut:
                 return .timeout(host: host)
             case NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed:
-                return .unreachable(host: host, message: "host not found on this network")
+                return .unreachable(host: host, message: "host not found")
             case NSURLErrorCannotConnectToHost:
                 return .unreachable(
                     host: host, message: "connection refused (is /remote-control enabled?)")
             case NSURLErrorNotConnectedToInternet:
                 return .unreachable(
                     host: host,
-                    message: "no network (check Wi-Fi and the Local Network permission)")
+                    message: "no network (check your connection and, for a computer on your Wi-Fi, the Local Network permission)")
             case NSURLErrorNetworkConnectionLost:
                 return .unreachable(host: host, message: "the connection dropped")
             case NSURLErrorBadServerResponse:

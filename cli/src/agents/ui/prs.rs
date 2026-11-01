@@ -288,6 +288,11 @@ impl Ui {
             if summary.kind != "Coding" && summary.kind != "coding" {
                 continue;
             }
+            // Pull request discovery runs git and gh in the session's
+            // worktree, which for server sessions is on the server.
+            if summary.server.is_some() {
+                continue;
+            }
             if summary.status == Status::Starting && !summary.worktree {
                 continue;
             }

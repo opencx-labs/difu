@@ -10,9 +10,9 @@ struct SessionListView: View {
     @Environment(AppModel.self) private var app
     @State private var filter = Filter.active
     @State private var search = ""
-    @State private var path: [String] = []
+    @State private var path: [SessionRef] = []
     @State private var showingNewSession = false
-    @State private var renaming: SessionSummary?
+    @State private var renaming: ServerSession?
     @State private var renameText = ""
     @State private var error: String?
 
@@ -21,7 +21,7 @@ struct SessionListView: View {
             content
                 .navigationTitle("Agents")
                 .searchable(text: $search, prompt: "Search sessions")
-                .refreshable { await app.sessions.refresh() }
+                .refreshable { await app.refreshSessions() }
                 .toolbar {
                     ToolbarItem(placement: .primaryAction) {
                         Button {
@@ -29,14 +29,14 @@ struct SessionListView: View {
                         } label: {
                             Label("New Session", systemImage: "plus")
                         }
-                        .disabled(!app.isConnected)
+                        .disabled(!app.isAnyConnected)
                     }
                 }
-                .navigationDestination(for: String.self) { id in
-                    SessionScreen(id: id)
+                .navigationDestination(for: SessionRef.self) { ref in
+                    SessionScreen(ref: ref)
                 }
                 .sheet(isPresented: $showingNewSession) {
-                    NewSessionSheet { id in path.append(id) }
+                    NewSessionSheet { ref in path.append(ref) }
                 }
                 .alert("Rename Session", isPresented: renameBinding) {
                     TextField("Title", text: $renameText)
@@ -48,18 +48,17 @@ struct SessionListView: View {
     }
 
     @ViewBuilder private var content: some View {
-        let store = app.sessions
-        if !store.loaded {
-            if let error = store.error {
+        if !app.sessionsLoaded {
+            if let error = app.sessionsError {
                 ContentUnavailableView {
                     Label("Couldn't load sessions", systemImage: "exclamationmark.triangle")
                 } description: {
                     Text(error)
                 } actions: {
-                    Button("Try Again") { Task { await store.refresh() } }
+                    Button("Try Again") { Task { await app.refreshSessions() } }
                 }
             } else {
-                ProgressView(app.isConnected ? "Loading sessions…" : "Waiting for \(app.computerName)…")
+                ProgressView(app.isAnyConnected ? "Loading sessions…" : "Waiting for \(app.serversLabel)…")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         } else {
@@ -73,14 +72,15 @@ struct SessionListView: View {
                     .listRowBackground(Color.clear)
                 }
                 Section {
-                    ForEach(filtered) { summary in
-                        NavigationLink(value: summary.id) {
-                            SessionRow(summary: summary)
+                    ForEach(filtered) { item in
+                        let summary = item.summary
+                        NavigationLink(value: item.id) {
+                            SessionRow(summary: summary, server: app.showsServerBadges ? item.server : nil)
                         }
                         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
                             if !summary.orchestrator {
                                 Button {
-                                    archive(summary)
+                                    archive(item)
                                 } label: {
                                     Label(
                                         summary.archived ? "Unarchive" : "Archive",
@@ -89,19 +89,19 @@ struct SessionListView: View {
                                 .tint(.indigo)
                             }
                             Button {
-                                startRename(summary)
+                                startRename(item)
                             } label: {
                                 Label("Rename", systemImage: "pencil")
                             }
                             .tint(.gray)
                         }
                         .contextMenu {
-                            Button("Rename", systemImage: "pencil") { startRename(summary) }
+                            Button("Rename", systemImage: "pencil") { startRename(item) }
                             if !summary.orchestrator {
                                 Button(
                                     summary.archived ? "Unarchive" : "Archive",
                                     systemImage: summary.archived ? "tray.and.arrow.up" : "archivebox"
-                                ) { archive(summary) }
+                                ) { archive(item) }
                             }
                         }
                     }
@@ -120,12 +120,12 @@ struct SessionListView: View {
                         ContentUnavailableView {
                             Label("No sessions", systemImage: "sparkles")
                         } description: {
-                            Text("Start a coding agent on \(app.computerName).")
+                            Text("Start a coding agent on \(app.serversLabel).")
                         } actions: {
                             Button("New Session") { showingNewSession = true }
                                 .buttonStyle(.borderedProminent)
                                 .foregroundStyle(Color.onAccent)
-                                .disabled(!app.isConnected)
+                                .disabled(!app.isAnyConnected)
                         }
                     }
                 }
@@ -133,12 +133,13 @@ struct SessionListView: View {
         }
     }
 
-    private var filtered: [SessionSummary] {
+    private var filtered: [ServerSession] {
         let query = search.trimmingCharacters(in: .whitespaces)
-        return app.sessions.summaries.filter { summary in
+        return app.sessions.filter { item in
+            let summary = item.summary
             guard summary.archived == (filter == .archived) else { return false }
             guard !query.isEmpty else { return true }
-            return [summary.displayTitle, summary.repository, summary.branch, summary.id]
+            return [summary.displayTitle, summary.repository, summary.branch, summary.id, item.server.name]
                 .compactMap { $0 }
                 .contains { $0.localizedCaseInsensitiveContains(query) }
         }
@@ -148,24 +149,28 @@ struct SessionListView: View {
         Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })
     }
 
-    private func startRename(_ summary: SessionSummary) {
-        renameText = summary.displayTitle
-        renaming = summary
+    private func startRename(_ item: ServerSession) {
+        renameText = item.summary.displayTitle
+        renaming = item
     }
 
     private func rename() {
-        guard let summary = renaming else { return }
+        guard let item = renaming else { return }
         let title = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !title.isEmpty else { return }
         Task {
-            do { try await app.api.rename(summary.id, title: title) } catch { self.error = error.localizedDescription }
+            do {
+                try await item.server.api.rename(item.summary.id, title: title)
+            } catch {
+                self.error = error.localizedDescription
+            }
         }
     }
 
-    private func archive(_ summary: SessionSummary) {
+    private func archive(_ item: ServerSession) {
         Task {
             do {
-                try await app.api.archive(summary.id, archived: !summary.archived)
+                try await item.server.api.archive(item.summary.id, archived: !item.summary.archived)
             } catch {
                 self.error = error.localizedDescription
             }

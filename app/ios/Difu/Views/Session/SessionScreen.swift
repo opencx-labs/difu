@@ -1,11 +1,29 @@
 import DifuKit
 import SwiftUI
 
-/// A live agent session: transcript, pending requests, queue and composer.
+/// A session on one of the saved servers.
 struct SessionScreen: View {
-    let id: String
+    let ref: SessionRef
 
     @Environment(AppModel.self) private var app
+
+    var body: some View {
+        if let server = app.server(ref.server) {
+            SessionContent(id: ref.session, server: server)
+                .environment(server)
+        } else {
+            ContentUnavailableView(
+                "Server removed", systemImage: "server.rack",
+                description: Text("This session's server is no longer saved on this phone."))
+        }
+    }
+}
+
+/// A live agent session: transcript, pending requests, queue and composer.
+struct SessionContent: View {
+    let id: String
+    let server: ServerConnection
+
     @Environment(\.dismiss) private var dismiss
     @State private var composer = ComposerModel()
     @State private var scrollTrigger = 0
@@ -26,7 +44,7 @@ struct SessionScreen: View {
     }
 
     var body: some View {
-        let model = app.sessions.model(for: id)
+        let model = server.sessions.model(for: id)
         content(model)
             .navigationTitle(title(model))
             .navigationBarTitleDisplayMode(.inline)
@@ -34,14 +52,14 @@ struct SessionScreen: View {
                 ToolbarItem(placement: .principal) { header(model) }
                 ToolbarItem(placement: .primaryAction) { menu(model) }
             }
-            .onAppear { app.sessions.open(id) }
-            .onDisappear { app.sessions.close(id) }
+            .onAppear { server.sessions.open(id) }
+            .onDisappear { server.sessions.close(id) }
             .sheet(item: $sheet) { sheet in
                 switch sheet {
                 case .model:
-                    ModelSheet(sessionID: id, view: model.view)
+                    ModelSheet(sessionID: id, view: model.view).environment(server)
                 case .changes:
-                    ChangesSheet(sessionID: id)
+                    ChangesSheet(sessionID: id).environment(server)
                 }
             }
             .confirmationDialog(
@@ -53,12 +71,12 @@ struct SessionScreen: View {
                 switch confirmation {
                 case .clear:
                     Button("Clear Session", role: .destructive) {
-                        perform { try await app.api.clear(id) }
+                        perform { try await server.api.clear(id) }
                     }
                 case .delete:
                     Button("Delete Session", role: .destructive) {
                         perform {
-                            try await app.api.delete(id)
+                            try await server.api.delete(id)
                             dismiss()
                         }
                     }
@@ -68,7 +86,7 @@ struct SessionScreen: View {
                 case .clear:
                     Text("Starts a fresh conversation and worktree. The current transcript is discarded.")
                 case .delete:
-                    Text("Removes the chat and its worktree on \(app.computerName). This can't be undone.")
+                    Text("Removes the chat and its worktree on \(server.name). This can't be undone.")
                 }
             }
             .alert("Rename Session", isPresented: $showingRename) {
@@ -77,7 +95,7 @@ struct SessionScreen: View {
                 Button("Rename") {
                     let title = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !title.isEmpty else { return }
-                    perform { try await app.api.rename(id, title: title) }
+                    perform { try await server.api.rename(id, title: title) }
                 }
             }
             .errorAlert($error)
@@ -94,8 +112,8 @@ struct SessionScreen: View {
                     if !view.queue.isEmpty {
                         QueueSection(
                             view: view,
-                            remove: { index in perform { try await app.api.unqueue(id, index: index) } },
-                            sendNow: { perform { try await app.api.sendNow(id) } }
+                            remove: { index in perform { try await server.api.unqueue(id, index: index) } },
+                            sendNow: { perform { try await server.api.sendNow(id) } }
                         )
                         .padding(.horizontal, 12)
                         .padding(.top, 8)
@@ -118,16 +136,16 @@ struct SessionScreen: View {
             } description: {
                 Text(message)
             } actions: {
-                Button("Try Again") { Task { await app.sessions.watch(id) } }
+                Button("Try Again") { Task { await server.sessions.watch(id) } }
             }
         } else {
-            ProgressView(app.isConnected ? "Loading transcript…" : "Waiting for \(app.computerName)…")
+            ProgressView(server.isConnected ? "Loading transcript…" : "Waiting for \(server.name)…")
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
     private func title(_ model: SessionModel) -> String {
-        model.view?.displayTitle ?? app.sessions.summary(for: id)?.displayTitle ?? "Session"
+        model.view?.displayTitle ?? server.sessions.summary(for: id)?.displayTitle ?? "Session"
     }
 
     private func header(_ model: SessionModel) -> some View {
@@ -135,7 +153,7 @@ struct SessionScreen: View {
             Text(title(model))
                 .font(.headline)
                 .lineLimit(1)
-            if let summary = model.view?.summary ?? app.sessions.summary(for: id) {
+            if let summary = model.view?.summary ?? server.sessions.summary(for: id) {
                 HStack(spacing: 4) {
                     Circle().fill(StatusTone(summary).color).frame(width: 6, height: 6)
                     Text(subtitle(summary, view: model.view))
@@ -157,7 +175,7 @@ struct SessionScreen: View {
 
     private func menu(_ model: SessionModel) -> some View {
         let view = model.view
-        let summary = view?.summary ?? app.sessions.summary(for: id)
+        let summary = view?.summary ?? server.sessions.summary(for: id)
         return Menu {
             Button("Rename", systemImage: "pencil") {
                 renameText = summary?.displayTitle ?? ""
@@ -165,10 +183,10 @@ struct SessionScreen: View {
             }
             Button("Model & Effort", systemImage: "cpu") { sheet = .model }
             Button("Compact", systemImage: "arrow.down.right.and.arrow.up.left") {
-                perform { try await app.api.compact(id) }
+                perform { try await server.api.compact(id) }
             }
             Button("Continue Session", systemImage: "play") {
-                perform { try await app.api.resume(id) }
+                perform { try await server.api.resume(id) }
             }
             if summary?.canReadChanges ?? true {
                 Button("Changes", systemImage: "plus.forwardslash.minus") { sheet = .changes }
@@ -180,7 +198,7 @@ struct SessionScreen: View {
                     archived ? "Unarchive" : "Archive",
                     systemImage: archived ? "tray.and.arrow.up" : "archivebox"
                 ) {
-                    perform { try await app.api.archive(id, archived: !archived) }
+                    perform { try await server.api.archive(id, archived: !archived) }
                 }
             }
             Button("Clear…", systemImage: "eraser", role: .destructive) { confirmation = .clear }
@@ -210,7 +228,7 @@ struct SessionScreen: View {
         Task {
             defer { composer.sending = false }
             do {
-                try await app.api.send(id, text: text, queue: queue, attachments: attachments)
+                try await server.api.send(id, text: text, queue: queue, attachments: attachments)
             } catch {
                 // Put the draft back so nothing is lost.
                 if composer.text.isEmpty { composer.text = text }
@@ -222,7 +240,7 @@ struct SessionScreen: View {
 
     private func stop() {
         Haptics.warning()
-        perform { try await app.api.interrupt(id) }
+        perform { try await server.api.interrupt(id) }
     }
 
     private func loadFull(_ entry: EntryView, model: SessionModel) {
@@ -231,7 +249,7 @@ struct SessionScreen: View {
         Task {
             defer { model.loadingEntries.remove(entry.id) }
             do {
-                model.fullEntries[entry.id] = try await app.api.entry(session: id, entry: entry.id)
+                model.fullEntries[entry.id] = try await server.api.entry(session: id, entry: entry.id)
             } catch {
                 self.error = error.localizedDescription
             }

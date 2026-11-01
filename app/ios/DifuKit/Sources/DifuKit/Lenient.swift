@@ -74,6 +74,15 @@ extension KeyedDecodingContainer where Key == AnyKey {
         return nil
     }
 
+    /// A timestamp as Unix milliseconds: accepts milliseconds, seconds (small
+    /// numbers) and ISO-8601 strings.
+    func timestamp(_ key: String) -> Int? {
+        if let value = int(key) {
+            return abs(value) < 100_000_000_000 ? value * 1000 : value
+        }
+        return Dates.parse(string(key))?.milliseconds
+    }
+
     /// Decodes an array, dropping elements that fail to decode.
     func list<T: Decodable>(_ key: String, of type: T.Type = T.self) -> [T] {
         guard let items = value(key, as: [Lossy<T>].self) else { return [] }

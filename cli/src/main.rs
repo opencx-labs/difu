@@ -72,6 +72,32 @@ enum Commands {
         #[arg(value_parser = ["."])]
         target: String,
     },
+    /// Connect to and manage cloud servers running difu.
+    Server {
+        #[command(subcommand)]
+        command: difu::cloud::cli::ServerCommand,
+    },
+    /// Run the agent service in the foreground as a cloud server (systemd).
+    Serve {
+        /// Port for clients; defaults to the saved port, then 3438.
+        #[arg(long)]
+        port: Option<u16>,
+    },
+    /// Manage remote control on this server: pairing, devices, password.
+    Remote {
+        #[command(subcommand)]
+        command: difu::cloud::cli::RemoteCommand,
+    },
+    /// Manage repositories kept cloned on this server.
+    Repos {
+        #[command(subcommand)]
+        command: Option<difu::cloud::cli::ReposCommand>,
+    },
+    /// Manage per-session sandboxes on this server.
+    Sandbox {
+        #[command(subcommand)]
+        command: difu::cloud::cli::SandboxCommand,
+    },
 }
 
 fn parse_shell_action(text: &str) -> Result<serde_json::Value, serde_json::Error> {
@@ -79,6 +105,11 @@ fn parse_shell_action(text: &str) -> Result<serde_json::Value, serde_json::Error
 }
 
 fn main() -> Result<()> {
+    // `difu server add` runs difu as ssh's askpass helper; answer before
+    // anything else. Inert unless DIFU_ASKPASS_SECRET_FILE is set.
+    if let Some(answered) = difu::cloud::onboard::answer_askpass() {
+        return answered;
+    }
     let args = Args::parse();
     if args.agent_service || args.refresh_agent_service {
         if args.agent_service {
@@ -96,6 +127,32 @@ fn main() -> Result<()> {
         } else {
             difu::agents::server::run(storage)
         };
+    }
+    match args.command {
+        Some(Commands::Serve { port }) => {
+            let storage = match (args.agent_config, args.agent_cache) {
+                (Some(config), Some(cache)) => Storage { config, cache },
+                _ => Storage::discover()?,
+            };
+            difu::cpu::start();
+            return difu::cloud::serve::run(storage, port);
+        }
+        Some(Commands::Server { command }) => {
+            return difu::cloud::cli::server(&Storage::discover()?, command);
+        }
+        Some(Commands::Remote { command }) => {
+            return difu::cloud::cli::remote(&Storage::discover()?, command);
+        }
+        Some(Commands::Repos { command }) => {
+            return difu::cloud::cli::repos(
+                &Storage::discover()?,
+                command.unwrap_or(difu::cloud::cli::ReposCommand::List),
+            );
+        }
+        Some(Commands::Sandbox { command }) => {
+            return difu::cloud::cli::sandbox(&Storage::discover()?, command);
+        }
+        _ => {}
     }
     if let Some(Commands::StopVoice { session }) = &args.command {
         let storage = Storage::discover()?;

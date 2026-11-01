@@ -327,8 +327,9 @@ pub(super) fn reload_idle(
     }
 }
 fn replace_connection(rpc: &mut Connection, session: &Session, cancel: &Cancel) -> Result<()> {
-    let mut replacement = Connection::open(
+    let mut replacement = Connection::open_in(
         session.workspace.as_deref().context("Missing workspace")?,
+        rpc.sandbox.clone(),
         cancel,
     )?;
     replacement.initialize(cancel)?;

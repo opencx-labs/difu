@@ -30,14 +30,51 @@ pub(super) fn load(storage: &Storage, path: &Path) -> Result<(PathBuf, String)> 
     Ok((root, rules))
 }
 
+/// Reads or replaces a repository's rules; empty rules remove the entry.
+pub(super) fn request(
+    storage: &Storage,
+    path: &Path,
+    rules: Option<String>,
+) -> Result<super::Reply> {
+    let root = repository(path)?;
+    let rules = match rules {
+        Some(rules) => {
+            storage.update_config(|config| {
+                if rules.trim().is_empty() {
+                    config.repository_rules.remove(&root);
+                } else {
+                    config.repository_rules.insert(root.clone(), rules.clone());
+                }
+            })?;
+            rules
+        }
+        None => storage
+            .load_config()?
+            .repository_rules
+            .get(&root)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    Ok(super::Reply::RepositoryRules { root, rules })
+}
+
 pub(super) fn capture(storage: &Storage, session: &mut Session) -> Result<()> {
     if let Job::Coding(launch) = &session.job {
         session.repository_rules = load(storage, &launch.repository)?.1;
+        session.server_mode = storage.load_config()?.server.enabled;
     }
     Ok(())
 }
 
+/// Appends repository rules after the validation guidance, which on a server
+/// is `SERVER_VALIDATION_RULE` (added when the base has no local rule to replace).
 pub(super) fn instructions(session: &Session, base: String) -> String {
+    let base = super::validation(session, &base);
+    let base = if session.server_mode && !base.contains(super::SERVER_VALIDATION_RULE) {
+        format!("{base}\n\n{}", super::SERVER_VALIDATION_RULE)
+    } else {
+        base
+    };
     if session.repository_rules.trim().is_empty() {
         base
     } else {
@@ -127,6 +164,47 @@ mod tests {
             instructions(&legacy, "Base instructions".into()),
             "Base instructions"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn sessions_capture_server_mode_with_their_rules() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().join("repository");
+        std::fs::create_dir(&root)?;
+        git(&root, &["init", "-b", "main"])?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let mut session = Session::new(
+            "server".into(),
+            Job::Coding(Launch {
+                repository: root,
+                isolated: true,
+                base: "HEAD".into(),
+                prompt: "task".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        capture(&storage, &mut session)?;
+        assert!(!session.server_mode);
+        storage.update_config(|config| config.server.enabled = true)?;
+        capture(&storage, &mut session)?;
+        assert!(session.server_mode);
+        let prompt = instructions(&session, "Base".into());
+        assert_eq!(
+            prompt,
+            format!("Base\n\n{}", super::super::SERVER_VALIDATION_RULE)
+        );
+        let mut saved = serde_json::to_value(&session)?;
+        saved
+            .as_object_mut()
+            .context("session")?
+            .remove("server_mode");
+        let saved: Session = serde_json::from_value(saved)?;
+        assert!(!saved.server_mode);
         Ok(())
     }
 }

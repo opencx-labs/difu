@@ -6,7 +6,7 @@ struct PendingCard: View {
     let pending: PendingView
     let sessionID: String
 
-    @Environment(AppModel.self) private var app
+    @Environment(ServerConnection.self) private var server
     @State private var busy = false
     @State private var error: String?
 
@@ -70,7 +70,7 @@ struct PendingCard: View {
         ForEach(questions) { question in
             QuestionForm(question: question) { answer in
                 await run {
-                    try await app.api.answer(
+                    try await server.api.answer(
                         sessionID, request: pending.request, question: question.id, answer: answer)
                 }
             }
@@ -84,7 +84,7 @@ struct PendingCard: View {
                 let destructive = Self.isNegative(choice)
                 Button {
                     Task {
-                        await run { try await app.api.decide(sessionID, request: pending.request, choice: choice.id) }
+                        await run { try await server.api.decide(sessionID, request: pending.request, choice: choice.id) }
                     }
                 } label: {
                     Text(choice.label)

@@ -1,0 +1,32 @@
+# difu sandbox image (`difu sandbox build` tags it localhost/difu-sandbox:latest).
+#
+# Every session's agent (Claude Code or Codex app-server) and its shells run in
+# a container from this image. The agent CLIs are not installed here: difu
+# mounts the server's own ~/.local/bin and Claude Code's versions directory
+# read-only, so the sandbox always runs the server's CLI versions and logins.
+FROM docker.io/library/ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8
+
+# bubblewrap lets a session that explicitly picks a restricted Codex or Claude
+# Code permission profile try their own sandbox inside the container.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bubblewrap \
+        build-essential \
+        ca-certificates \
+        curl \
+        gh \
+        git \
+        jq \
+        libssl-dev \
+        nodejs \
+        npm \
+        pkg-config \
+        python3 \
+        python3-pip \
+        python3-venv \
+        ripgrep \
+        unzip \
+    && rm -rf /var/lib/apt/lists/*
