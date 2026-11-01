@@ -29,7 +29,7 @@ pub(super) fn counts(diff: &str) -> (usize, usize) {
     let mut hunk = false;
     for line in diff.lines() {
         if line.starts_with("@@") {
-            hunk = starts(line).is_some();
+            hunk = line == "@@" || starts(line).is_some();
         } else if hunk {
             if line.starts_with('+') {
                 added += 1;
@@ -57,18 +57,51 @@ pub(super) fn render(diff: &str, width: u16) -> (Vec<Line<'static>>, usize, usiz
     )
 }
 pub(super) fn render_full(diff: &str, width: u16) -> (Vec<SourceRow>, usize, usize) {
+    render_rows(diff, width, false)
+}
+
+/// Command output can contain several files, so retain its file headers.
+pub(super) fn output(diff: &str, width: u16) -> Vec<Line<'static>> {
+    render_rows(diff, width, true)
+        .0
+        .into_iter()
+        .map(|row| row.line)
+        .collect()
+}
+
+pub(super) fn is_diff(text: &str) -> bool {
+    text.lines()
+        .any(|line| line.starts_with("diff --git ") || line == "@@" || starts(line).is_some())
+}
+
+fn render_rows(diff: &str, width: u16, headers: bool) -> (Vec<SourceRow>, usize, usize) {
     let mut rows = Vec::new();
     let mut sources = Vec::new();
     let mut added = 0;
     let mut removed = 0;
     let mut numbers = None;
+    let mut anonymous = false;
     for (source_index, source) in diff.lines().enumerate() {
         let before = rows.len();
+        if source.starts_with("diff --git ") {
+            numbers = None;
+            anonymous = false;
+        }
+        if source == "@@" {
+            if numbers.is_some() || anonymous {
+                rows.push(Line::from(Span::styled("    ⋮", Style::default().fg(DIM))));
+            }
+            numbers = Some((0, 0));
+            anonymous = true;
+            sources.resize_with(rows.len(), || None);
+            continue;
+        }
         if let Some((old, new)) = starts(source) {
             if numbers.is_some() {
                 rows.push(Line::from(Span::styled("    ⋮", Style::default().fg(DIM))));
             }
             numbers = Some((old, new));
+            anonymous = false;
             sources.resize_with(rows.len(), || None);
             continue;
         }
@@ -100,7 +133,12 @@ pub(super) fn render_full(diff: &str, width: u16) -> (Vec<SourceRow>, usize, usi
             Some((content, number, marker, background))
         });
         if let Some((content, number, marker, background)) = parsed {
-            let prefix = format!(" {number:>5} {marker} ");
+            // Edit arguments contain snippets, not absolute source positions.
+            let prefix = if anonymous {
+                format!(" {marker} ")
+            } else {
+                format!(" {number:>5} {marker} ")
+            };
             let prefix = crate::ui::crop(&prefix, 0, usize::from(width).saturating_sub(1));
             let gutter = unicode_width::UnicodeWidthStr::width(prefix.as_str());
             let content = crate::model::clean(content).replace('\t', "    ");
@@ -139,7 +177,8 @@ pub(super) fn render_full(diff: &str, width: u16) -> (Vec<SourceRow>, usize, usi
                 ));
                 rows.push(Line::from(spans).style(Style::default().bg(background)));
             }
-        } else if numbers.is_none()
+        } else if !headers
+            && numbers.is_none()
             && (source.starts_with("diff --git ")
                 || source.starts_with("index ")
                 || source.starts_with("--- ")
