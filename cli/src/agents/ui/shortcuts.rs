@@ -92,7 +92,7 @@ impl Ui {
                 Modal::QueuedEdit { .. } => AGENT_QUEUE_BUTTON,
                 Modal::Menu { .. } => AGENT_MENU,
                 Modal::Rename(_) | Modal::RenameFolder { .. } => AGENT_RENAME,
-                Modal::FolderPicker { .. } => AGENT_MENU,
+                Modal::FolderPicker { .. } | Modal::NewSession(_) => AGENT_MENU,
                 Modal::DeleteFolder(_) => AGENT_DELETE,
                 Modal::Model { .. } => AGENT_MODEL,
                 Modal::ModelPicker(_) => AGENT_MODEL_PICKER,
