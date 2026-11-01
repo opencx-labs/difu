@@ -667,6 +667,12 @@ fn private_dir(home: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// A remote listening on loopback only, for end-to-end tests of clients.
+#[cfg(test)]
+pub(crate) fn loopback(storage: Storage) -> Arc<Remote> {
+    Remote::open(storage, Some("127.0.0.1".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
