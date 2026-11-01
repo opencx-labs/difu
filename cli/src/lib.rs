@@ -5,6 +5,7 @@ pub mod clipboard;
 pub mod codex;
 pub mod conflicts;
 pub mod context;
+pub mod cpu;
 pub mod diff;
 pub mod editor;
 pub mod github;

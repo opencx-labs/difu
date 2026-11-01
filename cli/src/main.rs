@@ -88,6 +88,9 @@ fn main() -> Result<()> {
             (Some(config), Some(cache)) => Storage { config, cache },
             _ => Storage::discover()?,
         };
+        if args.agent_service {
+            difu::cpu::start();
+        }
         return if args.refresh_agent_service {
             difu::agents::client::refresh_running(&storage)
         } else {
@@ -176,6 +179,8 @@ fn main() -> Result<()> {
     } else {
         Shell::new(storage, config, pr)
     };
+    difu::cpu::start();
+    app.start_cpu_monitor();
     let signals = authentication::Signals::register()?;
     let mut terminal = match ratatui::try_init() {
         Ok(terminal) => terminal,
@@ -270,6 +275,7 @@ fn main() -> Result<()> {
                 focused,
                 app.redraw_interval(),
             ) {
+                let _cpu = difu::cpu::measure(difu::cpu::Area::Rendering);
                 let frame = terminal.draw(|frame| {
                     app.draw(frame);
                     difu::theme::present(frame.buffer_mut());
@@ -277,6 +283,7 @@ fn main() -> Result<()> {
                 app.reviews
                     .hover
                     .render(&mut io::stdout().lock(), frame.buffer)?;
+                difu::cpu::frame();
             }
             // Flush the cleared composer and optimistic message before any work
             // that receives provider results or schedules cache refreshes.

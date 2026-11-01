@@ -56,6 +56,7 @@ impl Store {
         Ok(read(sessions.get(id).context("Session not found")?))
     }
     pub fn update(&self, id: &str, f: impl FnOnce(&mut Session)) -> Result<()> {
+        let _cpu = crate::cpu::measure(crate::cpu::Area::SessionUpdates);
         let mut sessions = self
             .sessions
             .lock()
@@ -81,6 +82,7 @@ impl Store {
         action()
     }
     pub fn save(&self, id: &str) -> Result<()> {
+        let _cpu = crate::cpu::measure(crate::cpu::Area::Persistence);
         let _guard = self
             .save_lock
             .lock()
@@ -462,6 +464,7 @@ impl Service {
                     .context("Notification service unavailable")?
                     .request(command)?,
             )),
+            Request::Cpu { after } => Ok(Reply::Cpu(crate::cpu::snapshot(after))),
             Request::Ping => Ok(Reply::Ok),
             Request::ServiceVersion => Ok(Reply::ServiceVersion {
                 version: env!("CARGO_PKG_VERSION").into(),

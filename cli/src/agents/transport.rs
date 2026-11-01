@@ -27,6 +27,7 @@ pub struct ChildDelta {
 }
 impl Delta {
     pub fn between(previous: &Session, next: &Session) -> Self {
+        let _cpu = crate::cpu::measure(crate::cpu::Area::Transport);
         let entries = next
             .entries
             .iter()
@@ -67,6 +68,7 @@ impl Delta {
         }
     }
     pub fn apply(mut self, current: &mut Session) -> Result<()> {
+        let _cpu = crate::cpu::measure(crate::cpu::Area::SessionUpdates);
         ensure!(
             self.base == current.version && self.session.id == current.id,
             "Session update base changed; reconnecting"
@@ -174,6 +176,7 @@ impl<W: Write> Write for FramedWriter<'_, W> {
     }
 }
 pub fn write_reply(output: &mut impl Write, reply: &Reply) -> Result<()> {
+    let _cpu = crate::cpu::measure(crate::cpu::Area::Transport);
     let mut writer = FramedWriter {
         output,
         buffer: Vec::with_capacity(CHUNK),
@@ -215,6 +218,7 @@ impl<R: BufRead> Read for FramedReader<'_, R> {
     }
 }
 pub fn read_reply(input: &mut impl BufRead) -> Result<Reply> {
+    let _cpu = crate::cpu::measure(crate::cpu::Area::Transport);
     let first = client::read_line(input).context("Receive session service reply")?;
     if first.trim() != START {
         return serde_json::from_str(&first).context("Decode session service reply");

@@ -18,6 +18,7 @@ use std::io::Write;
 use unicode_width::UnicodeWidthStr;
 
 const TAB_MARGIN: u16 = 1;
+mod cpu_panel;
 mod notifications;
 mod palette;
 mod preferences;
@@ -32,6 +33,7 @@ pub struct Shell {
     reviews_started: bool,
     notification_client: crate::agents::notifications::client::Client,
     palette: Option<palette::Palette>,
+    cpu: cpu_panel::Panel,
     pub(crate) settings: Option<settings_panel::Panel>,
     settings_action_open: bool,
     settings_refreshed: Option<std::time::Instant>,
@@ -64,6 +66,7 @@ impl Shell {
             agents_active: !reviews_started,
             reviews_started,
             palette: None,
+            cpu: cpu_panel::Panel::default(),
             settings: None,
             settings_action_open: false,
             settings_refreshed: None,
@@ -107,6 +110,9 @@ impl Shell {
         }
     }
     fn take_settings_request(&mut self) {
+        if std::mem::take(&mut self.agents.cpu_requested) {
+            self.open_cpu();
+        }
         if let Some(category) = self.agents.settings_requested.take() {
             self.open_settings(Some(category));
         }
@@ -132,6 +138,9 @@ impl Shell {
         }
     }
     pub fn redraw_interval(&self) -> Option<std::time::Duration> {
+        if self.cpu.open {
+            return None;
+        }
         if self
             .settings
             .as_ref()
@@ -197,6 +206,9 @@ impl Shell {
         ]
     }
     pub fn key(&mut self, key: KeyEvent) {
+        if self.cpu_key(key) {
+            return;
+        }
         self.reconcile_settings_action();
         if key.kind == KeyEventKind::Release {
             if self.agents_active {
@@ -339,6 +351,9 @@ impl Shell {
         }
     }
     pub fn mouse(&mut self, mouse: MouseEvent) {
+        if self.cpu_mouse(mouse) {
+            return;
+        }
         self.reconcile_settings_action();
         if self.settings_action_open {
             self.agents.mouse(mouse);
@@ -373,6 +388,12 @@ impl Shell {
         }
     }
     pub fn paste(&mut self, text: String) {
+        if self.cpu.open {
+            if let Some(palette) = &mut self.palette {
+                palette.paste(&text);
+            }
+            return;
+        }
         self.reconcile_settings_action();
         if self.settings_action_open {
             self.agents.paste(&text);
@@ -394,6 +415,13 @@ impl Shell {
         }
     }
     pub fn draw(&mut self, frame: &mut Frame) {
+        if self.cpu.open {
+            self.agents
+                .configure_images(&self.reviews.images, true, frame.area());
+        }
+        if self.draw_cpu(frame) {
+            return;
+        }
         let _images = crate::images::defer_drawing(
             self.settings.is_none()
                 && self
@@ -456,6 +484,7 @@ impl Shell {
         {
             self.switched = None;
         }
+        self.cpu.draw_toast(frame);
     }
     pub fn clipboard(&mut self, output: &mut impl Write) {
         self.reviews.flush_clipboard(output);

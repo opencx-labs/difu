@@ -689,9 +689,12 @@ fn read_output(terminal: Arc<Mutex<Terminal>>, mut reader: Box<dyn Read + Send>)
                 return;
             }
             Ok(count) => {
-                terminal
-                    .parser
-                    .process(buffer.get(..count).unwrap_or_default());
+                {
+                    let _cpu = crate::cpu::measure(crate::cpu::Area::TerminalParsing);
+                    terminal
+                        .parser
+                        .process(buffer.get(..count).unwrap_or_default());
+                }
                 terminal.revision += 1;
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
