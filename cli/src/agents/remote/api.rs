@@ -349,8 +349,15 @@ struct Upload {
 }
 
 fn new_session(inner: &Inner, params: &Value) -> Result<Value> {
-    let saved = config(&inner.storage).agent_defaults;
-    let repository: Option<PathBuf> = optional(params, "repository")?;
+    let config = config(&inner.storage);
+    let saved = config.agent_defaults;
+    // A server also takes `owner/name`, adding and cloning it when needed.
+    let repository = match optional::<String>(params, "repository")? {
+        Some(repository) if config.server.enabled => {
+            Some(crate::cloud::repos::resolve(&inner.storage, &repository)?)
+        }
+        repository => repository.map(PathBuf::from),
+    };
     let defaults = AgentDefaults {
         provider: saved.provider,
         starting_mode: saved.starting_mode,
@@ -391,10 +398,24 @@ fn new_session(inner: &Inner, params: &Value) -> Result<Value> {
 }
 
 /// Repositories difu already knows: the default, review clones, local diff
-/// repositories, and repositories of existing sessions.
+/// repositories, and repositories of existing sessions. A server offers its
+/// server repositories instead.
 fn repositories(inner: &Inner) -> Result<Vec<Value>> {
     let config = config(&inner.storage);
     let default = config.agent_defaults.repository.clone();
+    if config.server.enabled {
+        return Ok(crate::cloud::repos::list(&inner.storage)?
+            .into_iter()
+            .filter(|repository| !repository.path.as_os_str().is_empty())
+            .map(|repository| {
+                json!({
+                    "path": repository.path.display().to_string(),
+                    "name": repository.name,
+                    "default": default.as_ref() == Some(&repository.path),
+                })
+            })
+            .collect());
+    }
     let mut seen = BTreeSet::new();
     let mut paths = Vec::new();
     let Reply::Sessions(list) = inner.request(Request::List)? else {
@@ -659,6 +680,35 @@ mod tests {
             files.get(3).map(|f| at(f, "/oldPath").clone()),
             Some(json!("x"))
         );
+    }
+
+    #[test]
+    fn servers_offer_their_server_repositories() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let clone = crate::cloud::repos::path(&storage, "owner/repo")?;
+        storage.update_config(|config| {
+            config.server.enabled = true;
+            config.server.repositories = vec!["owner/repo".into(), "owner/next".into()];
+            config.agent_defaults.repository = Some(clone.clone());
+        })?;
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+        let connection = Connection::new(storage, 0, sender);
+        assert_eq!(
+            repositories(&connection.0)?,
+            [
+                json!({"path": clone.display().to_string(), "name": "owner/repo", "default": true}),
+                json!({
+                    "path": clone.with_file_name("next").display().to_string(),
+                    "name": "owner/next",
+                    "default": false,
+                }),
+            ]
+        );
+        Ok(())
     }
 
     #[test]
