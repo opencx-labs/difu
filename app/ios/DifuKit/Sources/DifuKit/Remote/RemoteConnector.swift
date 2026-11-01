@@ -5,7 +5,7 @@ public enum RemoteConnector {
     /// Per-host connect + handshake timeout.
     public static let hostTimeout: TimeInterval = 4
     /// Password pairing derives a slow key on both sides, so it gets longer.
-    public static let passwordTimeout: TimeInterval = 25
+    public static let passwordTimeout: TimeInterval = 15
 
     /// Pairs with the computer in `link`. Returns the live connection and the
     /// credential to store (with the device token from `welcome`).

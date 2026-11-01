@@ -49,9 +49,9 @@ extension RemoteError: LocalizedError {
         case .invalidAddress(let message):
             message
         case .pinMismatch(let host, let expected, let actual):
-            "\(host) presented a different certificate than the paired computer "
+            "\(host) presented a different certificate than the one this phone paired with "
                 + "(expected \(expected.prefix(12))…, got \(actual.prefix(12))…). "
-                + "If you reset remote control on your computer, pair again."
+                + "If remote control was reset there, pair again."
         case .tls(let host, let message):
             "Secure connection to \(host) failed: \(message)"
         case .timeout(let host):
@@ -70,15 +70,15 @@ extension RemoteError: LocalizedError {
         case .server(let message):
             message
         case .requestTimedOut(let method):
-            "The computer took too long to answer (\(method))."
+            "difu took too long to answer (\(method))."
         case .connectionLost(let message):
             message
         case .notConnected:
-            "Not connected to your computer."
+            "Not connected right now. difu keeps trying to reconnect."
         case .notPaired:
             "This phone isn't paired with this computer or server."
         case .protocolError(let message):
-            "Unexpected reply from the computer: \(message)"
+            "Unexpected reply from difu: \(message)"
         }
     }
 

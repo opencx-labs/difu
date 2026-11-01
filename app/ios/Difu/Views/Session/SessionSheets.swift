@@ -6,7 +6,7 @@ struct ModelSheet: View {
     let sessionID: String
     let view: SessionView?
 
-    @Environment(AppModel.self) private var app
+    @Environment(ServerConnection.self) private var server
     @Environment(\.dismiss) private var dismiss
     @State private var models: [AgentModel]?
     @State private var modelsError: String?
@@ -47,7 +47,7 @@ struct ModelSheet: View {
                 model = view?.model
                 effort = view?.effort
                 do {
-                    models = try await app.api.models()
+                    models = try await server.api.models()
                 } catch {
                     modelsError = error.localizedDescription
                 }
@@ -62,7 +62,7 @@ struct ModelSheet: View {
         Task {
             defer { saving = false }
             do {
-                try await app.api.setModel(sessionID, model: model, effort: effort)
+                try await server.api.setModel(sessionID, model: model, effort: effort)
                 dismiss()
             } catch {
                 self.error = error.localizedDescription
@@ -75,7 +75,7 @@ struct ModelSheet: View {
 struct ChangesSheet: View {
     let sessionID: String
 
-    @Environment(AppModel.self) private var app
+    @Environment(ServerConnection.self) private var server
     @Environment(\.dismiss) private var dismiss
     @State private var files: [DiffFile]?
     @State private var error: String?
@@ -99,7 +99,7 @@ struct ChangesSheet: View {
 
     private func load() async {
         do {
-            files = try await app.api.changes(sessionID)
+            files = try await server.api.changes(sessionID)
             error = nil
         } catch {
             self.error = error.localizedDescription

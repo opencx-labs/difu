@@ -3,12 +3,14 @@
 <plist version="1.0">
 <dict>
 	<key>NSCameraUsageDescription</key>
-	<string>difu uses the camera to scan the pairing QR code shown by /remote-control on your computer.</string>
+	<string>difu uses the camera to scan the pairing QR code shown by difu on your computer or server.</string>
+	<key>NSFaceIDUsageDescription</key>
+	<string>difu uses Face ID to keep your coding agents and reviews locked when you're away.</string>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>difu connects to your computer on this Wi-Fi network.</string>
+	<string>difu connects to computers running difu on your local network.</string>
 	<key>NSAppTransportSecurity</key>
 	<dict>
-		<key>NSAllowsLocalNetworking</key>
+		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
 	<key>CFBundleURLTypes</key>

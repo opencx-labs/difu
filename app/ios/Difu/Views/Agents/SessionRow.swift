@@ -31,6 +31,8 @@ struct StatusBadge: View {
 
 struct SessionRow: View {
     let summary: SessionSummary
+    /// The session's server, shown as a badge when several are saved.
+    var server: ServerConnection?
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -59,6 +61,9 @@ struct SessionRow: View {
                     }
                     if summary.archived {
                         Pill(text: "Archived", systemImage: "archivebox")
+                    }
+                    if let server {
+                        ServerBadge(server: server)
                     }
                 }
                 if let subtitle {
@@ -96,5 +101,18 @@ struct SessionRow: View {
     private var subtitle: String? {
         let parts = [summary.repository, summary.branch].compactMap { $0 }.filter { !$0.isEmpty }
         return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    }
+}
+
+/// The server a session runs on (only shown when several are saved).
+struct ServerBadge: View {
+    let server: ServerConnection
+
+    var body: some View {
+        Pill(text: server.name, systemImage: server.isServer ? "server.rack" : "laptopcomputer", color: .indigo)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .layoutPriority(-1)
+            .accessibilityLabel("On \(server.name)")
     }
 }

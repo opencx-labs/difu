@@ -1,15 +1,19 @@
 import DifuKit
 import SwiftUI
 
-/// Starts a session: repository, optional model and effort, first message.
+/// Starts a session: server (when several are saved), repository, optional
+/// base branch, model and effort, first message.
 struct NewSessionSheet: View {
-    var onCreated: (String) -> Void
+    var onCreated: (SessionRef) -> Void
 
     @Environment(AppModel.self) private var app
     @Environment(\.dismiss) private var dismiss
+    @State private var serverID: String?
     @State private var repositories: [AgentRepository]?
     @State private var repositoriesError: String?
     @State private var repository: String?
+    @State private var otherRepository = ""
+    @State private var base = ""
     @State private var models: [AgentModel]?
     @State private var modelsError: String?
     @State private var model: String?
@@ -19,37 +23,30 @@ struct NewSessionSheet: View {
     @State private var error: String?
     @FocusState private var focused: Bool
 
+    private var server: ServerConnection? {
+        app.server(serverID) ?? app.servers.first(where: \.isConnected) ?? app.servers.first
+    }
+
     var body: some View {
         NavigationStack {
             Form {
-                Section("Repository") {
-                    if let repositories {
-                        if repositories.isEmpty {
-                            Text("No repositories yet — the default workspace is used.")
-                                .foregroundStyle(.secondary)
-                        } else {
-                            Picker("Repository", selection: $repository) {
-                                ForEach(repositories) { repository in
-                                    Text(repository.isDefault ? "\(repository.name) (default)" : repository.name)
-                                        .tag(Optional(repository.path))
+                if app.servers.count > 1 {
+                    Section("Server") {
+                        Picker("Server", selection: $serverID) {
+                            ForEach(app.servers) { server in
+                                Label {
+                                    Text(server.isConnected ? server.name : "\(server.name) (offline)")
+                                } icon: {
+                                    Image(systemName: server.isServer ? "server.rack" : "laptopcomputer")
                                 }
-                            }
-                            .pickerStyle(.navigationLink)
-                            if let path = repository {
-                                Text(path)
-                                    .font(.monoCaption)
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                                    .truncationMode(.head)
+                                .tag(Optional(server.id))
                             }
                         }
-                    } else if let repositoriesError {
-                        Label(repositoriesError, systemImage: "exclamationmark.triangle")
-                            .foregroundStyle(.secondary)
-                    } else {
-                        ProgressView()
+                        .pickerStyle(.navigationLink)
                     }
                 }
+
+                repositorySection
 
                 ModelPickerSection(models: models, error: modelsError, model: $model, effort: $effort)
 
@@ -70,19 +67,87 @@ struct NewSessionSheet: View {
                         ProgressView()
                     } else {
                         Button("Start") { create() }
-                            .disabled(!app.isConnected)
+                            .disabled(server?.isConnected != true)
                     }
                 }
             }
-            .task { await loadRepositories() }
-            .task { await loadModels() }
+            .onAppear {
+                if serverID == nil { serverID = server?.id }
+            }
+            .task(id: serverID) { await load() }
             .errorAlert($error, title: "Couldn't start the session")
         }
     }
 
-    private func loadRepositories() async {
+    @ViewBuilder private var repositorySection: some View {
+        Section {
+            if let repositories {
+                if repositories.isEmpty {
+                    Text(server?.isServer == true
+                        ? "No server repositories yet. Type owner/name below, or add some in Settings."
+                        : "No repositories yet — the default workspace is used.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    Picker("Repository", selection: $repository) {
+                        ForEach(repositories) { repository in
+                            Text(repository.isDefault ? "\(repository.name) (default)" : repository.name)
+                                .tag(Optional(repository.path))
+                        }
+                    }
+                    .pickerStyle(.navigationLink)
+                    .disabled(!otherRepository.isEmpty)
+                    if let path = repository, otherRepository.isEmpty {
+                        Text(path)
+                            .font(.monoCaption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.head)
+                    }
+                }
+                if server?.isServer == true {
+                    TextField("Other repository (owner/name)", text: $otherRepository)
+                        .font(.monoBody)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    TextField("Base branch (default branch)", text: $base)
+                        .font(.monoBody)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+            } else if let repositoriesError {
+                Label(repositoriesError, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.secondary)
+            } else {
+                ProgressView()
+            }
+        } header: {
+            Text("Repository")
+        } footer: {
+            if server?.isServer == true {
+                Text("A repository the server doesn't have yet is added and cloned first.")
+            }
+        }
+    }
+
+    private func load() async {
+        // `serverID` is set on appear; loading before that would load twice.
+        guard serverID != nil, let server else { return }
+        repositories = nil
+        repositoriesError = nil
+        repository = nil
+        models = nil
+        modelsError = nil
+        model = nil
+        effort = nil
+        async let repositories: Void = loadRepositories(server)
+        async let models: Void = loadModels(server)
+        _ = await (repositories, models)
+    }
+
+    private func loadRepositories(_ server: ServerConnection) async {
         do {
-            let list = try await app.api.repositories()
+            let list = try await server.api.repositories()
+            guard server.id == self.server?.id else { return }
             repositories = list
             repository = (list.first(where: \.isDefault) ?? list.first)?.path
         } catch {
@@ -90,25 +155,31 @@ struct NewSessionSheet: View {
         }
     }
 
-    private func loadModels() async {
+    private func loadModels(_ server: ServerConnection) async {
         do {
-            models = try await app.api.models()
+            let list = try await server.api.models()
+            guard server.id == self.server?.id else { return }
+            models = list
         } catch {
             modelsError = error.localizedDescription
         }
     }
 
     private func create() {
+        guard let server else { return }
         creating = true
         let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let other = otherRepository.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isServer = server.isServer
         Task {
             defer { creating = false }
             do {
-                let id = try await app.api.newSession(
-                    repository: repository, model: model, effort: effort, text: message)
+                let id = try await server.api.newSession(
+                    repository: other.isEmpty || !isServer ? repository : other,
+                    base: isServer ? base : nil, model: model, effort: effort, text: message)
                 Haptics.send()
                 dismiss()
-                onCreated(id)
+                onCreated(SessionRef(server: server.id, session: id))
             } catch {
                 self.error = error.localizedDescription
             }

@@ -2,12 +2,15 @@ import DifuKit
 import SwiftUI
 
 struct PrRoute: Hashable {
+    /// The saved server the pull request is reviewed through.
+    let server: String
     let repo: String
     let number: Int
     var title: String?
 }
 
 struct RepoRoute: Hashable {
+    let server: String
     let name: String
 }
 
@@ -23,20 +26,51 @@ struct ReviewsView: View {
 
     var body: some View {
         NavigationStack {
-            content
-                .navigationTitle("Reviews")
-                .navigationDestination(for: PrRoute.self) { PrScreen(route: $0) }
-                .navigationDestination(for: RepoRoute.self) { RepositoryPrsView(repo: $0.name) }
-                .task(id: app.generation) {
-                    let reviews = app.reviews
-                    if reviews.inbox == nil { await reviews.loadInbox(refresh: false) }
-                    if reviews.repositories == nil { await reviews.loadRepositories() }
+            Group {
+                if let server = app.reviewsServer {
+                    content(server)
+                        .task(id: "\(server.id)#\(server.generation)") {
+                            let reviews = server.reviews
+                            if reviews.inbox == nil { await reviews.loadInbox(refresh: false) }
+                            if reviews.repositories == nil { await reviews.loadRepositories() }
+                        }
                 }
+            }
+            .navigationTitle("Reviews")
+            .toolbar {
+                if app.servers.count > 1, let current = app.reviewsServer {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        Menu {
+                            Picker("Server", selection: serverBinding) {
+                                ForEach(app.servers) { server in
+                                    Text(server.name).tag(server.id)
+                                }
+                            }
+                        } label: {
+                            Label(current.name, systemImage: current.isServer ? "server.rack" : "laptopcomputer")
+                                .labelStyle(.titleAndIcon)
+                                .lineLimit(1)
+                        }
+                    }
+                }
+            }
+            .navigationDestination(for: PrRoute.self) { PrScreen(route: $0) }
+            .navigationDestination(for: RepoRoute.self) { route in
+                if let server = app.server(route.server) {
+                    RepositoryPrsView(server: server, repo: route.name)
+                }
+            }
         }
     }
 
-    private var content: some View {
-        let reviews = app.reviews
+    private var serverBinding: Binding<String> {
+        Binding(
+            get: { app.reviewsServer?.id ?? "" },
+            set: { app.reviewsServerID = $0 })
+    }
+
+    private func content(_ server: ServerConnection) -> some View {
+        let reviews = server.reviews
         return List {
             Section {
                 Picker("Show", selection: $tab) {
@@ -48,11 +82,11 @@ struct ReviewsView: View {
             }
             switch tab {
             case .mine:
-                prSection(reviews.inbox?.mine)
+                prSection(reviews.inbox?.mine, server: server)
             case .requested:
-                prSection(reviews.inbox?.reviewing)
+                prSection(reviews.inbox?.reviewing, server: server)
             case .repos:
-                repoSection(reviews.repositories)
+                repoSection(reviews.repositories, server: server)
             }
         }
         .listStyle(.insetGrouped)
@@ -63,31 +97,35 @@ struct ReviewsView: View {
                 await reviews.loadInbox(refresh: true)
             }
         }
-        .overlay { overlay }
+        .overlay { overlay(reviews) }
     }
 
-    @ViewBuilder private func prSection(_ prs: [Pr]?) -> some View {
+    @ViewBuilder private func prSection(_ prs: [Pr]?, server: ServerConnection) -> some View {
         if let prs, !prs.isEmpty {
             Section {
                 ForEach(prs) { pr in
-                    NavigationLink(value: PrRoute(repo: pr.repo, number: pr.number, title: pr.title)) {
+                    NavigationLink(
+                        value: PrRoute(server: server.id, repo: pr.repo, number: pr.number, title: pr.title)
+                    ) {
                         PrRow(pr: pr)
                     }
                 }
             } footer: {
-                if let viewer = app.reviews.inbox?.viewer {
+                if let viewer = server.reviews.inbox?.viewer {
                     Text("Signed in to GitHub as \(viewer). Pull to refresh from GitHub.")
                 }
             }
         }
     }
 
-    @ViewBuilder private func repoSection(_ repositories: [ReviewRepository]?) -> some View {
+    @ViewBuilder private func repoSection(
+        _ repositories: [ReviewRepository]?, server: ServerConnection
+    ) -> some View {
         if let repositories, !repositories.isEmpty {
             let sorted = repositories.filter(\.pinned) + repositories.filter { !$0.pinned }
             Section {
                 ForEach(sorted) { repository in
-                    NavigationLink(value: RepoRoute(name: repository.name)) {
+                    NavigationLink(value: RepoRoute(server: server.id, name: repository.name)) {
                         HStack(spacing: 8) {
                             Image(systemName: repository.pinned ? "pin.fill" : "folder")
                                 .foregroundStyle(repository.pinned ? Color.accentColor : .secondary)
@@ -101,8 +139,7 @@ struct ReviewsView: View {
         }
     }
 
-    @ViewBuilder private var overlay: some View {
-        let reviews = app.reviews
+    @ViewBuilder private func overlay(_ reviews: ReviewsStore) -> some View {
         switch tab {
         case .mine, .requested:
             if let inbox = reviews.inbox {
@@ -149,9 +186,8 @@ struct ReviewsView: View {
 
 /// Open pull requests in one repository.
 struct RepositoryPrsView: View {
+    let server: ServerConnection
     let repo: String
-
-    @Environment(AppModel.self) private var app
     @State private var prs: [Pr]?
     @State private var error: String?
 
@@ -163,7 +199,9 @@ struct RepositoryPrsView: View {
                     description: Text(repo))
             } else {
                 List(prs) { pr in
-                    NavigationLink(value: PrRoute(repo: pr.repo, number: pr.number, title: pr.title)) {
+                    NavigationLink(
+                        value: PrRoute(server: server.id, repo: pr.repo, number: pr.number, title: pr.title)
+                    ) {
                         PrRow(pr: pr, showRepo: false)
                     }
                 }
@@ -178,7 +216,7 @@ struct RepositoryPrsView: View {
 
     private func load() async {
         do {
-            prs = try await app.api.pullRequests(in: repo)
+            prs = try await server.api.pullRequests(in: repo)
             error = nil
         } catch {
             self.error = error.localizedDescription

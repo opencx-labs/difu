@@ -1,76 +1,54 @@
 import DifuKit
 import SwiftUI
 
+/// Identifies a saved server in the Settings navigation stack.
+struct ServerRoute: Hashable {
+    let id: String
+}
+
 struct SettingsView: View {
     @Environment(AppModel.self) private var app
-    @State private var showingRepair = false
-    @State private var confirmingForget = false
+    @State private var addingServer = false
 
     var body: some View {
         NavigationStack {
             Form {
-                if let credential = app.credential {
-                    Section("Computer") {
-                        LabeledContent("Name", value: credential.computerName)
-                        LabeledContent("Status") { ConnectionStatusLabel() }
-                        if case .connected(let host) = app.connection {
-                            LabeledContent("Connected via") {
-                                Text("\(host):\(String(credential.port))").font(.monoCaption)
-                            }
+                Section {
+                    ForEach(app.servers) { server in
+                        NavigationLink(value: ServerRoute(id: server.id)) {
+                            ServerRow(server: server)
                         }
-                        LabeledContent("difu version", value: app.server?.version ?? credential.serverVersion ?? "—")
-                        if case .connecting(let failures, let error?) = app.connection, failures > 0 {
-                            Text(error)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Button("Reconnect Now") { app.retryNow() }
-                            .disabled(app.isConnected)
                     }
-
-                    Section {
-                        ForEach(credential.candidateHosts, id: \.self) { host in
-                            HStack {
-                                Text(host).font(.monoCaption)
-                                Spacer()
-                                if host == credential.preferredHost {
-                                    Text("last used").font(.caption).foregroundStyle(.secondary)
-                                }
-                            }
-                        }
-                        LabeledContent("Port") { Text(String(credential.port)).font(.monoCaption) }
-                    } header: {
-                        Text("Addresses")
-                    } footer: {
-                        Text("Tried in order; refreshed every time the phone connects.")
+                    Button {
+                        addingServer = true
+                    } label: {
+                        Label("Add Server", systemImage: "plus")
                     }
-
-                    Section {
-                        Button("Pair with a Different Computer") { showingRepair = true }
-                        Button("Forget This Computer", role: .destructive) { confirmingForget = true }
-                    } footer: {
-                        Text("Forgetting only removes the pairing from this phone. To revoke access, remove this phone in /remote-control on your computer.")
-                    }
+                } header: {
+                    Text("Servers")
+                } footer: {
+                    Text("difu connects to every saved computer and server while the app is open.")
                 }
+
+                LockSection()
 
                 Section("About") {
                     LabeledContent("This phone", value: UIDevice.current.name)
                     LabeledContent("App version", value: appVersion)
                     LabeledContent("Protocol", value: "v\(remoteProtocolVersion)")
-                    if let paired = app.credential?.pairedAt {
-                        LabeledContent("Paired", value: paired.formatted(date: .abbreviated, time: .shortened))
-                    }
                 }
             }
             .navigationTitle("Settings")
-            .sheet(isPresented: $showingRepair) { RepairSheet() }
-            .confirmationDialog(
-                "Forget \(app.computerName)?", isPresented: $confirmingForget, titleVisibility: .visible
-            ) {
-                Button("Forget", role: .destructive) { app.forget() }
-            } message: {
-                Text("You'll need to scan the QR code again to reconnect.")
+            .navigationDestination(for: ServerRoute.self) { route in
+                if let server = app.server(route.id) {
+                    ServerSettingsView(server: server)
+                } else {
+                    ContentUnavailableView(
+                        "Server removed", systemImage: "server.rack",
+                        description: Text("This server is no longer saved on this phone."))
+                }
             }
+            .sheet(isPresented: $addingServer) { AddServerSheet() }
         }
     }
 
@@ -82,11 +60,51 @@ struct SettingsView: View {
     }
 }
 
-struct ConnectionStatusLabel: View {
-    @Environment(AppModel.self) private var app
+/// The app lock toggle.
+private struct LockSection: View {
+    @Environment(AppLock.self) private var lock
 
     var body: some View {
-        switch app.connection {
+        Section {
+            Toggle(
+                "Require \(lock.methodName)",
+                isOn: Binding(
+                    get: { lock.enabled },
+                    set: { on in Task { await lock.setEnabled(on) } }))
+                // Also re-reads `enabled` when a cancelled check leaves it on.
+                .disabled(lock.authenticating)
+        } header: {
+            Text("Security")
+        } footer: {
+            Text("Asks when difu opens and after 5 minutes in the background.")
+        }
+    }
+}
+
+/// A saved server in the Settings list.
+struct ServerRow: View {
+    let server: ServerConnection
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(systemName: server.isServer ? "server.rack" : "laptopcomputer")
+                .foregroundStyle(Color.accentColor)
+                .frame(width: 26)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(server.name)
+                    .lineLimit(1)
+                ConnectionStatusLabel(server: server)
+                    .font(.caption)
+            }
+        }
+    }
+}
+
+struct ConnectionStatusLabel: View {
+    let server: ServerConnection
+
+    var body: some View {
+        switch server.state {
         case .connected:
             Label("Connected", systemImage: "circle.fill")
                 .foregroundStyle(Color.success)
