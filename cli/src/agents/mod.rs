@@ -22,6 +22,7 @@ mod questions;
 mod registration;
 pub mod remote;
 mod rules;
+pub mod sandbox;
 pub mod server;
 mod shared;
 pub mod shells;

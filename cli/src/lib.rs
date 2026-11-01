@@ -2,6 +2,7 @@ pub mod app;
 pub mod bounds;
 pub mod ci;
 pub mod clipboard;
+pub mod cloud;
 pub mod codex;
 pub mod conflicts;
 pub mod context;
