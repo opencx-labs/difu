@@ -112,6 +112,32 @@ fn missing_readings_low_usage_and_sleep_gaps_break_sustained_warning() {
     assert!(!alert.update(start + Duration::from_secs(3600), Some(90.0)));
 }
 #[test]
+fn suspend_and_wall_clock_adjustments_break_a_streak_even_if_instant_pauses() {
+    let start = Instant::now();
+    for new_wall in [3_600_000, -3_600_000] {
+        let mut alert = Alert::default();
+        for second in 0..30 {
+            assert!(!alert.sample(
+                start + Duration::from_secs(second),
+                second as i64 * 1000,
+                Some(50.0),
+            ));
+        }
+        for second in 30..60 {
+            assert!(!alert.sample(
+                start + Duration::from_secs(second),
+                new_wall + (second as i64 - 30) * 1000,
+                Some(50.0),
+            ));
+        }
+        assert!(alert.sample(
+            start + Duration::from_secs(60),
+            new_wall + 30_000,
+            Some(50.0)
+        ));
+    }
+}
+#[test]
 fn service_restart_duplicate_samples_and_stale_data_are_handled() -> Result<()> {
     let start = Instant::now();
     let mut history = History::new(1, 0);

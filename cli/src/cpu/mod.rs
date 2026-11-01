@@ -327,9 +327,22 @@ impl Drop for Guard<'_> {
 pub(crate) struct Alert {
     high: Duration,
     previous: Option<Instant>,
+    previous_wall: Option<i64>,
     last_warning: Option<Instant>,
 }
 impl Alert {
+    pub fn sample(&mut self, now: Instant, at_ms: i64, percent: Option<f64>) -> bool {
+        // Instant may stop during system suspend. Check wall-clock continuity
+        // as well, so sleep (or a clock adjustment) cannot preserve a CPU streak.
+        if self
+            .previous_wall
+            .replace(at_ms)
+            .is_some_and(|at| !(0..=3_000).contains(&at_ms.saturating_sub(at)))
+        {
+            self.update(now, None);
+        }
+        self.update(now, percent)
+    }
     /// Count only consecutive measured intervals; missing samples and sleep gaps
     /// must not turn a stale high reading into a sustained-CPU warning.
     pub fn update(&mut self, now: Instant, percent: Option<f64>) -> bool {

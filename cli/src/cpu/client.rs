@@ -104,7 +104,7 @@ impl Client {
                     }
                     let percent = overview.combined();
                     overview.warning = alert
-                        .update(Instant::now(), percent)
+                        .sample(Instant::now(), overview.at_ms, percent)
                         .then_some(percent)
                         .flatten();
                     {
