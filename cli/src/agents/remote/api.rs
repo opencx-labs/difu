@@ -336,7 +336,10 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
         "pr.comment" | "pr.review" | "pr.merge" | "pr.close" | "pr.ready" => {
             reviews::act(method, params)
         }
-        _ => anyhow::bail!("Unknown method `{method}`; update difu on your computer"),
+        _ => match super::server_api::dispatch(&inner.storage, method, params) {
+            Some(result) => result,
+            None => anyhow::bail!("Unknown method `{method}`; update difu on your computer"),
+        },
     }
 }
 

@@ -967,6 +967,14 @@ pub enum Request {
     Remote {
         command: remote::Command,
     },
+    /// Read (`rules: None`) or replace a repository's rules. `server` names a
+    /// saved cloud server; `None` is this machine.
+    RepositoryRules {
+        #[serde(default)]
+        server: Option<String>,
+        repository: PathBuf,
+        rules: Option<String>,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
@@ -1005,6 +1013,10 @@ pub enum Reply {
         permissions: String,
     },
     Remote(remote::Status),
+    RepositoryRules {
+        root: PathBuf,
+        rules: String,
+    },
     Error(String),
 }
 

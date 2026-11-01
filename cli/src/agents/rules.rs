@@ -30,6 +30,34 @@ pub(super) fn load(storage: &Storage, path: &Path) -> Result<(PathBuf, String)> 
     Ok((root, rules))
 }
 
+/// Reads or replaces a repository's rules; empty rules remove the entry.
+pub(super) fn request(
+    storage: &Storage,
+    path: &Path,
+    rules: Option<String>,
+) -> Result<super::Reply> {
+    let root = repository(path)?;
+    let rules = match rules {
+        Some(rules) => {
+            storage.update_config(|config| {
+                if rules.trim().is_empty() {
+                    config.repository_rules.remove(&root);
+                } else {
+                    config.repository_rules.insert(root.clone(), rules.clone());
+                }
+            })?;
+            rules
+        }
+        None => storage
+            .load_config()?
+            .repository_rules
+            .get(&root)
+            .cloned()
+            .unwrap_or_default(),
+    };
+    Ok(super::Reply::RepositoryRules { root, rules })
+}
+
 pub(super) fn capture(storage: &Storage, session: &mut Session) -> Result<()> {
     if let Job::Coding(launch) = &session.job {
         session.repository_rules = load(storage, &launch.repository)?.1;

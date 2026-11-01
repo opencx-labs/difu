@@ -1352,6 +1352,15 @@ impl Service {
             )?)),
             Request::Defaults { cwd } => super::engine::defaults(&cwd),
             Request::Remote { command } => Ok(Reply::Remote(self.remote.command(command)?)),
+            Request::RepositoryRules {
+                server: None,
+                repository,
+                rules,
+            } => super::rules::request(&self.store.storage, &repository, rules),
+            Request::RepositoryRules {
+                server: Some(server),
+                ..
+            } => anyhow::bail!("Server {server} is not connected"),
             Request::Skills { id, force } => {
                 let session = self.store.get(&id)?;
                 ensure!(

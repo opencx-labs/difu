@@ -8,6 +8,7 @@ mod identity;
 mod listener;
 mod network;
 mod reviews;
+mod server_api;
 mod view;
 
 use crate::storage::{self, Storage};
