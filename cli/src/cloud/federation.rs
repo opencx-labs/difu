@@ -443,6 +443,8 @@ impl Federation {
         if state.loaded == Some(modified) {
             return Vec::new();
         }
+        // Report a broken file once per change, keeping the current links.
+        state.loaded = Some(modified);
         let saved = match servers::load(&self.storage) {
             Ok(saved) => saved,
             Err(error) => {
@@ -450,7 +452,6 @@ impl Federation {
                 return Vec::new();
             }
         };
-        state.loaded = Some(modified);
         state.links.retain(|name, link| {
             saved
                 .iter()
@@ -746,12 +747,14 @@ impl Federation {
         &self,
         server: &str,
         id: &str,
-        version: Option<u64>,
         mut send: impl FnMut(&Reply) -> Result<()>,
     ) -> Result<()> {
+        // Like the local watch, every subscription starts from a full baseline
+        // (the terminal app applies deltas only on top of one), so the
+        // subscriber's version is not passed on.
         let mut stream = match self
             .remote(server)
-            .and_then(|remote| remote.watch(id, version))
+            .and_then(|remote| remote.watch(id, None))
         {
             Ok(stream) => stream,
             Err(error) => return send(&Reply::Error(format!("{error:#}"))),
@@ -1165,7 +1168,7 @@ pub(crate) mod tests {
             "{status:?}"
         );
         let mut sent = Vec::new();
-        federation.watch("box", "1", None, |reply| {
+        federation.watch("box", "1", |reply| {
             sent.push(reply.clone());
             Ok(())
         })?;
@@ -1194,7 +1197,7 @@ pub(crate) mod tests {
                         .map_err(|_| anyhow::anyhow!("lock"))?
                         .pop()
                     {
-                        anyhow::ensure!(id == "1" && version == Some(7), "watch params");
+                        anyhow::ensure!(id == "1" && version.is_none(), "watch params");
                         break tx;
                     }
                     anyhow::ensure!(Instant::now() < deadline, "watch never opened");
@@ -1208,7 +1211,7 @@ pub(crate) mod tests {
             })
         };
         let mut sent = Vec::new();
-        federation.watch("box", "1", Some(7), |reply| {
+        federation.watch("box", "1", |reply| {
             sent.push(reply.clone());
             Ok(())
         })?;

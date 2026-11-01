@@ -1729,7 +1729,7 @@ fn serve(service: &Service, mut stream: UnixStream) -> Result<()> {
         if let Some(federation) = &service.federation
             && let Some((server, session)) = federation.watch_target(&id)
         {
-            return federation.watch(&server, &session, version, |reply| {
+            return federation.watch(&server, &session, |reply| {
                 super::transport::write_reply(&mut stream, reply)
             });
         }
