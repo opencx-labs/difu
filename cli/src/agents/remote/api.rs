@@ -378,6 +378,7 @@ fn new_session(inner: &Inner, params: &Value) -> Result<Value> {
         defaults,
         cwd: dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")),
         remember_repository: false,
+        server: None,
     })? {
         Reply::Launched(id) => id,
         Reply::ChooseRepository => anyhow::bail!("Choose a Git repository for the new session"),

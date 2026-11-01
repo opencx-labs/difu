@@ -2582,6 +2582,7 @@ fn new_defaults_choose_explicit_provider_and_acknowledge_mode_before_first_turn(
                 },
                 cwd: repo,
                 remember_repository: false,
+                server: None,
             },
         )?
         else {
@@ -2631,6 +2632,7 @@ fn rejected_starting_mode_stays_pending_and_sends_no_first_turn() -> Result<()> 
             },
             cwd: repo,
             remember_repository: false,
+            server: None,
         },
     )?
     else {
@@ -2687,6 +2689,7 @@ fn claude_starting_modes_use_native_arguments_and_repository_restrictions() -> R
                 },
                 cwd: repo,
                 remember_repository: false,
+                server: None,
             },
         )?
         else {
@@ -2730,6 +2733,7 @@ fn claude_starting_modes_use_native_arguments_and_repository_restrictions() -> R
             },
             cwd: repo,
             remember_repository: false,
+            server: None,
         },
     )?
     else {

@@ -202,6 +202,8 @@ struct Service {
     workers: Mutex<BTreeMap<String, Worker>>,
     action_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
     launch_lock: Mutex<()>,
+    /// Saved cloud servers; requests for their sessions are forwarded.
+    federation: Option<Arc<crate::cloud::federation::Federation>>,
 }
 
 pub fn home(storage: &Storage) -> Result<PathBuf> {
@@ -397,6 +399,13 @@ impl Service {
         Ok(id)
     }
     fn handle(&self, request: Request) -> Result<Reply> {
+        let request = match &self.federation {
+            Some(federation) => match federation.route(request) {
+                crate::cloud::federation::Route::Local(request) => request,
+                crate::cloud::federation::Route::Handled(reply) => return reply,
+            },
+            None => request,
+        };
         let (request, route) = match request {
             Request::SlackControl { id, control, route } => {
                 (Request::Control { id, control }, Some(route))
@@ -469,7 +478,19 @@ impl Service {
             Request::ServiceVersion => Ok(Reply::ServiceVersion {
                 version: env!("CARGO_PKG_VERSION").into(),
             }),
-            Request::List => Ok(Reply::Sessions(self.store.list()?)),
+            Request::List => {
+                let local = self.store.list()?;
+                Ok(Reply::Sessions(match &self.federation {
+                    Some(federation) => federation.list(local),
+                    None => local,
+                }))
+            }
+            Request::Servers => Ok(Reply::Servers(
+                self.federation
+                    .as_ref()
+                    .map(|federation| federation.servers())
+                    .unwrap_or_default(),
+            )),
             Request::AttachPr { id, url } => {
                 super::pr_attachments::handle(
                     &self.store,
@@ -488,9 +509,14 @@ impl Service {
                 }
             }),
             Request::NewAgent {
+                server: Some(server),
+                ..
+            } => anyhow::bail!("Server {server} is not connected"),
+            Request::NewAgent {
                 defaults,
                 cwd,
                 remember_repository,
+                server: None,
             } => {
                 defaults.validate()?;
                 let root = match super::workspace::repository(
@@ -1594,6 +1620,7 @@ pub fn run(storage: Storage) -> Result<()> {
     }
     let remote = super::remote::Remote::start(storage.clone());
     let notifications = notifications::Dispatcher::start(storage.clone(), notifications::Native)?;
+    let federation = crate::cloud::federation::Federation::start(storage.clone());
     let service = Arc::new(Service {
         remote,
         store: Arc::new(Store {
@@ -1608,6 +1635,7 @@ pub fn run(storage: Storage) -> Result<()> {
         workers: Mutex::new(BTreeMap::new()),
         action_locks: Mutex::new(BTreeMap::new()),
         launch_lock: Mutex::new(()),
+        federation: Some(federation),
     });
     ensure_orchestrator(&service.store)?;
     let _pr_cache =
@@ -1656,6 +1684,9 @@ pub fn run(storage: Storage) -> Result<()> {
             }
         }
     }
+    if let Some(federation) = &service.federation {
+        federation.stop();
+    }
     let workers = std::mem::take(
         &mut *service
             .workers
@@ -1695,6 +1726,13 @@ fn serve(service: &Service, mut stream: UnixStream) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let request: Request = serde_json::from_str(&super::client::read_line(&mut reader)?)?;
     if let Request::Watch { id, version } = request {
+        if let Some(federation) = &service.federation
+            && let Some((server, session)) = federation.watch_target(&id)
+        {
+            return federation.watch(&server, &session, version, |reply| {
+                super::transport::write_reply(&mut stream, reply)
+            });
+        }
         return watch(&service.store, &mut stream, &id, version);
     }
     let reply = service
@@ -1807,6 +1845,156 @@ mod watch_tests {
 }
 
 #[cfg(test)]
+mod federation_tests {
+    use super::*;
+    use crate::cloud::federation::tests::{Fake, connected, session};
+    use std::io::Write;
+
+    fn service(
+        federation: Option<crate::cloud::federation::Federation>,
+    ) -> Result<(tempfile::TempDir, Arc<Service>)> {
+        let temp = tempfile::tempdir()?;
+        let mut local = Session::new(
+            "local".into(),
+            Job::Coding(Launch {
+                repository: temp.path().into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        local.status = Status::Idle;
+        let store = Arc::new(Store::fixture(temp.path().into(), vec![local]));
+        let service = Arc::new(Service {
+            remote: super::remote::Remote::start(store.storage.clone()),
+            store,
+            workers: Mutex::new(BTreeMap::new()),
+            action_locks: Mutex::new(BTreeMap::new()),
+            launch_lock: Mutex::new(()),
+            federation: federation.map(Arc::new),
+        });
+        Ok((temp, service))
+    }
+
+    #[test]
+    fn service_merges_server_sessions_and_forwards_their_requests() -> Result<()> {
+        let fake = Fake::new(vec![session("1")]);
+        let (_servers, federation) = connected(vec![("box", fake.clone())])?;
+        let (_temp, service) = service(Some(federation))?;
+        let Reply::Sessions(list) = service.handle(Request::List)? else {
+            anyhow::bail!("sessions");
+        };
+        let mut ids: Vec<_> = list.iter().map(|s| s.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["box:1", "local"]);
+        let Reply::Session(read) = service.handle(Request::Read {
+            id: "box:1".into(),
+            version: None,
+        })?
+        else {
+            anyhow::bail!("server session");
+        };
+        assert_eq!(read.id, "box:1");
+        let Reply::Session(read) = service.handle(Request::Read {
+            id: "local".into(),
+            version: None,
+        })?
+        else {
+            anyhow::bail!("local session");
+        };
+        assert_eq!(read.id, "local");
+        let Reply::Servers(servers) = service.handle(Request::Servers)? else {
+            anyhow::bail!("servers");
+        };
+        assert_eq!(
+            servers.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            vec!["box"]
+        );
+        assert!(
+            fake.requests()
+                .iter()
+                .all(|r| !matches!(r, Request::Read { id, .. } if id == "local"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn without_servers_requests_stay_local() -> Result<()> {
+        let (_temp, service) = service(None)?;
+        let Reply::Sessions(list) = service.handle(Request::List)? else {
+            anyhow::bail!("sessions");
+        };
+        assert_eq!(
+            list.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            vec!["local"]
+        );
+        assert!(matches!(service.handle(Request::Servers)?, Reply::Servers(s) if s.is_empty()));
+        let error = service
+            .handle(Request::NewAgent {
+                defaults: crate::storage::AgentDefaults::default(),
+                cwd: PathBuf::new(),
+                remember_repository: false,
+                server: Some("box".into()),
+            })
+            .err()
+            .context("an unknown server cannot launch")?;
+        assert!(format!("{error:#}").contains("box"));
+        Ok(())
+    }
+
+    #[test]
+    fn watch_connections_for_server_sessions_stream_namespaced_replies() -> Result<()> {
+        let fake = Fake::new(vec![session("1")]);
+        let (_servers, federation) = connected(vec![("box", fake.clone())])?;
+        let (_temp, service) = service(Some(federation))?;
+        let (mut client, server) = UnixStream::pair()?;
+        client.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let serving = service.clone();
+        let worker = thread::spawn(move || serve(&serving, server));
+        serde_json::to_writer(
+            &mut client,
+            &Request::Watch {
+                id: "box:1".into(),
+                version: None,
+            },
+        )?;
+        client.write_all(b"\n")?;
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let feed = loop {
+            if let Some((id, _, tx)) = fake
+                .watches
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock"))?
+                .pop()
+            {
+                assert_eq!(id, "1");
+                break tx;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "server watch never opened");
+            thread::sleep(Duration::from_millis(2));
+        };
+        feed.send(Ok(Reply::Session(Box::new(session("1")))))?;
+        let mut reader = BufReader::new(client);
+        let first = super::super::transport::read_reply(&mut reader)?;
+        assert!(matches!(first, Reply::Session(s) if s.id == "box:1"));
+        drop(feed);
+        let last = loop {
+            match super::super::transport::read_reply(&mut reader)? {
+                Reply::Unchanged => continue,
+                other => break other,
+            }
+        };
+        assert!(matches!(last, Reply::Error(e) if e.contains("box")));
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("serve panicked"))??;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod routed_queue_tests {
     use super::*;
     #[test]
@@ -1838,6 +2026,7 @@ mod routed_queue_tests {
             workers: Mutex::new(BTreeMap::new()),
             action_locks: Mutex::new(BTreeMap::new()),
             launch_lock: Mutex::new(()),
+            federation: None,
         };
         let mut route = slack::Route {
             account: "account".into(),
@@ -1914,6 +2103,7 @@ mod routed_queue_tests {
             workers: Mutex::new(BTreeMap::new()),
             action_locks: Mutex::new(BTreeMap::new()),
             launch_lock: Mutex::new(()),
+            federation: None,
         };
         service.handle(Request::SlackControl {
             id: "worker".into(),
@@ -2064,6 +2254,7 @@ mod clear_tests {
             workers: Mutex::new(BTreeMap::new()),
             action_locks: Mutex::new(BTreeMap::new()),
             launch_lock: Mutex::new(()),
+            federation: None,
         };
         assert!(crate::github::store::load(&service.store.storage, &pr).is_none());
         let scope = crate::process::fixture::Scope::new(
@@ -2254,6 +2445,7 @@ mod clear_tests {
                 workers: Mutex::new(BTreeMap::new()),
                 action_locks: Mutex::new(BTreeMap::new()),
                 launch_lock: Mutex::new(()),
+                federation: None,
             });
 
             // Pause cleanup to observe progress before the clear request returns.

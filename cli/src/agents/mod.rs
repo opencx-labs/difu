@@ -672,6 +672,7 @@ impl Session {
                 && self.workspace_ready
                 && !self.workspace_removed
                 && matches!(self.job, Job::Coding(_)),
+            server: None,
         }
     }
 }
@@ -703,6 +704,10 @@ pub struct Summary {
     pub can_read_changes: bool,
     pub pending: usize,
     pub queued: usize,
+    /// The saved cloud server running this session; `None` is this machine.
+    /// Server sessions have `<server>:<session>` ids and server-side paths.
+    #[serde(default)]
+    pub server: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Skill {
@@ -926,6 +931,9 @@ pub enum Request {
         defaults: crate::storage::AgentDefaults,
         cwd: PathBuf,
         remember_repository: bool,
+        /// A saved cloud server to start the session on; `None` is this machine.
+        #[serde(default)]
+        server: Option<String>,
     },
     Control {
         id: String,
@@ -1011,6 +1019,8 @@ pub enum Request {
         repository: PathBuf,
         rules: Option<String>,
     },
+    /// Saved cloud servers with their connection state and repositories.
+    Servers,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
@@ -1053,6 +1063,7 @@ pub enum Reply {
         root: PathBuf,
         rules: String,
     },
+    Servers(Vec<crate::cloud::federation::ServerStatus>),
     Error(String),
 }
 

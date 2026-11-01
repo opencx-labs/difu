@@ -1443,6 +1443,7 @@ impl Ui {
                 defaults,
                 cwd,
                 remember_repository,
+                server: None,
             },
             true,
         );
