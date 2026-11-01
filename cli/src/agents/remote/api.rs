@@ -895,7 +895,13 @@ mod tests {
             config.agent_defaults.repository = Some(clone.clone());
         })?;
         let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
-        let connection = Connection::new(storage, 0, sender);
+        let connection = Connection::new(
+            super::super::Remote::start(storage),
+            "device".into(),
+            super::super::Access::Standard,
+            0,
+            sender,
+        );
         assert_eq!(
             repositories(&connection.0)?,
             [
