@@ -865,6 +865,9 @@ pub enum Request {
     },
     Ping,
     ServiceVersion,
+    Cpu {
+        after: Option<crate::cpu::Cursor>,
+    },
     List,
     /// Subscribe to the selected session; unchanged replies are heartbeats.
     Watch {
@@ -966,6 +969,7 @@ pub enum Request {
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
+    Cpu(crate::cpu::Snapshot),
     Notifications(notifications::Snapshot),
     Permissions {
         snapshot: permissions::Snapshot,

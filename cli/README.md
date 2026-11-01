@@ -102,6 +102,21 @@ assigning **Shift+Left** to open questions.
 
 ### Command palette
 
+**Cmd+K → /cpu** opens local CPU diagnostics from either tab. It shows CPU for
+this terminal UI and the background agent service, redraws per second, five
+minutes of history, and CPU time in instrumented areas such as rendering,
+session updates, persistence, terminal parsing, and session transport. CPU is
+sampled once per second; 100% means one core. Agent, build, Git subprocess,
+terminal-emulator, and GPU usage is outside those totals. Missing readings are
+shown as unavailable. The diagnostics view replaces chat rendering, so use its
+history to inspect the workload before opening it.
+
+A static toast appears when combined difu CPU stays above 25% of one core for
+30 seconds, with a 10-minute cooldown. Click it or open `/cpu` for details.
+Monitoring does not throttle work. History stays in memory, expires after five
+minutes, and is never uploaded or written to a diagnostic log. CPU percentages
+are not measurements of battery watts. **Esc** closes the view.
+
 **Cmd+K** opens global search from either tab. Search sessions by title,
 repository, branch, worktree, or PR number, and launch commands from both the
 Agents and Reviews `/` menus. PR results offer a preview alongside connected
@@ -423,7 +438,7 @@ With an empty composer, **Up** recalls sent prompts from the current session.
 Recalled prompts are editable and never sent automatically.
 
 Type **/** in an empty composer for native commands: `/compact`, `/model`, `/effort`,
-`/skills`, `/status`, `/rules`, `/usage`, `/mcp`, `/permissions`, `/diff`, `/new`, `/rename`, `/clear`, `/repo`, `/worktree`,
+`/skills`, `/status`, `/rules`, `/usage`, `/cpu`, `/mcp`, `/permissions`, `/diff`, `/new`, `/rename`, `/clear`, `/repo`, `/worktree`,
 `/help`, `/voice`, `/tweaks`, `/theme`, `/remote-control`, and `/actions`.
 Opening a session keeps the composer focused; pending questions remain available
 through the questions control.

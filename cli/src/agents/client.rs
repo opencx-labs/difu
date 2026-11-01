@@ -61,6 +61,8 @@ pub fn request(storage: &Storage, request: Request) -> Result<Reply> {
         Request::Delete { .. } | Request::Repository { .. } | Request::Clear { .. }
     ) {
         None
+    } else if matches!(request, Request::Cpu { .. }) {
+        Some(Duration::from_secs(2))
     } else {
         Some(Duration::from_secs(65))
     };

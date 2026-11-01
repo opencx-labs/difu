@@ -44,6 +44,7 @@ impl Shell {
     }
     /// Call every event-loop iteration, including sustained input and motion-off frames.
     pub fn notification_tick(&mut self, focused: bool) {
+        self.cpu.tick(focused);
         if self
             .settings
             .as_mut()

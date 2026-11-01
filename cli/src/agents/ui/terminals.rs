@@ -114,6 +114,7 @@ impl Terminal {
         }
     }
     fn receive(&mut self, value: &Value) -> Result<()> {
+        let _cpu = crate::cpu::measure(crate::cpu::Area::TerminalParsing);
         let rows = dimension(
             value
                 .get("rows")

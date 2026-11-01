@@ -387,6 +387,7 @@ enum Task {
 pub struct Ui {
     pub(crate) preferences: crate::settings::Preferences,
     shortcut_config: Config,
+    pub(crate) cpu_requested: bool,
     pub(crate) settings_requested: Option<crate::settings::Category>,
     panels: panels::Panels,
     prs: prs::State,
@@ -577,6 +578,7 @@ impl Ui {
             workspace_paths: HashMap::new(),
             paths_loading: HashSet::new(),
             settings_requested: None,
+            cpu_requested: false,
             voice: voice::State::new(config.voice_enabled),
             tweaks: config.tweaks,
             theme: crate::theme::index(config.theme.as_deref()),
@@ -692,6 +694,7 @@ impl Ui {
             self.tick_permissions();
         }
         while let Ok(message) = self.receiver.try_recv() {
+            let _cpu = crate::cpu::measure(crate::cpu::Area::SessionUpdates);
             let unchanged = match (&message.kind, &message.result) {
                 (Task::List, Ok(Reply::Sessions(sessions))) => {
                     sessions.len() == self.summaries.len()

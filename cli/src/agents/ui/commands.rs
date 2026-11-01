@@ -2,6 +2,10 @@ use super::*;
 
 const COMMANDS: &[(&str, &str)] = &[
     (
+        "cpu",
+        "CPU usage, rendering costs, history and high-CPU warnings",
+    ),
+    (
         "settings",
         "Preferences, keyboard shortcuts, notifications and connections",
     ),
@@ -400,6 +404,10 @@ impl Ui {
             return;
         }
         match name.as_str() {
+            "/cpu" => {
+                self.cpu_requested = true;
+                self.modal = None;
+            }
             "/slack" => self.open_slack(),
             "/remote-control" => self.open_remote(),
             "/voice" => self.toggle_voice(),

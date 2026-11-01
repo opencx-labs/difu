@@ -538,7 +538,7 @@ impl Shell {
         let mut matched = items.into_iter().filter_map(|item| {
             if commands_first {
                 match &item.action {
-                    Action::AgentCommand(name) if settings_panel::command_category(name).is_none() && (!session_context || !name.starts_with('/')) => return None,
+                    Action::AgentCommand(name) if name != "/cpu" && settings_panel::command_category(name).is_none() && (!session_context || !name.starts_with('/')) => return None,
                     Action::AgentMenu(_) if !session_context => return None,
                     Action::ReviewHome(_) | Action::ReviewCommand(_) if session_context => return None,
                     _ => {}
@@ -714,6 +714,7 @@ impl Shell {
             .map(|p| p.query.text())
             .unwrap_or_default();
         self.palette = None;
+        self.cpu.open = false;
         match item.action {
             Action::Session(id) => {
                 self.switch(true);
@@ -739,6 +740,10 @@ impl Shell {
                 app.action(ReviewAction::SetView(View::Overview));
             }
             Action::AgentCommand(name) => {
+                if name == "/cpu" {
+                    self.open_cpu();
+                    return;
+                }
                 if let Some(category) = settings_panel::command_category(&name) {
                     self.open_settings(Some(category));
                     return;
@@ -1295,7 +1300,7 @@ mod tests {
         ));
         let has_unrelated_controls = items.iter().any(|item| {
             matches!(item.action, Action::AgentMenu(_) | Action::ReviewHome(0))
-                || matches!(&item.action, Action::AgentCommand(name) if settings_panel::command_category(name).is_none())
+                || matches!(&item.action, Action::AgentCommand(name) if name != "/cpu" && settings_panel::command_category(name).is_none())
         });
         assert!(!has_unrelated_controls);
         query(&mut shell, "/PR controls");
@@ -1403,6 +1408,33 @@ mod tests {
         assert!(!shell.reviews.home);
         assert_eq!(shell.reviews.view, View::Overview);
         assert_eq!(shell.reviews.key(), Some(key.id()));
+        Ok(())
+    }
+    #[test]
+    fn cpu_command_is_global_and_preserves_the_underlying_tab() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        for agents_active in [true, false] {
+            let mut shell = fixture(Storage {
+                config: dir.path().join("config.json"),
+                cache: dir.path().into(),
+            })?;
+            shell.agents_active = agents_active;
+            shell.agents.selected = None;
+            query(&mut shell, "/cpu");
+            let index = shell
+                .palette_items()
+                .iter()
+                .position(
+                    |item| matches!(&item.action, Action::AgentCommand(name) if name == "/cpu"),
+                )
+                .context("global CPU command")?;
+            shell.activate_palette(index);
+            assert!(shell.cpu.open);
+            assert_eq!(shell.agents_active, agents_active);
+            assert_eq!(shell.redraw_interval(), None);
+            shell.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(!shell.cpu.open);
+        }
         Ok(())
     }
     #[test]
