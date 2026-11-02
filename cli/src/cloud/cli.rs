@@ -98,7 +98,7 @@ pub enum ReposCommand {
 /// Run on a server: per-session containers.
 #[derive(Clone, Debug, Subcommand)]
 pub enum SandboxCommand {
-    /// Build the default sandbox image.
+    /// Build the sandbox image, or pull `server.sandbox.image` from its registry.
     Build,
     /// Show the runtime, image and running sandboxes.
     Status,

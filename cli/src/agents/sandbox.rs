@@ -338,7 +338,7 @@ impl Sandbox {
             .lock()
             .map_err(|_| anyhow::anyhow!("Sandbox lock failed"))?;
         // Podman would try to pull a missing local image and fail obscurely.
-        if self.image.starts_with("localhost/") {
+        if local_image(&self.image) {
             ensure!(
                 runner.podman(&os(["image", "exists", &self.image]))?.code == 0,
                 "The sandbox image {} is missing. Run `difu sandbox build` on the server",
@@ -750,30 +750,70 @@ fn bounded(command: &mut Command, timeout: Duration) -> Result<process::Output> 
 
 pub fn command(storage: &Storage, command: SandboxCommand) -> Result<()> {
     match command {
-        SandboxCommand::Build => build(),
+        SandboxCommand::Build => build(storage),
         SandboxCommand::Status => status(storage),
     }
 }
 
-fn build() -> Result<()> {
+/// Images under `localhost/` exist only on this machine: difu builds them
+/// from its Containerfile. Any other name lives in a registry.
+fn local_image(image: &str) -> bool {
+    image.starts_with("localhost/")
+}
+
+/// How `difu sandbox build` provides the configured image.
+#[derive(Debug, PartialEq, Eq)]
+enum Provision<'a> {
+    /// Build the bundled Containerfile and tag it with this local name.
+    Build(&'a str),
+    /// Pull this registry image as it is.
+    Pull(&'a str),
+}
+
+fn provision(image: &str) -> Provision<'_> {
+    if local_image(image) {
+        Provision::Build(image)
+    } else {
+        Provision::Pull(image)
+    }
+}
+
+fn build(storage: &Storage) -> Result<()> {
     ensure!(
         installed(PODMAN),
         "Podman is not installed. Install it first, for example with `sudo apt-get install podman`"
     );
-    let directory = tempfile::tempdir()?;
-    let file = directory.path().join("Containerfile");
-    fs::write(&file, CONTAINERFILE)?;
-    let status = Command::new(PODMAN)
-        .args(build_args(&file, directory.path()))
-        .status()
-        .context("Cannot run podman build")?;
-    ensure!(status.success(), "podman build failed ({status})");
-    println!("Built {}", SandboxSettings::DEFAULT_IMAGE);
+    let settings = storage.load_config()?.server.sandbox;
+    match provision(settings.image()) {
+        Provision::Build(tag) => {
+            let directory = tempfile::tempdir()?;
+            let file = directory.path().join("Containerfile");
+            fs::write(&file, CONTAINERFILE)?;
+            let status = Command::new(PODMAN)
+                .args(build_args(tag, &file, directory.path()))
+                .status()
+                .context("Cannot run podman build")?;
+            ensure!(status.success(), "podman build failed ({status})");
+            println!("Built {tag}");
+        }
+        Provision::Pull(image) => {
+            println!(
+                "server.sandbox.image is {image}, a registry image rather than a localhost/ one: \
+                 pulling it instead of building difu's Containerfile"
+            );
+            let status = Command::new(PODMAN)
+                .args(os(["pull", image]))
+                .status()
+                .context("Cannot run podman pull")?;
+            ensure!(status.success(), "podman pull {image} failed ({status})");
+            println!("Pulled {image}");
+        }
+    }
     Ok(())
 }
 
-fn build_args(file: &Path, context: &Path) -> Vec<OsString> {
-    let mut args = os(["build", "-t", SandboxSettings::DEFAULT_IMAGE, "-f"]);
+fn build_args(tag: &str, file: &Path, context: &Path) -> Vec<OsString> {
+    let mut args = os(["build", "-t", tag, "-f"]);
     args.push(file.into());
     args.push(context.into());
     args
@@ -800,14 +840,7 @@ fn status(storage: &Storage) -> Result<()> {
     );
     let image = settings.sandbox.image();
     let present = podman.podman(&os(["image", "exists", image]))?.code == 0;
-    println!(
-        "Image: {image} ({})",
-        if present {
-            "present"
-        } else {
-            "missing; run `difu sandbox build`"
-        }
-    );
+    println!("Image: {}", image_status(image, present));
     let listed = podman.podman(&os([
         "pod",
         "ps",
@@ -836,6 +869,23 @@ fn mode(settings: &ServerSettings) -> String {
         (false, true) => "off until server mode is on (`difu serve`)".into(),
         (_, false) => "off (agents run directly on this machine)".into(),
     }
+}
+
+/// The configured image, whether it is difu's own, and whether it is here.
+fn image_status(image: &str, present: bool) -> String {
+    let origin = if image == SandboxSettings::DEFAULT_IMAGE {
+        "default"
+    } else {
+        "custom, from server.sandbox.image"
+    };
+    let state = match (present, local_image(image)) {
+        (true, _) => "present",
+        (false, true) => "missing; run `difu sandbox build`",
+        (false, false) => {
+            "not pulled yet; run `difu sandbox build` to pull it now, or Podman pulls it on first use"
+        }
+    };
+    format!("{image} ({origin}; {state})")
 }
 
 fn limits(sandbox: &SandboxSettings) -> String {
@@ -1545,6 +1595,7 @@ mod tests {
         }
         assert_eq!(
             strings(&build_args(
+                SandboxSettings::DEFAULT_IMAGE,
                 Path::new("/tmp/x/Containerfile"),
                 Path::new("/tmp/x")
             )),
@@ -1557,6 +1608,57 @@ mod tests {
                 "/tmp/x",
             ]
         );
+    }
+
+    #[test]
+    fn build_tags_a_custom_local_image_and_pulls_a_registry_image() {
+        let image = |name: &str| SandboxSettings {
+            image: name.into(),
+            ..SandboxSettings::default()
+        };
+        assert_eq!(
+            provision(image("").image()),
+            Provision::Build(SandboxSettings::DEFAULT_IMAGE)
+        );
+        assert_eq!(
+            provision(image(" localhost/team-sandbox:2 ").image()),
+            Provision::Build("localhost/team-sandbox:2")
+        );
+        for remote in [
+            "ghcr.io/owner/sandbox:1",
+            "docker.io/library/ubuntu:24.04",
+            // A registry on this machine is still a registry.
+            "localhost:5000/sandbox",
+        ] {
+            assert_eq!(provision(image(remote).image()), Provision::Pull(remote));
+        }
+        let args = strings(&build_args(
+            "localhost/team-sandbox:2",
+            Path::new("/tmp/x/Containerfile"),
+            Path::new("/tmp/x"),
+        ));
+        assert_eq!(
+            args.get(..3),
+            Some(&["build", "-t", "localhost/team-sandbox:2"].map(String::from)[..])
+        );
+    }
+
+    #[test]
+    fn status_reports_the_configured_image() {
+        assert_eq!(
+            image_status(SandboxSettings::DEFAULT_IMAGE, true),
+            "localhost/difu-sandbox:latest (default; present)"
+        );
+        assert_eq!(
+            image_status("localhost/team:2", false),
+            "localhost/team:2 (custom, from server.sandbox.image; missing; run `difu sandbox build`)"
+        );
+        let remote = image_status("ghcr.io/owner/sandbox:1", false);
+        assert!(
+            remote.starts_with("ghcr.io/owner/sandbox:1 (custom"),
+            "{remote}"
+        );
+        assert!(remote.contains("pulls it on first use"), "{remote}");
     }
 
     /// Runs only where rootless Podman works (Linux CI); skips elsewhere.

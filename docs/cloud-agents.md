@@ -58,7 +58,7 @@ Server side (run on the server, usually over SSH):
 | `difu remote password [--generate] [--disable]` | Set the server password (prompt or stdin), generate a strong one, or turn password pairing off. |
 | `difu remote config [--host H]... [--clear-hosts] [--port P]` | Addresses to advertise to clients (public IP, DNS or Tailscale name) and a fixed port. |
 | `difu repos [list]` / `difu repos add [owner/name]` / `difu repos remove owner/name` / `difu repos refresh [owner/name]` | Server repositories. `add` without a name opens a picker built from `gh repo list`. |
-| `difu sandbox build` / `difu sandbox status` | Build the sandbox image / show runtime, image and running sandboxes. |
+| `difu sandbox build` / `difu sandbox status` | Build (or pull) the configured sandbox image / show runtime, image and running sandboxes. |
 
 ## Onboarding (`difu server add`)
 
@@ -149,6 +149,11 @@ Permission prompts are unchanged.
   the service starts.
 * `difu sandbox build` builds `localhost/difu-sandbox:latest` from a bundled
   Containerfile (Ubuntu LTS with git, gh, build tools, Python, Node, ripgrep).
+  A custom `config.server.sandbox.image` under `localhost/` is built from the
+  same Containerfile and tagged with that name; any other image comes from a
+  registry, so `difu sandbox build` pulls it instead (and says so).
+  `difu sandbox status` reports the configured image and whether it is
+  present.
 * Sessions are always worktrees, exactly as on a local difu. Worktrees share the
   base clone's object store and refs, so a sandbox could rewrite another session's
   branch refs (not its files); this is accepted, as it is locally.
