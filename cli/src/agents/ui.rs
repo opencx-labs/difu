@@ -14,6 +14,7 @@ mod inline_questions;
 mod mcp_panel;
 mod media;
 mod models;
+mod moving;
 #[cfg(test)]
 mod overlay_shortcut_tests;
 mod panels;
@@ -246,6 +247,8 @@ enum Action {
     DismissNotice,
     /// A machine or repository in the new-session server picker.
     ServerChoice(usize),
+    /// A saved server in the "Move to server…" picker.
+    MoveChoice(usize),
 }
 pub enum Modal {
     Subagents {
@@ -351,6 +354,11 @@ pub enum Modal {
     Help(crate::help::State),
     /// Where a new session runs when cloud servers are saved.
     NewSession(Box<servers::Picker>),
+    /// Saved servers the selected session can move to.
+    MoveToServer {
+        servers: Vec<String>,
+        selected: usize,
+    },
 }
 struct ResultMessage {
     kind: Task,
@@ -1505,6 +1513,7 @@ impl Ui {
             "Repository rules",
             "Permissions and mode · Shift+Tab",
             "Move to folder · F",
+            "Move to server…",
         ];
         if self.plan_available() {
             entries.push("Review completed plan");
@@ -1543,7 +1552,8 @@ impl Ui {
             return;
         }
         match index {
-            21 => self.open_plan_prompt(),
+            22 => self.open_plan_prompt(),
+            21 => self.open_move_to_server(),
             20 => {
                 self.modal = None;
                 self.open_folder_picker();
@@ -2827,6 +2837,18 @@ impl Ui {
                     *selected = 0;
                 }
             },
+            Some(Modal::MoveToServer { servers, selected }) => match shortcut {
+                Some(crate::shortcuts::ids::NAVIGATION_UP) => {
+                    *selected = selected.saturating_sub(1)
+                }
+                Some(crate::shortcuts::ids::NAVIGATION_DOWN) => {
+                    *selected = (*selected + 1).min(servers.len().saturating_sub(1))
+                }
+                Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) => {
+                    action = Some(Action::MoveChoice(*selected))
+                }
+                _ => {}
+            },
             Some(Modal::RenameFolder { id, name }) => {
                 if shortcut == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) {
                     let (id, name) = (id.clone(), name.text());
@@ -2969,6 +2991,7 @@ impl Ui {
             Action::OpenFolder(id) => self.open_folder(id),
             Action::FolderBack => self.close_folder(),
             Action::FolderChoice(index) => self.choose_folder(index),
+            Action::MoveChoice(index) => self.choose_move_server(index),
             Action::Select(id) => {
                 if id == super::orchestrator::ID && !self.orchestrator_list {
                     self.open_orchestrator_list();
@@ -4595,6 +4618,7 @@ impl Ui {
             Some(Modal::QueuedEdit { .. }) => "Edit queued message",
             Some(Modal::Rename(_)) => "Rename session",
             Some(Modal::FolderPicker { .. }) => "Move to folder",
+            Some(Modal::MoveToServer { .. }) => "Move to server",
             Some(Modal::RenameFolder { .. }) => "Rename folder",
             Some(Modal::DeleteFolder(_)) => "Delete folder",
             Some(Modal::Model { .. }) => "Session model",
@@ -4912,6 +4936,18 @@ impl Ui {
                 *selected = (*selected).min(picker.len().saturating_sub(1));
                 let selected = *selected;
                 self.draw_folder_picker(frame, area, selected, &picker, &mut deferred);
+            }
+            Some(Modal::MoveToServer { servers, selected }) => {
+                *selected = (*selected).min(servers.len().saturating_sub(1));
+                let (servers, selected) = (servers.clone(), *selected);
+                self.draw_move_to_server(
+                    frame,
+                    area,
+                    &servers,
+                    selected,
+                    &activate_hint,
+                    &mut deferred,
+                );
             }
             Some(Modal::RenameFolder { name, .. }) => {
                 editor(
