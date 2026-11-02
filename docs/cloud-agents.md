@@ -388,6 +388,13 @@ owner out. The server stores only the verifier
 `{salt, iterations, key}`, never the password. Passwords must be at least 12
 characters.
 
+Connection limits: a client address (IPv6 per /64) may hold 4 unauthenticated
+connections and the server 32 connections in all. Each connection has 15
+seconds from accept to finish TLS, the WebSocket handshake and authentication
+(including the password challenge and proof); the server then closes it,
+however slowly the client was still sending, so slow clients cannot hold the
+slots.
+
 ### `welcome` additions
 
 ```json

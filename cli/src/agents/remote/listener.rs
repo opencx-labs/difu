@@ -2,7 +2,10 @@
 //! between short socket reads and draining replies/events queued by workers.
 //! Failed pairing is limited per client address (and password guesses
 //! globally) before any secret is checked; token authentication of paired
-//! devices is never locked out.
+//! devices is never locked out. A connection must finish TLS, the WebSocket
+//! handshake and authentication (including a password challenge) within
+//! [`AUTH_DEADLINE`] of being accepted, so slow clients cannot hold the
+//! per-address or global connection slots.
 use super::{Access, Enrolled, Remote, identity::Identity};
 use crate::cloud::password;
 use anyhow::{Context, Result, ensure};
@@ -35,6 +38,8 @@ const PASSWORD_WINDOW: Duration = Duration::from_secs(60 * 60);
 /// Slows guessing; tokens and codes are too long to brute-force anyway.
 const DENIAL_DELAY: Duration = Duration::from_millis(if cfg!(test) { 20 } else { 1000 });
 const LIMITED: &str = "Too many failed attempts from this address. Try again in a few minutes.";
+/// From accept until the client is authenticated, however it spreads its bytes.
+const AUTH_DEADLINE: Duration = Duration::from_secs(15);
 const MAX_MESSAGE: usize = 64 << 20;
 
 pub struct Server {
@@ -129,6 +134,7 @@ fn accept(
     stop: Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::Relaxed) {
+        remote.peers.expire(Instant::now());
         match listener.accept() {
             // Unauthenticated sockets hold a thread until their handshake times out.
             Ok(_) if remote.peers.count() >= MAX_PEERS => {}
@@ -175,19 +181,36 @@ impl Drop for Admission {
 }
 
 /// Live connections, so disabling remote control or forgetting a device also
-/// disconnects it immediately, and pairing events reach every other device.
-#[derive(Default)]
+/// disconnects it immediately, pairing events reach every other device, and
+/// a connection still unauthenticated at its deadline is cut off.
 pub struct Peers {
     next: AtomicU64,
     peers: Mutex<Vec<Peer>>,
+    /// Time from accept to authentication.
+    limit: Duration,
+}
+impl Default for Peers {
+    fn default() -> Self {
+        Self::with_deadline(AUTH_DEADLINE)
+    }
 }
 struct Peer {
     serial: u64,
     device: Option<String>,
     socket: TcpStream,
     events: Option<SyncSender<String>>,
+    /// Cleared once authenticated.
+    deadline: Option<Instant>,
+    expired: bool,
 }
 impl Peers {
+    fn with_deadline(limit: Duration) -> Self {
+        Self {
+            next: AtomicU64::new(0),
+            peers: Mutex::new(Vec::new()),
+            limit,
+        }
+    }
     fn add(&self, socket: &TcpStream) -> Result<u64> {
         let serial = self.next.fetch_add(1, Ordering::Relaxed);
         let socket = socket.try_clone()?;
@@ -197,9 +220,38 @@ impl Peers {
                 device: None,
                 socket,
                 events: None,
+                deadline: Some(Instant::now() + self.limit),
+                expired: false,
             });
         }
         Ok(serial)
+    }
+    /// The connection authenticated in time; it stays until it closes.
+    fn authenticated(&self, serial: u64) {
+        if let Ok(mut peers) = self.peers.lock()
+            && let Some(peer) = peers.iter_mut().find(|p| p.serial == serial)
+        {
+            peer.deadline = None;
+        }
+    }
+    /// Shuts down connections still unauthenticated at their deadline. Their
+    /// blocked reads and writes fail at once, wherever the handshake is.
+    fn expire(&self, now: Instant) {
+        if let Ok(mut peers) = self.peers.lock() {
+            for peer in peers
+                .iter_mut()
+                .filter(|p| p.deadline.is_some_and(|deadline| deadline <= now))
+            {
+                peer.deadline = None;
+                peer.expired = true;
+                let _ = peer.socket.shutdown(Shutdown::Both);
+            }
+        }
+    }
+    fn expired(&self, serial: u64) -> bool {
+        self.peers
+            .lock()
+            .is_ok_and(|peers| peers.iter().any(|p| p.serial == serial && p.expired))
     }
     fn identify(&self, serial: u64, device: &str, events: SyncSender<String>) {
         if let Ok(mut peers) = self.peers.lock()
@@ -415,9 +467,17 @@ fn serve(
             anyhow::Ok(authenticated.map(|a| (socket, a)))
         })();
         drop(admission);
-        let Some((mut socket, authenticated)) = opened? else {
+        let opened = match opened {
+            Err(_) if remote.peers.expired(serial) => anyhow::bail!(
+                "Disconnected: not authenticated within {} seconds",
+                remote.peers.limit.as_secs_f32()
+            ),
+            opened => opened?,
+        };
+        let Some((mut socket, authenticated)) = opened else {
             return Ok(());
         };
+        remote.peers.authenticated(serial);
         run(
             remote,
             serial,
@@ -565,16 +625,9 @@ fn password_pairing(
         "nonce": server_nonce,
     });
     socket.send(Message::text(challenge.to_string()))?;
-    // Deriving the key takes a phone a moment.
-    socket
-        .get_ref()
-        .sock
-        .set_read_timeout(Some(Duration::from_secs(60)))?;
+    // Deriving the key takes a phone about a second; the authentication
+    // deadline bounds the whole exchange.
     let text = read_text(socket, "Waiting for the password proof")?;
-    socket
-        .get_ref()
-        .sock
-        .set_read_timeout(Some(Duration::from_secs(10)))?;
     let Answer::Proof { proof } =
         serde_json::from_str(&text).context("Expected a password proof")?;
     if !verifier.accepts(&identity.fingerprint, &server_nonce, client_nonce, &proof) {
@@ -671,6 +724,172 @@ fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::Storage;
+    use std::io::{Read, Write};
+
+    const LIMIT: Duration = Duration::from_millis(800);
+
+    /// Listens on loopback with a short authentication deadline.
+    fn listening(temp: &tempfile::TempDir) -> Result<(Arc<Remote>, u16)> {
+        let remote = Arc::new(Remote {
+            storage: Storage {
+                config: temp.path().join("config.json"),
+                cache: temp.path().join("cache"),
+            },
+            home: temp.path().join("remote"),
+            bind: Some("127.0.0.1".into()),
+            identity: Mutex::new(None),
+            state: Mutex::new(super::super::State {
+                settings: super::super::Settings::default(),
+                pairing: None,
+                server: None,
+                error: None,
+            }),
+            peers: Peers::with_deadline(LIMIT),
+            guard: Guard::default(),
+        });
+        let port = remote.command(super::super::Command::Open)?.port;
+        Ok((remote, port))
+    }
+
+    /// Waits until the server dropped every connection and released its
+    /// unauthenticated slots.
+    fn released(remote: &Remote) -> Result<()> {
+        let started = Instant::now();
+        while remote.peers.count() > 0 || !remote.guard.limits().pending.is_empty() {
+            ensure!(
+                started.elapsed() < Duration::from_secs(5),
+                "The server kept the connection's slots"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_client_trickling_its_tls_handshake_is_cut_off_at_the_deadline() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (remote, port) = listening(&temp)?;
+        let mut client = TcpStream::connect(("127.0.0.1", port))?;
+        client.set_read_timeout(Some(Duration::from_millis(50)))?;
+        let started = Instant::now();
+        // A TLS record header announcing a 512-byte handshake, then its body
+        // one byte at a time: every read on the server gets data well within
+        // its own timeout, so only the overall deadline ends this.
+        let mut bytes = [0x16u8, 0x03, 0x01, 0x02, 0x00]
+            .into_iter()
+            .chain(std::iter::repeat(0));
+        let closed = loop {
+            let byte = bytes.next().unwrap_or_default();
+            if client.write_all(&[byte]).is_err() {
+                break started.elapsed();
+            }
+            match client.read(&mut [0u8; 64]) {
+                Ok(0) | Err(_) if started.elapsed() > LIMIT + Duration::from_secs(5) => {
+                    anyhow::bail!("The slow client was never cut off")
+                }
+                Ok(0) => break started.elapsed(),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => break started.elapsed(),
+                Ok(_) => {}
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        ensure!(closed >= LIMIT, "Closed before the deadline: {closed:?}");
+        ensure!(
+            closed < LIMIT + Duration::from_secs(2),
+            "Closed late: {closed:?}"
+        );
+        released(&remote)?;
+        remote.shut_down()
+    }
+
+    #[test]
+    fn a_client_that_never_answers_the_password_challenge_is_cut_off() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (remote, port) = listening(&temp)?;
+        remote.command(super::super::Command::Password {
+            verifier: Some(password::Verifier::with_iterations(
+                "correct horse battery",
+                100_000,
+            )?),
+        })?;
+        let (mut socket, _) = crate::cloud::client::open("127.0.0.1", port, None)?;
+        let started = Instant::now();
+        socket.send(Message::text(
+            json!({
+                "type": "password",
+                "device": {"id": "slow-client-1", "name": "Slow"},
+                "nonce": "abcdefghijklmnopqrstuvwxyz012345",
+            })
+            .to_string(),
+        ))?;
+        let challenge = socket.read()?;
+        ensure!(
+            challenge.to_text()?.contains("challenge"),
+            "Expected a challenge, got {challenge:?}"
+        );
+        // No proof follows. The server hangs up at the deadline, long before
+        // its per-read timeout.
+        loop {
+            match socket.read() {
+                Ok(Message::Ping(_) | Message::Pong(_)) => {}
+                Ok(other) => anyhow::bail!("Unexpected message {other:?}"),
+                Err(_) => break,
+            }
+        }
+        let closed = started.elapsed();
+        ensure!(
+            closed < LIMIT + Duration::from_secs(2),
+            "Closed late: {closed:?}"
+        );
+        released(&remote)?;
+        // Nothing was paired.
+        assert!(remote.status()?.devices.is_empty());
+        remote.shut_down()
+    }
+
+    #[test]
+    fn only_unauthenticated_connections_expire() -> Result<()> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let peers = Peers::with_deadline(Duration::from_secs(60));
+        let mut clients = Vec::new();
+        let mut serials = Vec::new();
+        for _ in 0..2 {
+            let client = TcpStream::connect(address)?;
+            client.set_read_timeout(Some(Duration::from_secs(5)))?;
+            let (server, _) = listener.accept()?;
+            serials.push(peers.add(&server)?);
+            clients.push((client, server));
+        }
+        let [waiting, signed_in] = serials.as_slice() else {
+            anyhow::bail!("Expected two connections");
+        };
+        peers.authenticated(*signed_in);
+        peers.expire(Instant::now());
+        ensure!(!peers.expired(*waiting), "Expired before its deadline");
+        peers.expire(Instant::now() + Duration::from_secs(61));
+        ensure!(peers.expired(*waiting) && !peers.expired(*signed_in));
+        let [(first, _), (second, _)] = clients.as_mut_slice() else {
+            anyhow::bail!("Expected two clients");
+        };
+        assert_eq!(
+            first.read(&mut [0u8; 8])?,
+            0,
+            "The waiting client is closed"
+        );
+        second.set_read_timeout(Some(Duration::from_millis(100)))?;
+        ensure!(
+            second.read(&mut [0u8; 8]).is_err(),
+            "The authenticated client stays open"
+        );
+        Ok(())
+    }
 
     #[test]
     fn repeated_failures_lock_an_address_out_for_a_while() {
