@@ -278,10 +278,16 @@ public final class RemoteConnection: @unchecked Sendable {
 
     // MARK: Requests
 
+    /// How long to wait for a reply by default: disk cleanups can run for minutes.
+    public static func timeout(for method: String) -> TimeInterval {
+        method == "server.disk.clean" ? 15 * 60 : 120
+    }
+
     /// Sends a request and returns the raw response frame (`{"id":..,"result":..}`).
     public func call(
-        _ method: String, _ params: [String: JSONValue] = [:], timeout: TimeInterval = 120
+        _ method: String, _ params: [String: JSONValue] = [:], timeout: TimeInterval? = nil
     ) async throws -> Data {
+        let timeout = timeout ?? Self.timeout(for: method)
         let id: Int = lock.withLock {
             nextId += 1
             return nextId

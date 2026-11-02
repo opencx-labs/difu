@@ -1,7 +1,7 @@
 import Foundation
 
 // Methods every paired device can call on a difu server (docs/cloud-agents.md):
-// devices, server repositories, repository rules and logins.
+// devices, server repositories, repository rules, logins and disk space.
 
 extension DifuAPI {
     // MARK: Devices
@@ -81,6 +81,20 @@ extension DifuAPI {
 
     public func logout(_ tool: String) async throws {
         try await perform("server.logout", ["tool": .string(tool)])
+    }
+
+    // MARK: Disk
+
+    /// Disk space and what uses it. `refresh` re-measures the breakdown in the
+    /// background: the reply has `measuring` and the previous breakdown.
+    public func disk(refresh: Bool = false) async throws -> ServerDisk {
+        try await request("server.disk", refresh ? ["refresh": .bool(true)] : [:], as: ServerDisk.self)
+    }
+
+    /// Runs a cleanup; it can take minutes.
+    public func cleanDisk(_ action: DiskCleanAction) async throws -> DiskCleanResult {
+        try await request(
+            "server.disk.clean", ["action": .string(action.rawValue)], as: DiskCleanResult.self)
     }
 }
 

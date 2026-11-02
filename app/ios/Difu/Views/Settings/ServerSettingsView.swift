@@ -1,8 +1,8 @@
 import DifuKit
 import SwiftUI
 
-/// One saved computer or server: connection, logins, repositories, rules,
-/// paired devices, and Forget.
+/// One saved computer or server: connection, disk, logins, repositories,
+/// rules, paired devices, and Forget.
 struct ServerSettingsView: View {
     let server: ServerConnection
 
@@ -10,6 +10,8 @@ struct ServerSettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var confirmingForget = false
     @State private var forgetting = false
+    @State private var disk: ServerDisk?
+    @State private var diskError: String?
 
     var body: some View {
         let credential = server.credential
@@ -37,6 +39,28 @@ struct ServerSettingsView: View {
             }
 
             if server.isServer {
+                Section("Disk") {
+                    NavigationLink {
+                        ServerDiskView(server: server)
+                    } label: {
+                        if let disk {
+                            DiskUsageSummary(disk: disk)
+                        } else if let note = diskError ?? (server.isConnected ? nil : "Shown once connected.") {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Label("Disk Space", systemImage: "internaldrive")
+                                Text(note)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        } else {
+                            HStack {
+                                ProgressView()
+                                Text("Loading disk space…").foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+
                 Section("Server") {
                     NavigationLink {
                         LoginsView(server: server)
@@ -100,12 +124,26 @@ struct ServerSettingsView: View {
         }
         .navigationTitle(server.name)
         .navigationBarTitleDisplayMode(.inline)
+        .task(id: server.isConnected) { await loadDisk() }
         .confirmationDialog(
             "Forget \(server.name)?", isPresented: $confirmingForget, titleVisibility: .visible
         ) {
             Button("Forget", role: .destructive) { forget() }
         } message: {
             Text("This phone loses access until you pair again.")
+        }
+    }
+
+    /// Reloads on appear (so it's fresh after cleaning up) and on reconnect.
+    private func loadDisk() async {
+        guard server.isServer, server.isConnected else { return }
+        do {
+            disk = try await server.api.disk()
+            diskError = nil
+        } catch is CancellationError {
+            return
+        } catch {
+            diskError = ServerDiskView.message(for: error, on: server)
         }
     }
 

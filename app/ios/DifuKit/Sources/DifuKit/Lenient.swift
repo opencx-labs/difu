@@ -61,6 +61,21 @@ extension KeyedDecodingContainer where Key == AnyKey {
         return nil
     }
 
+    /// A byte count: integers (up to `UInt64`), doubles and numeric strings,
+    /// clamped to `0...Int64.max`.
+    func bytes(_ key: String) -> Int64? {
+        if let value = value(key, as: Int64.self) { return max(0, value) }
+        if let value = value(key, as: UInt64.self) { return Int64(clamping: value) }
+        if let value = value(key, as: Double.self), value.isFinite {
+            if value <= 0 { return 0 }
+            return value >= Double(Int64.max) ? .max : Int64(value)
+        }
+        if let value = value(key, as: String.self) {
+            return Int64(value.trimmingCharacters(in: .whitespaces)).map { max(0, $0) }
+        }
+        return nil
+    }
+
     func bool(_ key: String) -> Bool? {
         if let value = value(key, as: Bool.self) { return value }
         if let value = value(key, as: Int.self) { return value != 0 }

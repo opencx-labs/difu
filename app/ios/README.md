@@ -62,9 +62,11 @@ A server set up with `difu server add` (see
 Add more computers and servers from **Settings › Servers › Add Server**. The
 app connects to all of them while it's open and shows their sessions in one
 list (with a server badge once there's more than one). New sessions start by
-picking a server. Each server's page in Settings shows its logins (GitHub and
-Codex device-code login, Claude Code token), repositories (add, remove,
-**Refresh Mains**), repository rules and paired devices.
+picking a server. Each server's page in Settings shows its disk space (free
+space, status, what uses it, and cleanups for archived worktrees, build outputs
+and sandbox storage), logins (GitHub and Codex device-code login, Claude Code
+token), repositories (add, remove, **Refresh Mains**), repository rules and
+paired devices.
 
 **Forget** revokes the phone on that server first, then removes it from the
 phone. When another device pairs with one of your servers, a banner offers to

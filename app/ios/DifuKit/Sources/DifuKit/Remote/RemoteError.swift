@@ -87,4 +87,10 @@ extension RemoteError: LocalizedError {
         if case .denied = self { return true }
         return false
     }
+
+    /// Whether the server's difu predates the method (`Unknown method …`).
+    public var isUnknownMethod: Bool {
+        if case .server(let message) = self { return message.hasPrefix("Unknown method") }
+        return false
+    }
 }
