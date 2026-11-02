@@ -39,7 +39,8 @@ const MAX_MESSAGE: usize = 64 << 20;
 const SILENCE: Duration = Duration::from_secs(45);
 const CLOSED: &str = "Server connection closed";
 
-type Socket = tungstenite::WebSocket<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
+pub(crate) type Socket =
+    tungstenite::WebSocket<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
 
 /// Device credentials returned by a successful pairing.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -540,7 +541,7 @@ fn fingerprint(certificate: &CertificateDer<'_>) -> String {
 
 /// Connect, finish TLS and the WebSocket handshake, and report the fingerprint
 /// of the certificate the server presented.
-fn open(host: &str, port: u16, pinned: Option<&str>) -> Result<(Socket, String)> {
+pub(crate) fn open(host: &str, port: u16, pinned: Option<&str>) -> Result<(Socket, String)> {
     let host = host
         .strip_prefix('[')
         .and_then(|h| h.strip_suffix(']'))
@@ -771,7 +772,8 @@ mod tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
-            let _ = self.remote.command(Command::Disable);
+            // Some fixtures run in server mode, which refuses `Disable`.
+            let _ = self.remote.shut_down();
         }
     }
 

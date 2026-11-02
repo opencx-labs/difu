@@ -6,7 +6,7 @@ pub(crate) const PERSONAL: &str = "palette-personal";
 pub(crate) const LOOKUPS: &str = "palette-lookups";
 pub(crate) const SESSION_LINKS: &str = "palette-session-prs.json";
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct SessionLink {
+pub struct SessionLink {
     pub workspace: std::path::PathBuf,
     #[serde(deserialize_with = "deserialize_pr")]
     pub pr: github::SessionPr,
@@ -117,6 +117,11 @@ pub(crate) type SessionLinks = std::collections::HashMap<String, Vec<SessionLink
 
 /// Accept the single-PR cache written by earlier versions without losing history.
 pub(crate) fn load_links(path: &std::path::Path) -> SessionLinks {
+    load_selected(path, |_| true)
+}
+/// `load_links` for the sessions `wanted` accepts, without reading the
+/// snapshots and GitHub records of every other session.
+fn load_selected(path: &std::path::Path, wanted: impl Fn(&str) -> bool) -> SessionLinks {
     let Ok(bytes) = std::fs::read(path) else {
         return Default::default();
     };
@@ -127,6 +132,7 @@ pub(crate) fn load_links(path: &std::path::Path) -> SessionLinks {
             .map(|(id, link)| (id, vec![link]))
             .collect()
     });
+    links.retain(|id, _| wanted(id));
     if let Some(cache) = path.parent() {
         for (id, links) in &mut links {
             let saved = read_snapshot(cache, id);
@@ -270,6 +276,97 @@ pub(super) fn disconnect(storage: &Storage, id: &str, revision: u64) -> anyhow::
     Ok(())
 }
 
+/// A session's links from the background refresher and UI discoveries,
+/// without the explicit attachments only its snapshot holds yet.
+fn known_links(storage: &Storage, id: &str) -> Vec<SessionLink> {
+    let mut links = load_selected(&storage.cache.join(SESSION_LINKS), |key| key == id)
+        .remove(id)
+        .unwrap_or_default();
+    let discovered = load_selected(&storage.cache.join("agent-prs.json"), |key| key == id)
+        .remove(id)
+        .unwrap_or_default();
+    merge_links(&mut links, discovered);
+    links
+}
+
+/// What the terminal app shows for each coding session without asking GitHub:
+/// refreshed and discovered links plus explicit attachments, minus links from
+/// before a repository reset, current open PRs first.
+pub(crate) fn cached(storage: &Storage, sessions: &[super::Summary]) -> SessionLinks {
+    let ids = sessions
+        .iter()
+        .map(|session| session.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    let mut known = load_selected(&storage.cache.join(SESSION_LINKS), |id| ids.contains(id));
+    let discovered = load_selected(&storage.cache.join("agent-prs.json"), |id| ids.contains(id));
+    for (id, links) in discovered {
+        merge_links(known.entry(id).or_default(), links);
+    }
+    sessions
+        .iter()
+        .filter(|session| session.kind == "Coding")
+        .filter_map(|session| {
+            let saved = snapshot(storage, &session.id);
+            let mut links = known.remove(&session.id).unwrap_or_default();
+            saved.retain_connected(&mut links);
+            merge_links(&mut links, saved.links);
+            let branch = saved.branch.as_deref().or(session.branch.as_deref());
+            sort_links(&mut links, &session.workspace, branch);
+            (!links.is_empty()).then(|| (session.id.clone(), links))
+        })
+        .collect()
+}
+
+/// A session's PRs for a terminal app on another computer
+/// (`Request::SessionPrs`): this machine has the worktree and the GitHub login.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Lookup {
+    pub links: Vec<SessionLink>,
+    /// The worktree's current branch, which orders the links.
+    #[serde(default)]
+    pub branch: Option<String>,
+    /// Why refreshing failed; `links` are then the cached ones.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Refresh a session's PRs here under the shared lease (so asking often costs
+/// GitHub nothing more than the background refresher), falling back to the
+/// cached links and the error when GitHub cannot be reached. `history` also
+/// checks closed and merged PRs, as when a session is opened.
+pub(crate) fn lookup(
+    storage: &Storage,
+    session: &super::Summary,
+    history: bool,
+    cancel: &Cancel,
+) -> Lookup {
+    let refresh = if history {
+        Refresh::Open
+    } else {
+        Refresh::Visible
+    };
+    let known = known_links(storage, &session.id);
+    let result = refresh_session(storage, session, known, refresh, cancel);
+    let saved = snapshot(storage, &session.id);
+    match result {
+        Ok(mut links) => {
+            saved.retain_connected(&mut links);
+            Lookup {
+                links,
+                branch: saved.branch,
+                error: None,
+            }
+        }
+        Err(error) => Lookup {
+            links: cached(storage, std::slice::from_ref(session))
+                .remove(&session.id)
+                .unwrap_or_default(),
+            branch: saved.branch,
+            error: Some(format!("{error:#}")),
+        },
+    }
+}
+
 /// Associate a verified PR URL without assuming it belongs to this checkout.
 pub(super) fn attach(
     storage: &Storage,
@@ -311,6 +408,24 @@ pub(super) fn attach(
         session.branch.as_deref(),
     );
     save_snapshot(storage, &path, &saved)
+}
+
+/// The pull requests explicitly attached to a session, for moving it.
+pub(super) fn attached(storage: &Storage, id: &str) -> Vec<github::SessionPr> {
+    let mut saved = snapshot(storage, id);
+    for name in [SESSION_LINKS, "agent-prs.json"] {
+        let mut known = load_links(&storage.cache.join(name))
+            .remove(id)
+            .unwrap_or_default();
+        saved.retain_connected(&mut known);
+        merge_links(&mut saved.links, known);
+    }
+    saved
+        .links
+        .into_iter()
+        .filter(|link| link.attached)
+        .map(|link| link.pr)
+        .collect()
 }
 
 /// Branch switches in an existing worktree do not change its saved session ID.
@@ -626,6 +741,7 @@ impl Drop for Worker {
 mod tests {
     use super::*;
     use crate::model::{PrKey, PrSummary};
+    use anyhow::Context;
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -677,6 +793,160 @@ mod tests {
         disconnect(&storage, &session.id, 1)?;
         assert!(attach(&storage, &session, make("three"), &Cancel::default()).is_err());
         assert!(snapshot(&storage, &session.id).links.is_empty());
+        Ok(())
+    }
+
+    fn link(number: u64, state: &str, workspace: &std::path::Path, attached: bool) -> SessionLink {
+        SessionLink {
+            attached,
+            workspace_revision: 0,
+            workspace: workspace.into(),
+            pr: github::SessionPr {
+                summary: None,
+                key: PrKey {
+                    owner: "example".into(),
+                    repo: if attached { "other" } else { "project" }.into(),
+                    number,
+                },
+                state: state.into(),
+                draft: false,
+                conflicts: false,
+                head_branch: if attached { "elsewhere" } else { "feature" }.into(),
+                head: String::new(),
+                updated: format!("2026-10-{number:02}"),
+            },
+        }
+    }
+
+    #[test]
+    fn cached_links_merge_refreshed_discovered_and_attached_prs() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let mut session = super::super::Session::new(
+            "cached".into(),
+            super::super::Job::Coding(super::super::Launch {
+                repository: dir.path().into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.status = super::super::Status::Idle;
+        session.branch = Some("feature".into());
+        let summary = session.summary();
+        let workspace = summary.workspace.clone();
+        std::fs::create_dir_all(&storage.cache)?;
+        save_links(
+            &storage,
+            &storage.cache.join(SESSION_LINKS),
+            &SessionLinks::from([
+                ("cached".into(), vec![link(1, "MERGED", &workspace, false)]),
+                ("gone".into(), vec![link(9, "OPEN", &workspace, false)]),
+            ]),
+        )?;
+        save_links(
+            &storage,
+            &storage.cache.join("agent-prs.json"),
+            &SessionLinks::from([("cached".into(), vec![link(2, "OPEN", &workspace, false)])]),
+        )?;
+        // An agent attached a PR: only the snapshot knows it yet.
+        attach(
+            &storage,
+            &summary,
+            link(3, "OPEN", &workspace, true).pr,
+            &Cancel::default(),
+        )?;
+        let mut orchestrator = summary.clone();
+        orchestrator.id = "gone".into();
+        orchestrator.kind = "Orchestrator".into();
+        let found = cached(&storage, &[summary.clone(), orchestrator]);
+        assert_eq!(found.keys().collect::<Vec<_>>(), vec!["cached"]);
+        let numbers = |links: &[SessionLink]| {
+            links
+                .iter()
+                .map(|link| (link.pr.key.number, link.attached))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            numbers(found.get("cached").context("links")?),
+            vec![(2, false), (3, true), (1, false)],
+            "the branch's open PR first, then other open ones, then history"
+        );
+        // A repository reset hides everything from before it.
+        disconnect(&storage, "cached", 1)?;
+        assert!(cached(&storage, std::slice::from_ref(&summary)).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn lookups_answer_from_the_shared_lease_and_report_failures_with_cached_links()
+    -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let mut session = super::super::Session::new(
+            "lookup".into(),
+            super::super::Job::Coding(super::super::Launch {
+                repository: dir.path().into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.status = super::super::Status::Idle;
+        session.branch = Some("feature".into());
+        let summary = session.summary();
+        let workspace = summary.workspace.clone();
+        std::fs::create_dir_all(&storage.cache)?;
+        save_links(
+            &storage,
+            &storage.cache.join(SESSION_LINKS),
+            &SessionLinks::from([("lookup".into(), vec![link(1, "OPEN", &workspace, false)])]),
+        )?;
+        let path = snapshot_path(&storage, "lookup");
+        std::fs::create_dir_all(path.parent().context("snapshot directory")?)?;
+        let now = github::polling::now();
+        // Refreshed moments ago (here or by the background refresher): no
+        // GitHub request, and the known links come back with the attachment.
+        let mut saved = Snapshot {
+            links: vec![link(2, "OPEN", &workspace, true)],
+            checked_at: now,
+            branch: Some("feature".into()),
+            attempted_at: now,
+            revision: summary.workspace_revision,
+            history_at: now,
+            error: None,
+            disconnected_before: 0,
+        };
+        save_snapshot(&storage, &path, &saved)?;
+        let fresh = lookup(&storage, &summary, false, &Cancel::default());
+        assert_eq!(fresh.error, None);
+        assert_eq!(fresh.branch.as_deref(), Some("feature"));
+        let mut numbers: Vec<_> = fresh.links.iter().map(|l| l.pr.key.number).collect();
+        numbers.sort_unstable();
+        assert_eq!(numbers, vec![1, 2]);
+        // The last attempt failed (say, a rate limit): the cached links come
+        // back with the reason, so the terminal marks them stale.
+        saved.error = Some("GitHub rate limit; refresh paused".into());
+        save_snapshot(&storage, &path, &saved)?;
+        let failed = lookup(&storage, &summary, false, &Cancel::default());
+        assert_eq!(
+            failed.error.as_deref(),
+            Some("GitHub rate limit; refresh paused")
+        );
+        assert_eq!(failed.links.len(), 2);
+        // The reply crosses the wire as JSON.
+        let wire: Lookup = serde_json::from_value(serde_json::to_value(&failed)?)?;
+        assert_eq!(wire, failed);
         Ok(())
     }
 

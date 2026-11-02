@@ -2,7 +2,11 @@
 //! replies through the connection's queue; subscriptions push events the same
 //! way. `full` devices may also tunnel the service protocol (`rpc`, `rpc.watch`).
 use super::{
-    super::{Control, Reply, Request, Session, client, media, server, transport},
+    super::{
+        Control, Reply, Request, Session, Summary, client, media,
+        pr_cache::{self, SessionLink, SessionLinks},
+        server, transport,
+    },
     Access, Remote, reviews,
     view::{self, EntryView, SessionSummary, SessionView},
 };
@@ -26,6 +30,8 @@ use std::{
 };
 
 const MODELS_TTL: Duration = Duration::from_secs(10 * 60);
+/// Session lists and watched sessions reread cached pull requests this often.
+const PRS_TTL: Duration = Duration::from_secs(5);
 /// `rpc.watch` streams one connection may hold open.
 const MAX_STREAMS: usize = 64;
 
@@ -55,6 +61,7 @@ struct Inner {
     next_stream: AtomicU64,
     listing: AtomicBool,
     models: Mutex<Option<(Instant, Value)>>,
+    prs: Mutex<Option<(Instant, SessionLinks)>>,
 }
 
 /// One `rpc.watch`: a service subscription forwarded as events.
@@ -99,6 +106,7 @@ impl Connection {
             next_stream: AtomicU64::new(1),
             listing: AtomicBool::new(false),
             models: Mutex::new(None),
+            prs: Mutex::new(None),
         }))
     }
 
@@ -211,7 +219,26 @@ impl Inner {
             &list,
             &config.pinned_sessions,
             &config.session_order,
+            &self.prs(&list),
         ))
+    }
+    /// Cached pull requests of the listed sessions, reread every few seconds.
+    fn prs(&self, list: &[Summary]) -> SessionLinks {
+        let mut cached = self.prs.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, prs)) = cached.as_ref()
+            && at.elapsed() < PRS_TTL
+        {
+            return prs.clone();
+        }
+        let prs = pr_cache::cached(&self.storage, list);
+        *cached = Some((Instant::now(), prs.clone()));
+        prs
+    }
+    /// A watched session's cached pull requests.
+    fn session_prs(&self, session: &Session) -> Vec<SessionLink> {
+        pr_cache::cached(&self.storage, &[session.summary()])
+            .remove(&session.id)
+            .unwrap_or_default()
     }
 }
 
@@ -724,6 +751,7 @@ fn watch(inner: &Inner, id: &str, stop: &AtomicBool) {
         let mut cache = view::Cache::default();
         let mut pinned = config(&inner.storage).pinned_sessions;
         let mut pinned_at = Instant::now();
+        let mut prs = None;
         while !stop.load(Ordering::Relaxed) && !inner.closed.load(Ordering::Relaxed) {
             match transport::read_reply(&mut reader)? {
                 Reply::Session(next) => session = Some(*next),
@@ -738,12 +766,14 @@ fn watch(inner: &Inner, id: &str, stop: &AtomicBool) {
                 Reply::Error(error) => anyhow::bail!("{error}"),
                 _ => anyhow::bail!("Unexpected session update"),
             }
-            if pinned_at.elapsed() >= Duration::from_secs(5) {
+            if pinned_at.elapsed() >= PRS_TTL {
                 pinned = config(&inner.storage).pinned_sessions;
                 pinned_at = Instant::now();
+                prs = None;
             }
             let Some(session) = &session else { continue };
-            let next = SessionView::cached(session, &pinned, &mut cache);
+            let prs = prs.get_or_insert_with(|| inner.session_prs(session));
+            let next = SessionView::cached(session, &pinned, prs, &mut cache);
             let delivered = match &sent {
                 None => inner.event("session", &next),
                 Some(previous) if *previous != next => {

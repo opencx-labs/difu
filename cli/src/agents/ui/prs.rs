@@ -1,7 +1,14 @@
-//! Cached, asynchronous PR discovery for visible coding sessions.
+//! Cached, asynchronous PR discovery for visible coding sessions. Server
+//! sessions ask their server (`Request::SessionPrs`), which has the worktree,
+//! the branch and the GitHub login.
 use super::*;
 use crate::{github::SessionPr, process::Cancel};
 use std::path::PathBuf;
+
+/// How often a visible server session asks its server. The server refreshes
+/// from GitHub under the same two-minute lease as a local session, so asking
+/// more often only picks up attached PRs sooner.
+const SERVER_POLL: Duration = Duration::from_secs(15);
 
 struct Update {
     id: String,
@@ -9,6 +16,8 @@ struct Update {
     branch: Option<String>,
     revision: u64,
     result: Result<Vec<Cached>, String>,
+    /// The links are cached ones: refreshing them failed.
+    stale: bool,
 }
 use crate::agents::pr_cache::{self, SESSION_LINKS, SessionLink as Cached};
 pub(super) struct State {
@@ -82,16 +91,26 @@ impl State {
         self.refreshed.remove(id);
     }
     fn due(&self, id: &str) -> bool {
+        let interval = if servers::is_server_session(id) {
+            SERVER_POLL
+        } else {
+            Duration::from_secs(crate::github::PR_REFRESH_SECONDS)
+        };
         !self.pending.contains_key(id)
-            && self.refreshed.get(id).is_none_or(|t| {
-                t.elapsed() >= Duration::from_secs(crate::github::PR_REFRESH_SECONDS)
-            })
+            && self
+                .refreshed
+                .get(id)
+                .is_none_or(|t| t.elapsed() >= interval)
     }
     fn receive(&mut self, update: Update) -> bool {
         self.pending.remove(&update.id);
         self.refreshed.insert(update.id.clone(), Instant::now());
         if let Ok(links) = update.result {
-            self.stale.remove(&update.id);
+            if update.stale {
+                self.stale.insert(update.id.clone());
+            } else {
+                self.stale.remove(&update.id);
+            }
             self.branches
                 .insert(update.id.clone(), update.branch.clone());
             let cached = self.cache.entry(update.id).or_default();
@@ -172,7 +191,13 @@ impl Ui {
         {
             self.prs.loaded_at = Some(Instant::now());
             let storage = self.storage.clone();
-            let summaries = self.summaries.clone();
+            // A server session's PRs are cached on its server, not here.
+            let summaries = self
+                .summaries
+                .iter()
+                .filter(|summary| summary.server.is_none())
+                .cloned()
+                .collect::<Vec<_>>();
             let mut cache = self.prs.cache.clone();
             let (sender, receiver) = mpsc::channel();
             self.prs.loading = Some(receiver);
@@ -288,11 +313,6 @@ impl Ui {
             if summary.kind != "Coding" && summary.kind != "coding" {
                 continue;
             }
-            // Pull request discovery runs git and gh in the session's
-            // worktree, which for server sessions is on the server.
-            if summary.server.is_some() {
-                continue;
-            }
             if summary.status == Status::Starting && !summary.worktree {
                 continue;
             }
@@ -322,6 +342,39 @@ impl Ui {
             let cancel = Cancel::default();
             self.prs.pending.insert(id.clone(), cancel.clone());
             let sender = self.prs.sender.clone();
+            // Discovery runs git and gh in the session's worktree, which for a
+            // server session is on the server.
+            if summary.server.is_some() {
+                thread::spawn(move || {
+                    let reply = client::request(
+                        &storage,
+                        Request::SessionPrs {
+                            id: id.clone(),
+                            history,
+                        },
+                    );
+                    let (result, branch, stale) = match reply {
+                        // Cached links from a failed refresh are shown stale.
+                        Ok(Reply::SessionPrs(lookup)) => match lookup.error {
+                            Some(error) if lookup.links.is_empty() => {
+                                (Err(error), lookup.branch, true)
+                            }
+                            error => (Ok(lookup.links), lookup.branch, error.is_some()),
+                        },
+                        Ok(_) => (Err("Unexpected PR reply".into()), None, true),
+                        Err(error) => (Err(format!("{error:#}")), None, true),
+                    };
+                    let _ = sender.send(Update {
+                        id,
+                        workspace,
+                        branch,
+                        revision: summary.workspace_revision,
+                        result,
+                        stale,
+                    });
+                });
+                continue;
+            }
             thread::spawn(move || {
                 let mut result =
                     pr_cache::refresh_session(&storage, &summary, known, refresh, &cancel)
@@ -339,6 +392,7 @@ impl Ui {
                     branch: saved.branch,
                     revision: summary.workspace_revision,
                     result,
+                    stale: false,
                 });
             });
         }
@@ -362,14 +416,17 @@ impl Ui {
         app.start_embedded(key.clone());
         // Seed discovery from the session checkout. PR preparation resolves and
         // remembers its main clone so deleting this worktree cannot break reviews.
-        if let Some(root) = self
-            .prs
-            .cache
-            .get(&id)
-            .and_then(|links| links.iter().find(|link| link.pr.key == key))
-            .filter(|link| !link.attached)
-            .map(|c| c.workspace.clone())
-            .filter(|p| p.is_dir())
+        // A server session's checkout is on the server; reviews then use a
+        // clone on this computer, as for any PR.
+        if !servers::is_server_session(&id)
+            && let Some(root) = self
+                .prs
+                .cache
+                .get(&id)
+                .and_then(|links| links.iter().find(|link| link.pr.key == key))
+                .filter(|link| !link.attached)
+                .map(|c| c.workspace.clone())
+                .filter(|p| p.is_dir())
             && let Some(review) = app.reviews.get_mut(&key.id())
         {
             review.root = Some(root);
@@ -448,6 +505,7 @@ mod tests {
             workspace: temp.path().into(),
             branch: None,
             revision: 0,
+            stale: false,
             result: Ok(vec![first.clone(), second.clone()]
                 .into_iter()
                 .map(|pr| Cached {
@@ -527,6 +585,118 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn server_sessions_ask_their_server_and_show_its_prs() -> Result<()> {
+        use crate::agents::pr_cache::Lookup;
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let temp = tempfile::tempdir()?;
+        let storage = store(temp.path());
+        let workspace = PathBuf::from("/srv/difu/agents/worktrees/1");
+        let link = Cached {
+            attached: false,
+            workspace_revision: 0,
+            workspace: workspace.clone(),
+            pr: pr(),
+        };
+        let listener = UnixListener::bind(crate::agents::server::socket(&storage)?)?;
+        let replies = vec![
+            Reply::SessionPrs(Lookup {
+                links: vec![link.clone()],
+                branch: Some("difu/agent-1".into()),
+                error: None,
+            }),
+            Reply::SessionPrs(Lookup {
+                links: vec![link.clone()],
+                branch: Some("difu/agent-1".into()),
+                error: Some("GitHub rate limit; refresh paused".into()),
+            }),
+            Reply::Error("Server box is not connected yet".into()),
+        ];
+        let (requests, received) = mpsc::channel();
+        let service = thread::spawn(move || -> Result<()> {
+            for reply in replies {
+                let (mut stream, _) = listener.accept()?;
+                let mut line = String::new();
+                BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+                requests.send(serde_json::from_str::<Request>(&line)?)?;
+                serde_json::to_writer(&mut stream, &reply)?;
+                stream.write_all(b"\n")?;
+            }
+            Ok(())
+        });
+        let mut ui = Ui::new(storage.clone(), &Config::default());
+        let mut session = crate::cloud::federation::tests::session("box:1");
+        session.workspace = Some(workspace.clone());
+        let mut summary = session.summary();
+        summary.server = Some("box".into());
+        ui.summaries.push(summary);
+        ui.sessions.insert("box:1".into(), session);
+        ui.selected = Some("box:1".into());
+        ui.drilled = true;
+        let answered = |ui: &mut Ui, history: bool| -> Result<()> {
+            ui.tick_prs(true);
+            let request = received.recv_timeout(Duration::from_secs(5))?;
+            anyhow::ensure!(
+                matches!(&request, Request::SessionPrs { id, history: asked } if id == "box:1" && *asked == history),
+                "{request:?}"
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while ui.prs.pending.contains_key("box:1") || ui.prs.loading.is_some() {
+                anyhow::ensure!(Instant::now() < deadline, "no update");
+                thread::sleep(Duration::from_millis(5));
+                ui.tick_prs(true);
+            }
+            Ok(())
+        };
+        // Opening the session also checks closed and merged PRs, on the server.
+        answered(&mut ui, true)?;
+        assert_eq!(ui.prs.all("box:1"), std::slice::from_ref(&link));
+        assert!(!ui.prs.stale("box:1"));
+        assert!(!ui.prs.due("box:1"));
+        // The local cache's disk refresh does not mark it stale.
+        ui.prs.loaded_at = None;
+        ui.tick_prs(true);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ui.prs.loading.is_some() {
+            anyhow::ensure!(Instant::now() < deadline, "no disk refresh");
+            thread::sleep(Duration::from_millis(5));
+            ui.tick_prs(true);
+        }
+        assert!(!ui.prs.stale("box:1"));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(180, 45))?;
+        terminal.draw(|f| ui.draw(f))?;
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(screen.contains("PR #42 · Open"), "badge and footer");
+        // Server sessions are asked again sooner than GitHub is: the server
+        // answers from its own two-minute lease.
+        ui.prs.refreshed.insert(
+            "box:1".into(),
+            Instant::now().checked_sub(SERVER_POLL).context("time")?,
+        );
+        assert!(ui.prs.due("box:1"));
+        answered(&mut ui, false)?;
+        assert_eq!(ui.prs.all("box:1").len(), 1);
+        assert!(ui.prs.stale("box:1"), "a failed refresh is marked stale");
+        ui.prs.refreshed.remove("box:1");
+        answered(&mut ui, false)?;
+        assert!(ui.prs.stale("box:1"));
+        assert_eq!(
+            ui.prs.all("box:1"),
+            std::slice::from_ref(&link),
+            "kept while offline"
+        );
+        service
+            .join()
+            .map_err(|_| anyhow::anyhow!("service panicked"))??;
+        Ok(())
+    }
+    #[test]
     fn statuses_persist_refresh_and_survive_network_failures() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let storage = store(temp.path());
@@ -553,6 +723,7 @@ mod tests {
             workspace: temp.path().into(),
             branch: None,
             revision: 0,
+            stale: false,
             result: Ok(vec![Cached {
                 attached: false,
                 workspace_revision: 0,
@@ -573,6 +744,7 @@ mod tests {
             workspace: temp.path().into(),
             branch: None,
             revision: 0,
+            stale: false,
             result: Err("offline".into())
         }));
         assert!(state.stale("one"));
@@ -618,6 +790,7 @@ mod tests {
             workspace: temp.path().into(),
             branch: None,
             revision: 0,
+            stale: false,
             result: Ok(vec![Cached {
                 attached: false,
                 workspace_revision: 0,
@@ -757,6 +930,7 @@ mod tests {
             workspace: temp.path().into(),
             branch: None,
             revision: 0,
+            stale: false,
             result: Ok([41, 40]
                 .into_iter()
                 .map(|number| {

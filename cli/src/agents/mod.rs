@@ -1,5 +1,5 @@
 //! Durable, local coding sessions. Only sessions launched by difu are registered.
-mod artifacts;
+pub(crate) mod artifacts;
 mod claude;
 pub mod client;
 pub mod connections;
@@ -10,6 +10,7 @@ mod guidance;
 mod management;
 pub mod mcp;
 pub mod media;
+pub mod moving;
 pub mod notifications;
 mod orchestrator;
 mod peers;
@@ -435,6 +436,13 @@ pub struct Session {
     /// Realtime voice is connected to this session's thread.
     #[serde(default)]
     pub voice: bool,
+    /// The `<server>:<session>` this session moved to; it takes no more messages.
+    #[serde(default)]
+    pub moved_to: Option<String>,
+    /// The saved server `difu_move_to_server` moves this session to once its
+    /// turn ends. Never persisted, so a restart never replays a move.
+    #[serde(skip)]
+    pub move_scheduled: Option<String>,
 }
 impl Session {
     pub fn new(id: String, job: Job) -> Self {
@@ -525,6 +533,8 @@ impl Session {
             result: None,
             guide: None,
             voice: false,
+            moved_to: None,
+            move_scheduled: None,
         }
     }
     /// Freeze completed output and pending-request origins before another UI or
@@ -924,6 +934,32 @@ pub enum Request {
         id: String,
         url: String,
     },
+    /// The session's attached and discovered PRs, refreshed by the machine
+    /// running it (a terminal app asks this for server sessions); `history`
+    /// also checks closed and merged PRs.
+    SessionPrs {
+        id: String,
+        history: bool,
+    },
+    /// Store pasted media on the machine running the session (a server
+    /// session's attachments are uploaded on Send); the reply is the private
+    /// copy to send with the message.
+    UploadAttachment {
+        id: String,
+        label: String,
+        kind: media::Kind,
+        /// The original file's extension, e.g. `png`.
+        extension: String,
+        /// Base64 file contents.
+        data: String,
+    },
+    /// A presented HTML artifact's contents (a terminal app downloads a
+    /// server session's artifacts to preview them).
+    ReadArtifact {
+        id: String,
+        path: PathBuf,
+        workspace: Option<PathBuf>,
+    },
     Launch {
         job: Box<Job>,
     },
@@ -1000,8 +1036,31 @@ pub enum Request {
     WorkspacePaths {
         id: String,
     },
+    /// Codex's configured model, reasoning and permissions for `cwd`. `server`
+    /// names a saved cloud server (`cwd` is then a path on it); `None` is this
+    /// machine.
     Defaults {
         cwd: PathBuf,
+        #[serde(default)]
+        server: Option<String>,
+    },
+    /// The new-session defaults saved at a location: this machine (`None`) or a
+    /// saved cloud server.
+    AgentDefaults {
+        #[serde(default)]
+        server: Option<String>,
+    },
+    /// Saves a location's default model and reasoning for new sessions.
+    DefaultModel {
+        #[serde(default)]
+        server: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+    },
+    /// The Codex and Claude Code models available at a location.
+    Models {
+        #[serde(default)]
+        server: Option<String>,
     },
     Skills {
         id: String,
@@ -1021,6 +1080,17 @@ pub enum Request {
     },
     /// Saved cloud servers with their connection state and repositories.
     Servers,
+    /// Move a session on this computer to a saved cloud server; replies
+    /// `Launched` with the new `<server>:<session>` id.
+    Move {
+        id: String,
+        server: String,
+    },
+    /// Create a server session from a moved session (sent by `Move` over `rpc`);
+    /// replies `Launched` with the new session's id.
+    Import {
+        package: Box<moving::Package>,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
@@ -1058,12 +1128,18 @@ pub enum Reply {
         effort: String,
         permissions: String,
     },
+    AgentDefaults(crate::storage::AgentDefaults),
+    Models(Vec<crate::model::ModelInfo>),
     Remote(remote::Status),
     RepositoryRules {
         root: PathBuf,
         rules: String,
     },
     Servers(Vec<crate::cloud::federation::ServerStatus>),
+    SessionPrs(pr_cache::Lookup),
+    Attachment(media::Attachment),
+    /// Base64 file contents.
+    ArtifactFile(String),
     Error(String),
 }
 

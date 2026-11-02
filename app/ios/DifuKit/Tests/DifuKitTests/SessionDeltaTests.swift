@@ -44,6 +44,28 @@ final class SessionDeltaTests: XCTestCase {
         XCTAssertEqual(view.entries.map(\.id), ["a"], "entries survive a delta without entries")
     }
 
+    func testDeltaReplacesPullRequests() throws {
+        var view = try decode(
+            SessionView.self,
+            #"{"id": "s", "version": 10, "prs": [{"repo": "a/b", "number": 1, "state": "OPEN"}], "entries": [{"id": "a", "role": "user"}]}"#
+        )
+        XCTAssertEqual(view.prs.map(\.label), ["Open"])
+        let merged = try decode(
+            SessionDelta.self,
+            #"{"id": "s", "base": 10, "session": {"id": "s", "version": 11, "prs": [{"repo": "a/b", "number": 1, "state": "MERGED", "label": "Merged"}, {"repo": "c/d", "number": 2, "label": "Draft"}]}, "count": 1, "entries": []}"#
+        )
+        XCTAssertEqual(view.apply(merged), .applied)
+        XCTAssertEqual(view.prs.map(\.id), ["a/b#1", "c/d#2"])
+        XCTAssertEqual(view.prs.map(\.label), ["Merged", "Draft"])
+        XCTAssertEqual(view.entries.map(\.id), ["a"])
+        let cleared = try decode(
+            SessionDelta.self,
+            #"{"id": "s", "base": 11, "session": {"id": "s", "version": 12, "prs": []}, "count": 1, "entries": []}"#
+        )
+        XCTAssertEqual(view.apply(cleared), .applied)
+        XCTAssertTrue(view.prs.isEmpty)
+    }
+
     func testTruncates() throws {
         var view = try makeView(entries: ["a", "b", "c", "d"])
         XCTAssertEqual(view.apply(try makeDelta(count: 2, changes: [(1, "b2")])), .applied)

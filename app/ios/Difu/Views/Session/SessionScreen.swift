@@ -24,6 +24,7 @@ struct SessionContent: View {
     let id: String
     let server: ServerConnection
 
+    @Environment(AppModel.self) private var app
     @Environment(\.dismiss) private var dismiss
     @State private var composer = ComposerModel()
     @State private var scrollTrigger = 0
@@ -32,6 +33,8 @@ struct SessionContent: View {
     @State private var showingRename = false
     @State private var renameText = ""
     @State private var error: String?
+    /// The pull request opened from the PR strip.
+    @State private var pr: PrRoute?
 
     enum Sheet: String, Identifiable {
         case model, changes
@@ -61,6 +64,19 @@ struct SessionContent: View {
                 case .changes:
                     ChangesSheet(sessionID: id).environment(server)
                 }
+            }
+            .sheet(item: $pr) { route in
+                // Its own stack keeps the transcript watched underneath and
+                // the PR screen's toolbar actions available.
+                NavigationStack {
+                    PrScreen(route: route)
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Done") { pr = nil }
+                            }
+                        }
+                }
+                .environment(app)
             }
             .confirmationDialog(
                 confirmation == .delete ? "Delete this session?" : "Clear this session?",
@@ -107,6 +123,15 @@ struct SessionContent: View {
                 view: view, model: model, scrollTrigger: scrollTrigger,
                 stop: stop, loadFull: { loadFull($0, model: model) }
             )
+            .safeAreaInset(edge: .top, spacing: 0) {
+                let prs = view.prs.isEmpty ? (server.sessions.summary(for: id)?.prs ?? []) : view.prs
+                if !prs.isEmpty {
+                    SessionPrStrip(prs: prs) { pr in
+                        self.pr = PrRoute(server: server.id, repo: pr.repo, number: pr.number, title: pr.title)
+                    }
+                    .background(.bar)
+                }
+            }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 VStack(spacing: 0) {
                     if !view.queue.isEmpty {
@@ -263,6 +288,86 @@ struct SessionContent: View {
             } catch {
                 self.error = error.localizedDescription
             }
+        }
+    }
+}
+
+// MARK: Pull requests
+
+extension PrRoute: Identifiable {
+    var id: String { "\(server)|\(repo)#\(number)" }
+}
+
+/// The session's attached and discovered pull requests as compact chips;
+/// tapping one opens it on the session's computer or server.
+struct SessionPrStrip: View {
+    let prs: [SessionPr]
+    let open: (SessionPr) -> Void
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(prs) { pr in
+                    Button { open(pr) } label: { SessionPrChip(pr: pr) }
+                        .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+        }
+    }
+}
+
+private struct SessionPrChip: View {
+    let pr: SessionPr
+
+    var body: some View {
+        let style = SessionPrStyle(pr)
+        HStack(spacing: 6) {
+            Image(systemName: style.icon)
+                .imageScale(.small)
+                .foregroundStyle(style.color)
+            // Attached PRs may live in another repository, as in the terminal.
+            Text(pr.attached ? "\(pr.repoName)#\(pr.number)" : "#\(pr.number)")
+                .font(.caption.monospacedDigit().weight(.semibold))
+            if let title = pr.title {
+                Text(title)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .frame(maxWidth: 180, alignment: .leading)
+            }
+            if pr.label != "Unknown" {
+                Pill(text: pr.label, color: style.color)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(Color.secondary.opacity(0.12), in: Capsule())
+        .contentShape(Capsule())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            ["Pull request \(pr.repoName) number \(pr.number)", pr.title, pr.label]
+                .compactMap { $0 }.joined(separator: ", "))
+        .accessibilityAddTraits(.isButton)
+    }
+}
+
+/// Icon and colour for a session PR's display label, matching the terminal's
+/// badge colours (conflicts in red).
+struct SessionPrStyle {
+    let icon: String
+    let color: Color
+
+    init(_ pr: SessionPr) {
+        switch pr.label {
+        case "Merged": (icon, color) = ("arrow.triangle.merge", .purple)
+        case "Closed": (icon, color) = ("xmark.circle", .red)
+        case "Has conflicts": (icon, color) = ("exclamationmark.triangle", .red)
+        case "Draft": (icon, color) = ("pencil.circle", .secondary)
+        case "Open": (icon, color) = ("arrow.triangle.pull", Color.success)
+        default: (icon, color) = ("arrow.triangle.pull", .secondary)
         }
     }
 }

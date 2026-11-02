@@ -98,6 +98,25 @@ enum Commands {
         #[command(subcommand)]
         command: difu::cloud::cli::SandboxCommand,
     },
+    /// Act on difu sessions.
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionCommand {
+    /// Move a session on this computer to a saved cloud server; prints the new
+    /// server session's id. The local session is archived.
+    Move {
+        /// Difu session ID on this computer.
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        session: String,
+        /// Saved server name (see `difu server list`).
+        #[arg(value_parser = clap::builder::NonEmptyStringValueParser::new())]
+        server: String,
+    },
 }
 
 fn parse_shell_action(text: &str) -> Result<serde_json::Value, serde_json::Error> {
@@ -123,7 +142,11 @@ fn main() -> Result<()> {
             difu::cpu::start();
         }
         return if args.refresh_agent_service {
-            difu::agents::client::refresh_running(&storage)
+            difu::agents::client::refresh_running(&storage)?;
+            if let Some(warning) = difu::agents::client::take_warning() {
+                eprintln!("Warning: {warning}");
+            }
+            Ok(())
         } else {
             difu::agents::server::run(storage)
         };
@@ -171,6 +194,9 @@ fn main() -> Result<()> {
     if let Some(Commands::Shell { session, action }) = &args.command {
         let storage = Storage::discover()?;
         difu::agents::client::ensure_running(&storage)?;
+        if let Some(warning) = difu::agents::client::take_warning() {
+            eprintln!("Warning: {warning}");
+        }
         match difu::agents::client::request(
             &storage,
             difu::agents::Request::ShellTool {
@@ -185,9 +211,30 @@ fn main() -> Result<()> {
         }
         return Ok(());
     }
+    if let Some(Commands::Session {
+        command: SessionCommand::Move { session, server },
+    }) = &args.command
+    {
+        let storage = Storage::discover()?;
+        difu::agents::client::ensure_running(&storage)?;
+        match difu::agents::client::request(
+            &storage,
+            difu::agents::Request::Move {
+                id: session.clone(),
+                server: server.clone(),
+            },
+        )? {
+            difu::agents::Reply::Launched(id) => println!("{id}"),
+            other => anyhow::bail!("Unexpected move reply: {other:?}"),
+        }
+        return Ok(());
+    }
     if let Some(Commands::AttachPr { url, session }) = &args.command {
         let storage = Storage::discover()?;
         difu::agents::client::ensure_running(&storage)?;
+        if let Some(warning) = difu::agents::client::take_warning() {
+            eprintln!("Warning: {warning}");
+        }
         let reply = difu::agents::client::request(
             &storage,
             difu::agents::Request::AttachPr {
@@ -394,6 +441,27 @@ mod tests {
             assert!(
                 Args::try_parse_from(["difu", "attach-pr", value, "--session", "one"]).is_err()
             );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn session_move_takes_a_session_and_a_server() -> Result<()> {
+        let args = Args::try_parse_from(["difu", "session", "move", "1790-ab12", "hetzner"])?;
+        assert!(matches!(
+            args.command,
+            Some(Commands::Session {
+                command: SessionCommand::Move { session, server }
+            }) if session == "1790-ab12" && server == "hetzner"
+        ));
+        for argv in [
+            vec!["difu", "session", "move", "1790-ab12"],
+            vec!["difu", "session", "move"],
+            vec!["difu", "session", "move", "", "hetzner"],
+            vec!["difu", "session", "move", "1790-ab12", ""],
+            vec!["difu", "session"],
+        ] {
+            assert!(Args::try_parse_from(argv.clone()).is_err(), "{argv:?}");
         }
         Ok(())
     }

@@ -1,4 +1,4 @@
-use super::{Job, Reply, Request, Session, Status};
+use super::{Control, Job, Reply, Request, Session, Status};
 use crate::{process::Cancel, storage::Storage};
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -7,9 +7,45 @@ use std::{
     os::unix::{fs::OpenOptionsExt, net::UnixStream},
     path::Path,
     process::{Command, Stdio},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
+
+/// On a server, systemd runs the service (`difu serve`); a terminal app never
+/// starts one of its own.
+const SERVER_NOT_RUNNING: &str = "The difu service is not running on this server. Start it with `systemctl start difu-agent` (as root) or `difu serve`.";
+/// A version-drift warning for the terminal app to show once.
+static WARNING: Mutex<Option<String>> = Mutex::new(None);
+static WARNED: AtomicBool = AtomicBool::new(false);
+
+/// The warning left by an automatic upgrade that kept a server's service, once
+/// per process.
+pub fn take_warning() -> Option<String> {
+    WARNING.lock().ok()?.take()
+}
+
+fn warn_once(text: String) {
+    if !WARNED.swap(true, Ordering::Relaxed)
+        && let Ok(mut warning) = WARNING.lock()
+    {
+        *warning = Some(text);
+    }
+}
+
+/// Why a server's older service was kept, and how to upgrade it.
+fn drift_warning(running: Option<&str>) -> String {
+    let running = running.map_or_else(|| "an older difu".to_owned(), |v| format!("difu {v}"));
+    format!(
+        "This server's difu service runs {running}, older than this difu {}. A terminal app never \
+         replaces a server's service; run `difu server upgrade <name>` on the computer that set \
+         the server up.",
+        env!("CARGO_PKG_VERSION")
+    )
+}
 
 pub fn read_line(reader: &mut impl BufRead) -> Result<String> {
     let mut line = Vec::new();
@@ -50,19 +86,35 @@ pub fn request(storage: &Storage, request: Request) -> Result<Reply> {
         Request::Usage { id } => format!("read usage for {id}"),
         Request::AttachPr { id, .. } => format!("attach PR to session {id}"),
         Request::Launch { .. } | Request::NewAgent { .. } => "create session".into(),
+        Request::Move { id, server } => format!("move session {id} to {server}"),
+        Request::Import { .. } => "import a moved session".into(),
         _ => "request session service data".into(),
     };
     let mut stream = UnixStream::connect(super::server::socket(storage)?)
         .context("Agent service is disconnected; refresh to reconnect")?;
-    // Large worktrees can take longer than an RPC timeout to remove. These
-    // actions run off the UI thread; deletion progress is read independently.
+    // Large worktrees can take longer than an RPC timeout to remove, and a
+    // move may clone its repository on the server first. These actions run off
+    // the UI thread; deletion progress is read independently.
     let timeout = if matches!(
         request,
-        Request::Delete { .. } | Request::Repository { .. } | Request::Clear { .. }
+        Request::Delete { .. }
+            | Request::Repository { .. }
+            | Request::Clear { .. }
+            | Request::Move { .. }
+            | Request::Import { .. }
     ) {
         None
     } else if matches!(request, Request::Cpu { .. }) {
         Some(Duration::from_secs(2))
+    } else if matches!(
+        request,
+        Request::Control {
+            control: Control::MessageWithAttachments { .. },
+            ..
+        }
+    ) {
+        // A server session's attachments are uploaded before the message.
+        Some(Duration::from_secs(10 * 60))
     } else {
         Some(Duration::from_secs(65))
     };
@@ -180,6 +232,11 @@ fn stop_service(pid: nix::unistd::Pid, service_lock: &Path) -> Result<()> {
 
 fn ensure_version(storage: &Storage, executable: &Path, only_existing: bool) -> Result<()> {
     use nix::fcntl::{Flock, FlockArg};
+    // `difu serve` under systemd: stopping it would fight `Restart=always`, and
+    // a replacement would lack the unit's environment.
+    let server = storage
+        .load_config()
+        .is_ok_and(|config| config.server.enabled);
     let home = super::server::home(storage)?;
     let socket = super::server::socket(storage)?;
     // Every upgraded UI and installer serializes its check-and-replace operation.
@@ -201,9 +258,13 @@ fn ensure_version(storage: &Storage, executable: &Path, only_existing: bool) -> 
                 // or a broad process-name match that could affect another installation.
                 let pid = peer_pid(&stream)?;
                 let version = service_version(&mut stream)?;
-                if let Some(version) = version
-                    && version_number(&version)? >= version_number(env!("CARGO_PKG_VERSION"))?
+                if let Some(version) = &version
+                    && version_number(version)? >= version_number(env!("CARGO_PKG_VERSION"))?
                 {
+                    return Ok(());
+                }
+                if server {
+                    warn_once(drift_warning(version.as_deref()));
                     return Ok(());
                 }
                 stop_service(pid, &home.join("service.lock"))?;
@@ -217,6 +278,7 @@ fn ensure_version(storage: &Storage, executable: &Path, only_existing: bool) -> 
                 if only_existing && !existed {
                     return Ok(());
                 }
+                ensure!(!server, SERVER_NOT_RUNNING);
             }
             Err(error) => return Err(error.into()),
         }
@@ -325,6 +387,39 @@ pub fn review_job(
             observer.check()?;
             thread::sleep(Duration::from_millis(100));
         }
+    }
+}
+
+#[cfg(test)]
+mod drift_tests {
+    use super::*;
+
+    #[test]
+    fn drift_warnings_name_both_versions_and_the_upgrade_command() {
+        let warning = drift_warning(Some("0.35.0"));
+        assert!(warning.contains("difu 0.35.0"), "{warning}");
+        assert!(warning.contains(env!("CARGO_PKG_VERSION")), "{warning}");
+        assert!(warning.contains("difu server upgrade"), "{warning}");
+        assert!(drift_warning(None).contains("an older difu"));
+    }
+
+    #[test]
+    fn a_server_without_its_service_does_not_get_one_from_a_terminal_app() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        };
+        std::fs::write(&storage.config, r#"{"server":{"enabled":true}}"#)?;
+        // An executable that would fail loudly if difu tried to start it.
+        let error = ensure_version(&storage, Path::new("/nonexistent/difu"), false)
+            .err()
+            .context("A terminal app must not start a server's service")?;
+        assert!(format!("{error:#}").contains("systemctl start difu-agent"));
+        // The installer refresh has nothing to do.
+        ensure_version(&storage, Path::new("/nonexistent/difu"), true)?;
+        assert!(!super::super::server::socket(&storage)?.exists());
+        Ok(())
     }
 }
 

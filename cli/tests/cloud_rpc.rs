@@ -81,3 +81,59 @@ fn full_devices_drive_the_service_over_rpc() -> Result<()> {
     ensure!(closed.is_err_and(|e| e.to_string().contains("Session not found")));
     service.stop()
 }
+
+/// A server keeps accepting its clients: neither a full device over `rpc` nor
+/// `difu remote` on the server can turn remote control off.
+#[test]
+fn servers_refuse_to_turn_remote_control_off() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let storage = Storage {
+        config: temp.path().join("config/config.json"),
+        cache: temp.path().join("cache"),
+    };
+    std::fs::create_dir_all(temp.path().join("config"))?;
+    std::fs::create_dir_all(&storage.cache)?;
+    std::fs::write(&storage.config, r#"{"server":{"enabled":true}}"#)?;
+    let mut service = Service::start(&storage, |command| {
+        command.env("DIFU_REMOTE_BIND", "127.0.0.1");
+    })?;
+    let remote = |command| match client::request(&storage, Request::Remote { command }) {
+        Ok(Reply::Remote(status)) => Ok(status),
+        Ok(other) => anyhow::bail!("Unexpected remote control reply: {other:?}"),
+        Err(error) => Err(error),
+    };
+    let link = remote(Command::Open)?
+        .pairing
+        .context("Missing pairing link")?;
+    let paired = pair_with_link(&link, "Build Mac", true)?;
+    let connection = Connection::connect(&SavedServer {
+        name: paired.name.clone(),
+        id: paired.server_id.clone(),
+        hosts: paired.hosts.clone(),
+        port: paired.port,
+        fingerprint: paired.fingerprint.clone(),
+        device: paired.device.clone(),
+        token: paired.token.clone(),
+        ssh: None,
+    })?;
+    let refused = connection.rpc(&Request::Remote {
+        command: Command::Disable,
+    });
+    ensure!(
+        refused.is_err_and(|error| error.to_string().contains("difu server")),
+        "A full device must not turn the server's remote control off"
+    );
+    let local = remote(Command::Disable);
+    ensure!(
+        local.is_err_and(|error| error.to_string().contains("difu server")),
+        "`difu remote` on the server must not turn remote control off"
+    );
+    let status = remote(Command::Status)?;
+    ensure!(status.enabled && status.listening && status.server);
+    // The connection that asked stays usable.
+    ensure!(matches!(
+        connection.rpc(&Request::List)?,
+        Reply::Sessions(_)
+    ));
+    service.stop()
+}

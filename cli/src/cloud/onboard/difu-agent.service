@@ -1,4 +1,5 @@
-# Installed by `difu server add`; @UID@ and @HOME@ are the difu user's.
+# Installed by `difu server add` and `difu server upgrade`; @UID@ and @HOME@ are
+# the difu user's.
 [Unit]
 Description=difu agent service
 Documentation=https://github.com/opencx-labs/difu/blob/main/docs/cloud-agents.md
@@ -12,6 +13,8 @@ WorkingDirectory=@HOME@
 Environment=XDG_RUNTIME_DIR=/run/user/@UID@
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/@UID@/bus
 Environment=PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
+# One Claude Code config, lock and temporary files for the service and every sandbox.
+Environment=CLAUDE_CONFIG_DIR=@HOME@/.claude
 EnvironmentFile=-@HOME@/.config/difu/server.env
 ExecStart=/usr/local/bin/difu serve
 Restart=always

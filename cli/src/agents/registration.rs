@@ -153,7 +153,12 @@ pub(super) fn apply(session: &mut Session, prepared: &Prepared) {
 }
 
 /// Double-quoted paths follow JSON escaping; an existing unquoted path may contain spaces.
-pub(super) fn parse_command(args: &str) -> Result<(PathBuf, Option<String>)> {
+/// `/worktree <path> [base]`. An unquoted path with spaces is recognised when
+/// `is_dir` finds it, which only works where the session's files are.
+pub(super) fn parse_command(
+    args: &str,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Result<(PathBuf, Option<String>)> {
     let args = args.trim();
     ensure!(!args.is_empty(), "Usage: /worktree <absolute path> [base]");
     let (path, rest) = if args.starts_with('"') {
@@ -163,7 +168,7 @@ pub(super) fn parse_command(args: &str) -> Result<(PathBuf, Option<String>)> {
             PathBuf::from(path),
             args.get(values.byte_offset()..).unwrap_or_default().trim(),
         )
-    } else if Path::new(args).is_dir() {
+    } else if is_dir(Path::new(args)) {
         (PathBuf::from(args), "")
     } else if let Some((path, base)) = args.rsplit_once(char::is_whitespace) {
         (PathBuf::from(path.trim()), base.trim())

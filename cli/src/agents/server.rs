@@ -204,6 +204,8 @@ struct Service {
     launch_lock: Mutex<()>,
     /// Saved cloud servers; requests for their sessions are forwarded.
     federation: Option<Arc<crate::cloud::federation::Federation>>,
+    /// Removes a server session's sandbox pod; a fake in tests.
+    pods: Arc<dyn super::sandbox::Runner>,
 }
 
 pub fn home(storage: &Storage) -> Result<PathBuf> {
@@ -359,23 +361,26 @@ impl Service {
         );
         Ok(())
     }
-    fn insert_session(
-        &self,
-        mut job: Job,
-        empty: bool,
-        defaults: Option<&crate::storage::AgentDefaults>,
-    ) -> Result<String> {
+    fn new_id(&self) -> Result<String> {
         let entropy = tempfile::Builder::new()
             .prefix("id-")
             .tempfile_in(&self.store.home)?;
-        let id = format!(
+        Ok(format!(
             "{}-{}",
             chrono::Utc::now().timestamp_millis(),
             storage::hash(entropy.path().as_os_str().as_encoded_bytes())
                 .chars()
                 .take(8)
                 .collect::<String>()
-        );
+        ))
+    }
+    fn insert_session(
+        &self,
+        mut job: Job,
+        empty: bool,
+        defaults: Option<&crate::storage::AgentDefaults>,
+    ) -> Result<String> {
+        let id = self.new_id()?;
         if let Job::Coding(launch) = &mut job {
             launch.isolated = true;
         }
@@ -397,6 +402,138 @@ impl Service {
             .insert(id.clone(), session);
         self.start(&id, None)?;
         Ok(id)
+    }
+    /// Moves a session on this computer to a saved server (`Request::Move`).
+    /// The local session keeps its chat and worktree, is archived, and refuses
+    /// further messages with a pointer to the server session.
+    fn move_session(&self, id: &str, server: &str) -> Result<String> {
+        let federation = self
+            .federation
+            .as_ref()
+            .context("This difu service cannot reach saved servers")?;
+        let session = match self.store.get(id) {
+            Ok(session) => session,
+            Err(_) if crate::cloud::federation::split(id).is_some() => {
+                anyhow::bail!(
+                    "{id} already runs on a server; only sessions on this computer can move"
+                )
+            }
+            Err(error) => return Err(error),
+        };
+        super::moving::check(&session)?;
+        // Connected, with full access and the same difu version.
+        federation.remote_within(server, Duration::from_secs(10))?;
+        self.stop_worker(id)?;
+        let package = super::moving::export(
+            &self.store.get(id)?,
+            &self.store.storage,
+            &Cancel::default(),
+        )?;
+        super::moving::fits(&package, super::moving::LIMIT)?;
+        let moved = match federation.forward(
+            server,
+            &Request::Import {
+                package: Box::new(package),
+            },
+        )? {
+            Reply::Launched(moved) => moved,
+            Reply::Error(error) => anyhow::bail!("{error}"),
+            _ => anyhow::bail!("{server} did not create the session"),
+        };
+        let _shell_lifecycle = self
+            .store
+            .shells
+            .lifecycle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
+        self.store.shells.stop_session(&self.store, id)?;
+        self.store.update(id, |s| {
+            s.moved_to = Some(moved.clone());
+            s.move_scheduled = None;
+            s.archived = true;
+            super::plan::invalidate(s);
+            s.note(
+                "system",
+                format!("Moved to {server} as {moved}. The conversation continues there; this copy is archived and its worktree is kept."),
+            );
+        })?;
+        self.store.save(id)?;
+        Ok(moved)
+    }
+    /// Creates a server session from a moved one (`Request::Import`).
+    fn import_session(&self, package: &super::moving::Package) -> Result<String> {
+        ensure!(
+            self.store.storage.load_config()?.server.enabled,
+            "Sessions can move only to a difu server (`difu serve`)"
+        );
+        let root = crate::cloud::repos::ensure(&self.store.storage, &package.repository)?;
+        let id = self.new_id()?;
+        let session =
+            super::moving::import(package, id.clone(), root, &self.store, &Cancel::default())?;
+        storage::atomic_json(&self.store.home.join(format!("{id}.json")), &session)?;
+        self.store
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session lock failed"))?
+            .insert(id.clone(), session);
+        self.store.changed.notify_all();
+        // The provider starts with the first message, which carries the handoff.
+        Ok(id)
+    }
+    /// Runs the moves `difu_move_to_server` scheduled once their turn has
+    /// ended. A turn that failed or was interrupted cancels its move.
+    fn scheduled_moves(self: &Arc<Self>) -> Result<Vec<thread::JoinHandle<()>>> {
+        let due: Vec<(String, String, Status)> = self
+            .store
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session lock failed"))?
+            .values()
+            .filter(|s| s.turn_id.is_none() && !s.status.active())
+            .filter_map(|s| {
+                s.move_scheduled
+                    .clone()
+                    .map(|server| (s.id.clone(), server, s.status))
+            })
+            .collect();
+        let mut moves = Vec::new();
+        for (id, server, status) in due {
+            let finished = matches!(status, Status::Idle | Status::Completed);
+            self.store.update(&id, |s| {
+                s.move_scheduled = None;
+                if !finished {
+                    s.note(
+                        "system",
+                        format!("Move to {server} cancelled because the turn did not finish"),
+                    );
+                }
+            })?;
+            if !finished {
+                self.store.save(&id)?;
+                continue;
+            }
+            let service = self.clone();
+            moves.push(
+                thread::Builder::new()
+                    .name("difu-move-session".into())
+                    .spawn(move || {
+                        let request = Request::Move {
+                            id: id.clone(),
+                            server: server.clone(),
+                        };
+                        if let Err(error) = service.handle(request) {
+                            let message =
+                                format!("Could not move this session to {server}: {error:#}");
+                            let _ = service.store.update(&id, |s| {
+                                s.error = Some(message.clone());
+                                s.note("error", message);
+                            });
+                            let _ = service.store.save(&id);
+                        }
+                    })?,
+            );
+        }
+        Ok(moves)
     }
     fn handle(&self, request: Request) -> Result<Reply> {
         let request = match &self.federation {
@@ -423,6 +560,7 @@ impl Service {
             | Request::AttachPr { id, .. }
             | Request::Permissions { id, .. }
             | Request::Usage { id }
+            | Request::Move { id, .. }
             | Request::Rename { id, .. } => Some(id.clone()),
             _ => None,
         };
@@ -500,6 +638,56 @@ impl Service {
                 )?;
                 Ok(Reply::Ok)
             }
+            Request::SessionPrs { id, history } => {
+                let session = self.store.get(&id)?;
+                ensure!(
+                    matches!(session.job, Job::Coding(_)) && !session.orchestrator,
+                    "Pull requests belong to coding sessions"
+                );
+                Ok(Reply::SessionPrs(super::pr_cache::lookup(
+                    &self.store.storage,
+                    &session.summary(),
+                    history,
+                    &Cancel::default(),
+                )))
+            }
+            Request::UploadAttachment {
+                id,
+                label,
+                kind,
+                extension,
+                data,
+            } => {
+                ensure!(
+                    matches!(self.store.get(&id)?.job, Job::Coding(_)),
+                    "Attachments are available for coding sessions"
+                );
+                // Base64 is a third larger than the file it carries.
+                ensure!(
+                    data.len() / 4 * 3 <= super::media::UPLOAD_LIMIT + 3,
+                    "{label} is larger than {} MB",
+                    super::media::UPLOAD_LIMIT >> 20
+                );
+                let bytes =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
+                        .context("Attachment is not valid base64")?;
+                Ok(Reply::Attachment(super::media::upload(
+                    &self.store.storage,
+                    &id,
+                    &label,
+                    kind,
+                    &extension,
+                    &bytes,
+                )?))
+            }
+            Request::ReadArtifact {
+                id,
+                path,
+                workspace,
+            } => Ok(Reply::ArtifactFile(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                super::artifacts::read(&self.store.get(&id)?, &path, workspace.as_deref())?,
+            ))),
             Request::Watch { .. } => anyhow::bail!("Watch requires a streaming connection"),
             Request::Read { id, version } => self.store.inspect(&id, |session| {
                 if version == Some(session.version) {
@@ -574,6 +762,11 @@ impl Service {
             }
             Request::Control { id, control } => {
                 let session = self.store.get(&id)?;
+                if let Some(moved) = &session.moved_to {
+                    anyhow::bail!(
+                        "This session moved to {moved}; continue it there. This copy keeps its chat and worktree but takes no more messages."
+                    );
+                }
                 ensure!(
                     !session.workspace_removed,
                     "This worktree was explicitly removed. Launch a new session from its retained branch to continue coding."
@@ -1137,7 +1330,7 @@ impl Service {
                         .lock()
                         .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
                     self.store.shells.stop_session(&self.store, &id)?;
-                    super::sandbox::remove_pod(&self.store.storage, &id);
+                    super::sandbox::remove_pod(&self.store.storage, self.pods.as_ref(), &id);
                     let previous = self.store.get(&id)?;
                     super::workspace::discard(&previous, &self.store.home, &Cancel::default())?;
                     let revision = previous.workspace_revision.saturating_add(1);
@@ -1259,7 +1452,7 @@ impl Service {
                         .lock()
                         .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
                     self.store.shells.stop_session(&self.store, &id)?;
-                    super::sandbox::remove_pod(&self.store.storage, &id);
+                    super::sandbox::remove_pod(&self.store.storage, self.pods.as_ref(), &id);
                     self.store.update(&id, |s| {
                         if s.status.active() {
                             s.status = Status::Interrupted;
@@ -1330,7 +1523,7 @@ impl Service {
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
                 self.store.shells.stop_session(&self.store, &id)?;
-                super::sandbox::remove_pod(&self.store.storage, &id);
+                super::sandbox::remove_pod(&self.store.storage, self.pods.as_ref(), &id);
                 super::workspace::cleanup(&session, &self.store.home, &Cancel::default())?;
                 self.store.update(&id, |s| {
                     s.archived = true;
@@ -1379,7 +1572,37 @@ impl Service {
                 &self.store.get(&id)?,
                 &Cancel::default(),
             )?)),
-            Request::Defaults { cwd } => super::engine::defaults(&cwd),
+            Request::Defaults { cwd, server: None } => super::engine::defaults(&cwd),
+            Request::AgentDefaults { server: None } => Ok(Reply::AgentDefaults(
+                self.store.storage.load_config()?.agent_defaults,
+            )),
+            Request::DefaultModel {
+                server: None,
+                model,
+                effort,
+            } => {
+                let mut draft = self.store.storage.settings_draft()?;
+                draft.select_default_model(model, effort)?;
+                let config = self.store.storage.save_settings_draft(&mut draft)?;
+                Ok(Reply::AgentDefaults(config.agent_defaults))
+            }
+            Request::Models { server: None } => {
+                Ok(Reply::Models(provider::models(&Cancel::default())?))
+            }
+            Request::Defaults {
+                server: Some(server),
+                ..
+            }
+            | Request::AgentDefaults {
+                server: Some(server),
+            }
+            | Request::DefaultModel {
+                server: Some(server),
+                ..
+            }
+            | Request::Models {
+                server: Some(server),
+            } => anyhow::bail!("Server {server} is not connected"),
             Request::Remote { command } => Ok(Reply::Remote(self.remote.command(command)?)),
             Request::RepositoryRules {
                 server: None,
@@ -1390,6 +1613,8 @@ impl Service {
                 server: Some(server),
                 ..
             } => anyhow::bail!("Server {server} is not connected"),
+            Request::Move { id, server } => Ok(Reply::Launched(self.move_session(&id, &server)?)),
+            Request::Import { package } => Ok(Reply::Launched(self.import_session(&package)?)),
             Request::Skills { id, force } => {
                 let session = self.store.get(&id)?;
                 ensure!(
@@ -1454,6 +1679,8 @@ fn reset_workspace(s: &mut Session, candidate: Session, revision: u64) {
 /// learned: the next message starts a new native thread with no handoff context.
 fn clear_conversation(s: &mut Session) {
     super::plan::invalidate(s);
+    s.moved_to = None;
+    s.move_scheduled = None;
     s.entries.clear();
     s.subagents.clear();
     s.slack_route = None;
@@ -1641,6 +1868,7 @@ pub fn run(storage: Storage) -> Result<()> {
         action_locks: Mutex::new(BTreeMap::new()),
         launch_lock: Mutex::new(()),
         federation: Some(federation),
+        pods: super::sandbox::podman(),
     });
     ensure_orchestrator(&service.store)?;
     let _pr_cache =
@@ -1682,6 +1910,9 @@ pub fn run(storage: Storage) -> Result<()> {
             continue;
         }
         flushed = Instant::now();
+        if let Err(error) = service.scheduled_moves() {
+            eprintln!("Scheduled moves: {error:#}");
+        }
         for session in service.store.list()? {
             if saved.get(&session.id) != Some(&session.version) {
                 service.store.save(&session.id)?;
@@ -1879,6 +2110,7 @@ mod federation_tests {
             action_locks: Mutex::new(BTreeMap::new()),
             launch_lock: Mutex::new(()),
             federation: federation.map(Arc::new),
+            pods: super::sandbox::podman(),
         });
         Ok((temp, service))
     }
@@ -1926,6 +2158,283 @@ mod federation_tests {
     }
 
     #[test]
+    fn uploaded_media_lands_in_the_sessions_attachments() -> Result<()> {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let (_temp, service) = service(None)?;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2))
+            .write_to(&mut png, image::ImageFormat::Png)?;
+        let png = png.into_inner();
+        let upload = |id: &str, data: String| Request::UploadAttachment {
+            id: id.into(),
+            label: "image 2".into(),
+            kind: super::super::media::Kind::Image,
+            extension: "png".into(),
+            data,
+        };
+        let Reply::Attachment(stored) = service.handle(upload("local", STANDARD.encode(&png)))?
+        else {
+            anyhow::bail!("expected the stored copy");
+        };
+        assert_eq!(stored.label, "image 2");
+        assert_eq!(std::fs::read(&stored.path)?, png);
+        // Exactly what sending the message checks before the agent sees it.
+        super::super::media::validate(&service.store.storage, "local", &stored)?;
+        for (id, data, expected) in [
+            ("missing", STANDARD.encode(&png), "Session not found"),
+            ("local", "not base64!".into(), "not valid base64"),
+            (
+                "local",
+                "A".repeat((super::super::media::UPLOAD_LIMIT / 3 + 2) * 4),
+                "larger than 32 MB",
+            ),
+        ] {
+            let error = service
+                .handle(upload(id, data))
+                .err()
+                .context("the upload must fail")?;
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn pr_lookups_answer_for_coding_sessions_without_extra_github_requests() -> Result<()> {
+        let (_temp, service) = service(None)?;
+        // Archived sessions are not polled, so this asks GitHub nothing.
+        service
+            .store
+            .update("local", |session| session.archived = true)?;
+        let Reply::SessionPrs(lookup) = service.handle(Request::SessionPrs {
+            id: "local".into(),
+            history: false,
+        })?
+        else {
+            anyhow::bail!("expected a PR lookup");
+        };
+        assert_eq!(lookup, super::super::pr_cache::Lookup::default());
+        assert!(
+            service
+                .handle(Request::SessionPrs {
+                    id: "missing".into(),
+                    history: false,
+                })
+                .is_err()
+        );
+        Ok(())
+    }
+
+    /// A real service standing in for a cloud server, reached through the
+    /// federation the way `client::Connection` carries requests over `rpc`.
+    /// Messages are recorded instead of starting an agent.
+    struct Loopback {
+        service: Arc<Service>,
+        messages: Mutex<Vec<Request>>,
+    }
+    impl crate::cloud::federation::Remote for Loopback {
+        fn version(&self) -> String {
+            env!("CARGO_PKG_VERSION").into()
+        }
+        fn full(&self) -> bool {
+            true
+        }
+        fn closed(&self) -> bool {
+            false
+        }
+        fn call(&self, method: &str, _params: serde_json::Value) -> Result<serde_json::Value> {
+            anyhow::ensure!(method == "server.repos", "unexpected {method}");
+            Ok(serde_json::json!({"repositories": []}))
+        }
+        fn rpc(&self, request: &Request) -> Result<Reply> {
+            if matches!(request, Request::Control { .. }) {
+                self.messages
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("lock"))?
+                    .push(request.clone());
+                return Ok(Reply::Ok);
+            }
+            self.service.handle(request.clone())
+        }
+        fn watch(
+            &self,
+            _id: &str,
+            _version: Option<u64>,
+        ) -> Result<Box<dyn crate::cloud::federation::Replies>> {
+            anyhow::bail!("not used")
+        }
+    }
+
+    #[test]
+    fn server_session_shells_artifacts_and_media_work_from_another_computer() -> Result<()> {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let (server_dir, server) = service(None)?;
+        let workspace = server_dir.path().canonicalize()?.join("worktree");
+        std::fs::create_dir_all(workspace.join("out"))?;
+        std::fs::write(workspace.join("out/report.html"), "<h1>Report</h1>")?;
+        let artifact = super::super::artifacts::Artifact {
+            path: "out/report.html".into(),
+            title: "Report".into(),
+            workspace: Some(workspace.clone()),
+        };
+        server.store.update("local", |session| {
+            session.workspace = Some(workspace.clone());
+            session.workspace_ready = true;
+            session.artifacts.push(artifact.clone());
+        })?;
+        let loopback = Arc::new(Loopback {
+            service: server.clone(),
+            messages: Mutex::new(Vec::new()),
+        });
+        let (_servers, federation) = crate::cloud::federation::tests::connected_to(vec![(
+            "box",
+            loopback.clone() as Arc<dyn crate::cloud::federation::Remote>,
+        )])?;
+        let (_mac_dir, mac) = service(Some(federation))?;
+        let id = || "box:local".to_owned();
+
+        // A shell opens on the server in the session's worktree; input,
+        // output and resizing all travel as forwarded requests.
+        let Reply::Shell(opened) = mac.handle(Request::Shell {
+            id: id(),
+            action: shells::Action::Open,
+        })?
+        else {
+            anyhow::bail!("expected an opened shell");
+        };
+        let shell = opened
+            .get("shell")
+            .and_then(serde_json::Value::as_str)
+            .context("shell id")?
+            .to_owned();
+        assert_eq!(
+            opened.get("cwd").and_then(serde_json::Value::as_str),
+            workspace.to_str()
+        );
+        mac.handle(Request::Shell {
+            id: id(),
+            action: shells::Action::Human {
+                shell: shell.clone(),
+                client: "mac".into(),
+                sequence: 1,
+                focused: true,
+                text: "printf 'from-%s\\n' mac\r".into(),
+            },
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            server.store.shells.tick(&server.store)?;
+            let Reply::Shell(screen) = mac.handle(Request::Shell {
+                id: id(),
+                action: shells::Action::Exchange {
+                    shell: shell.clone(),
+                    rows: 12,
+                    cols: 70,
+                    scrollback: 0,
+                },
+            })?
+            else {
+                anyhow::bail!("expected a screen");
+            };
+            assert_eq!(
+                (screen.get("rows"), screen.get("cols")),
+                (Some(&serde_json::json!(12)), Some(&serde_json::json!(70)))
+            );
+            let text = screen
+                .get("screen")
+                .and_then(serde_json::Value::as_str)
+                .map(|screen| STANDARD.decode(screen))
+                .transpose()?
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            if text.contains("from-mac") {
+                break;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "no shell output: {text:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let Reply::Shells(listed) = mac.handle(Request::Shells { id: id() })? else {
+            anyhow::bail!("expected shells");
+        };
+        assert!(
+            listed
+                .iter()
+                .any(|s| s.get("itemId").and_then(serde_json::Value::as_str) == Some(&shell))
+        );
+        mac.handle(Request::Shell {
+            id: id(),
+            action: shells::Action::Close {
+                shell: shell.clone(),
+            },
+        })?;
+        assert!(server.store.shells.list("local")?.is_empty());
+
+        // Presented artifacts are read from the server for a local preview;
+        // nothing else in the worktree is.
+        let Reply::ArtifactFile(data) = mac.handle(Request::ReadArtifact {
+            id: id(),
+            path: artifact.path.clone(),
+            workspace: artifact.workspace.clone(),
+        })?
+        else {
+            anyhow::bail!("expected the artifact");
+        };
+        assert_eq!(STANDARD.decode(data)?, b"<h1>Report</h1>");
+        std::fs::write(workspace.join("secret.html"), "private")?;
+        assert!(
+            mac.handle(Request::ReadArtifact {
+                id: id(),
+                path: "secret.html".into(),
+                workspace: artifact.workspace.clone(),
+            })
+            .is_err()
+        );
+
+        // Pasted media is uploaded on Send and the message names copies the
+        // server accepts as the session's own.
+        let source = tempfile::tempdir()?;
+        let shot = source.path().join("shot.png");
+        image::RgbaImage::new(2, 2).save(&shot)?;
+        let mac_storage = mac.federation.as_ref().context("federation")?.storage();
+        let super::super::media::Paste::Attachments(mut copies) =
+            super::super::media::files(mac_storage, "box:local", vec![shot])?
+        else {
+            anyhow::bail!("expected media");
+        };
+        for copy in &mut copies {
+            copy.label = "image 1".into();
+        }
+        mac.handle(Request::Control {
+            id: id(),
+            control: Control::MessageWithAttachments {
+                text: "see [image 1]".into(),
+                queue: false,
+                skills: Vec::new(),
+                attachments: copies,
+            },
+        })?;
+        let messages = loopback
+            .messages
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock"))?
+            .clone();
+        let [
+            Request::Control {
+                id: sent,
+                control: Control::MessageWithAttachments { attachments, .. },
+            },
+        ] = messages.as_slice()
+        else {
+            anyhow::bail!("one message: {messages:?}");
+        };
+        assert_eq!(sent, "local");
+        let [uploaded] = attachments.as_slice() else {
+            anyhow::bail!("one attachment");
+        };
+        super::super::media::validate(&server.store.storage, "local", uploaded)?;
+        Ok(())
+    }
+
+    #[test]
     fn without_servers_requests_stay_local() -> Result<()> {
         let (_temp, service) = service(None)?;
         let Reply::Sessions(list) = service.handle(Request::List)? else {
@@ -1946,6 +2455,73 @@ mod federation_tests {
             .err()
             .context("an unknown server cannot launch")?;
         assert!(format!("{error:#}").contains("box"));
+        Ok(())
+    }
+
+    #[test]
+    fn location_defaults_answer_here_or_on_the_named_server() -> Result<()> {
+        let fake = Fake::new(Vec::new());
+        let (_servers, federation) = connected(vec![("box", fake.clone())])?;
+        let (_temp, agents) = service(Some(federation))?;
+        agents.store.storage.update_config(|config| {
+            config.agent_defaults.model = Some("local-model".into());
+        })?;
+        let Reply::AgentDefaults(local) = agents.handle(Request::AgentDefaults { server: None })?
+        else {
+            anyhow::bail!("local defaults");
+        };
+        assert_eq!(local.model.as_deref(), Some("local-model"));
+        let Reply::AgentDefaults(remote) = agents.handle(Request::AgentDefaults {
+            server: Some("box".into()),
+        })?
+        else {
+            anyhow::bail!("server defaults");
+        };
+        assert_eq!(remote, crate::cloud::federation::tests::server_defaults());
+        // Saving here goes through the settings draft, so the provider follows.
+        let Reply::AgentDefaults(saved) = agents.handle(Request::DefaultModel {
+            server: None,
+            model: Some("claude/opus".into()),
+            effort: Some("max".into()),
+        })?
+        else {
+            anyhow::bail!("saved defaults");
+        };
+        let config = agents.store.storage.load_config()?.agent_defaults;
+        assert_eq!(saved, config);
+        assert_eq!(
+            (
+                config.model.as_deref(),
+                config.effort.as_deref(),
+                config.provider
+            ),
+            (
+                Some("claude/opus"),
+                Some("max"),
+                Some(provider::Provider::Claude)
+            )
+        );
+        // A server's Codex defaults come from that server.
+        let Reply::Defaults { model, .. } = agents.handle(Request::Defaults {
+            cwd: "/srv/difu/repos/acme/api".into(),
+            server: Some("box".into()),
+        })?
+        else {
+            anyhow::bail!("server Codex defaults");
+        };
+        assert_eq!(model, "codex-at-/srv/difu/repos/acme/api");
+        let (_alone_temp, alone) = service(None)?;
+        for request in [
+            Request::AgentDefaults {
+                server: Some("box".into()),
+            },
+            Request::Models {
+                server: Some("box".into()),
+            },
+        ] {
+            let error = alone.handle(request).err().context("unknown server")?;
+            assert!(format!("{error:#}").contains("box"));
+        }
         Ok(())
     }
 
@@ -2032,6 +2608,7 @@ mod routed_queue_tests {
             action_locks: Mutex::new(BTreeMap::new()),
             launch_lock: Mutex::new(()),
             federation: None,
+            pods: super::sandbox::podman(),
         };
         let mut route = slack::Route {
             account: "account".into(),
@@ -2109,6 +2686,7 @@ mod routed_queue_tests {
             action_locks: Mutex::new(BTreeMap::new()),
             launch_lock: Mutex::new(()),
             federation: None,
+            pods: super::sandbox::podman(),
         };
         service.handle(Request::SlackControl {
             id: "worker".into(),
@@ -2260,6 +2838,7 @@ mod clear_tests {
             action_locks: Mutex::new(BTreeMap::new()),
             launch_lock: Mutex::new(()),
             federation: None,
+            pods: super::sandbox::podman(),
         };
         assert!(crate::github::store::load(&service.store.storage, &pr).is_none());
         let scope = crate::process::fixture::Scope::new(
@@ -2451,6 +3030,7 @@ mod clear_tests {
                 action_locks: Mutex::new(BTreeMap::new()),
                 launch_lock: Mutex::new(()),
                 federation: None,
+                pods: super::sandbox::podman(),
             });
 
             // Pause cleanup to observe progress before the clear request returns.
@@ -2557,6 +3137,443 @@ mod clear_tests {
                 1
             );
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod move_tests {
+    use super::super::moving::tests::{git, local_session, origin, server_storage};
+    use super::*;
+    use crate::cloud::federation::{Remote, Replies};
+
+    /// A server reached in-process; requests and replies cross JSON as they
+    /// do over `rpc`.
+    struct Loopback(Arc<Service>);
+
+    impl Remote for Loopback {
+        fn version(&self) -> String {
+            env!("CARGO_PKG_VERSION").into()
+        }
+        fn full(&self) -> bool {
+            true
+        }
+        fn closed(&self) -> bool {
+            false
+        }
+        fn call(&self, method: &str, _params: Value) -> Result<Value> {
+            ensure!(method == "server.repos", "unexpected {method}");
+            Ok(serde_json::json!({"repositories": []}))
+        }
+        fn rpc(&self, request: &Request) -> Result<Reply> {
+            let request: Request = serde_json::from_slice(&serde_json::to_vec(request)?)?;
+            let reply = self.0.handle(request)?;
+            Ok(serde_json::from_slice(&serde_json::to_vec(&reply)?)?)
+        }
+        fn watch(&self, _id: &str, _version: Option<u64>) -> Result<Box<dyn Replies>> {
+            anyhow::bail!("not watched in these tests")
+        }
+    }
+
+    fn service(
+        store: Arc<Store>,
+        federation: Option<crate::cloud::federation::Federation>,
+    ) -> Arc<Service> {
+        Arc::new(Service {
+            remote: super::remote::Remote::start(store.storage.clone()),
+            store,
+            workers: Mutex::new(BTreeMap::new()),
+            action_locks: Mutex::new(BTreeMap::new()),
+            launch_lock: Mutex::new(()),
+            federation: federation.map(Arc::new),
+            pods: super::sandbox::podman(),
+        })
+    }
+
+    /// This computer with session `one` and saved server `box`, a server-mode
+    /// service with a base clone of the session's repository.
+    struct Pair {
+        temp: tempfile::TempDir,
+        local: Arc<Service>,
+        server: Arc<Service>,
+    }
+
+    fn pair() -> Result<Pair> {
+        let temp = tempfile::tempdir()?;
+        let origin = origin(temp.path())?;
+        let local_home = temp.path().join("mac");
+        let session = local_session(temp.path(), &origin, &local_home)?;
+        let server_home = temp.path().join("server");
+        server_storage(&server_home, &origin)?;
+        let server = service(Arc::new(Store::fixture(server_home, Vec::new())), None);
+        let store = Arc::new(Store::fixture(local_home, vec![session]));
+        let federation = crate::cloud::federation::tests::linked(
+            store.storage.clone(),
+            BTreeMap::from([(
+                "box".to_owned(),
+                Arc::new(Loopback(server.clone())) as Arc<dyn Remote>,
+            )]),
+        )?;
+        let local = service(store, Some(federation));
+        Ok(Pair {
+            temp,
+            local,
+            server,
+        })
+    }
+
+    fn message(text: &str) -> Control {
+        Control::Message {
+            text: text.into(),
+            queue: false,
+            skills: Vec::new(),
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn moving_continues_the_session_on_the_server_and_retires_the_local_copy() -> Result<()> {
+        let pair = pair()?;
+        let Reply::Launched(moved) = pair.local.handle(Request::Move {
+            id: "one".into(),
+            server: "box".into(),
+        })?
+        else {
+            anyhow::bail!("expected the server session");
+        };
+        let (server, id) = crate::cloud::federation::split(&moved).context("namespaced")?;
+        assert_eq!(server, "box");
+
+        let local = pair.local.store.get("one")?;
+        assert!(local.archived);
+        assert_eq!(local.moved_to.as_deref(), Some(moved.as_str()));
+        assert!(local.entries.last().is_some_and(
+            |e| e.kind == "system" && e.text.starts_with(&format!("Moved to box as {moved}"))
+        ));
+        // The local worktree stays; difu never deletes it on a move.
+        assert!(
+            local
+                .workspace
+                .as_deref()
+                .is_some_and(|path| path.join("feature.rs").exists())
+        );
+        let refused = pair
+            .local
+            .handle(Request::Control {
+                id: "one".into(),
+                control: message("keep going"),
+            })
+            .err()
+            .context("a moved session takes no messages")?;
+        assert!(format!("{refused:#}").contains(&moved), "{refused:#}");
+        let again = pair
+            .local
+            .handle(Request::Move {
+                id: "one".into(),
+                server: "box".into(),
+            })
+            .err()
+            .context("a session moves once")?;
+        assert!(format!("{again:#}").contains("already moved"), "{again:#}");
+
+        let imported = pair.server.store.get(id)?;
+        assert!(pair.server.store.home.join(format!("{id}.json")).exists());
+        // Media, artifacts and attached pull requests came along.
+        let media = super::media::directory(&pair.server.store.storage, id)?;
+        assert!(media.join("media-clip.mp4").exists());
+        assert_eq!(
+            imported
+                .artifacts
+                .iter()
+                .map(|a| a.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Report", "Build output", "Notes"]
+        );
+        assert!(
+            super::pr_cache::snapshot(&pair.server.store.storage, id)
+                .links
+                .iter()
+                .any(|link| link.attached && link.pr.key.id() == "acme/tools#42")
+        );
+        assert!(imported.provider_context.is_some() && imported.thread_id.is_none());
+        assert!(
+            imported
+                .entries
+                .iter()
+                .any(|e| e.text == "Build the widget")
+        );
+        let worktree = imported.workspace.clone().context("server worktree")?;
+        assert_eq!(
+            git(&worktree, &["rev-parse", "HEAD"])?,
+            git(
+                local.workspace.as_deref().context("local worktree")?,
+                &["rev-parse", "HEAD"]
+            )?
+        );
+        // The sidebar lists the new server session at once.
+        let Reply::Sessions(list) = pair.local.handle(Request::List)? else {
+            anyhow::bail!("sessions");
+        };
+        assert!(list.iter().any(|summary| summary.id == moved));
+        let Reply::Session(read) = pair.local.handle(Request::Read {
+            id: moved.clone(),
+            version: None,
+        })?
+        else {
+            anyhow::bail!("server session");
+        };
+        assert_eq!(read.id, moved);
+        Ok(())
+    }
+
+    #[test]
+    fn busy_unknown_and_refused_moves_leave_the_local_session_as_it_was() -> Result<()> {
+        let pair = pair()?;
+        pair.local.store.update("one", |s| {
+            s.status = Status::Running;
+            s.turn_id = Some("turn".into());
+        })?;
+        let busy = pair
+            .local
+            .handle(Request::Move {
+                id: "one".into(),
+                server: "box".into(),
+            })
+            .err()
+            .context("busy")?;
+        assert!(format!("{busy:#}").contains("current turn"), "{busy:#}");
+        pair.local.store.update("one", |s| {
+            s.status = Status::Idle;
+            s.turn_id = None;
+        })?;
+        for (id, server, reason) in [
+            ("one", "nowhere", "No saved server named nowhere"),
+            ("box:1", "box", "only sessions on this computer"),
+        ] {
+            let error = pair
+                .local
+                .handle(Request::Move {
+                    id: id.into(),
+                    server: server.into(),
+                })
+                .err()
+                .context(reason)?;
+            assert!(format!("{error:#}").contains(reason), "{error:#}");
+        }
+        // A computer that is not a server never imports.
+        pair.server
+            .store
+            .storage
+            .update_config(|config| config.server.enabled = false)?;
+        let error = pair
+            .local
+            .handle(Request::Move {
+                id: "one".into(),
+                server: "box".into(),
+            })
+            .err()
+            .context("not a server")?;
+        assert!(
+            format!("{error:#}").contains("only to a difu server"),
+            "{error:#}"
+        );
+        let local = pair.local.store.get("one")?;
+        assert!(!local.archived && local.moved_to.is_none());
+        assert!(pair.server.store.list()?.is_empty());
+        assert!(!pair.temp.path().join("server").join("worktrees").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_moves_wait_for_the_turn_and_interrupted_turns_cancel_them() -> Result<()> {
+        let pair = pair()?;
+        pair.local.store.update("one", |s| {
+            s.move_scheduled = Some("box".into());
+            s.status = Status::Running;
+            s.turn_id = Some("turn".into());
+        })?;
+        assert!(pair.local.scheduled_moves()?.is_empty());
+        assert!(pair.local.store.get("one")?.move_scheduled.is_some());
+
+        pair.local.store.update("one", |s| {
+            s.status = Status::Interrupted;
+            s.turn_id = None;
+        })?;
+        assert!(pair.local.scheduled_moves()?.is_empty());
+        let cancelled = pair.local.store.get("one")?;
+        assert!(cancelled.move_scheduled.is_none() && cancelled.moved_to.is_none());
+        assert!(
+            cancelled
+                .entries
+                .last()
+                .is_some_and(|e| e.text.contains("cancelled because the turn did not finish"))
+        );
+
+        pair.local.store.update("one", |s| {
+            s.status = Status::Idle;
+            s.move_scheduled = Some("box".into());
+        })?;
+        for handle in pair.local.scheduled_moves()? {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("move thread panicked"))?;
+        }
+        let moved = pair.local.store.get("one")?;
+        assert!(moved.archived && moved.move_scheduled.is_none());
+        assert!(
+            moved
+                .moved_to
+                .as_deref()
+                .is_some_and(|id| id.starts_with("box:"))
+        );
+        assert_eq!(pair.server.store.list()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_scheduled_move_is_reported_in_the_chat() -> Result<()> {
+        let pair = pair()?;
+        pair.local.store.update("one", |s| {
+            s.move_scheduled = Some("box".into());
+            s.queue.push("later".into());
+        })?;
+        for handle in pair.local.scheduled_moves()? {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("move thread panicked"))?;
+        }
+        let session = pair.local.store.get("one")?;
+        assert!(session.moved_to.is_none() && !session.archived);
+        assert!(session.entries.last().is_some_and(|e| e.kind == "error"
+            && e.text.starts_with("Could not move this session to box")
+            && e.text.contains("queued messages")));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod server_delete_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    /// Records Podman calls instead of running Podman.
+    #[derive(Default)]
+    struct Pods(Mutex<Vec<String>>);
+    impl super::super::sandbox::Runner for Pods {
+        fn podman(&self, args: &[OsString]) -> Result<crate::process::Output> {
+            self.0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Pods lock failed"))?
+                .push(
+                    args.iter()
+                        .map(|arg| arg.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            Ok(crate::process::Output {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                code: 0,
+            })
+        }
+    }
+
+    fn git(root: &std::path::Path, args: &[&str]) -> Result<String> {
+        crate::process::checked(
+            crate::repo::git(root)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args),
+            &Cancel::default(),
+        )
+        .map(|s| s.trim().to_owned())
+    }
+
+    /// Phones (`session.delete`) and Macs (`rpc` through federation) both reach
+    /// the service as `Request::Delete`: on a server it removes the session's
+    /// sandbox pod, its worktree and its saved session.
+    #[test]
+    fn deleting_a_server_session_removes_its_pod_worktree_and_record() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let (origin, base, home) = (root.join("origin"), root.join("base"), root.join("home"));
+        for path in [&origin, &base] {
+            fs::create_dir(path)?;
+            git(path, &["init", "-b", "main"])?;
+            fs::write(path.join("tracked.txt"), "base\n")?;
+            git(path, &["add", "."])?;
+            git(path, &["commit", "-m", "base"])?;
+        }
+        git(
+            &base,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.to_str().context("origin")?,
+            ],
+        )?;
+        let id = "1791875325706-02acb407";
+        let mut session = Session::new(
+            id.into(),
+            Job::Coding(Launch {
+                repository: base.clone(),
+                isolated: true,
+                base: "origin/main".into(),
+                prompt: "Task".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        let cancel = Cancel::default();
+        super::super::workspace::inspect(&mut session, &cancel)?;
+        super::super::workspace::prepare(&mut session, &home, &cancel, |_| Ok(()))?;
+        let tree = home.join("worktrees").join(id);
+        assert_eq!(session.workspace.as_deref(), Some(tree.as_path()));
+        // Uncommitted work the sandbox left behind goes with the worktree.
+        fs::write(tree.join("untracked.txt"), "agent output\n")?;
+        session.status = Status::Idle;
+        let store = Arc::new(Store::fixture(home.clone(), vec![session]));
+        store.save(id)?;
+        store.storage.update_config(|config| {
+            config.server.enabled = true;
+            config.server.sandbox.enabled = true;
+        })?;
+        let pods = Arc::new(Pods::default());
+        let service = Service {
+            remote: super::remote::Remote::start(store.storage.clone()),
+            store: store.clone(),
+            workers: Mutex::new(BTreeMap::new()),
+            action_locks: Mutex::new(BTreeMap::new()),
+            launch_lock: Mutex::new(()),
+            federation: None,
+            pods: pods.clone(),
+        };
+        assert!(matches!(
+            service.handle(Request::Delete { id: id.into() })?,
+            Reply::Ok
+        ));
+        assert_eq!(
+            *pods
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Pods lock failed"))?,
+            [format!("pod rm -f -t 0 difu-{id}")]
+        );
+        assert!(!tree.exists(), "The worktree was left behind");
+        assert!(!git(&base, &["worktree", "list"])?.contains(id));
+        assert!(!home.join(format!("{id}.json")).exists());
+        assert!(store.get(id).is_err());
+        let Reply::Sessions(sessions) = service.handle(Request::List)? else {
+            anyhow::bail!("Expected the session list");
+        };
+        assert!(sessions.iter().all(|summary| summary.id != id));
         Ok(())
     }
 }

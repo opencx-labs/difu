@@ -255,7 +255,7 @@ impl std::fmt::Display for ModelChoice {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
     pub name: String,

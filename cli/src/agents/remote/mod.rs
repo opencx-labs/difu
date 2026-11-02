@@ -30,6 +30,8 @@ use std::{
 
 /// A pairing code shown in the QR modal stays valid this long and works once.
 const PAIRING_TTL: Duration = Duration::from_secs(10 * 60);
+/// Why a server refuses to turn remote control off.
+pub const SERVER_STAYS_ON: &str = "This is a difu server: remote control stays on so its computers and phones can always reach their sessions. Revoke one device with `difu remote forget`, turn password pairing off with `difu remote password --disable`, or stop the server with `systemctl stop difu-agent`.";
 pub const PROTOCOL: u32 = 1;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -232,19 +234,11 @@ impl Remote {
                 }
                 self.listen()?;
             }
+            // `difu remote`, `rpc` from a full device and the terminal app on
+            // the server all arrive here.
             Command::Disable => {
-                let server = {
-                    let mut state = self.lock()?;
-                    state.settings.enabled = false;
-                    state.pairing = None;
-                    state.error = None;
-                    save(&self.home, &state.settings)?;
-                    state.server.take()
-                };
-                if let Some(server) = server {
-                    server.stop();
-                }
-                self.peers.close_all();
+                ensure!(!self.server_mode(), SERVER_STAYS_ON);
+                self.stop_listening()?;
             }
             Command::Forget { device } => {
                 self.forget(&device, true)?;
@@ -261,6 +255,29 @@ impl Remote {
             } => self.configure(hosts, clear_hosts, port)?,
         }
         self.status()
+    }
+
+    /// Turns remote control off and disconnects every device.
+    fn stop_listening(&self) -> Result<()> {
+        let server = {
+            let mut state = self.lock()?;
+            state.settings.enabled = false;
+            state.pairing = None;
+            state.error = None;
+            save(&self.home, &state.settings)?;
+            state.server.take()
+        };
+        if let Some(server) = server {
+            server.stop();
+        }
+        self.peers.close_all();
+        Ok(())
+    }
+
+    /// Tests stop their listener even in server mode, where `Disable` is refused.
+    #[cfg(test)]
+    pub(crate) fn shut_down(&self) -> Result<()> {
+        self.stop_listening()
     }
 
     fn configure(
@@ -803,6 +820,28 @@ mod tests {
         assert_eq!(load(&remote.home)?.port, free);
         assert!(std::net::TcpStream::connect(("127.0.0.1", first)).is_err());
         remote.command(Command::Disable)?;
+        Ok(())
+    }
+
+    #[test]
+    fn servers_never_turn_remote_control_off() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let remote = remote(&temp);
+        fs::write(&remote.storage.config, r#"{"server":{"enabled":true}}"#)?;
+        let port = remote.command(Command::Open)?.port;
+        let error = remote
+            .command(Command::Disable)
+            .err()
+            .context("A server must refuse to stop remote control")?;
+        assert!(error.to_string().contains("difu server"), "{error:#}");
+        let status = remote.status()?;
+        assert!(status.enabled && status.listening && status.server);
+        assert!(load(&remote.home)?.enabled);
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+        // Revoking devices and password pairing stay available.
+        remote.command(Command::Password { verifier: None })?;
+        remote.shut_down()?;
+        assert!(!remote.status()?.listening);
         Ok(())
     }
 

@@ -149,6 +149,9 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                 super::folders::TOOL => {
                     super::folders::handle_tool(store, id, args).map(|value| value.to_string())
                 }
+                super::moving::TOOL => {
+                    super::moving::schedule(store, id, args).map(|value| value.to_string())
+                }
                 super::artifacts::TOOL => super::artifacts::register(&mut session, args)
                     .map(|()| "Artifact registered in difu".to_owned()),
                 super::management::TOOL => (|| {
@@ -188,6 +191,7 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                     super::pr_attachments::TOOL,
                     super::shells::TOOL,
                     super::folders::TOOL,
+                    super::moving::TOOL,
                 ]
                 .contains(&name)
             {
@@ -739,6 +743,11 @@ pub(super) fn instructions(session: &Session) -> String {
         super::folders::INSTRUCTIONS
     );
     let instructions = format!("{instructions}\n\n{}", super::shells::instructions(session));
+    let instructions = if session.server_mode {
+        instructions
+    } else {
+        format!("{instructions}\n\n{}", super::moving::INSTRUCTIONS)
+    };
     let instructions = if session.native_setup {
         instructions
     } else {
@@ -1125,4 +1134,81 @@ fn commands(response: &Value) -> Result<Vec<super::Skill>> {
             })
         })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_difu_mcp_server_lists_and_schedules_the_move_tool() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut session = Session::new(
+            "one".into(),
+            Job::Coding(super::super::Launch {
+                repository: "/tmp/repo".into(),
+                isolated: true,
+                base: "origin/main".into(),
+                prompt: "task".into(),
+                model: Some("claude/opus".into()),
+                effort: None,
+            }),
+        );
+        session.provider = Provider::Claude;
+        session.status = Status::Running;
+        let store = Store::fixture(temp.path().into(), vec![session]);
+        crate::cloud::servers::save(
+            &store.storage,
+            crate::cloud::servers::tests::server("box", "id-box"),
+        )?;
+        let frame = |message: Value| json!({"request":{"subtype":"mcp_message","server_name":"difu","message":message}});
+        let listed = mcp(
+            &store,
+            "one",
+            &frame(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})),
+        )?;
+        let tool = listed
+            .pointer("/mcp_response/result/tools")
+            .and_then(Value::as_array)
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|tool| tool.get("name") == Some(&json!(super::super::moving::TOOL)))
+            })
+            .context("move tool listed")?;
+        assert!(tool.get("type").is_none());
+        assert_eq!(
+            tool.pointer("/inputSchema/required"),
+            Some(&json!(["server"]))
+        );
+        let called = mcp(
+            &store,
+            "one",
+            &frame(
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{
+                "name":super::super::moving::TOOL,"arguments":{"server":"box"}}}),
+            ),
+        )?;
+        assert_eq!(
+            called.pointer("/mcp_response/result/isError"),
+            Some(&json!(false))
+        );
+        // Scheduled during the turn; the service moves it after the turn ends.
+        let session = store.get("one")?;
+        assert_eq!(session.move_scheduled.as_deref(), Some("box"));
+        assert!(session.moved_to.is_none() && !session.archived);
+        let refused = mcp(
+            &store,
+            "one",
+            &frame(
+                json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{
+                "name":super::super::moving::TOOL,"arguments":{"server":"elsewhere"}}}),
+            ),
+        )?;
+        assert_eq!(
+            refused.pointer("/mcp_response/result/isError"),
+            Some(&json!(true))
+        );
+        Ok(())
+    }
 }

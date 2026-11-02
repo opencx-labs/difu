@@ -14,6 +14,8 @@ mod inline_questions;
 mod mcp_panel;
 mod media;
 mod models;
+mod moving;
+mod new_session;
 #[cfg(test)]
 mod overlay_shortcut_tests;
 mod panels;
@@ -244,8 +246,13 @@ enum Action {
     QuestionNote(usize),
     SubmitQuestion(bool),
     DismissNotice,
-    /// A machine or repository in the new-session server picker.
-    ServerChoice(usize),
+    /// A saved server in the "Move to server…" picker.
+    MoveChoice(usize),
+    /// A field of the new-session form.
+    NewSessionField(usize),
+    /// A row in the new-session form's list for its focused field.
+    NewSessionOption(usize),
+    NewSessionStart,
 }
 pub enum Modal {
     Subagents {
@@ -349,8 +356,13 @@ pub enum Modal {
     Delete,
     Clear,
     Help(crate::help::State),
-    /// Where a new session runs when cloud servers are saved.
-    NewSession(Box<servers::Picker>),
+    /// Where a new session runs, then its repository, model and reasoning.
+    NewSession(Box<new_session::Form>),
+    /// Saved servers the selected session can move to.
+    MoveToServer {
+        servers: Vec<String>,
+        selected: usize,
+    },
 }
 struct ResultMessage {
     kind: Task,
@@ -372,10 +384,20 @@ enum Task {
     Shells(String),
     Terminal(String, terminals::Operation),
     OpenArtifact,
+    /// A server session's artifact downloaded into `path`.
+    ServerArtifact {
+        session: String,
+        path: std::path::PathBuf,
+        title: String,
+        reload: bool,
+    },
     OpenLink,
     InstallBrowser(String, std::path::PathBuf, String),
     WorkspacePaths(String, std::path::PathBuf),
     Defaults(String),
+    /// A saved server's new-session defaults; the model name when they were
+    /// just saved from the model picker.
+    LocationDefaults(String, Option<String>),
     Skills(String, std::path::PathBuf, provider::Provider),
     Launch,
     Repository(String),
@@ -484,6 +506,11 @@ pub struct Ui {
     slack: slack::State,
     remote: remote_control::State,
     model_completion: models::State,
+    /// Saved cloud servers' new-session defaults, as last read from each.
+    location_defaults: HashMap<String, crate::storage::AgentDefaults>,
+    /// The defaults of the launch in flight, reused when the service asks for
+    /// a repository first.
+    launch_defaults: Option<crate::storage::AgentDefaults>,
     toast_rect: Rect,
     media_pending: Option<(String, mpsc::Receiver<Result<super::media::Paste, String>>)>,
 }
@@ -590,6 +617,8 @@ impl Ui {
             slack: slack::State::default(),
             remote: remote_control::State::default(),
             model_completion: models::State::default(),
+            location_defaults: HashMap::new(),
+            launch_defaults: None,
             toast_rect: Rect::default(),
             media_pending: None,
         }
@@ -678,6 +707,10 @@ impl Ui {
     pub fn tick(&mut self, visible: bool) {
         if let Some(error) = self.cache_writer.error() {
             self.notice = Some((error, true));
+        }
+        // A server's older service was kept rather than replaced.
+        if let Some(warning) = client::take_warning() {
+            self.notice = Some((warning, true));
         }
         self.tick_watch(visible);
         self.tick_selection_click();
@@ -771,10 +804,12 @@ impl Ui {
                     self.interrupting.remove(id);
                 }
                 Task::Defaults(_)
+                | Task::LocationDefaults(..)
                 | Task::Send(..)
                 | Task::Terminal(..)
                 | Task::Question
                 | Task::OpenArtifact
+                | Task::ServerArtifact { .. }
                 | Task::OpenLink
                 | Task::InstallBrowser(..)
                 | Task::Usage(_)
@@ -873,6 +908,11 @@ impl Ui {
                     }
                     if matches!(message.kind, Task::Question) {
                         self.question_send = None;
+                    }
+                    if matches!(message.kind, Task::Launch)
+                        && let Some(Modal::NewSession(form)) = &mut self.modal
+                    {
+                        form.failed(&error);
                     }
                     self.notice = Some((error, true));
                 }
@@ -999,10 +1039,9 @@ impl Ui {
                                 .outgoing
                                 .retain(|pending| !pending.observed(&session));
                         }
-                        // Provider defaults come from this computer's Codex
-                        // configuration, which does not describe a server.
+                        // Provider defaults come from the Codex configuration
+                        // where the session runs.
                         if !self.sessions.contains_key(&id)
-                            && !servers::is_server_session(&id)
                             && session.thread_id.is_none()
                             && session.provider == provider::Provider::Codex
                         {
@@ -1010,6 +1049,7 @@ impl Ui {
                                 Task::Defaults(id.clone()),
                                 Request::Defaults {
                                     cwd: session.job.root().clone(),
+                                    server: servers::server_name(&id).map(str::to_owned),
                                 },
                                 true,
                             );
@@ -1061,6 +1101,18 @@ impl Ui {
                     (Task::Launch, Reply::ChooseRepository) => {
                         self.modal = Some(Modal::Repository(Editor::default()));
                     }
+                    (Task::LocationDefaults(server, saved), Reply::AgentDefaults(defaults)) => {
+                        if let Some(name) = saved {
+                            self.notice = Some((
+                                format!(
+                                    "{} is now the default model for new sessions on {server}",
+                                    crate::model::clean(&name)
+                                ),
+                                false,
+                            ));
+                        }
+                        self.location_defaults.insert(server, defaults);
+                    }
                     (Task::Launch, Reply::Launched(id)) => {
                         self.task(
                             Task::Read(id.clone()),
@@ -1079,6 +1131,7 @@ impl Ui {
                         self.focus = Focus::Composer;
                         self.modal = None;
                         self.refreshed = None;
+                        self.launch_defaults = None;
                         if let Ok(config) = self.storage.load_config() {
                             self.defaults = config.agent_defaults;
                         }
@@ -1089,6 +1142,15 @@ impl Ui {
                     (Task::OpenArtifact, Reply::Ok) => {
                         self.notice = Some(("Opened artifact in browser".into(), false));
                     }
+                    (
+                        Task::ServerArtifact {
+                            session,
+                            path,
+                            title,
+                            reload,
+                        },
+                        Reply::Ok,
+                    ) => self.downloaded_artifact(&session, path, title, reload),
                     (Task::Delete(id), Reply::Ok) => {
                         self.panels.shells.remove(&id);
                         self.sidebar.counts.remove(&id);
@@ -1426,16 +1488,16 @@ impl Ui {
             self.task(Task::Action, Request::Control { id, control }, false);
         }
     }
+    /// Every new coding session starts in the new-session form.
     pub fn launch(&mut self) {
         if self.busy {
             return;
         }
-        match crate::cloud::servers::load(&self.storage) {
-            Ok(saved) if !saved.is_empty() => self.open_new_session(saved),
-            _ => self.launch_in(None),
-        }
+        self.open_new_session();
     }
-    fn launch_in(&mut self, repository: Option<std::path::PathBuf>) {
+    /// Starts the launch the service paused for a repository in `repository`,
+    /// remembering it as this Mac's default.
+    fn launch_in(&mut self, repository: std::path::PathBuf) {
         if self.busy {
             return;
         }
@@ -1446,18 +1508,18 @@ impl Ui {
                 return;
             }
         };
-        let mut defaults = self.defaults.clone();
-        let remember_repository = repository.is_some();
-        if let Some(repository) = repository {
-            defaults.repository = Some(repository);
-        }
+        let mut defaults = self
+            .launch_defaults
+            .clone()
+            .unwrap_or_else(|| self.defaults.clone());
+        defaults.repository = Some(repository);
         self.busy = true;
         self.task(
             Task::Launch,
             Request::NewAgent {
                 defaults,
                 cwd,
-                remember_repository,
+                remember_repository: true,
                 server: None,
             },
             true,
@@ -1505,6 +1567,7 @@ impl Ui {
             "Repository rules",
             "Permissions and mode · Shift+Tab",
             "Move to folder · F",
+            "Move to server…",
         ];
         if self.plan_available() {
             entries.push("Review completed plan");
@@ -1543,7 +1606,8 @@ impl Ui {
             return;
         }
         match index {
-            21 => self.open_plan_prompt(),
+            22 => self.open_plan_prompt(),
+            21 => self.open_move_to_server(),
             20 => {
                 self.modal = None;
                 self.open_folder_picker();
@@ -1838,7 +1902,7 @@ impl Ui {
                 _ => None,
             },
             Some(Modal::Menu { query, .. } | Modal::Commands { query, .. }) => Some(query),
-            Some(Modal::NewSession(picker)) if picker.choosing_repository() => Some(&picker.query),
+            Some(Modal::NewSession(form)) => Some(&form.query),
             Some(Modal::Help(state)) => Some(&state.query),
             Some(Modal::Permissions(state)) => state.editor(),
             Some(Modal::Plan(state)) => state.editor(),
@@ -2590,10 +2654,15 @@ impl Ui {
             && let Some(cwd) = self
                 .selected
                 .as_ref()
-                .filter(|id| !servers::is_server_session(id))
-                .and_then(|id| self.sessions.get(id))
-                .and_then(|s| s.workspace.as_deref())
-            && let Some(paths) = super::media::paths(text, cwd)
+                .filter(|id| {
+                    servers::is_server_session(id)
+                        || self
+                            .sessions
+                            .get(*id)
+                            .is_some_and(|s| s.workspace.is_some())
+                })
+                .and_then(|id| self.paste_directory(id))
+            && let Some(paths) = super::media::paths(text, &cwd)
         {
             self.attach(Some(paths));
             return;
@@ -2827,6 +2896,18 @@ impl Ui {
                     *selected = 0;
                 }
             },
+            Some(Modal::MoveToServer { servers, selected }) => match shortcut {
+                Some(crate::shortcuts::ids::NAVIGATION_UP) => {
+                    *selected = selected.saturating_sub(1)
+                }
+                Some(crate::shortcuts::ids::NAVIGATION_DOWN) => {
+                    *selected = (*selected + 1).min(servers.len().saturating_sub(1))
+                }
+                Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) => {
+                    action = Some(Action::MoveChoice(*selected))
+                }
+                _ => {}
+            },
             Some(Modal::RenameFolder { id, name }) => {
                 if shortcut == Some(crate::shortcuts::ids::NAVIGATION_ACTIVATE) {
                     let (id, name) = (id.clone(), name.text());
@@ -2964,11 +3045,14 @@ impl Ui {
             Action::RulesOption(index) => self.rules_option(index),
             Action::RulesSave => self.save_rules(),
             Action::RulesCancel => self.close_rules(),
-            Action::ServerChoice(index) => self.new_session_choice(index),
+            Action::NewSessionField(field) => self.new_session_field(field),
+            Action::NewSessionOption(index) => self.new_session_option(index),
+            Action::NewSessionStart => self.start_new_session(),
             Action::OrchestratorBack => self.close_orchestrator_list(),
             Action::OpenFolder(id) => self.open_folder(id),
             Action::FolderBack => self.close_folder(),
             Action::FolderChoice(index) => self.choose_folder(index),
+            Action::MoveChoice(index) => self.choose_move_server(index),
             Action::Select(id) => {
                 if id == super::orchestrator::ID && !self.orchestrator_list {
                     self.open_orchestrator_list();
@@ -3130,7 +3214,7 @@ impl Ui {
                 if let Some(Modal::Repository(editor)) = &self.modal {
                     let path = editor.text();
                     if !path.trim().is_empty() {
-                        self.launch_in(Some(path.trim().into()));
+                        self.launch_in(path.trim().into());
                     }
                 }
             }
@@ -3860,6 +3944,35 @@ impl Ui {
             let icon_inset = usize::from(status_icons::WIDTH) + 1;
             let title_width = usize::from(row.width)
                 .saturating_sub(icon_inset + unicode_width::UnicodeWidthStr::width(pin));
+            // The repository, then a tree for a worktree and a cloud for a
+            // server session.
+            let place = format!(
+                "{}{}{}",
+                session
+                    .repository
+                    .as_ref()
+                    .unwrap_or(&session.workspace)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                if session.worktree { " 🌳" } else { "" },
+                if session.server.is_some() {
+                    format!(" {}", servers::CLOUD)
+                } else {
+                    String::new()
+                }
+            );
+            // In a narrow list the server's name gives way, so the icons stay.
+            let server_name = session
+                .server
+                .as_ref()
+                .map(|server| format!("{server} · "))
+                .filter(|name| {
+                    3 + unicode_width::UnicodeWidthStr::width(name.as_str())
+                        + unicode_width::UnicodeWidthStr::width(place.as_str())
+                        <= usize::from(row.width)
+                })
+                .unwrap_or_default();
             let mut lines = vec![
                 Line::from(Span::styled(
                     format!(
@@ -3879,26 +3992,14 @@ impl Ui {
                     Span::styled("   ", Style::default().fg(DIM)),
                     // Server sessions name their server, subtly, before the repository.
                     Span::styled(
-                        session
-                            .server
-                            .as_ref()
-                            .map(|server| format!("{server} · "))
-                            .unwrap_or_default(),
+                        server_name,
                         Style::default()
                             .fg(DIM)
                             .add_modifier(ratatui::style::Modifier::ITALIC),
                     ),
                     Span::styled(
                         format!(
-                            "{}{}{}",
-                            session
-                                .repository
-                                .as_ref()
-                                .unwrap_or(&session.workspace)
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy(),
-                            if session.worktree { " 🌳" } else { "" },
+                            "{place}{}",
                             if session.pending > 0 {
                                 format!(" · {} requests", session.pending)
                             } else if session.queued > 0 {
@@ -4595,6 +4696,7 @@ impl Ui {
             Some(Modal::QueuedEdit { .. }) => "Edit queued message",
             Some(Modal::Rename(_)) => "Rename session",
             Some(Modal::FolderPicker { .. }) => "Move to folder",
+            Some(Modal::MoveToServer { .. }) => "Move to server",
             Some(Modal::RenameFolder { .. }) => "Rename folder",
             Some(Modal::DeleteFolder(_)) => "Delete folder",
             Some(Modal::Model { .. }) => "Session model",
@@ -4912,6 +5014,18 @@ impl Ui {
                 *selected = (*selected).min(picker.len().saturating_sub(1));
                 let selected = *selected;
                 self.draw_folder_picker(frame, area, selected, &picker, &mut deferred);
+            }
+            Some(Modal::MoveToServer { servers, selected }) => {
+                *selected = (*selected).min(servers.len().saturating_sub(1));
+                let (servers, selected) = (servers.clone(), *selected);
+                self.draw_move_to_server(
+                    frame,
+                    area,
+                    &servers,
+                    selected,
+                    &activate_hint,
+                    &mut deferred,
+                );
             }
             Some(Modal::RenameFolder { name, .. }) => {
                 editor(
@@ -9827,6 +9941,69 @@ mod tests {
         ui.summaries = vec![session.summary()];
         let (screen, _) = draw(&mut ui, 120, 35)?;
         assert!(screen.contains("project") && !screen.contains("🌳"));
+        Ok(())
+    }
+
+    #[test]
+    fn sidebar_marks_server_sessions_with_a_cloud_after_the_worktree_tree() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        });
+        let mut session = crate::cloud::federation::tests::session("hetzner:1");
+        session.title = "Server task".into();
+        session.workspace = Some("/srv/difu/worktrees/1".into());
+        session.workspace_ready = true;
+        let mut summary = session.summary();
+        summary.server = Some("hetzner".into());
+        ui.summaries.push(summary);
+        ui.sessions.insert(session.id.clone(), session);
+        // Two cells, like the tree, so the rest of the row stays aligned.
+        assert_eq!(unicode_width::UnicodeWidthStr::width(servers::CLOUD), 2);
+        assert_eq!(unicode_width::UnicodeWidthStr::width("🌳"), 2);
+        for width in [120, 40] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 35))?;
+            terminal.draw(|f| ui.draw(f))?;
+            let buffer = terminal.backend().buffer();
+            let rows: Vec<Vec<String>> = (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .filter_map(|x| buffer.cell((x, y)).map(|c| c.symbol().to_owned()))
+                        .collect()
+                })
+                .collect();
+            // The server's name shows when the whole row fits.
+            let server = rows
+                .iter()
+                .find(|row| {
+                    let text = row.concat();
+                    text.contains("api") && text.contains("🌳") && !text.contains("project")
+                })
+                .context("server session row")?;
+            assert_eq!(
+                server.concat().contains("hetzner · api"),
+                width == 120,
+                "{width}: {}",
+                server.concat()
+            );
+            let tree = server
+                .iter()
+                .position(|cell| cell == "🌳")
+                .context("worktree tree")?;
+            // The tree's second cell, a space, then the cloud.
+            assert_eq!(
+                server.get(tree + 3).map(String::as_str),
+                Some(servers::CLOUD),
+                "{width}: {}",
+                server.concat()
+            );
+            let local = rows
+                .iter()
+                .find(|row| row.concat().contains("project"))
+                .context("local session row")?;
+            assert!(!local.concat().contains(servers::CLOUD));
+        }
         Ok(())
     }
 

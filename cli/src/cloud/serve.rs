@@ -29,6 +29,14 @@ pub fn run(storage: Storage, port: Option<u16>) -> Result<()> {
         "difu {} serving agents; remote control on port {port}",
         env!("CARGO_PKG_VERSION")
     );
+    // Before any session starts, so no Claude Code is writing the file yet.
+    if let Some(home) = dirs::home_dir() {
+        match super::claude_config::share(&home) {
+            Ok(Some(note)) => eprintln!("{note}"),
+            Ok(None) => {}
+            Err(error) => eprintln!("Claude Code config: {error:#}"),
+        }
+    }
     crate::agents::server::run(storage)
 }
 

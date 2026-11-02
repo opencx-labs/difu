@@ -24,6 +24,8 @@ public struct SessionSummary: Identifiable, Hashable, Sendable {
     public var pending: Int
     public var queued: Int
     public var canReadChanges: Bool
+    /// Attached and discovered pull requests, current open ones first.
+    public var prs: [SessionPr]
 
     public var displayTitle: String {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -59,5 +61,6 @@ extension SessionSummary: Decodable {
         pending = f.int("pending") ?? f.value("pending", as: [JSONValue].self)?.count ?? 0
         queued = f.int("queued") ?? f.value("queue", as: [JSONValue].self)?.count ?? 0
         canReadChanges = f.bool("canReadChanges") ?? false
+        prs = f.list("prs")
     }
 }

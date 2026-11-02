@@ -19,6 +19,11 @@ is in [remote-protocol.md](remote-protocol.md).
   the foreground (systemd), with remote control always on and *server mode*
   enabled. Each server is self-contained: its own Codex/Claude/GitHub logins,
   repositories, repository rules, sessions, sandboxes and paired devices.
+  A server never stops accepting its clients: turning remote control off is
+  refused from every path (`difu remote`, `rpc` from a full device, the
+  terminal app's `/remote-control` on the server) with a message pointing at
+  `difu remote forget`, `difu remote password --disable` or
+  `systemctl stop difu-agent`.
 * **Clients connect directly to each server.** A client keeps a list of servers
   (name, hosts, port, certificate fingerprint, device token). The Mac's local
   difu service holds these connections and merges server sessions into the
@@ -44,7 +49,8 @@ Client side (your Mac):
 | `difu server remove <name>` | Revoke this computer on the server (when reachable) and forget it locally. |
 | `difu server ssh <name>` | Open a shell on the server as the `difu` user. |
 | `difu server pair <name>` | Show a phone pairing QR for that server in this terminal. |
-| `difu server upgrade <name>` | Install this computer's difu version on the server and restart it. |
+| `difu server upgrade <name>` | Install this computer's difu version on the server, update Codex and Claude Code, rebuild the sandbox image when sandboxing is on, refresh `difu-agent.service` and restart it. Safe to repeat. |
+| `difu session move <session> <server>` | Move a session on this computer to a saved server; prints the new `<server>:<id>`. See *Moving a session to a server*. |
 
 Server side (run on the server, usually over SSH):
 
@@ -57,7 +63,7 @@ Server side (run on the server, usually over SSH):
 | `difu remote password [--generate] [--disable]` | Set the server password (prompt or stdin), generate a strong one, or turn password pairing off. |
 | `difu remote config [--host H]... [--clear-hosts] [--port P]` | Addresses to advertise to clients (public IP, DNS or Tailscale name) and a fixed port. |
 | `difu repos [list]` / `difu repos add [owner/name]` / `difu repos remove owner/name` / `difu repos refresh [owner/name]` | Server repositories. `add` without a name opens a picker built from `gh repo list`. |
-| `difu sandbox build` / `difu sandbox status` | Build the sandbox image / show runtime, image and running sandboxes. |
+| `difu sandbox build` / `difu sandbox status` | Build (or pull) the configured sandbox image / show runtime, image and running sandboxes. |
 
 ## Onboarding (`difu server add`)
 
@@ -88,6 +94,34 @@ Server side (run on the server, usually over SSH):
 8. Pick server repositories from the server's `gh repo list`; clone them.
 9. Advertise the address used to connect (`difu remote config --host <ip>`), pair
    this Mac as a **full** device, save the server, and print a phone pairing QR.
+
+## Upgrades (`difu server upgrade`)
+
+Run from the computer that set the server up (it needs difu's SSH key). Over
+SSH as root, the bootstrap script runs four steps, each safe to repeat:
+
+1. `difu`: download this computer's difu release for the server, verify its
+   checksum and install it.
+2. `tools`: install the latest Codex build and run `claude update` (a failed
+   download keeps the installed CLI and says so), print both versions.
+3. `image`: when the server's `config.server.sandbox.enabled` is on, rebuild
+   the sandbox image (or pull a custom registry image) because the bundled
+   Containerfile may have changed; running sandboxes keep their image. The
+   setting itself is never changed.
+4. `service`: install the current `difu-agent.service` (so new unit settings
+   such as `CLAUDE_CONFIG_DIR` arrive), reload systemd and restart the
+   service.
+
+### Version drift
+
+On a computer, the terminal app replaces an older background service with its
+own version. On a server (`config.server.enabled`) it never does: systemd runs
+`difu serve` with `Restart=always` and the unit's environment, so a
+replacement started by a terminal app would fight systemd and run without that
+environment. A terminal app (or `--refresh-agent-service`) of a newer version
+keeps the server's service and warns once, naming both versions and
+`difu server upgrade`; with no service running it reports that the service is
+not running instead of starting one.
 
 ## Repositories
 
@@ -130,9 +164,15 @@ Permission prompts are unchanged.
   * the session worktree and its base repository's `.git` mounted at the same
     absolute paths (worktree metadata keeps working; commits and pushes happen in
     the sandbox);
-  * the server's logins mounted (`~/.codex`, `~/.claude`, `~/.claude.json`,
-    `~/.config/gh`), and `~/.gitconfig` plus the host's CLI binaries
-    (`~/.local/bin`, Claude's versions directory) mounted read-only;
+  * the server's logins mounted (`~/.codex`, `~/.claude`, `~/.config/gh`), and
+    `~/.gitconfig` plus the host's CLI binaries (`~/.local/bin`, Claude's
+    versions directory) mounted read-only;
+  * `CLAUDE_CONFIG_DIR=~/.claude`, so Claude Code's global config is
+    `~/.claude/.claude.json` inside the mounted directory (see *Claude Code's
+    shared config*);
+  * the session's attachment directory (`<data>/agents/attachments/<id>`)
+    mounted read-only, so Codex can read images sent from a Mac or a phone by
+    path and the agent can open mentioned videos;
   * secrets passed by variable name only, so they never appear in `ps`.
 * CPU and memory limits from `config.server.sandbox` apply to the whole pod, one
   budget per session.
@@ -143,11 +183,166 @@ Permission prompts are unchanged.
   groups with SIGKILL, which `podman run` cannot forward). Deleting, clearing or
   cleaning up a session removes its pod, and leftover containers are swept when
   the service starts.
+* Deleting a session from any client (a Mac through `rpc`, a phone with
+  `session.delete`) is the same service request: it stops the agent and its
+  shells, removes the session's pod, its worktree (uncommitted files included),
+  attachments and saved session.
 * `difu sandbox build` builds `localhost/difu-sandbox:latest` from a bundled
   Containerfile (Ubuntu LTS with git, gh, build tools, Python, Node, ripgrep).
-* Known v1 limit: sandboxes share the base clone's object store and refs, so a
-  sandbox could rewrite another session's branch refs (not its files). Per-session
-  `git clone --reference` clones are the planned follow-up.
+  A custom `config.server.sandbox.image` under `localhost/` is built from the
+  same Containerfile and tagged with that name; any other image comes from a
+  registry, so `difu sandbox build` pulls it instead (and says so).
+  `difu sandbox status` reports the configured image and whether it is
+  present.
+* Sessions are always worktrees, exactly as on a local difu. Worktrees share the
+  base clone's object store and refs, so a sandbox could rewrite another session's
+  branch refs (not its files); this is accepted, as it is locally.
+
+## Moving a session to a server
+
+A coding session on this computer can continue on a saved server. The server
+gets the conversation, the branch with its commits and the uncommitted files,
+and continues them as a new server session. The local session is archived,
+keeps its chat and its worktree (a move never deletes it), and refuses new
+messages with a pointer to the server session.
+
+Three ways to start a move:
+
+* `difu session move <session> <server>` prints the new session's id, e.g.
+  `hetzner:1790000100000-ef56ab78`.
+* **Move to server…** in the session actions menu, then a saved server. difu
+  opens the server session when the move finishes.
+* The agent tool `difu_move_to_server` with `{"server": "<name>"}`, offered to
+  Codex (a dynamic tool) and Claude Code (the difu MCP server) in local coding
+  sessions, not on servers. Its description and instructions allow it only when
+  the user explicitly asks, and it moves only the calling session. A session
+  cannot move mid-turn, so the tool *schedules* the move and the agent ends its
+  turn; the service runs the move once the turn has ended (status Ready) and
+  reports the outcome in the chat (`Moved to <server> as <server>:<id>`, or an
+  error entry). A turn that fails or is interrupted cancels the move. Scheduled
+  moves are not persisted, so a service restart never replays one.
+
+What moves:
+
+| | |
+| --- | --- |
+| Chat | Every entry except transient sending markers, restored as is. |
+| Settings | Title, provider, model, effort, first prompt, the permission mode (restored as the starting mode when the provider has it) and the Codex preset. |
+| Repository | `owner/name` from the `origin` remote, which must be on GitHub. The server lists and clones it first when needed, as for new sessions. |
+| Branch | The local branch name when it is free on the server, otherwise the managed `difu/agent-<id>`. Tracking `origin/<branch>` (as after `git push -u`) is restored, so pushes keep updating the branch and its pull request. |
+| Commits | The commits on the branch that are not on `origin/main`, as a `git bundle`. |
+| Uncommitted files | Modified, deleted and untracked files (binary-safe) as a scratch commit on top of HEAD, built with a temporary index so the local worktree and index do not change. They come back as unstaged changes and untracked files; staged changes become unstaged and ignored files stay behind. |
+| Attachments | The session's private copies of pasted images and videos that the chat refers to (not unreferenced copies or the composer draft). They become the server session's private copies in its attachment directory, which its sandbox mounts read-only like any server session's, and every path to them in the chat (prompts, attachment lists, video path text) is rewritten, so resending, the handoff and the agent all find them. |
+| HTML artifacts | Every registration with its title. Files in the worktree that git carries (tracked or untracked) arrive with the worktree; ignored files are written back to the same path in the new worktree; files registered in another workspace go to `artifacts/<n>/` in the session's attachment directory. Each registration points at its file on the server. |
+| Pull requests | PRs attached by URL (`difu_attach_pr`, `difu attach-pr`) are attached to the server session. PRs found from the branch are found again from the preserved branch. |
+
+A session cannot move while a turn is running, with pending questions or
+approvals, with queued messages, while archived, preparing, clearing or being
+deleted, after its worktree was removed, after it already moved, on a server, or
+without a GitHub `origin` and an `origin/main`.
+
+On the server the session gets a normal difu worktree exactly like a new session
+(fetched `origin/main`, `<data>/worktrees/<id>` on `difu/agent-<id>`). Then the
+bundle's objects are unpacked (`git bundle unbundle`, with object checks, no ref
+changes), the branch is reset to the moved HEAD and the scratch commit's tree is
+read into the worktree and the index reset to HEAD. If the server's clone lacks
+the commits the bundle builds on (say, this computer's `origin/main` has commits
+GitHub does not), the import fails and removes the worktree and branch it made.
+The new session waits, idle, without a provider thread. Its first message starts
+one and carries the prior conversation the way a provider switch does
+(`provider_context`: the chat as JSON context, not instructions), followed by a
+system entry saying where the session came from. Sandboxing follows the server's
+configuration, as for any session.
+
+### Wire format
+
+The terminal app asks its local service with `Request::Move`; the local service
+exports the session, sends `Request::Import` over the server's `rpc` (forwarded
+like other server requests, full access and equal versions required) and records
+the result.
+
+```json
+{"Move": {"id": "1790000000000-ab12cd34", "server": "hetzner"}}
+→ {"Launched": "hetzner:1790000100000-ef56ab78"}
+
+{"Import": {"package": {
+  "source": "1790000000000-ab12cd34", "computer": "Ali's MacBook Pro",
+  "title": "Widget work", "title_manual": true,
+  "provider": "claude", "model": "claude/opus", "effort": "high",
+  "mode": "plan", "preset": null, "prompt": "Build the widget",
+  "entries": [{"id": "…", "kind": "userMessage", "text": "Build the widget", "data": null}],
+  "repository": "acme/widgets", "branch": "difu/agent-1790000000000-ab12cd34", "upstream": true,
+  "head": "<sha>", "wip": "<sha> | null", "bundle": "<base64 git bundle> | null", "commits": 2,
+  "media": [{"path": "/Users/me/…/agents/attachments/1790000000000-ab12cd34/media-x1.png", "data": "<base64>"}],
+  "artifacts": [
+    {"path": "report.html", "title": "Report", "outside": false, "data": null},
+    {"path": "build/out.html", "title": "Build output", "outside": false, "data": "<base64>"},
+    {"path": "notes.html", "title": "Notes", "outside": true, "data": "<base64>"}
+  ],
+  "prs": [{"key": {"owner": "acme", "repo": "tools", "number": 42}, "state": "OPEN", "draft": false, "conflicts": false, "head_branch": "widget-tools", "head": "<sha>", "updated": "…", "summary": null}]
+}}}
+→ {"Launched": "1790000100000-ef56ab78"}
+```
+
+* `head` is the worktree's HEAD; `wip`, when present, is the scratch commit (its
+  parent is `head`) whose tree is the worktree with its uncommitted files.
+* `bundle` holds the commits from `origin/main` up to `wip` (or `head`) under one
+  ref, `refs/difu/move/<source>`; it is `null` when there are none. `commits`
+  counts the branch's own commits for the server's note.
+* `media[].path` is the path the chat uses on this computer; the server stores
+  the file under the same name in its own attachment directory and replaces that
+  path everywhere in the chat.
+* `artifacts[].data` is `null` when the worktree changes carry the file (or it
+  no longer exists); `outside` marks a file registered in another workspace.
+* `prs` are the attached pull requests as the PR cache stores them; the server
+  attaches them without contacting GitHub.
+* Only a server-mode service imports; anything else answers with an error. A
+  failed import removes the worktree, branch and attachment copies it made.
+* A move travels in one WebSocket message: the serialized package plus a 64 KiB
+  envelope must fit in 48 MiB. A larger session is refused before anything is
+  sent, with its size and a breakdown by part, largest first: attachments, HTML
+  artifacts, commits and files, chat, and other.
+
+Not moved: shells and their output, ignored files that are not artifacts, and
+the composer draft. The handoff contains the whole chat, which for very long
+sessions can be large for the provider, as with provider switching. Moving a
+server session back to a computer or on to another server is not supported.
+
+### Claude Code's shared config
+
+Claude Code keeps its global config (account state, onboarding, user MCP
+servers, per-project trust) in `$CLAUDE_CONFIG_DIR/.claude.json`, or
+`~/.claude.json` when the variable is unset. It saves the file under a lock
+directory beside it (`.claude.json.lock`, `mkdir`/`rmdir`) by writing
+`.claude.json.tmp.<pid>.<hex>` next to it and renaming that over the file; when
+the rename fails with `EXDEV`, `EPERM`, `EEXIST` or `EBUSY` it truncates and
+rewrites the file in place. A sandbox with only the file `~/.claude.json`
+mounted therefore took the lock in its own throwaway home (no exclusion between
+sessions) and could not rename onto the mount point, so concurrent sessions
+rewrote the shared file in place, where another process could read it half
+written.
+
+On a server every writer uses one directory instead:
+
+* The service (`difu-agent.service` sets `CLAUDE_CONFIG_DIR=~/.claude`, and the
+  service adds it to every agent's environment in server mode), every sandbox
+  (the variable plus the `~/.claude` directory mount) and SSH logins (an
+  `export` in the `difu` user's `~/.profile`) share `~/.claude/.claude.json`,
+  its lock and its temporary files, so writes exclude each other and replace
+  the file atomically.
+* `difu serve` moves an existing `~/.claude.json` into `~/.claude/` when it
+  starts (before any session runs), under Claude Code's own lock, keeps the
+  original as `~/.claude.json.difu-backup-<time>`, and leaves `~/.claude.json`
+  as a symlink to `.claude/.claude.json`, so a Claude Code started without the
+  variable still reads the same file and replaces it atomically through the
+  link. Starting a sandbox repeats the check. If both files exist (a Claude
+  Code with the variable ran first), they are combined: the newer file's
+  settings win and map settings such as `projects` and `mcpServers` are merged
+  entry by entry; both originals are kept as backups. A symlink the user made
+  is left alone.
+* Server setup and `difu server upgrade` run the Claude Code installer and
+  `claude update` with the same variable once the file has moved.
+* Ordinary installations are unchanged: only server mode sets the variable.
 
 ## Wire protocol additions
 
@@ -224,6 +419,13 @@ owner out. The server stores only the verifier
 `{salt, iterations, key}`, never the password. Passwords must be at least 12
 characters.
 
+Connection limits: a client address (IPv6 per /64) may hold 4 unauthenticated
+connections and the server 32 connections in all. Each connection has 15
+seconds from accept to finish TLS, the WebSocket handshake and authentication
+(including the password challenge and proof); the server then closes it,
+however slowly the client was still sending, so slow clients cannot hold the
+slots.
+
 ### `welcome` additions
 
 ```json
@@ -283,6 +485,23 @@ call's `error`; `Request::Watch` must use `rpc.watch`. Clients must check that t
 server's `version` equals their own before using `rpc` (`difu server upgrade`
 fixes a mismatch).
 
+Three service requests exist for clients whose sessions live elsewhere:
+
+* `{"SessionPrs": {"id", "history"}}` → `{"SessionPrs": {"links", "branch", "error"}}`:
+  the session's attached and discovered PRs, refreshed by the server with its
+  worktree and `gh` under the same two-minute lease as its background refresh
+  (`history` also checks closed and merged PRs, as opening a session does). On
+  a failed refresh `links` are the cached ones and `error` says why.
+* `{"UploadAttachment": {"id", "label", "kind": "Image"|"Video", "extension", "data": "<base64>"}}`
+  → `{"Attachment": {"label", "path", "kind", "hash"}}`: stores pasted media as
+  the session's private copy on the server (images are checked like a paste),
+  at most 32 MB per file so the request stays within the WebSocket message
+  cap. The reply is sent in `Control::Message*` `attachments`.
+* `{"ReadArtifact": {"id", "path", "workspace"}}` → `{"ArtifactFile": "<base64>"}`:
+  a presented HTML artifact (matched by its registered `path` and
+  `workspace`, resolved with the same checks as opening it locally), at most
+  32 MB. Nothing else in the worktree can be read this way.
+
 ## Clients
 
 ### Mac
@@ -291,14 +510,51 @@ fixes a mismatch).
   port, fingerprint, device id and token.
 * The local agent service connects to every saved server as a `full` device and
   merges their sessions into `Request::List` replies. Server session ids are
-  namespaced as `<server name>:<session id>` and summaries carry `server` for a
-  sidebar badge. Requests for a namespaced id are forwarded with `rpc`; watches
+  namespaced as `<server name>:<session id>` and summaries carry `server`: the
+  sessions list shows a ☁️ after the worktree 🌳 and the server's name before
+  the repository when the row has room. Requests for a namespaced id are forwarded with `rpc`; watches
   with `rpc.watch`.
-* The new-session flow offers a server picker (This Mac + saved servers);
-  repositories come from the chosen server.
-* Features that need the session's files on this machine (attachments, local
-  file paths, HTML artifact previews) say they are unavailable for server
-  sessions.
+* Every new session opens one form: **Location** (This Mac, then each saved
+  server with its connection state or problem), **Repository**, **Model** and
+  **Reasoning**, prefilled from the chosen location's saved defaults (a
+  server's come from `Request::AgentDefaults`, cached with its repositories in
+  `Request::Servers`). Enter starts right away; choosing another location
+  reloads the other lists from it.
+* Anything that consults a machine on a session's behalf asks the session's
+  location. Requests with a session id are forwarded by id; the others carry
+  `server`: `NewAgent`, `RepositoryRules`, `Defaults` (Codex's configured model
+  for a directory), `AgentDefaults`, `DefaultModel` (saves a location's default
+  model, so Alt+M on a server session sets that server's default) and `Models`
+  (the Codex and Claude Code models that location's logins offer).
+* Pull requests: the server is the source of truth. The terminal asks it for a
+  visible server session's PRs (`SessionPrs`, every 15 s; the server only asks
+  GitHub every two minutes), so badges, the chat footer and the Option+D diff
+  selector work as for a local session. Published diffs (`PrChanges`) come
+  from the server's `gh`; the local service caches PR states and diffs in this
+  computer's GitHub store. The PR panel is the embedded review app and uses
+  this computer's `gh` by `owner/repo#number`, like any pull request in
+  Reviews; its Diff and Guide tabs need a local clone.
+* Pasted images and videos stay private copies on the Mac (drafts included,
+  under `attachments/<server>@<session>`) until Send. The local service then
+  uploads each one with `UploadAttachment` and sends the message with the
+  server's copies. A file over 32 MB fails the send with a clear error before
+  anything reaches the server. Deleting or cleaning up the session removes the
+  Mac's copies.
+* Artifacts: badges and the artifact list come from the session as usual.
+  Opening one downloads it (`ReadArtifact`) into
+  `<cache>/server-artifacts/<server>@<session>/`, then previews that copy in
+  the artifact pane or an external browser exactly like a local artifact.
+  Each open and Refresh (button or Ctrl+R) downloads it again, so the preview
+  follows changes on the server. Artifacts should be self-contained HTML:
+  files they reference relatively are not downloaded. Deleting or cleaning up
+  the session removes the copies.
+* Shells (`!command`, Open shells, the shell pane) are `Request::Shell` /
+  `Request::Shells` forwarded to the server, so they run there, in the
+  session's sandbox when sandboxing is on. The pane's polling (`Exchange`,
+  which also carries the pane size) and typed input (`Human`) are server round
+  trips, so a distant server makes the pane less responsive than a local one.
+  `difu_shell` runs on the server like every agent tool.
+* A local session can move to a saved server (*Moving a session to a server*).
 * The phone API of a Mac hides relayed server sessions, because phones connect to
   servers directly.
 
@@ -310,6 +566,9 @@ fixes a mismatch).
   pairing, `standard` access).
 * While active, connect to every saved server; one combined session list with a
   server badge; New Session picks a server, then its repositories.
+* The session screen shows the session's PRs (`SessionSummary.prs`) as chips;
+  tapping one opens the PR screen on the same server. Photos are sent with
+  `session.send` straight to the server running the session.
 * Per-server settings: logins (status, device-code login, Claude token), server
   repositories (add from `server.repos.available`, remove, refresh mains),
   repository rules, paired devices (revoke).

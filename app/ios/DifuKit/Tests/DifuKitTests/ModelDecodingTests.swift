@@ -85,6 +85,53 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(summary.displayTitle, "Difu orchestrator")
     }
 
+    func testSummaryPullRequests() throws {
+        let summary = try decode(
+            SessionSummary.self,
+            #"""
+            {"id": "s", "prs": [
+              {"repo": "opencx-labs/difu", "number": 45, "title": "Fix login redirect", "state": "OPEN",
+               "label": "Open", "draft": false, "conflicts": false, "attached": false,
+               "url": "https://github.com/opencx-labs/difu/pull/45", "headBranch": "feature"},
+              {"repo": "opencx-labs/difu", "title": "no number"},
+              {"number": 7},
+              "garbage",
+              {"repo": "other/repo", "number": "12", "title": null, "state": "", "attached": true,
+               "headBranch": null, "futureField": 1},
+              {"repo": "other/repo", "number": 13, "state": "OPEN", "draft": true, "conflicts": true}
+            ]}
+            """#)
+        XCTAssertEqual(summary.prs.map(\.id), ["opencx-labs/difu#45", "other/repo#12", "other/repo#13"])
+        let first = try XCTUnwrap(summary.prs.first)
+        XCTAssertEqual(first.title, "Fix login redirect")
+        XCTAssertEqual(first.label, "Open")
+        XCTAssertEqual(first.state, "OPEN")
+        XCTAssertEqual(first.headBranch, "feature")
+        XCTAssertEqual(first.url, "https://github.com/opencx-labs/difu/pull/45")
+        XCTAssertEqual(first.repoName, "difu")
+        XCTAssertFalse(first.attached)
+        let attached = summary.prs[1]
+        XCTAssertNil(attached.title)
+        XCTAssertNil(attached.headBranch)
+        XCTAssertTrue(attached.attached)
+        XCTAssertEqual(attached.number, 12)
+        XCTAssertEqual(attached.label, "Unknown", "no label and no state yet")
+        XCTAssertEqual(summary.prs[2].label, "Has conflicts", "label derived when missing")
+
+        // Older services send no PRs.
+        XCTAssertTrue(try decode(SessionSummary.self, summaryJSON).prs.isEmpty)
+        XCTAssertTrue(try decode(SessionSummary.self, #"{"id": "x", "prs": null}"#).prs.isEmpty)
+    }
+
+    func testSessionViewCarriesPullRequests() throws {
+        let view = try decode(
+            SessionView.self,
+            #"{"id": "s", "version": 3, "prs": [{"repo": "a/b", "number": 1, "state": "MERGED", "label": "Merged"}], "entries": []}"#
+        )
+        XCTAssertEqual(view.prs.map(\.id), ["a/b#1"])
+        XCTAssertEqual(view.prs.first?.label, "Merged")
+    }
+
     func testSessionListDropsOnlyBadRows() throws {
         let frame = try decode(
             IncomingFrame.self,

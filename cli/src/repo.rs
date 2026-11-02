@@ -61,7 +61,8 @@ pub fn validate(path: &Path, key: &PrKey, cancel: &Cancel) -> Result<PathBuf> {
     Ok(root)
 }
 
-fn remote_repository(remote: &str) -> Option<String> {
+/// `owner/name` (lowercase) of a github.com remote URL, SSH or HTTPS.
+pub(crate) fn remote_repository(remote: &str) -> Option<String> {
     let path = if let Some(path) = remote.strip_prefix("git@github.com:") {
         path.to_owned()
     } else {

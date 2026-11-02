@@ -10,6 +10,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+/// The largest attachment uploaded to a server session (or sent by the iOS
+/// app): its base64 request stays well inside the WebSocket message cap.
+pub const UPLOAD_LIMIT: usize = 32 << 20;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Kind {
     Image,
@@ -38,16 +42,24 @@ fn kind(path: &Path) -> Option<Kind> {
         _ => None,
     }
 }
+/// A session's directory name for files kept per session. A server session's
+/// (`<server>:<session>`) pasted media stays on this computer until Send
+/// uploads it, under `<server>@<session>`; ids never contain `@`.
+pub(crate) fn directory_name(session: &str) -> Result<String> {
+    let part = |part: &str| {
+        !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    };
+    let valid = match session.split_once(':') {
+        Some((server, id)) => part(server) && part(id),
+        None => part(session),
+    };
+    ensure!(valid, "Invalid attachment session");
+    Ok(session.replacen(':', "@", 1))
+}
 pub fn directory(storage: &Storage, session: &str) -> Result<PathBuf> {
-    ensure!(
-        !session.is_empty()
-            && session
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-'),
-        "Invalid attachment session"
-    );
+    let name = directory_name(session)?;
     let root = super::server::home(storage)?.join("attachments");
-    let dir = root.join(session);
+    let dir = root.join(name);
     for path in [&root, &dir] {
         fs::create_dir_all(path)?;
         ensure!(
@@ -121,7 +133,10 @@ fn persist(storage: &Storage, session: &str, source: &Path, kind: Kind) -> Resul
 }
 /// Save an image sent by the iOS app as a private session copy.
 pub fn store(storage: &Storage, session: &str, bytes: &[u8]) -> Result<Attachment> {
-    ensure!(bytes.len() <= 32 << 20, "Images must be smaller than 32 MB");
+    ensure!(
+        bytes.len() <= UPLOAD_LIMIT,
+        "Images must be smaller than 32 MB"
+    );
     let extension = match image::guess_format(bytes) {
         Ok(image::ImageFormat::Png) => "png",
         Ok(image::ImageFormat::Jpeg) => "jpg",
@@ -147,6 +162,55 @@ pub fn store(storage: &Storage, session: &str, bytes: &[u8]) -> Result<Attachmen
         kind: Kind::Image,
         hash: format!("{:x}", Sha256::digest(bytes)),
     })
+}
+/// Save media uploaded for a server session (`Request::UploadAttachment`) as
+/// a private session copy, checked like a pasted file.
+pub fn upload(
+    storage: &Storage,
+    session: &str,
+    label: &str,
+    kind: Kind,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<Attachment> {
+    ensure!(
+        !label.is_empty()
+            && label.chars().count() <= 64
+            && !label.contains(['[', ']'])
+            && !label.chars().any(char::is_control),
+        "Invalid attachment label"
+    );
+    ensure!(
+        bytes.len() <= UPLOAD_LIMIT,
+        "{label} is larger than {} MB",
+        UPLOAD_LIMIT >> 20
+    );
+    let extension = extension.to_ascii_lowercase();
+    ensure!(
+        extension.chars().all(|c| c.is_ascii_alphanumeric())
+            && self::kind(Path::new(&format!("upload.{extension}"))).as_ref() == Some(&kind),
+        "Unsupported attachment; choose an image or video file"
+    );
+    let mut attachment = match kind {
+        Kind::Image => store(storage, session, bytes)?,
+        Kind::Video => {
+            let mut copy = tempfile::Builder::new()
+                .prefix("media-")
+                .suffix(&format!(".{extension}"))
+                .tempfile_in(directory(storage, session)?)?;
+            copy.write_all(bytes)?;
+            copy.as_file_mut().sync_all()?;
+            let (_, path) = copy.keep()?;
+            Attachment {
+                label: String::new(),
+                path,
+                kind: Kind::Video,
+                hash: format!("{:x}", Sha256::digest(bytes)),
+            }
+        }
+    };
+    attachment.label = label.to_owned();
+    Ok(attachment)
 }
 pub fn validate(storage: &Storage, session: &str, attachment: &Attachment) -> Result<()> {
     let dir = directory(storage, session)?.canonicalize()?;
@@ -325,6 +389,87 @@ mod tests {
         assert!(validate(&storage, "session-1", a).is_err());
         assert!(paths("some prose about image.png", root.path()).is_none());
         assert!(directory(&storage, "../outside").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn server_sessions_keep_pasted_media_in_their_own_directory() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let storage = Storage {
+            config: root.path().join("config.json"),
+            cache: root.path().join("cache"),
+        };
+        let local = directory(&storage, "1791-abc")?;
+        let server = directory(&storage, "box:1791-abc")?;
+        assert_eq!(local.file_name().and_then(|n| n.to_str()), Some("1791-abc"));
+        assert_eq!(
+            server.file_name().and_then(|n| n.to_str()),
+            Some("box@1791-abc")
+        );
+        assert_eq!(server.parent(), local.parent());
+        for invalid in ["box:", ":1", "a:b:c", "box:../x", "box@1", "../outside", ""] {
+            assert!(directory(&storage, invalid).is_err(), "{invalid}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn uploads_are_checked_like_pasted_files_and_keep_their_label() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let storage = Storage {
+            config: root.path().join("config.json"),
+            cache: root.path().join("cache"),
+        };
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2))
+            .write_to(&mut png, image::ImageFormat::Png)?;
+        let png = png.into_inner();
+        let image = upload(&storage, "1791-abc", "image 3", Kind::Image, "PNG", &png)?;
+        assert_eq!(
+            (image.label.as_str(), &image.kind),
+            ("image 3", &Kind::Image)
+        );
+        validate(&storage, "1791-abc", &image)?;
+        assert_eq!(fs::read(&image.path)?, png);
+        assert_eq!(
+            fs::metadata(&image.path)?.permissions().mode() & 0o777,
+            0o600
+        );
+        let video = upload(
+            &storage,
+            "1791-abc",
+            "video 1",
+            Kind::Video,
+            "mov",
+            b"frames",
+        )?;
+        assert_eq!(video.path.extension().and_then(|e| e.to_str()), Some("mov"));
+        validate(&storage, "1791-abc", &video)?;
+        for (label, kind, extension, bytes) in [
+            // Not an image, whatever its name says.
+            ("image 1", Kind::Image, "png", b"not an image".as_slice()),
+            // The kind must match the extension.
+            ("video 1", Kind::Video, "png", png.as_slice()),
+            ("image 1", Kind::Image, "mp4", png.as_slice()),
+            ("file 1", Kind::Video, "exe", b"x".as_slice()),
+            ("video 1", Kind::Video, "../mp4", b"x".as_slice()),
+            // Labels become message tokens.
+            ("image [1]", Kind::Image, "png", png.as_slice()),
+            ("", Kind::Image, "png", png.as_slice()),
+        ] {
+            assert!(
+                upload(&storage, "1791-abc", label, kind, extension, bytes).is_err(),
+                "{label} {extension}"
+            );
+        }
+        let large = vec![0u8; UPLOAD_LIMIT + 1];
+        let error = upload(&storage, "1791-abc", "video 2", Kind::Video, "mp4", &large)
+            .err()
+            .context("too large")?;
+        assert!(
+            format!("{error:#}").contains("larger than 32 MB"),
+            "{error:#}"
+        );
         Ok(())
     }
 }

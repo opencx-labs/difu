@@ -82,7 +82,13 @@ impl Ui {
         if self.busy {
             return;
         }
-        let parsed = super::super::registration::parse_command(args);
+        // A server session's worktree is on the server: this Mac's files say
+        // nothing about it, so paths with spaces must be quoted there.
+        let local = !self
+            .selected
+            .as_deref()
+            .is_some_and(servers::is_server_session);
+        let parsed = super::super::registration::parse_command(args, |path| local && path.is_dir());
         let (path, base) = match parsed {
             Ok(value) => value,
             Err(error) => {
@@ -737,5 +743,43 @@ impl Ui {
             .style(Style::default().fg(TEXT)),
             area,
         );
+    }
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::*;
+    use anyhow::Result;
+
+    #[test]
+    fn worktree_paths_with_spaces_are_only_looked_up_on_this_mac_for_local_sessions() -> Result<()>
+    {
+        let (mut ui, dir, _) = shortcut_tests::fixture(None)?;
+        let spaced = dir.path().join("with space");
+        std::fs::create_dir(&spaced)?;
+        let args = spaced.display().to_string();
+        let local =
+            shortcut_tests::request_at_boundary_with(&mut ui, |ui| ui.register_worktree(&args))?;
+        assert!(matches!(
+            local,
+            Request::RegisterWorktree { path, base: None, .. } if path == spaced
+        ));
+        // The same directory on this Mac says nothing about a server's files:
+        // the last word is the base, as for any path that is not found.
+        let (mut ui, dir, _) = shortcut_tests::fixture(None)?;
+        let spaced = dir.path().join("with space");
+        std::fs::create_dir(&spaced)?;
+        let session = crate::cloud::federation::tests::session("hetzner:1");
+        ui.sessions.insert(session.id.clone(), session);
+        ui.selected = Some("hetzner:1".into());
+        let args = spaced.display().to_string();
+        let server =
+            shortcut_tests::request_at_boundary_with(&mut ui, |ui| ui.register_worktree(&args))?;
+        assert!(matches!(
+            server,
+            Request::RegisterWorktree { id, path, base: Some(base) }
+                if id == "hetzner:1" && path == dir.path().join("with") && base == "space"
+        ));
+        Ok(())
     }
 }

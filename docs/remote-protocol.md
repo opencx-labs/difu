@@ -136,9 +136,34 @@ Timestamps are Unix **milliseconds** unless stated otherwise.
   "worktree": true,
   "pending": 1,                     // unanswered questions + approvals
   "queued": 0,
-  "canReadChanges": true
+  "canReadChanges": true,
+  "prs": [SessionPr]                // attached and discovered pull requests; may be absent (older computers)
 }
 ```
+
+`SessionPr` — a pull request the terminal shows as a badge for the session:
+
+```json
+{
+  "repo": "opencx-labs/difu",       // with `number`, the `pr.overview` / `pr.diff` parameters
+  "number": 45,
+  "title": "Fix login redirect",    // null until GitHub was asked
+  "state": "OPEN",                  // OPEN | MERGED | CLOSED, or "" until GitHub was asked
+  "label": "Open",                  // Open | Draft | Has conflicts | Merged | Closed | Unknown
+  "draft": false,
+  "conflicts": false,
+  "attached": false,                // attached with difu_attach_pr (maybe another repository), not found from the branch
+  "url": "https://github.com/opencx-labs/difu/pull/45",
+  "headBranch": "difu/agent-1791875325706-02acb407"   // may be null
+}
+```
+
+`prs` is ordered like the terminal's badges: open pull requests for the
+session's current branch first, then other open ones, then closed and merged
+history. The list comes from the computer's PR cache (refreshed in the
+background about every two minutes, and immediately when an agent attaches a
+PR), so it can lag GitHub by that much. Open one with `pr.overview` / `pr.diff`
+on the same connection: they run on that computer or server with its own `gh`.
 
 The `sessions` array is already in display order (orchestrator, pinned, the
 user's custom order, newest first) and excludes guide-generation jobs. Archived
@@ -232,7 +257,7 @@ all other fields with `session` (including `version`).
 | `session.watch` | `id` | `{}`; then a `session` event, followed by `session.delta` events. Several sessions may be watched at once. |
 | `session.unwatch` | `id` | `{}` |
 | `session.entry` | `id`, `entry` (entry id) | `{"entry": EntryView}` untruncated (up to ~4 MB) |
-| `session.send` | `id`, `text`, `queue` (bool, default false), `attachments` (optional `[{"name": "photo.jpg", "data": "<base64>"}]`, PNG/JPEG/WebP/GIF) | `{}` |
+| `session.send` | `id`, `text`, `queue` (bool, default false), `attachments` (optional `[{"name": "photo.jpg", "data": "<base64>"}]`, PNG/JPEG/WebP/GIF, each under 32 MB) | `{}` |
 | `session.interrupt` | `id` | `{}` |
 | `session.sendNow` | `id` | `{}` — interrupt and send queued messages now |
 | `session.resume` | `id` | `{}` — "Continue session" |

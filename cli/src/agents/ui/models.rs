@@ -5,9 +5,15 @@ use crate::{
     shortcuts::{Bindings, contexts::*, ids::*},
 };
 
+/// The model catalog of one location at a time: this machine (`None`) or a
+/// saved cloud server, whose models only that server can discover.
 #[derive(Default)]
 pub(super) struct State {
     pub options: Vec<ModelInfo>,
+    /// Where `options`, or the running discovery, come from.
+    pub location: Option<String>,
+    /// Catalogs already read from other locations during this run.
+    cached: HashMap<Option<String>, Vec<ModelInfo>>,
     receiver: Option<mpsc::Receiver<Result<Vec<ModelInfo>, String>>>,
     cancel: Option<Cancel>,
     error: Option<String>,
@@ -22,42 +28,79 @@ impl Drop for State {
     }
 }
 impl State {
-    pub(super) fn load(&mut self) {
+    /// Starts listing `location`'s models for a completion list, retrying a
+    /// discovery that failed.
+    pub(super) fn load(&mut self, storage: &Storage, location: Option<&str>) {
         self.selected = 0;
         self.filled = false;
-        if !self.options.is_empty() || self.receiver.is_some() {
+        self.retry();
+        self.ensure(storage, location);
+    }
+    /// Shows `location`'s catalog, discovering it there unless it is known,
+    /// being discovered, or just failed (polled every frame, so no retry).
+    pub(super) fn ensure(&mut self, storage: &Storage, location: Option<&str>) {
+        if self.location.as_deref() != location {
+            if let Some(cancel) = self.cancel.take() {
+                cancel.cancel();
+            }
+            self.receiver = None;
+            self.error = None;
+            let previous = std::mem::replace(&mut self.location, location.map(str::to_owned));
+            let options = self.cached.remove(&self.location).unwrap_or_default();
+            let previous_options = std::mem::replace(&mut self.options, options);
+            if !previous_options.is_empty() {
+                self.cached.insert(previous, previous_options);
+            }
+        }
+        if !self.options.is_empty() || self.receiver.is_some() || self.error.is_some() {
             return;
         }
-        self.error = None;
         let cancel = Cancel::default();
         self.cancel = Some(cancel.clone());
         let (tx, rx) = mpsc::channel();
         self.receiver = Some(rx);
+        let storage = storage.clone();
+        let server = self.location.clone();
         thread::spawn(move || {
-            let (codex, claude) = thread::scope(|scope| {
-                let codex = scope.spawn(|| crate::codex::models(&cancel));
-                let claude = super::super::claude::models(&cancel);
-                (
-                    codex
-                        .join()
-                        .unwrap_or_else(|_| Err(anyhow::anyhow!("Codex model discovery stopped"))),
-                    claude,
-                )
-            });
-            let mut models = Vec::new();
-            let mut errors = Vec::new();
-            for result in [codex, claude] {
-                match result {
-                    Ok(options) => models.extend(options),
-                    Err(error) => errors.push(format!("{error:#}")),
-                }
-            }
-            let _ = tx.send(if models.is_empty() {
-                Err(errors.join("; "))
-            } else {
-                Ok(models)
-            });
+            let result = match server {
+                None => super::super::provider::models(&cancel),
+                // Only the server knows which models its own logins offer.
+                Some(server) => match client::request(
+                    &storage,
+                    Request::Models {
+                        server: Some(server),
+                    },
+                ) {
+                    Ok(Reply::Models(models)) => Ok(models),
+                    Ok(Reply::Error(error)) => Err(anyhow::anyhow!(error)),
+                    Ok(_) => Err(anyhow::anyhow!("Unexpected model list reply")),
+                    Err(error) => Err(error),
+                },
+            };
+            let _ = tx.send(result.map_err(|error| format!("{error:#}")));
         });
+    }
+    /// Lets the next `ensure` try again after a failed discovery.
+    pub(super) fn retry(&mut self) {
+        if self.receiver.is_none() {
+            self.error = None;
+        }
+    }
+    /// `location`'s models once they are known.
+    pub(super) fn catalog(&self, location: Option<&str>) -> Option<&[ModelInfo]> {
+        (self.location.as_deref() == location && !self.options.is_empty())
+            .then_some(self.options.as_slice())
+    }
+    pub(super) fn loading(&self) -> bool {
+        self.receiver.is_some()
+    }
+    /// Test catalogs for a location without discovering anything.
+    #[cfg(test)]
+    pub(super) fn set(&mut self, location: Option<&str>, options: Vec<ModelInfo>) {
+        self.location = location.map(str::to_owned);
+        self.options = options;
+        self.receiver = None;
+        self.error = None;
     }
     pub(super) fn choices(&self, model: &str, effort: &str, choosing_model: bool) -> Vec<String> {
         let query = if choosing_model { model } else { effort }.to_lowercase();
@@ -107,7 +150,8 @@ impl Ui {
             ),
             field,
         });
-        self.model_completion.load();
+        let server = self.selected_server();
+        self.model_completion.load(&self.storage, server.as_deref());
     }
     pub(super) fn tick_models(&mut self) {
         let output = self
@@ -427,11 +471,24 @@ fn capitalize(value: &str) -> String {
     }
 }
 impl Ui {
+    /// The new-session defaults where the selected session runs: a server's,
+    /// once read, or this Mac's.
+    fn location_defaults(&self, server: Option<&str>) -> Option<&crate::storage::AgentDefaults> {
+        match server {
+            Some(server) => self.location_defaults.get(server),
+            None => Some(&self.defaults),
+        }
+    }
     pub(super) fn open_model_picker(&mut self) {
+        let server = self.selected_server();
         let session = self.selected.as_ref().and_then(|id| self.sessions.get(id));
+        let defaults = self.location_defaults(server.as_deref());
         let (current, effort) = match session.and_then(|s| s.model.clone()) {
             Some(model) => (Some(model), session.and_then(|s| s.effort.clone())),
-            None => (self.defaults.model.clone(), self.defaults.effort.clone()),
+            None => (
+                defaults.and_then(|d| d.model.clone()),
+                defaults.and_then(|d| d.effort.clone()),
+            ),
         };
         let defaults = match self.storage.settings_draft() {
             Ok(defaults) => defaults,
@@ -447,7 +504,17 @@ impl Ui {
             current,
             placed: false,
         })));
-        self.model_completion.load();
+        self.model_completion.load(&self.storage, server.as_deref());
+        // Enter saves the default where the session runs; show which it is.
+        if let Some(server) = server {
+            self.task(
+                Task::LocationDefaults(server.clone(), None),
+                Request::AgentDefaults {
+                    server: Some(server),
+                },
+                false,
+            );
+        }
         self.place_picker();
     }
     pub(super) fn place_picker(&mut self) {
@@ -497,6 +564,7 @@ impl Ui {
         }
     }
     fn picker_apply(&mut self, default: bool) {
+        let server = self.selected_server();
         let Some(Modal::ModelPicker(picker)) = &mut self.modal else {
             return;
         };
@@ -513,7 +581,21 @@ impl Ui {
             self.notice = Some(("Select a coding session to change its model".into(), true));
             return;
         }
-        if default {
+        if default
+            && applies
+            && let Some(server) = server
+        {
+            // A server session's pick becomes that server's default.
+            self.task(
+                Task::LocationDefaults(server.clone(), Some(name)),
+                Request::DefaultModel {
+                    server: Some(server),
+                    model: Some(id.clone()),
+                    effort: effort.clone(),
+                },
+                false,
+            );
+        } else if default {
             let result = picker
                 .defaults
                 .select_default_model(Some(id.clone()), effort.clone())
@@ -560,11 +642,20 @@ impl Ui {
             .as_ref()
             .and_then(|id| self.sessions.get(id))
             .and_then(|s| s.model.clone());
+        let server = self.selected.as_deref().and_then(servers::server_name);
+        let default_model = match server {
+            Some(server) => self
+                .location_defaults
+                .get(server)
+                .and_then(|d| d.model.clone()),
+            None => self.defaults.model.clone(),
+        };
         let intro = Rect::new(area.x, area.y, area.width, 2.min(area.height));
         frame.render_widget(
-            Paragraph::new(
-                format!("Switch between Codex and Claude Code models. {} also makes your pick the default for new sessions.", hint(NAVIGATION_ACTIVATE)),
-            )
+            Paragraph::new(match server {
+                Some(server) => format!("Models on {server}. {} also makes your pick {server}'s default for new sessions.", hint(NAVIGATION_ACTIVATE)),
+                None => format!("Switch between Codex and Claude Code models. {} also makes your pick the default for new sessions.", hint(NAVIGATION_ACTIVATE)),
+            })
             .style(Style::default().fg(DIM))
             .wrap(Wrap { trim: false }),
             intro,
@@ -645,7 +736,7 @@ impl Ui {
                     dim,
                 ),
             ];
-            if Some(&model.id) == self.defaults.model.as_ref() {
+            if Some(&model.id) == default_model.as_ref() {
                 spans.push(Span::styled(" · default", dim));
             }
             frame.render_widget(Paragraph::new(Line::from(spans)).style(base), rect);
@@ -1149,6 +1240,146 @@ mod dependent_picker_tests {
         assert!(matches!(ui.modal, Some(Modal::ModelPicker(_))));
         assert!(ui.notice.as_ref().is_some_and(|(_, error)| *error));
         assert_eq!(std::fs::read(&storage.config)?, bytes);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::*;
+    use crate::cloud::federation::tests::{Fake, connected, server_defaults, server_models};
+    use anyhow::{Context, Result};
+    use new_session::tests::{Service, until};
+
+    fn server_session(ui: &mut Ui) {
+        let mut session = crate::cloud::federation::tests::session("hetzner:1");
+        session.model = Some("server-model".into());
+        let mut summary = session.summary();
+        summary.server = Some("hetzner".into());
+        ui.summaries.push(summary);
+        ui.sessions.insert(session.id.clone(), session);
+        ui.selected = Some("hetzner:1".into());
+    }
+
+    #[test]
+    fn a_server_session_picks_from_that_server_and_saves_its_default_there() -> Result<()> {
+        let fake = Fake::new(vec![crate::cloud::federation::tests::session("1")]);
+        let (_servers, federation) = connected(vec![("hetzner", fake.clone())])?;
+        let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
+        ui.model_completion.set(
+            None,
+            vec![ModelInfo {
+                id: "local-only".into(),
+                name: "Local Only".into(),
+                efforts: Vec::new(),
+            }],
+        );
+        server_session(&mut ui);
+        let service = Service::start(&ui.storage, federation)?;
+        ui.open_model_picker();
+        until(&mut ui, "the server catalog and defaults", |ui| {
+            ui.model_completion.catalog(Some("hetzner")).is_some()
+                && ui.location_defaults.contains_key("hetzner")
+        })?;
+        let ids: Vec<_> = ui
+            .model_completion
+            .options
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(ids, ["server-model", "claude/opus"]);
+        assert_eq!(
+            ui.location_defaults.get("hetzner"),
+            Some(&server_defaults())
+        );
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))?;
+        terminal.draw(|frame| ui.draw(frame))?;
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Models on hetzner"), "{text}");
+        assert!(text.contains("server-model · default"), "{text}");
+        assert!(!text.contains("Local Only"), "{text}");
+        // Enter applies the pick to the session and makes it hetzner's default.
+        ui.picker_option(1);
+        ui.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        until(&mut ui, "the saved default and applied model", |ui| {
+            !ui.busy
+                && ui
+                    .location_defaults
+                    .get("hetzner")
+                    .and_then(|d| d.model.as_deref())
+                    == Some("claude/opus")
+        })?;
+        assert!(
+            ui.storage.load_config()?.agent_defaults.model.is_none(),
+            "this Mac's default is untouched"
+        );
+        let requests = service.requests()?;
+        assert!(requests.iter().any(|r| matches!(
+            r,
+            Request::DefaultModel { server: Some(s), model: Some(m), .. }
+                if s == "hetzner" && m == "claude/opus"
+        )));
+        assert!(requests.iter().any(|r| matches!(
+            r,
+            Request::Control { id, control: Control::Model { model: Some(m), .. } }
+                if id == "hetzner:1" && m == "claude/opus"
+        )));
+        assert!(fake.requests().iter().any(|r| matches!(
+            r,
+            Request::Control { id, .. } if id == "1"
+        )));
+        // A local session gets this Mac's catalog back from memory.
+        ui.selected = Some("one".into());
+        ui.open_model_picker();
+        assert_eq!(
+            ui.model_completion
+                .catalog(None)
+                .and_then(|c| c.first())
+                .map(|m| m.id.as_str()),
+            Some("local-only")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_discovery_waits_for_the_next_open_instead_of_retrying_every_frame() -> Result<()> {
+        let (ui, _dir, _) = shortcut_tests::fixture(None)?;
+        let mut state = State::default();
+        state.set(Some("hetzner"), Vec::new());
+        state.error = Some("hetzner is not connected".into());
+        state.ensure(&ui.storage, Some("hetzner"));
+        assert!(!state.loading(), "no discovery while the error stands");
+        assert_eq!(state.empty_label(), "hetzner is not connected");
+        state.retry();
+        assert!(state.error.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn the_custom_model_form_completes_from_the_session_location() -> Result<()> {
+        let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
+        ui.model_completion.set(Some("hetzner"), server_models());
+        server_session(&mut ui);
+        ui.open_model(0);
+        let Some(Modal::Model { model, .. }) = &mut ui.modal else {
+            anyhow::bail!("model form");
+        };
+        *model = Editor::from("opus");
+        assert_eq!(ui.model_options(), ["claude/opus"]);
+        assert_eq!(
+            ui.model_completion.location.as_deref(),
+            Some("hetzner"),
+            "no discovery restarted for the server"
+        );
+        ui.model_completion
+            .catalog(Some("hetzner"))
+            .context("server catalog")?;
         Ok(())
     }
 }

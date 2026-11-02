@@ -46,6 +46,10 @@ pub(super) fn tools(session: &Session) -> Vec<Value> {
         if session.provider == super::provider::Provider::Codex {
             tools.push(super::voice_control::tool());
         }
+        // Server sessions cannot move on to another server.
+        if !session.server_mode {
+            tools.push(super::moving::tool());
+        }
         tools
     }
 }

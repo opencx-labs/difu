@@ -395,7 +395,8 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
         if method == "item/tool/call"
             && (session.orchestrator && tool == Some(super::orchestrator::TOOL)
                 || session.peer_tools && tool == Some(super::peers::TOOL)
-                || session.folder_tools && tool == Some(super::folders::TOOL))
+                || session.folder_tools && tool == Some(super::folders::TOOL)
+                || !session.orchestrator && tool == Some(super::moving::TOOL))
         {
             session.orchestrator_requests.push(Pending {
                 id: id.clone(),
@@ -1672,6 +1673,11 @@ fn instructions(session: &Session) -> String {
     } else {
         base
     };
+    let base = if session.server_mode {
+        base
+    } else {
+        format!("{base}\n\n{}", super::moving::INSTRUCTIONS)
+    };
     let base = if session.pr_tools {
         format!("{base}\n\n{}", super::pr_attachments::INSTRUCTIONS)
     } else {
@@ -2040,6 +2046,8 @@ pub fn run(
                         super::peers::handle(store, id, &args)
                     } else if tool == Some(super::folders::TOOL) {
                         super::folders::handle_tool(store, id, &args)
+                    } else if tool == Some(super::moving::TOOL) {
+                        super::moving::schedule(store, id, &args)
                     } else {
                         super::orchestrator::handle(store, id, &args)
                     }
@@ -2285,6 +2293,31 @@ mod tests {
         );
     }
     #[test]
+    fn move_tool_calls_wait_for_the_session_worker_and_belong_to_coding_sessions() {
+        let mut session = Session::new(
+            "one".into(),
+            Job::Coding(super::super::Launch {
+                repository: ".".into(),
+                isolated: true,
+                base: "origin/main".into(),
+                prompt: "task".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        let call = json!({"id":7,"method":"item/tool/call","params":{
+            "tool":super::super::moving::TOOL,"threadId":"thread","turnId":"turn",
+            "arguments":{"server":"box"}}});
+        apply_event(&mut session, &call);
+        assert_eq!(session.orchestrator_requests.len(), 1);
+        assert!(session.pending.is_empty());
+        session.orchestrator_requests.clear();
+        session.orchestrator = true;
+        apply_event(&mut session, &call);
+        assert!(session.orchestrator_requests.is_empty());
+        assert_eq!(session.pending.len(), 1);
+    }
+    #[test]
     fn completing_an_agent_turn_leaves_user_shell_commands_running() {
         let mut session = Session::new(
             "one".into(),
@@ -2358,6 +2391,7 @@ mod tests {
                 "difu_register_worktree",
                 "difu_delete_session",
                 "difu_peer_sessions",
+                "difu_move_to_server",
             ] {
                 assert!(prompt.contains(tool));
             }
@@ -2436,6 +2470,7 @@ mod tests {
             instructions(&waiting),
         ] {
             assert!(!prompt.contains("Do not run local"));
+            assert!(!prompt.contains("difu_move_to_server"));
             assert_eq!(prompt.matches(SERVER_VALIDATION_RULE).count(), 1);
             let guidance = prompt.find(SERVER_VALIDATION_RULE).context("guidance")?;
             let rules = prompt

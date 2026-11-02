@@ -4,7 +4,8 @@
 # difu runs this as root over SSH (`bash -s`, script on stdin) after replacing
 # the parameter line below with shell-quoted values:
 #
-#   DIFU_STEPS       steps to run, in order (see `main`)
+#   DIFU_STEPS       steps to run, in order (see `main`); `difu server upgrade`
+#                    runs `difu tools image service`
 #   DIFU_VERSION     difu release to install, e.g. 0.36.0
 #   DIFU_TARGET      release target, e.g. x86_64-unknown-linux-musl
 #   DIFU_PUBLIC_KEY  this computer's ed25519 key for the server (keys step)
@@ -40,6 +41,11 @@ quiet() {
   fi
 }
 
+# Like `quiet`, but reports failure to the caller instead of stopping.
+try() {
+  "$@" >>"$LOG" 2>&1
+}
+
 apt_get() {
   quiet apt-get -y -q -o DPkg::Lock::Timeout=600 \
     -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold "$@"
@@ -56,6 +62,19 @@ as_difu() {
     PATH="$home/.local/bin:/usr/local/bin:/usr/bin:/bin" \
     XDG_RUNTIME_DIR="/run/user/$uid" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@")
+}
+
+# Runs Claude Code as the difu user. Once difu moved its config into
+# ~/.claude (~/.claude.json is then a link), it shares the service's
+# CLAUDE_CONFIG_DIR and so its lock; before that, ~/.claude.json is the file.
+as_claude() {
+  local home
+  home=$(difu_home)
+  if [ -L "$home/.claude.json" ]; then
+    as_difu env CLAUDE_CONFIG_DIR="$home/.claude" "$@"
+  else
+    as_difu "$@"
+  fi
 }
 
 require_debian() {
@@ -228,24 +247,46 @@ step_difu() {
 }
 
 step_tools() {
-  say "Installing Codex and Claude Code for the difu user"
+  say "Installing or updating Codex and Claude Code for the difu user"
   local home
   home=$(difu_home)
   as_difu mkdir -p "$home/.local/bin"
   # Codex: OpenAI's static Linux build from its latest GitHub release. Its
   # targets match difu's; the archive holds one binary named after the target.
   local codex="codex-$DIFU_TARGET"
-  quiet curl -fsSL --retry 3 -o "$WORK/codex.tar.gz" \
-    "https://github.com/openai/codex/releases/latest/download/$codex.tar.gz"
-  mkdir -p "$WORK/codex"
-  tar -xzf "$WORK/codex.tar.gz" -C "$WORK/codex"
-  [ -f "$WORK/codex/$codex" ] || fail "The Codex release archive has no $codex binary."
-  install -m 0755 -o difu -g "$(id -gn difu)" "$WORK/codex/$codex" "$home/.local/bin/codex"
+  if try curl -fsSL --retry 3 -o "$WORK/codex.tar.gz" \
+    "https://github.com/openai/codex/releases/latest/download/$codex.tar.gz"; then
+    mkdir -p "$WORK/codex"
+    tar -xzf "$WORK/codex.tar.gz" -C "$WORK/codex"
+    [ -f "$WORK/codex/$codex" ] || fail "The Codex release archive has no $codex binary."
+    install -m 0755 -o difu -g "$(id -gn difu)" "$WORK/codex/$codex" "$home/.local/bin/codex"
+  elif [ -x "$home/.local/bin/codex" ]; then
+    say "Warning: could not download the latest Codex (details in $LOG); keeping the installed one."
+  else
+    fail "Could not download Codex from GitHub (details in $LOG). Check the server's internet access and try again."
+  fi
   quiet as_difu "$home/.local/bin/codex" --version
-  # Claude Code: Anthropic's native installer, which then keeps itself updated.
+  # Claude Code: Anthropic's native installer, then its own updater.
   if [ ! -x "$home/.local/bin/claude" ]; then
-    quiet as_difu bash -c 'set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash'
+    quiet as_claude bash -c 'set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash'
     [ -x "$home/.local/bin/claude" ] || fail "The Claude Code installer finished without $home/.local/bin/claude."
+  elif ! try as_claude "$home/.local/bin/claude" update; then
+    say "Warning: Claude Code could not update itself (details in $LOG); keeping the installed version."
+  fi
+  say "Codex: $(as_difu "$home/.local/bin/codex" --version 2>/dev/null | head -n 1 || true)"
+  say "Claude Code: $(as_claude "$home/.local/bin/claude" --version 2>/dev/null | head -n 1 || true)"
+  share_claude_config "$home"
+}
+
+# The service and every sandbox run Claude Code with CLAUDE_CONFIG_DIR=~/.claude
+# (one .claude.json, lock and temporary files); logins over SSH do too.
+share_claude_config() {
+  local profile="$1/.profile"
+  # shellcheck disable=SC2016 # $HOME expands when the profile runs.
+  local line='export CLAUDE_CONFIG_DIR="$HOME/.claude"'
+  [ -e "$profile" ] || as_difu touch "$profile"
+  if ! grep -qxF "$line" "$profile"; then
+    printf '\n# Claude Code shares one config with difu-agent and its sandboxes.\n%s\n' "$line" >>"$profile"
   fi
 }
 
@@ -289,6 +330,27 @@ step_sandbox() {
   ' sh "$home/.config/difu/config.json" "$enabled"
 }
 
+# Whether the server runs sessions in sandboxes, from difu's own settings.
+sandbox_enabled() {
+  [ -s "$1" ] && [ "$(jq -r '.server.sandbox.enabled // false' "$1" 2>/dev/null)" = true ]
+}
+
+# `difu server upgrade`: the bundled Containerfile may have changed, so rebuild
+# the sandbox image (or pull a custom one) when sandboxing is on. Unlike the
+# sandbox step, this never changes whether sandboxing is on.
+step_image() {
+  local home
+  home=$(difu_home)
+  if ! sandbox_enabled "$home/.config/difu/config.json"; then
+    say "Sandboxing is off; no sandbox image to rebuild"
+    return
+  fi
+  say "Rebuilding the sandbox image (a few minutes); running sessions keep theirs"
+  quiet as_difu /usr/local/bin/difu sandbox build
+  # The replaced image stays while running sandboxes use it.
+  try as_difu podman image prune -f || true
+}
+
 step_service() {
   say "Installing difu-agent.service"
   local uid home unit
@@ -300,10 +362,11 @@ step_service() {
   printf '%s\n' "$unit" >/etc/systemd/system/difu-agent.service
   quiet systemctl daemon-reload
   quiet systemctl enable difu-agent.service
-  step_restart
+  restart_service
 }
 
-step_restart() {
+# Part of the service step: restarts difu-agent and checks that it stays up.
+restart_service() {
   say "Starting difu"
   quiet systemctl restart difu-agent.service
   local _
@@ -329,7 +392,7 @@ main() {
   local step
   for step in $DIFU_STEPS; do
     case "$step" in
-      keys | ssh | packages | firewall | updates | tailscale | lockdown | difu | tools | sandbox | service | restart)
+      keys | ssh | packages | firewall | updates | tailscale | lockdown | difu | tools | sandbox | image | service)
         "step_$step"
         ;;
       *) fail "Unknown setup step: $step" ;;
