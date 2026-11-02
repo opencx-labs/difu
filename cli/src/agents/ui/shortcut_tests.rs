@@ -718,6 +718,11 @@ fn creation_permission_and_interrupt_keys_reach_the_real_service_boundary() -> R
                         modifiers
                     },
                 );
+                if action == ids::SESSION_NEW {
+                    // The key opens the new-session form; Enter starts it.
+                    assert!(matches!(ui.modal, Some(Modal::NewSession(_))));
+                    press(ui, KeyCode::Enter, KeyModifiers::NONE);
+                }
             })?;
             match action {
                 ids::SESSION_NEW => assert!(matches!(request, Request::NewAgent { .. })),

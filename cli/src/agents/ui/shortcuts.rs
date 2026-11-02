@@ -92,9 +92,9 @@ impl Ui {
                 Modal::QueuedEdit { .. } => AGENT_QUEUE_BUTTON,
                 Modal::Menu { .. } => AGENT_MENU,
                 Modal::Rename(_) | Modal::RenameFolder { .. } => AGENT_RENAME,
-                Modal::FolderPicker { .. } | Modal::NewSession(_) | Modal::MoveToServer { .. } => {
-                    AGENT_MENU
-                }
+                Modal::FolderPicker { .. } | Modal::MoveToServer { .. } => AGENT_MENU,
+                // A form of filterable fields with lists, like the model form.
+                Modal::NewSession(_) => AGENT_MODEL,
                 Modal::DeleteFolder(_) => AGENT_DELETE,
                 Modal::Model { .. } => AGENT_MODEL,
                 Modal::ModelPicker(_) => AGENT_MODEL_PICKER,

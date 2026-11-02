@@ -183,7 +183,8 @@ impl Ui {
                 self.modal = Some(Modal::AgentDefaults(Box::new(Settings::new(
                     config.agent_defaults,
                 ))));
-                self.model_completion.load();
+                // These are this Mac's defaults, so this Mac's models.
+                self.model_completion.load(&self.storage, None);
             }
             Err(error) => {
                 self.notice = Some((format!("Cannot read agent defaults: {error:#}"), true))

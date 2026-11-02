@@ -15,6 +15,7 @@ mod mcp_panel;
 mod media;
 mod models;
 mod moving;
+mod new_session;
 #[cfg(test)]
 mod overlay_shortcut_tests;
 mod panels;
@@ -245,10 +246,13 @@ enum Action {
     QuestionNote(usize),
     SubmitQuestion(bool),
     DismissNotice,
-    /// A machine or repository in the new-session server picker.
-    ServerChoice(usize),
     /// A saved server in the "Move to server…" picker.
     MoveChoice(usize),
+    /// A field of the new-session form.
+    NewSessionField(usize),
+    /// A row in the new-session form's list for its focused field.
+    NewSessionOption(usize),
+    NewSessionStart,
 }
 pub enum Modal {
     Subagents {
@@ -352,8 +356,8 @@ pub enum Modal {
     Delete,
     Clear,
     Help(crate::help::State),
-    /// Where a new session runs when cloud servers are saved.
-    NewSession(Box<servers::Picker>),
+    /// Where a new session runs, then its repository, model and reasoning.
+    NewSession(Box<new_session::Form>),
     /// Saved servers the selected session can move to.
     MoveToServer {
         servers: Vec<String>,
@@ -384,6 +388,9 @@ enum Task {
     InstallBrowser(String, std::path::PathBuf, String),
     WorkspacePaths(String, std::path::PathBuf),
     Defaults(String),
+    /// A saved server's new-session defaults; the model name when they were
+    /// just saved from the model picker.
+    LocationDefaults(String, Option<String>),
     Skills(String, std::path::PathBuf, provider::Provider),
     Launch,
     Repository(String),
@@ -492,6 +499,11 @@ pub struct Ui {
     slack: slack::State,
     remote: remote_control::State,
     model_completion: models::State,
+    /// Saved cloud servers' new-session defaults, as last read from each.
+    location_defaults: HashMap<String, crate::storage::AgentDefaults>,
+    /// The defaults of the launch in flight, reused when the service asks for
+    /// a repository first.
+    launch_defaults: Option<crate::storage::AgentDefaults>,
     toast_rect: Rect,
     media_pending: Option<(String, mpsc::Receiver<Result<super::media::Paste, String>>)>,
 }
@@ -598,6 +610,8 @@ impl Ui {
             slack: slack::State::default(),
             remote: remote_control::State::default(),
             model_completion: models::State::default(),
+            location_defaults: HashMap::new(),
+            launch_defaults: None,
             toast_rect: Rect::default(),
             media_pending: None,
         }
@@ -779,6 +793,7 @@ impl Ui {
                     self.interrupting.remove(id);
                 }
                 Task::Defaults(_)
+                | Task::LocationDefaults(..)
                 | Task::Send(..)
                 | Task::Terminal(..)
                 | Task::Question
@@ -881,6 +896,11 @@ impl Ui {
                     }
                     if matches!(message.kind, Task::Question) {
                         self.question_send = None;
+                    }
+                    if matches!(message.kind, Task::Launch)
+                        && let Some(Modal::NewSession(form)) = &mut self.modal
+                    {
+                        form.failed(&error);
                     }
                     self.notice = Some((error, true));
                 }
@@ -1069,6 +1089,18 @@ impl Ui {
                     (Task::Launch, Reply::ChooseRepository) => {
                         self.modal = Some(Modal::Repository(Editor::default()));
                     }
+                    (Task::LocationDefaults(server, saved), Reply::AgentDefaults(defaults)) => {
+                        if let Some(name) = saved {
+                            self.notice = Some((
+                                format!(
+                                    "{} is now the default model for new sessions on {server}",
+                                    crate::model::clean(&name)
+                                ),
+                                false,
+                            ));
+                        }
+                        self.location_defaults.insert(server, defaults);
+                    }
                     (Task::Launch, Reply::Launched(id)) => {
                         self.task(
                             Task::Read(id.clone()),
@@ -1087,6 +1119,7 @@ impl Ui {
                         self.focus = Focus::Composer;
                         self.modal = None;
                         self.refreshed = None;
+                        self.launch_defaults = None;
                         if let Ok(config) = self.storage.load_config() {
                             self.defaults = config.agent_defaults;
                         }
@@ -1434,16 +1467,16 @@ impl Ui {
             self.task(Task::Action, Request::Control { id, control }, false);
         }
     }
+    /// Every new coding session starts in the new-session form.
     pub fn launch(&mut self) {
         if self.busy {
             return;
         }
-        match crate::cloud::servers::load(&self.storage) {
-            Ok(saved) if !saved.is_empty() => self.open_new_session(saved),
-            _ => self.launch_in(None),
-        }
+        self.open_new_session();
     }
-    fn launch_in(&mut self, repository: Option<std::path::PathBuf>) {
+    /// Starts the launch the service paused for a repository in `repository`,
+    /// remembering it as this Mac's default.
+    fn launch_in(&mut self, repository: std::path::PathBuf) {
         if self.busy {
             return;
         }
@@ -1454,18 +1487,18 @@ impl Ui {
                 return;
             }
         };
-        let mut defaults = self.defaults.clone();
-        let remember_repository = repository.is_some();
-        if let Some(repository) = repository {
-            defaults.repository = Some(repository);
-        }
+        let mut defaults = self
+            .launch_defaults
+            .clone()
+            .unwrap_or_else(|| self.defaults.clone());
+        defaults.repository = Some(repository);
         self.busy = true;
         self.task(
             Task::Launch,
             Request::NewAgent {
                 defaults,
                 cwd,
-                remember_repository,
+                remember_repository: true,
                 server: None,
             },
             true,
@@ -1848,7 +1881,7 @@ impl Ui {
                 _ => None,
             },
             Some(Modal::Menu { query, .. } | Modal::Commands { query, .. }) => Some(query),
-            Some(Modal::NewSession(picker)) if picker.choosing_repository() => Some(&picker.query),
+            Some(Modal::NewSession(form)) => Some(&form.query),
             Some(Modal::Help(state)) => Some(&state.query),
             Some(Modal::Permissions(state)) => state.editor(),
             Some(Modal::Plan(state)) => state.editor(),
@@ -2986,7 +3019,9 @@ impl Ui {
             Action::RulesOption(index) => self.rules_option(index),
             Action::RulesSave => self.save_rules(),
             Action::RulesCancel => self.close_rules(),
-            Action::ServerChoice(index) => self.new_session_choice(index),
+            Action::NewSessionField(field) => self.new_session_field(field),
+            Action::NewSessionOption(index) => self.new_session_option(index),
+            Action::NewSessionStart => self.start_new_session(),
             Action::OrchestratorBack => self.close_orchestrator_list(),
             Action::OpenFolder(id) => self.open_folder(id),
             Action::FolderBack => self.close_folder(),
@@ -3153,7 +3188,7 @@ impl Ui {
                 if let Some(Modal::Repository(editor)) = &self.modal {
                     let path = editor.text();
                     if !path.trim().is_empty() {
-                        self.launch_in(Some(path.trim().into()));
+                        self.launch_in(path.trim().into());
                     }
                 }
             }

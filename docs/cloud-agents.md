@@ -389,8 +389,18 @@ fixes a mismatch).
   namespaced as `<server name>:<session id>` and summaries carry `server` for a
   sidebar badge. Requests for a namespaced id are forwarded with `rpc`; watches
   with `rpc.watch`.
-* The new-session flow offers a server picker (This Mac + saved servers);
-  repositories come from the chosen server.
+* Every new session opens one form: **Location** (This Mac, then each saved
+  server with its connection state or problem), **Repository**, **Model** and
+  **Reasoning**, prefilled from the chosen location's saved defaults (a
+  server's come from `Request::AgentDefaults`, cached with its repositories in
+  `Request::Servers`). Enter starts right away; choosing another location
+  reloads the other lists from it.
+* Anything that consults a machine on a session's behalf asks the session's
+  location. Requests with a session id are forwarded by id; the others carry
+  `server`: `NewAgent`, `RepositoryRules`, `Defaults` (Codex's configured model
+  for a directory), `AgentDefaults`, `DefaultModel` (saves a location's default
+  model, so Alt+M on a server session sets that server's default) and `Models`
+  (the Codex and Claude Code models that location's logins offer).
 * Features that need the session's files on this machine (attachments, local
   file paths, HTML artifact previews) say they are unavailable for server
   sessions.
