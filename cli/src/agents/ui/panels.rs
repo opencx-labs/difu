@@ -335,9 +335,6 @@ impl Ui {
     }
     pub(super) fn select_resource(&mut self, artifacts: bool, index: usize) {
         let id = self.selected.clone().unwrap_or_default();
-        if artifacts && self.unavailable_for_server(&id) {
-            return;
-        }
         let id = id.as_str();
         if artifacts {
             let Some(session) = self.sessions.get(id) else {
@@ -346,6 +343,12 @@ impl Ui {
             let Some(artifact) = session.artifacts.get(index) else {
                 return;
             };
+            // A server session's artifact is on the server: preview a copy.
+            if servers::is_server_session(id) {
+                let artifact = artifact.clone();
+                self.download_artifact(id.to_owned(), artifact, false);
+                return;
+            }
             let result = (|| -> Result<PathBuf> {
                 super::super::artifacts::resolve(
                     artifact
@@ -359,16 +362,9 @@ impl Ui {
             match result {
                 Ok(path) => {
                     let title = artifact.title.clone();
-                    if browser::executable("terminal-browser").is_none() && !self.panels.installing
-                    {
-                        self.modal = Some(Modal::InstallBrowser {
-                            path,
-                            title,
-                            selected: 0,
-                        });
+                    if !self.present_artifact(path, title) {
                         return;
                     }
-                    self.open_artifact(path, title);
                 }
                 Err(e) => {
                     self.notice = Some((format!("{e:#}"), true));
@@ -408,6 +404,114 @@ impl Ui {
         self.panels.scroll = 0;
         self.drilled = true;
         self.modal = None;
+    }
+    /// Preview an artifact file on this computer, offering to install the
+    /// embedded browser first; false when that offer is shown instead.
+    fn present_artifact(&mut self, path: PathBuf, title: String) -> bool {
+        if browser::executable("terminal-browser").is_none() && !self.panels.installing {
+            self.modal = Some(Modal::InstallBrowser {
+                path,
+                title,
+                selected: 0,
+            });
+            return false;
+        }
+        self.open_artifact(path, title);
+        true
+    }
+    /// Download a server session's artifact into this computer's cache, then
+    /// preview it (or, with `reload`, reload the open preview).
+    fn download_artifact(
+        &mut self,
+        session: String,
+        artifact: super::super::artifacts::Artifact,
+        reload: bool,
+    ) {
+        let path = match super::super::artifacts::local_copy(&self.storage, &session, &artifact) {
+            Ok(path) => path,
+            Err(error) => {
+                self.notice = Some((format!("{error:#}"), true));
+                return;
+            }
+        };
+        let server = servers::server_name(&session).unwrap_or("the server");
+        self.notice = Some((
+            format!("Downloading {} from {server}…", artifact.title),
+            false,
+        ));
+        let storage = self.storage.clone();
+        let sender = self.sender.clone();
+        let title = artifact.title.clone();
+        thread::spawn(move || {
+            let result = super::super::artifacts::download(&storage, &session, &artifact)
+                .map(|_| Reply::Ok)
+                .map_err(|error| format!("{error:#}"));
+            let _ = sender.send(ResultMessage {
+                kind: Task::ServerArtifact {
+                    session,
+                    path,
+                    title,
+                    reload,
+                },
+                result,
+            });
+        });
+    }
+    /// A server session's artifact arrived in its local copy.
+    pub(super) fn downloaded_artifact(
+        &mut self,
+        session: &str,
+        path: PathBuf,
+        title: String,
+        reload: bool,
+    ) {
+        self.notice = None;
+        if self.selected.as_deref() != Some(session) {
+            return;
+        }
+        if reload {
+            if let Some(View::Artifact {
+                path: current,
+                browser: Some(browser),
+                ..
+            }) = &mut self.panels.view
+                && *current == path
+            {
+                browser.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+            }
+            return;
+        }
+        if self.present_artifact(path, title) {
+            self.panels.scroll = 0;
+            self.modal = None;
+        }
+    }
+    /// Refresh downloads a server session's open artifact again.
+    fn refresh_server_artifact(&mut self) -> bool {
+        let Some(View::Artifact { path, .. }) = &self.panels.view else {
+            return false;
+        };
+        let Some(session) = self
+            .panels
+            .session
+            .clone()
+            .filter(|id| servers::is_server_session(id))
+        else {
+            return false;
+        };
+        let Some(artifact) = self.sessions.get(&session).and_then(|s| {
+            s.artifacts
+                .iter()
+                .find(|artifact| {
+                    super::super::artifacts::local_copy(&self.storage, &session, artifact)
+                        .is_ok_and(|copy| &copy == path)
+                })
+                .cloned()
+        }) else {
+            return false;
+        };
+        self.download_artifact(session, artifact, true);
+        true
     }
     pub(super) fn open_artifact(&mut self, path: PathBuf, title: String) {
         let (browser, error) = if self.panels.installing {
@@ -651,6 +755,20 @@ impl Ui {
             self.panels.focused = false;
             return false;
         }
+        // Reloading a server session's artifact downloads it again first.
+        if key.code == KeyCode::Char('r')
+            && key.modifiers == KeyModifiers::CONTROL
+            && matches!(
+                self.panels.view,
+                Some(View::Artifact {
+                    browser: Some(_),
+                    ..
+                })
+            )
+            && self.refresh_server_artifact()
+        {
+            return true;
+        }
         if let Some(View::Artifact {
             browser: Some(browser),
             ..
@@ -766,6 +884,9 @@ impl Ui {
 
     pub(super) fn refresh_artifact(&mut self) {
         self.panels.focused = true;
+        if self.refresh_server_artifact() {
+            return;
+        }
         if let Some(View::Artifact {
             browser: Some(browser),
             ..

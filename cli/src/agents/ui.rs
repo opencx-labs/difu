@@ -384,6 +384,13 @@ enum Task {
     Shells(String),
     Terminal(String, terminals::Operation),
     OpenArtifact,
+    /// A server session's artifact downloaded into `path`.
+    ServerArtifact {
+        session: String,
+        path: std::path::PathBuf,
+        title: String,
+        reload: bool,
+    },
     OpenLink,
     InstallBrowser(String, std::path::PathBuf, String),
     WorkspacePaths(String, std::path::PathBuf),
@@ -798,6 +805,7 @@ impl Ui {
                 | Task::Terminal(..)
                 | Task::Question
                 | Task::OpenArtifact
+                | Task::ServerArtifact { .. }
                 | Task::OpenLink
                 | Task::InstallBrowser(..)
                 | Task::Usage(_)
@@ -1130,6 +1138,15 @@ impl Ui {
                     (Task::OpenArtifact, Reply::Ok) => {
                         self.notice = Some(("Opened artifact in browser".into(), false));
                     }
+                    (
+                        Task::ServerArtifact {
+                            session,
+                            path,
+                            title,
+                            reload,
+                        },
+                        Reply::Ok,
+                    ) => self.downloaded_artifact(&session, path, title, reload),
                     (Task::Delete(id), Reply::Ok) => {
                         self.panels.shells.remove(&id);
                         self.sidebar.counts.remove(&id);

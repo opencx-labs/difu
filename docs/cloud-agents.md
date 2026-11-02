@@ -381,7 +381,7 @@ call's `error`; `Request::Watch` must use `rpc.watch`. Clients must check that t
 server's `version` equals their own before using `rpc` (`difu server upgrade`
 fixes a mismatch).
 
-Two service requests exist for clients whose sessions live elsewhere:
+Three service requests exist for clients whose sessions live elsewhere:
 
 * `{"SessionPrs": {"id", "history"}}` → `{"SessionPrs": {"links", "branch", "error"}}`:
   the session's attached and discovered PRs, refreshed by the server with its
@@ -393,6 +393,10 @@ Two service requests exist for clients whose sessions live elsewhere:
   the session's private copy on the server (images are checked like a paste),
   at most 32 MB per file so the request stays within the WebSocket message
   cap. The reply is sent in `Control::Message*` `attachments`.
+* `{"ReadArtifact": {"id", "path", "workspace"}}` → `{"ArtifactFile": "<base64>"}`:
+  a presented HTML artifact (matched by its registered `path` and
+  `workspace`, resolved with the same checks as opening it locally), at most
+  32 MB. Nothing else in the worktree can be read this way.
 
 ## Clients
 
@@ -432,8 +436,20 @@ Two service requests exist for clients whose sessions live elsewhere:
   server's copies. A file over 32 MB fails the send with a clear error before
   anything reaches the server. Deleting or cleaning up the session removes the
   Mac's copies.
-* Features that open the session's files on this machine (local file paths,
-  HTML artifact previews) say they are unavailable for server sessions.
+* Artifacts: badges and the artifact list come from the session as usual.
+  Opening one downloads it (`ReadArtifact`) into
+  `<cache>/server-artifacts/<server>@<session>/`, then previews that copy in
+  the artifact pane or an external browser exactly like a local artifact.
+  Each open and Refresh (button or Ctrl+R) downloads it again, so the preview
+  follows changes on the server. Artifacts should be self-contained HTML:
+  files they reference relatively are not downloaded. Deleting or cleaning up
+  the session removes the copies.
+* Shells (`!command`, Open shells, the shell pane) are `Request::Shell` /
+  `Request::Shells` forwarded to the server, so they run there, in the
+  session's sandbox when sandboxing is on. The pane's polling (`Exchange`,
+  which also carries the pane size) and typed input (`Human`) are server round
+  trips, so a distant server makes the pane less responsive than a local one.
+  `difu_shell` runs on the server like every agent tool.
 * A local session can move to a saved server (*Moving a session to a server*).
 * The phone API of a Mac hides relayed server sessions, because phones connect to
   servers directly.

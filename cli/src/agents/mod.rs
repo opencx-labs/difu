@@ -1,5 +1,5 @@
 //! Durable, local coding sessions. Only sessions launched by difu are registered.
-mod artifacts;
+pub(crate) mod artifacts;
 mod claude;
 pub mod client;
 pub mod connections;
@@ -953,6 +953,13 @@ pub enum Request {
         /// Base64 file contents.
         data: String,
     },
+    /// A presented HTML artifact's contents (a terminal app downloads a
+    /// server session's artifacts to preview them).
+    ReadArtifact {
+        id: String,
+        path: PathBuf,
+        workspace: Option<PathBuf>,
+    },
     Launch {
         job: Box<Job>,
     },
@@ -1131,6 +1138,8 @@ pub enum Reply {
     Servers(Vec<crate::cloud::federation::ServerStatus>),
     SessionPrs(pr_cache::Lookup),
     Attachment(media::Attachment),
+    /// Base64 file contents.
+    ArtifactFile(String),
     Error(String),
 }
 

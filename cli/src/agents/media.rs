@@ -42,10 +42,10 @@ fn kind(path: &Path) -> Option<Kind> {
         _ => None,
     }
 }
-/// A session's attachment directory name. A server session's
+/// A session's directory name for files kept per session. A server session's
 /// (`<server>:<session>`) pasted media stays on this computer until Send
 /// uploads it, under `<server>@<session>`; ids never contain `@`.
-fn directory_name(session: &str) -> Result<String> {
+pub(crate) fn directory_name(session: &str) -> Result<String> {
     let part = |part: &str| {
         !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
     };

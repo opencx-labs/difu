@@ -674,6 +674,14 @@ impl Service {
                     &bytes,
                 )?))
             }
+            Request::ReadArtifact {
+                id,
+                path,
+                workspace,
+            } => Ok(Reply::ArtifactFile(base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                super::artifacts::read(&self.store.get(&id)?, &path, workspace.as_deref())?,
+            ))),
             Request::Watch { .. } => anyhow::bail!("Watch requires a streaming connection"),
             Request::Read { id, version } => self.store.inspect(&id, |session| {
                 if version == Some(session.version) {
@@ -2205,6 +2213,216 @@ mod federation_tests {
                 })
                 .is_err()
         );
+        Ok(())
+    }
+
+    /// A real service standing in for a cloud server, reached through the
+    /// federation the way `client::Connection` carries requests over `rpc`.
+    /// Messages are recorded instead of starting an agent.
+    struct Loopback {
+        service: Arc<Service>,
+        messages: Mutex<Vec<Request>>,
+    }
+    impl crate::cloud::federation::Remote for Loopback {
+        fn version(&self) -> String {
+            env!("CARGO_PKG_VERSION").into()
+        }
+        fn full(&self) -> bool {
+            true
+        }
+        fn closed(&self) -> bool {
+            false
+        }
+        fn call(&self, method: &str, _params: serde_json::Value) -> Result<serde_json::Value> {
+            anyhow::ensure!(method == "server.repos", "unexpected {method}");
+            Ok(serde_json::json!({"repositories": []}))
+        }
+        fn rpc(&self, request: &Request) -> Result<Reply> {
+            if matches!(request, Request::Control { .. }) {
+                self.messages
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("lock"))?
+                    .push(request.clone());
+                return Ok(Reply::Ok);
+            }
+            self.service.handle(request.clone())
+        }
+        fn watch(
+            &self,
+            _id: &str,
+            _version: Option<u64>,
+        ) -> Result<Box<dyn crate::cloud::federation::Replies>> {
+            anyhow::bail!("not used")
+        }
+    }
+
+    #[test]
+    fn server_session_shells_artifacts_and_media_work_from_another_computer() -> Result<()> {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let (server_dir, server) = service(None)?;
+        let workspace = server_dir.path().canonicalize()?.join("worktree");
+        std::fs::create_dir_all(workspace.join("out"))?;
+        std::fs::write(workspace.join("out/report.html"), "<h1>Report</h1>")?;
+        let artifact = super::super::artifacts::Artifact {
+            path: "out/report.html".into(),
+            title: "Report".into(),
+            workspace: Some(workspace.clone()),
+        };
+        server.store.update("local", |session| {
+            session.workspace = Some(workspace.clone());
+            session.workspace_ready = true;
+            session.artifacts.push(artifact.clone());
+        })?;
+        let loopback = Arc::new(Loopback {
+            service: server.clone(),
+            messages: Mutex::new(Vec::new()),
+        });
+        let (_servers, federation) = crate::cloud::federation::tests::connected_to(vec![(
+            "box",
+            loopback.clone() as Arc<dyn crate::cloud::federation::Remote>,
+        )])?;
+        let (_mac_dir, mac) = service(Some(federation))?;
+        let id = || "box:local".to_owned();
+
+        // A shell opens on the server in the session's worktree; input,
+        // output and resizing all travel as forwarded requests.
+        let Reply::Shell(opened) = mac.handle(Request::Shell {
+            id: id(),
+            action: shells::Action::Open,
+        })?
+        else {
+            anyhow::bail!("expected an opened shell");
+        };
+        let shell = opened
+            .get("shell")
+            .and_then(serde_json::Value::as_str)
+            .context("shell id")?
+            .to_owned();
+        assert_eq!(
+            opened.get("cwd").and_then(serde_json::Value::as_str),
+            workspace.to_str()
+        );
+        mac.handle(Request::Shell {
+            id: id(),
+            action: shells::Action::Human {
+                shell: shell.clone(),
+                client: "mac".into(),
+                sequence: 1,
+                focused: true,
+                text: "printf 'from-%s\\n' mac\r".into(),
+            },
+        })?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            server.store.shells.tick(&server.store)?;
+            let Reply::Shell(screen) = mac.handle(Request::Shell {
+                id: id(),
+                action: shells::Action::Exchange {
+                    shell: shell.clone(),
+                    rows: 12,
+                    cols: 70,
+                    scrollback: 0,
+                },
+            })?
+            else {
+                anyhow::bail!("expected a screen");
+            };
+            assert_eq!(
+                (screen.get("rows"), screen.get("cols")),
+                (Some(&serde_json::json!(12)), Some(&serde_json::json!(70)))
+            );
+            let text = screen
+                .get("screen")
+                .and_then(serde_json::Value::as_str)
+                .map(|screen| STANDARD.decode(screen))
+                .transpose()?
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default();
+            if text.contains("from-mac") {
+                break;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "no shell output: {text:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let Reply::Shells(listed) = mac.handle(Request::Shells { id: id() })? else {
+            anyhow::bail!("expected shells");
+        };
+        assert!(
+            listed
+                .iter()
+                .any(|s| s.get("itemId").and_then(serde_json::Value::as_str) == Some(&shell))
+        );
+        mac.handle(Request::Shell {
+            id: id(),
+            action: shells::Action::Close {
+                shell: shell.clone(),
+            },
+        })?;
+        assert!(server.store.shells.list("local")?.is_empty());
+
+        // Presented artifacts are read from the server for a local preview;
+        // nothing else in the worktree is.
+        let Reply::ArtifactFile(data) = mac.handle(Request::ReadArtifact {
+            id: id(),
+            path: artifact.path.clone(),
+            workspace: artifact.workspace.clone(),
+        })?
+        else {
+            anyhow::bail!("expected the artifact");
+        };
+        assert_eq!(STANDARD.decode(data)?, b"<h1>Report</h1>");
+        std::fs::write(workspace.join("secret.html"), "private")?;
+        assert!(
+            mac.handle(Request::ReadArtifact {
+                id: id(),
+                path: "secret.html".into(),
+                workspace: artifact.workspace.clone(),
+            })
+            .is_err()
+        );
+
+        // Pasted media is uploaded on Send and the message names copies the
+        // server accepts as the session's own.
+        let source = tempfile::tempdir()?;
+        let shot = source.path().join("shot.png");
+        image::RgbaImage::new(2, 2).save(&shot)?;
+        let mac_storage = mac.federation.as_ref().context("federation")?.storage();
+        let super::super::media::Paste::Attachments(mut copies) =
+            super::super::media::files(mac_storage, "box:local", vec![shot])?
+        else {
+            anyhow::bail!("expected media");
+        };
+        for copy in &mut copies {
+            copy.label = "image 1".into();
+        }
+        mac.handle(Request::Control {
+            id: id(),
+            control: Control::MessageWithAttachments {
+                text: "see [image 1]".into(),
+                queue: false,
+                skills: Vec::new(),
+                attachments: copies,
+            },
+        })?;
+        let messages = loopback
+            .messages
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock"))?
+            .clone();
+        let [
+            Request::Control {
+                id: sent,
+                control: Control::MessageWithAttachments { attachments, .. },
+            },
+        ] = messages.as_slice()
+        else {
+            anyhow::bail!("one message: {messages:?}");
+        };
+        assert_eq!(sent, "local");
+        let [uploaded] = attachments.as_slice() else {
+            anyhow::bail!("one attachment");
+        };
+        super::super::media::validate(&server.store.storage, "local", uploaded)?;
         Ok(())
     }
 

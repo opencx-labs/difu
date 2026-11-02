@@ -209,6 +209,7 @@ fn session_id(request: &mut Request) -> Option<&mut String> {
         | Request::AttachPr { id, .. }
         | Request::SessionPrs { id, .. }
         | Request::UploadAttachment { id, .. }
+        | Request::ReadArtifact { id, .. }
         | Request::Control { id, .. }
         | Request::Voice { id, .. }
         | Request::Repository { id, .. }
@@ -312,7 +313,7 @@ fn upload_attachment(
 
 /// Keeps what a server answered where this computer's terminal app looks for
 /// it, as the local service would have: PR states and published diffs in the
-/// GitHub store, and no attachment copies for a deleted session.
+/// GitHub store, and no attachment or artifact copies for a deleted session.
 fn remember(storage: &Storage, server: &str, request: &Request, reply: &Reply) {
     let result = match (request, reply) {
         (Request::SessionPrs { .. }, Reply::SessionPrs(lookup)) => lookup
@@ -323,7 +324,9 @@ fn remember(storage: &Storage, server: &str, request: &Request, reply: &Reply) {
             crate::github::store::diff(storage, pr, patch)
         }
         (Request::Delete { id } | Request::Cleanup { id }, Reply::Ok) => {
-            media::cleanup(storage, &namespace(server, id))
+            let session = namespace(server, id);
+            media::cleanup(storage, &session)
+                .and(crate::agents::artifacts::forget_copies(storage, &session))
         }
         _ => Ok(()),
     };
@@ -397,6 +400,7 @@ pub fn prefix_reply(server: &str, reply: Reply) -> Reply {
         | Reply::Servers(_)
         | Reply::SessionPrs(_)
         | Reply::Attachment(_)
+        | Reply::ArtifactFile(_)
         | Reply::Error(_)) => reply,
     }
 }
@@ -514,6 +518,11 @@ impl Federation {
         let supervisor = federation.clone();
         thread::spawn(move || supervisor.supervise());
         federation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage(&self) -> &Storage {
+        &self.storage
     }
 
     pub fn stop(&self) {
@@ -1138,10 +1147,23 @@ pub(crate) mod tests {
     pub(crate) fn connected(
         servers: Vec<(&str, Arc<Fake>)>,
     ) -> Result<(tempfile::TempDir, Federation)> {
+        connected_to(
+            servers
+                .into_iter()
+                .map(|(name, fake)| (name, fake as Arc<dyn Remote>))
+                .collect(),
+        )
+    }
+
+    /// `connected` with any `Remote`, such as a real service standing in for
+    /// a server.
+    pub(crate) fn connected_to(
+        servers: Vec<(&str, Arc<dyn Remote>)>,
+    ) -> Result<(tempfile::TempDir, Federation)> {
         let (dir, storage) = storage()?;
         let remotes = servers
             .into_iter()
-            .map(|(name, fake)| (name.to_owned(), fake as Arc<dyn Remote>))
+            .map(|(name, remote)| (name.to_owned(), remote))
             .collect();
         Ok((dir, linked(storage, remotes)?))
     }
@@ -1256,6 +1278,17 @@ pub(crate) mod tests {
             saved,
         ) else {
             anyhow::bail!("expected a server upload");
+        };
+        assert_eq!(id, "1");
+        let Target::Server(_, Request::ReadArtifact { id, .. }) = target(
+            Request::ReadArtifact {
+                id: "box:1".into(),
+                path: "report.html".into(),
+                workspace: None,
+            },
+            saved,
+        ) else {
+            anyhow::bail!("expected a server artifact read");
         };
         assert_eq!(id, "1");
         let lookup = Reply::SessionPrs(lookup());
@@ -1846,17 +1879,29 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn deleting_a_server_session_removes_its_local_attachment_copies() -> Result<()> {
+    fn deleting_a_server_session_removes_its_local_copies() -> Result<()> {
         let fake = Fake::new(vec![session("1")]);
         let (_dir, federation) = connected(vec![("box", fake)])?;
         let copies = pasted(&federation, &[("shot.png", &png()?)])?;
         let copy = copies.first().context("copy")?;
         assert!(copy.path.is_file());
+        let artifact = crate::agents::artifacts::save_copy(
+            &federation.storage,
+            "box:1",
+            &crate::agents::artifacts::Artifact {
+                path: "report.html".into(),
+                title: "Report".into(),
+                workspace: None,
+            },
+            &STANDARD.encode("<h1>Report</h1>"),
+        )?;
+        assert!(artifact.is_file());
         let Route::Handled(reply) = federation.route(Request::Delete { id: "box:1".into() }) else {
             anyhow::bail!("expected forwarding");
         };
         assert!(matches!(reply?, Reply::Ok));
         assert!(!copy.path.exists());
+        assert!(!artifact.exists());
         Ok(())
     }
 
