@@ -247,6 +247,19 @@ step_tools() {
     quiet as_difu bash -c 'set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash'
     [ -x "$home/.local/bin/claude" ] || fail "The Claude Code installer finished without $home/.local/bin/claude."
   fi
+  share_claude_config "$home"
+}
+
+# The service and every sandbox run Claude Code with CLAUDE_CONFIG_DIR=~/.claude
+# (one .claude.json, lock and temporary files); logins over SSH do too.
+share_claude_config() {
+  local profile="$1/.profile"
+  # shellcheck disable=SC2016 # $HOME expands when the profile runs.
+  local line='export CLAUDE_CONFIG_DIR="$HOME/.claude"'
+  [ -e "$profile" ] || as_difu touch "$profile"
+  if ! grep -qxF "$line" "$profile"; then
+    printf '\n# Claude Code shares one config with difu-agent and its sandboxes.\n%s\n' "$line" >>"$profile"
+  fi
 }
 
 # Rootless Podman for the difu user: subordinate ids, a lingering systemd user

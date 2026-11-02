@@ -140,10 +140,33 @@ fn set_env(path: &Path, key: &str, value: Option<&str>) -> Result<()> {
 /// Extra environment for agent processes (e.g. `CLAUDE_CODE_OAUTH_TOKEN` from
 /// the server's 0600 `server.env`). Empty on ordinary installations.
 pub fn agent_env() -> Vec<(String, String)> {
-    Storage::discover()
-        .and_then(|storage| env_path(&storage))
+    let Ok(storage) = Storage::discover() else {
+        return Vec::new();
+    };
+    let pairs = env_path(&storage)
         .and_then(|path| read_env(&path))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let server = storage
+        .load_config()
+        .is_ok_and(|config| config.server.enabled);
+    server_env(pairs, server, dirs::home_dir().as_deref())
+}
+
+/// On a server, Claude Code always shares `~/.claude/.claude.json` (see
+/// `claude_config`), whatever `server.env` says.
+fn server_env(
+    mut pairs: Vec<(String, String)>,
+    server: bool,
+    home: Option<&Path>,
+) -> Vec<(String, String)> {
+    if let (true, Some(home)) = (server, home) {
+        pairs.retain(|(key, _)| key != super::claude_config::VARIABLE);
+        pairs.push((
+            super::claude_config::VARIABLE.to_owned(),
+            super::claude_config::dir(home).display().to_string(),
+        ));
+    }
+    pairs
 }
 
 /// Removes terminal colour and cursor sequences.
@@ -638,6 +661,27 @@ mod tests {
         );
         let missing = github_status(Err(anyhow::anyhow!("Could not start gh")));
         assert_eq!(missing.detail, "Could not start gh");
+    }
+
+    #[test]
+    fn server_agents_share_claude_codes_config_directory() {
+        let token = ("CLAUDE_CODE_OAUTH_TOKEN".to_owned(), "sk-ant".to_owned());
+        let custom = ("CLAUDE_CONFIG_DIR".to_owned(), "/elsewhere".to_owned());
+        let home = Path::new("/home/difu");
+        assert_eq!(
+            server_env(vec![token.clone(), custom.clone()], true, Some(home)),
+            [
+                token.clone(),
+                (
+                    "CLAUDE_CONFIG_DIR".to_owned(),
+                    "/home/difu/.claude".to_owned()
+                ),
+            ]
+        );
+        // Ordinary installations keep the user's own Claude Code setup.
+        let ordinary = vec![token];
+        assert_eq!(server_env(ordinary.clone(), false, Some(home)), ordinary);
+        assert_eq!(server_env(ordinary.clone(), true, None), ordinary);
     }
 
     #[test]

@@ -131,9 +131,12 @@ Permission prompts are unchanged.
   * the session worktree and its base repository's `.git` mounted at the same
     absolute paths (worktree metadata keeps working; commits and pushes happen in
     the sandbox);
-  * the server's logins mounted (`~/.codex`, `~/.claude`, `~/.claude.json`,
-    `~/.config/gh`), and `~/.gitconfig` plus the host's CLI binaries
-    (`~/.local/bin`, Claude's versions directory) mounted read-only;
+  * the server's logins mounted (`~/.codex`, `~/.claude`, `~/.config/gh`), and
+    `~/.gitconfig` plus the host's CLI binaries (`~/.local/bin`, Claude's
+    versions directory) mounted read-only;
+  * `CLAUDE_CONFIG_DIR=~/.claude`, so Claude Code's global config is
+    `~/.claude/.claude.json` inside the mounted directory (see *Claude Code's
+    shared config*);
   * the session's attachment directory (`<data>/agents/attachments/<id>`)
     mounted read-only, so Codex can read images sent from a Mac or a phone by
     path and the agent can open mentioned videos;
@@ -251,6 +254,38 @@ pull request for the preserved branch on its own), shells and their output, and
 ignored files. The handoff contains the whole chat, which for very long sessions
 can be large for the provider, as with provider switching. Moving a server
 session back to a computer or on to another server is not supported.
+
+### Claude Code's shared config
+
+Claude Code keeps its global config (account state, onboarding, user MCP
+servers, per-project trust) in `$CLAUDE_CONFIG_DIR/.claude.json`, or
+`~/.claude.json` when the variable is unset. It saves the file under a lock
+directory beside it (`.claude.json.lock`, `mkdir`/`rmdir`) by writing
+`.claude.json.tmp.<pid>.<hex>` next to it and renaming that over the file; when
+the rename fails with `EXDEV`, `EPERM`, `EEXIST` or `EBUSY` it truncates and
+rewrites the file in place. A sandbox with only the file `~/.claude.json`
+mounted therefore took the lock in its own throwaway home (no exclusion between
+sessions) and could not rename onto the mount point, so concurrent sessions
+rewrote the shared file in place, where another process could read it half
+written.
+
+On a server every writer uses one directory instead:
+
+* The service (`difu-agent.service` sets `CLAUDE_CONFIG_DIR=~/.claude`, and the
+  service adds it to every agent's environment in server mode), every sandbox
+  (the variable plus the `~/.claude` directory mount) and SSH logins (an
+  `export` in the `difu` user's `~/.profile`) share `~/.claude/.claude.json`,
+  its lock and its temporary files, so writes exclude each other and replace
+  the file atomically.
+* `difu serve` moves an existing `~/.claude.json` into `~/.claude/` when it
+  starts (before any session runs), under Claude Code's own lock, keeps the
+  original as `~/.claude.json.difu-backup-<time>`, and leaves `~/.claude.json`
+  as a symlink to `.claude/.claude.json`, so a Claude Code started without the
+  variable (an installer, `claude update`) still reads the same file and
+  replaces it atomically through the link. Starting a sandbox repeats the check.
+  If both files exist, the more recently written one becomes the shared file
+  and the other is kept as a backup. A symlink the user made is left alone.
+* Ordinary installations are unchanged: only server mode sets the variable.
 
 ## Wire protocol additions
 

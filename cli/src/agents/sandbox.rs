@@ -18,6 +18,11 @@
 //!   absolute paths, with `HOME` set to the host home. So is the session's
 //!   attachment directory (read-only): Codex reads pasted and uploaded images
 //!   by path, and videos are mentioned by path.
+//! * Claude Code's global config is shared through the mounted `~/.claude`
+//!   directory, never as a single mounted file: every process runs with
+//!   `CLAUDE_CONFIG_DIR=~/.claude`, so concurrent sessions and the host take the
+//!   same lock and replace the file with an atomic rename (see
+//!   [`crate::cloud::claude_config`]).
 //! * User mapping: rootless Podman's default mapping, pinned with `--user 0:0`
 //!   so an image's `USER` cannot change it. Container root is the host user that
 //!   runs difu (`difu` on a server) and has no privileges outside the
@@ -34,7 +39,7 @@
 //!   containers a stopped service left behind ([`sweep`]).
 use super::{Job, Session};
 use crate::{
-    cloud::{SandboxSettings, ServerSettings, cli::SandboxCommand},
+    cloud::{SandboxSettings, ServerSettings, claude_config, cli::SandboxCommand},
     process::{self, Cancel},
     storage::Storage,
 };
@@ -66,7 +71,9 @@ const ROLE_LABEL: &str = "difu.role";
 const SYSTEM_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 /// Server logins, relative to the home directory. Read-write: the CLIs refresh
 /// tokens and keep their conversation history there, which resuming needs.
-const LOGINS: [&str; 4] = [".codex", ".claude", ".claude.json", ".config/gh"];
+/// Claude Code's `.claude.json` lives inside `.claude` (`CLAUDE_CONFIG_DIR`):
+/// a single-file mount would break its lock and atomic rename.
+const LOGINS: [&str; 3] = [".codex", ".claude", ".config/gh"];
 /// Read-only: the Git identity and `gh auth setup-git` credential helper that
 /// commits and pushes need, and the agent CLIs (updated on the host).
 const READ_ONLY: [&str; 3] = [".gitconfig", ".local/bin", ".local/share/claude"];
@@ -118,6 +125,7 @@ impl Sandbox {
             installed(PODMAN),
             "Sandboxing is enabled on this server, but Podman is not installed. Install podman, or turn sandboxing off (server.sandbox.enabled in config.json) to run agents directly on the server"
         );
+        share_claude_config(&sandbox.home)?;
         // Created now, so media sent later appears inside the running sandbox.
         sandbox.attachments = Some(super::media::directory(storage, &session.id)?);
         Ok(Some(sandbox))
@@ -262,8 +270,8 @@ impl Sandbox {
         Ok(Invocation { args, env })
     }
 
-    /// The sandbox's own variables, then the command's. `HOME` and `PATH`
-    /// always describe the sandbox, never the host process.
+    /// The sandbox's own variables, then the command's. `HOME`, `PATH` and
+    /// `CLAUDE_CONFIG_DIR` always describe the sandbox, never the host process.
     fn variables(&self, program: &Program) -> Vec<Variable> {
         let mut path = self.home.join(".local/bin").into_os_string();
         path.push(":");
@@ -277,9 +285,12 @@ impl Sandbox {
             Variable::plain("DISABLE_AUTOUPDATER", "1"),
             // Container root is the unprivileged host user (see the module docs).
             Variable::plain("IS_SANDBOX", "1"),
+            // The mounted directory holds `.claude.json`, its lock and its
+            // temporary files, shared with every other session and the host.
+            Variable::plain(claude_config::VARIABLE, claude_config::dir(&self.home)),
         ];
         for (key, value) in &program.env {
-            if key == "HOME" || key == "PATH" {
+            if key == "HOME" || key == "PATH" || key == claude_config::VARIABLE {
                 continue;
             }
             variables.retain(|variable| &variable.key != key);
@@ -387,6 +398,19 @@ impl Sandbox {
         }
         args
     }
+}
+
+/// Before a sandbox mounts `~/.claude`: the directory exists and holds the
+/// one shared `.claude.json`. Moving a stray file is best effort; the mount
+/// itself is not.
+fn share_claude_config(home: &Path) -> Result<()> {
+    match claude_config::share(home) {
+        Ok(Some(note)) => eprintln!("{note}"),
+        Ok(None) => {}
+        Err(error) => eprintln!("Claude Code config: {error:#}"),
+    }
+    claude_config::ensure_dir(home)?;
+    Ok(())
 }
 
 /// Removes its sandbox container when dropped. Own it next to the process
@@ -1123,6 +1147,7 @@ mod tests {
             .args(["--print", "--model=opus"])
             .current_dir("/srv/worktrees/1791-abc")
             .env("CLAUDE_CODE_OAUTH_TOKEN", "secret-token")
+            .env("CLAUDE_CONFIG_DIR", "/root/.claude")
             .env("HOME", "/root")
             .env("LANG", "en_US.UTF-8")
             .env("XDG_CONFIG_HOME", "/home/difu/.config")
@@ -1182,6 +1207,8 @@ mod tests {
                 "DISABLE_AUTOUPDATER=1",
                 "-e",
                 "IS_SANDBOX=1",
+                "-e",
+                "CLAUDE_CONFIG_DIR=/home/difu/.claude",
                 "-e",
                 "CLAUDE_CODE_OAUTH_TOKEN",
                 "-e",
@@ -1331,6 +1358,7 @@ mod tests {
         )?;
         let home = root.join("home");
         fs::create_dir_all(home.join(".codex"))?;
+        fs::create_dir_all(home.join(".claude"))?;
         fs::create_dir_all(home.join(".local/bin"))?;
         fs::write(home.join(".claude.json"), "{}")?;
         fs::write(home.join(".gitconfig"), "")?;
@@ -1353,12 +1381,21 @@ mod tests {
             writable(worktree.clone()),
             writable(repository.join(".git")),
             writable(home.join(".codex")),
-            writable(home.join(".claude.json")),
+            writable(home.join(".claude")),
             read_only(home.join(".gitconfig")),
             read_only(home.join(".local/bin")),
         ];
         // A missing attachment directory is not mounted (Podman would fail).
         assert_eq!(sandbox.mounts(&worktree), expected);
+        // Never the single file: Claude Code could neither lock it nor rename
+        // onto it from inside a container.
+        ensure!(
+            !sandbox
+                .mounts(&worktree)
+                .iter()
+                .any(|mount| mount.path.ends_with(".claude.json")),
+            "~/.claude.json must not be mounted as a file"
+        );
         // Media sent to the session is readable inside, but cannot be changed.
         fs::create_dir_all(&attachments)?;
         let mounts = sandbox.mounts(&worktree);
@@ -1661,28 +1698,43 @@ mod tests {
         assert!(remote.contains("pulls it on first use"), "{remote}");
     }
 
-    /// Runs only where rootless Podman works (Linux CI); skips elsewhere.
-    #[test]
-    fn podman_runs_session_processes_in_the_pod_and_removes_them() -> Result<()> {
-        const IMAGE: &str = "quay.io/libpod/alpine:latest";
+    const TEST_IMAGE: &str = "quay.io/libpod/alpine:latest";
+
+    /// Whether rootless Podman works here with the test image (Linux CI).
+    fn podman_ready(test: &str) -> bool {
         let podman = Podman;
-        let available = installed(PODMAN)
-            && podman
-                .podman(&os(["info"]))
-                .is_ok_and(|output| output.code == 0);
-        if !available {
-            eprintln!("Skipping the Podman sandbox test: Podman is not available");
-            return Ok(());
-        }
         let succeeds = |args: &[&str]| {
             podman
                 .podman(&os(args.iter().copied()))
                 .is_ok_and(|output| output.code == 0)
         };
-        if !succeeds(&["image", "exists", IMAGE]) && !succeeds(&["pull", "-q", IMAGE]) {
-            eprintln!("Skipping the Podman sandbox test: cannot pull {IMAGE}");
+        if !installed(PODMAN) || !succeeds(&["info"]) {
+            eprintln!("Skipping {test}: Podman is not available");
+            return false;
+        }
+        if !succeeds(&["image", "exists", TEST_IMAGE]) && !succeeds(&["pull", "-q", TEST_IMAGE]) {
+            eprintln!("Skipping {test}: cannot pull {TEST_IMAGE}");
+            return false;
+        }
+        true
+    }
+
+    fn test_session(tag: &str) -> String {
+        format!(
+            "test-{tag}-{}-{:x}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_millis()
+        )
+    }
+
+    /// Runs only where rootless Podman works (Linux CI); skips elsewhere.
+    #[test]
+    fn podman_runs_session_processes_in_the_pod_and_removes_them() -> Result<()> {
+        const IMAGE: &str = TEST_IMAGE;
+        if !podman_ready("the Podman sandbox test") {
             return Ok(());
         }
+        let podman = Podman;
         let temp = tempfile::tempdir()?;
         let workspace = temp.path().canonicalize()?.join("workspace");
         let home = temp.path().canonicalize()?.join("home");
@@ -1691,11 +1743,7 @@ mod tests {
         fs::create_dir_all(&home)?;
         fs::create_dir_all(&attachments)?;
         fs::write(attachments.join("media-1.png"), "uploaded")?;
-        let session = format!(
-            "test-{}-{:x}",
-            std::process::id(),
-            chrono::Utc::now().timestamp_millis()
-        );
+        let session = test_session("pod");
         let sandbox = Sandbox {
             pod: pod_name(&session)?,
             session: session.clone(),
@@ -1781,6 +1829,116 @@ mod tests {
         })();
         remove_pod_with(&podman, &session)?;
         ensure!(!exists("pod", &sandbox.pod)?, "The pod was not removed");
+        result
+    }
+
+    /// Two sessions' sandboxes rewrite the shared Claude Code config at the
+    /// same time the way Claude Code does: under the `.claude.json.lock`
+    /// directory, by renaming a temporary file over `.claude.json`. Every read
+    /// on the host sees whole JSON and no update is lost, which needs the lock
+    /// and the rename to happen in one shared directory. Runs only where
+    /// rootless Podman works (Linux CI); skips elsewhere.
+    #[test]
+    fn podman_sandboxes_share_the_claude_config_lock_and_replace_it_atomically() -> Result<()> {
+        const ROUNDS: u64 = 40;
+        const SCRIPT: &str = r#"
+f="$CLAUDE_CONFIG_DIR/.claude.json"
+i=0
+while [ "$i" -lt "$ROUNDS" ]; do
+  until mkdir "$f.lock" 2>/dev/null; do :; done
+  n=$(sed -n 's/.*"count":\([0-9]*\).*/\1/p' "$f")
+  printf '{"count":%d,"writer":"%s","padding":"%s"}\n' "$((${n:-0} + 1))" "$WRITER" "$PADDING" > "$f.tmp.$$"
+  mv -f "$f.tmp.$$" "$f"
+  rmdir "$f.lock"
+  i=$((i + 1))
+done
+"#;
+        if !podman_ready("the shared Claude Code config test") {
+            return Ok(());
+        }
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let home = root.join("home");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace)?;
+        fs::create_dir_all(&home)?;
+        // An existing config moves into the shared directory first.
+        fs::write(home.join(".claude.json"), "{\"count\":0}\n")?;
+        share_claude_config(&home)?;
+        let config = claude_config::dir(&home).join(".claude.json");
+        ensure!(config.is_file(), "The config did not move into ~/.claude");
+        let sandboxes = ["a", "b"]
+            .into_iter()
+            .map(|writer| -> Result<(String, Sandbox)> {
+                let session = test_session(&format!("claude-{writer}"));
+                Ok((
+                    writer.to_owned(),
+                    Sandbox {
+                        pod: pod_name(&session)?,
+                        session,
+                        image: TEST_IMAGE.into(),
+                        cpus: String::new(),
+                        memory: String::new(),
+                        home: home.clone(),
+                        workspace: workspace.clone(),
+                        attachments: None,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let padding = "x".repeat(16 * 1024);
+        let result = (|| -> Result<()> {
+            let mut running = Vec::new();
+            for (writer, sandbox) in &sandboxes {
+                let mut command = Command::new("sh");
+                command
+                    .args(["-c", SCRIPT])
+                    .current_dir(&workspace)
+                    .env("ROUNDS", ROUNDS.to_string())
+                    .env("WRITER", writer)
+                    .env("PADDING", &padding);
+                let (mut wrapped, container) = sandbox.command(Role::Claude, &command)?;
+                let child = wrapped
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .spawn()?;
+                running.push((child, container));
+            }
+            // Read the file the whole time both sandboxes write it.
+            let mut reads = 0u64;
+            while running
+                .iter_mut()
+                .any(|(child, _)| child.try_wait().is_ok_and(|status| status.is_none()))
+            {
+                let text = fs::read_to_string(&config)?;
+                let value: serde_json::Value = serde_json::from_str(&text)
+                    .with_context(|| format!("A torn config was visible: {} bytes", text.len()))?;
+                ensure!(value.get("count").is_some(), "No count in {text}");
+                reads += 1;
+            }
+            for (child, mut container) in running {
+                let output = child.wait_with_output()?;
+                container.exited();
+                ensure!(
+                    output.status.success(),
+                    "A writer failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let value: serde_json::Value = serde_json::from_str(&fs::read_to_string(&config)?)?;
+            assert_eq!(
+                value.get("count").and_then(serde_json::Value::as_u64),
+                Some(2 * ROUNDS),
+                "Updates were lost, so the sandboxes did not share the lock"
+            );
+            ensure!(reads > 0, "The host never read the config");
+            ensure!(!claude_config::dir(&home).join(".claude.json.lock").exists());
+            Ok(())
+        })();
+        for (_, sandbox) in &sandboxes {
+            remove_pod_with(&Podman, &sandbox.session)?;
+        }
         result
     }
 }

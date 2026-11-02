@@ -1,6 +1,7 @@
 //! Cloud agents: difu running headless on a Linux server (`difu serve`) and the
 //! clients that connect to any number of such servers. Design and wire contract:
 //! docs/cloud-agents.md.
+pub mod claude_config;
 pub mod cli;
 pub mod client;
 pub mod federation;

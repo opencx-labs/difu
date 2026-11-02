@@ -1797,10 +1797,46 @@ mod tests {
             "ExecStart=/usr/local/bin/difu serve",
             "Restart=always",
             "Environment=XDG_RUNTIME_DIR=/run/user/@UID@",
+            "Environment=CLAUDE_CONFIG_DIR=@HOME@/.claude",
             "EnvironmentFile=-@HOME@/.config/difu/server.env",
         ] {
             assert!(UNIT.lines().any(|candidate| candidate == line), "{line}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_logins_share_the_services_claude_code_config_once() -> Result<()> {
+        let start = BOOTSTRAP
+            .find("share_claude_config() {")
+            .context("no share_claude_config")?;
+        let body = BOOTSTRAP
+            .get(start..)
+            .and_then(|rest| rest.find("\n}\n").and_then(|end| rest.get(..end + 3)))
+            .context("unterminated share_claude_config")?;
+        let home = tempfile::tempdir()?;
+        fs::write(home.path().join(".profile"), "PATH=\"$HOME/bin:$PATH\"\n")?;
+        for _ in 0..2 {
+            let output = run_bash(
+                &format!("set -eu\nas_difu() {{ \"$@\"; }}\n{body}share_claude_config \"$1\"\n"),
+                &["-s", &home.path().to_string_lossy()],
+            )?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let profile = fs::read_to_string(home.path().join(".profile"))?;
+        assert!(profile.starts_with("PATH="), "{profile}");
+        assert_eq!(
+            profile
+                .lines()
+                .filter(|line| *line == "export CLAUDE_CONFIG_DIR=\"$HOME/.claude\"")
+                .count(),
+            1,
+            "{profile}"
+        );
         Ok(())
     }
 
