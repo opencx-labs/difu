@@ -97,6 +97,45 @@ mod tests {
     }
 
     #[test]
+    fn server_sessions_mark_a_server_short_of_disk_space() -> Result<()> {
+        let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
+        let mut session = crate::cloud::federation::tests::session("hetzner:1");
+        session.title = "Server task".into();
+        let mut summary = session.summary();
+        summary.server = Some("hetzner".into());
+        ui.summaries.push(summary);
+        ui.sessions.insert(session.id.clone(), session);
+        ui.selected = Some("hetzner:1".into());
+        ui.drilled = false;
+        ui.focus = Focus::List;
+        let text = screen(&mut ui)?;
+        assert!(!text.contains("disk low"), "{text}");
+        let low = federation::ServerStatus {
+            name: "hetzner".into(),
+            disk: Some(crate::cloud::disk::Report {
+                status: crate::cloud::disk::Status::Low,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        ui.cloud.remember(&[low]);
+        let text = screen(&mut ui)?;
+        assert!(text.contains("on hetzner (disk low)"), "{text}");
+        // A narrow list keeps the name, colored, without the words.
+        assert!(text.contains("hetzner · api"), "{text}");
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40))?;
+        terminal.draw(|frame| ui.draw(frame))?;
+        let colored = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|cell| cell.symbol() == "h" && cell.fg == crate::ui::YELLOW);
+        assert!(colored, "the server name takes the low-disk color");
+        Ok(())
+    }
+
+    #[test]
     fn server_session_artifacts_open_from_a_downloaded_copy() -> Result<()> {
         use base64::{Engine, engine::general_purpose::STANDARD};
         use std::io::{BufRead, BufReader, Write};

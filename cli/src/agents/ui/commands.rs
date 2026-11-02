@@ -15,6 +15,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Pair the difu iPhone app over Wi-Fi and manage phones",
     ),
     (
+        "cloud",
+        "Cloud servers: connection, logins, disk space and cleanups",
+    ),
+    (
         "voice",
         "Enable or disable voice; hold Space to start, Esc to end",
     ),
@@ -416,6 +420,7 @@ impl Ui {
             }
             "/slack" => self.open_slack(),
             "/remote-control" => self.open_remote(),
+            "/cloud" => self.open_cloud(None),
             "/voice" => self.toggle_voice(),
             "/tweaks" => self.open_tweaks(),
             "/theme" => self.open_theme(),
@@ -469,6 +474,7 @@ impl Ui {
         match name {
             "/slack" => self.open_slack(),
             "/remote-control" => self.open_remote(),
+            "/cloud" => self.open_cloud(Some(args)),
             "/rules" => self.open_rules(Some(args.into())),
             "/repo" => self.change_repository(args),
             "/worktree" => self.register_worktree(args),
