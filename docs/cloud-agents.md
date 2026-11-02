@@ -232,6 +232,9 @@ What moves:
 | Branch | The local branch name when it is free on the server, otherwise the managed `difu/agent-<id>`. Tracking `origin/<branch>` (as after `git push -u`) is restored, so pushes keep updating the branch and its pull request. |
 | Commits | The commits on the branch that are not on `origin/main`, as a `git bundle`. |
 | Uncommitted files | Modified, deleted and untracked files (binary-safe) as a scratch commit on top of HEAD, built with a temporary index so the local worktree and index do not change. They come back as unstaged changes and untracked files; staged changes become unstaged and ignored files stay behind. |
+| Attachments | The session's private copies of pasted images and videos that the chat refers to (not unreferenced copies or the composer draft). They become the server session's private copies in its attachment directory, which its sandbox mounts read-only like any server session's, and every path to them in the chat (prompts, attachment lists, video path text) is rewritten, so resending, the handoff and the agent all find them. |
+| HTML artifacts | Every registration with its title. Files in the worktree that git carries (tracked or untracked) arrive with the worktree; ignored files are written back to the same path in the new worktree; files registered in another workspace go to `artifacts/<n>/` in the session's attachment directory. Each registration points at its file on the server. |
+| Pull requests | PRs attached by URL (`difu_attach_pr`, `difu attach-pr`) are attached to the server session. PRs found from the branch are found again from the preserved branch. |
 
 A session cannot move while a turn is running, with pending questions or
 approvals, with queued messages, while archived, preparing, clearing or being
@@ -269,7 +272,14 @@ the result.
   "mode": "plan", "preset": null, "prompt": "Build the widget",
   "entries": [{"id": "…", "kind": "userMessage", "text": "Build the widget", "data": null}],
   "repository": "acme/widgets", "branch": "difu/agent-1790000000000-ab12cd34", "upstream": true,
-  "head": "<sha>", "wip": "<sha> | null", "bundle": "<base64 git bundle> | null", "commits": 2
+  "head": "<sha>", "wip": "<sha> | null", "bundle": "<base64 git bundle> | null", "commits": 2,
+  "media": [{"path": "/Users/me/…/agents/attachments/1790000000000-ab12cd34/media-x1.png", "data": "<base64>"}],
+  "artifacts": [
+    {"path": "report.html", "title": "Report", "outside": false, "data": null},
+    {"path": "build/out.html", "title": "Build output", "outside": false, "data": "<base64>"},
+    {"path": "notes.html", "title": "Notes", "outside": true, "data": "<base64>"}
+  ],
+  "prs": [{"key": {"owner": "acme", "repo": "tools", "number": 42}, "state": "OPEN", "draft": false, "conflicts": false, "head_branch": "widget-tools", "head": "<sha>", "updated": "…", "summary": null}]
 }}}
 → {"Launched": "1790000100000-ef56ab78"}
 ```
@@ -279,18 +289,24 @@ the result.
 * `bundle` holds the commits from `origin/main` up to `wip` (or `head`) under one
   ref, `refs/difu/move/<source>`; it is `null` when there are none. `commits`
   counts the branch's own commits for the server's note.
-* Only a server-mode service imports; anything else answers with an error.
+* `media[].path` is the path the chat uses on this computer; the server stores
+  the file under the same name in its own attachment directory and replaces that
+  path everywhere in the chat.
+* `artifacts[].data` is `null` when the worktree changes carry the file (or it
+  no longer exists); `outside` marks a file registered in another workspace.
+* `prs` are the attached pull requests as the PR cache stores them; the server
+  attaches them without contacting GitHub.
+* Only a server-mode service imports; anything else answers with an error. A
+  failed import removes the worktree, branch and attachment copies it made.
 * A move travels in one WebSocket message: the serialized package plus a 64 KiB
   envelope must fit in 48 MiB. A larger session is refused before anything is
-  sent, with its size, the size of its commits and files, and the size of its
-  chat.
+  sent, with its size and a breakdown by part, largest first: attachments, HTML
+  artifacts, commits and files, chat, and other.
 
-Not moved: image and video attachments referenced in the chat (they stay on this
-computer), HTML artifacts, explicitly attached pull requests (the server finds a
-pull request for the preserved branch on its own), shells and their output, and
-ignored files. The handoff contains the whole chat, which for very long sessions
-can be large for the provider, as with provider switching. Moving a server
-session back to a computer or on to another server is not supported.
+Not moved: shells and their output, ignored files that are not artifacts, and
+the composer draft. The handoff contains the whole chat, which for very long
+sessions can be large for the provider, as with provider switching. Moving a
+server session back to a computer or on to another server is not supported.
 
 ### Claude Code's shared config
 

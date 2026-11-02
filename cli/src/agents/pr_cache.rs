@@ -410,6 +410,24 @@ pub(super) fn attach(
     save_snapshot(storage, &path, &saved)
 }
 
+/// The pull requests explicitly attached to a session, for moving it.
+pub(super) fn attached(storage: &Storage, id: &str) -> Vec<github::SessionPr> {
+    let mut saved = snapshot(storage, id);
+    for name in [SESSION_LINKS, "agent-prs.json"] {
+        let mut known = load_links(&storage.cache.join(name))
+            .remove(id)
+            .unwrap_or_default();
+        saved.retain_connected(&mut known);
+        merge_links(&mut saved.links, known);
+    }
+    saved
+        .links
+        .into_iter()
+        .filter(|link| link.attached)
+        .map(|link| link.pr)
+        .collect()
+}
+
 /// Branch switches in an existing worktree do not change its saved session ID.
 /// Discover against Git's current branch, retaining the saved branch as history.
 fn active_summary(session: &super::Summary, cancel: &Cancel) -> anyhow::Result<super::Summary> {

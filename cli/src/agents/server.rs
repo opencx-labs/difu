@@ -424,7 +424,11 @@ impl Service {
         // Connected, with full access and the same difu version.
         federation.remote_within(server, Duration::from_secs(10))?;
         self.stop_worker(id)?;
-        let package = super::moving::export(&self.store.get(id)?, &Cancel::default())?;
+        let package = super::moving::export(
+            &self.store.get(id)?,
+            &self.store.storage,
+            &Cancel::default(),
+        )?;
         super::moving::fits(&package, super::moving::LIMIT)?;
         let moved = match federation.forward(
             server,
@@ -3274,6 +3278,23 @@ mod move_tests {
 
         let imported = pair.server.store.get(id)?;
         assert!(pair.server.store.home.join(format!("{id}.json")).exists());
+        // Media, artifacts and attached pull requests came along.
+        let media = super::media::directory(&pair.server.store.storage, id)?;
+        assert!(media.join("media-clip.mp4").exists());
+        assert_eq!(
+            imported
+                .artifacts
+                .iter()
+                .map(|a| a.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Report", "Build output", "Notes"]
+        );
+        assert!(
+            super::pr_cache::snapshot(&pair.server.store.storage, id)
+                .links
+                .iter()
+                .any(|link| link.attached && link.pr.key.id() == "acme/tools#42")
+        );
         assert!(imported.provider_context.is_some() && imported.thread_id.is_none());
         assert!(
             imported

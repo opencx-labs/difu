@@ -1,20 +1,27 @@
 //! Moving a coding session from this computer to a saved cloud server. The local
 //! service exports the session (chat, settings, repository, branch, commits and
-//! uncommitted files as a git bundle) and sends it with `Request::Import` over the
-//! server's `rpc`; the server continues it as a new session in a normal difu
-//! worktree. Design and wire format: docs/cloud-agents.md.
-use super::{Entry, Job, Launch, Session, Status, permissions, provider, server::Store};
+//! uncommitted files as a git bundle, the media the chat refers to, HTML
+//! artifacts and attached pull requests) and sends it with `Request::Import`
+//! over the server's `rpc`; the server continues it as a new session in a
+//! normal difu worktree. Design and wire format: docs/cloud-agents.md.
+use super::{
+    Entry, Job, Launch, Session, Status, artifacts::Artifact, permissions, provider, server::Store,
+};
 use crate::{
+    github,
     process::{self, Cancel},
     repo,
+    storage::Storage,
 };
 use anyhow::{Context, Result, bail, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    fs,
-    path::{Path, PathBuf},
+    fs::{self, OpenOptions},
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::{Component, Path, PathBuf},
 };
 
 pub(super) const TOOL: &str = "difu_move_to_server";
@@ -78,6 +85,38 @@ pub struct Package {
     /// Commits on the branch that are not on origin/main.
     #[serde(default)]
     pub commits: usize,
+    /// The session's private media copies that the chat refers to.
+    #[serde(default)]
+    pub media: Vec<Media>,
+    /// HTML artifacts registered for the session.
+    #[serde(default)]
+    pub artifacts: Vec<MovedArtifact>,
+    /// Pull requests explicitly attached to the session.
+    #[serde(default)]
+    pub prs: Vec<github::SessionPr>,
+}
+
+/// One of the session's private media copies, by the path the chat uses.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Media {
+    pub path: PathBuf,
+    /// Base64 contents.
+    pub data: String,
+}
+
+/// An HTML artifact registration, with its file when the moved worktree
+/// changes do not carry it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MovedArtifact {
+    /// Relative to the workspace it was registered in.
+    pub path: PathBuf,
+    pub title: String,
+    /// Registered in a workspace other than the session's worktree.
+    #[serde(default)]
+    pub outside: bool,
+    /// Base64 contents of an ignored or outside file; `None` when the
+    /// worktree changes carry it, or when it no longer exists.
+    pub data: Option<String>,
 }
 
 /// Why `session` cannot move now.
@@ -123,7 +162,7 @@ pub(super) fn check(session: &Session) -> Result<()> {
 
 /// The local side of a move. Reads the worktree without changing it: the
 /// uncommitted files are captured with a temporary index.
-pub(super) fn export(session: &Session, cancel: &Cancel) -> Result<Package> {
+pub(super) fn export(session: &Session, storage: &Storage, cancel: &Cancel) -> Result<Package> {
     check(session)?;
     let Job::Coding(launch) = &session.job else {
         bail!("Only coding sessions can move to a server");
@@ -184,6 +223,14 @@ pub(super) fn export(session: &Session, cancel: &Cancel) -> Result<Package> {
     } else {
         None
     };
+    let entries: Vec<Entry> = session
+        .entries
+        .iter()
+        .filter(|entry| !transient(entry))
+        .cloned()
+        .collect();
+    let media = media(storage, &session.id, &entries)?;
+    let artifacts = artifacts(session, workspace, cancel)?;
     let state = &session.permission_state;
     Ok(Package {
         source: session.id.clone(),
@@ -199,12 +246,7 @@ pub(super) fn export(session: &Session, cancel: &Cancel) -> Result<Package> {
             .or(state.preset)
             .or_else(|| permissions::detected_preset(&session.permissions)),
         prompt: launch.prompt.clone(),
-        entries: session
-            .entries
-            .iter()
-            .filter(|entry| !transient(entry))
-            .cloned()
-            .collect(),
+        entries,
         repository,
         branch,
         upstream,
@@ -212,23 +254,51 @@ pub(super) fn export(session: &Session, cancel: &Cancel) -> Result<Package> {
         wip,
         bundle,
         commits,
+        media,
+        artifacts,
+        prs: super::pr_cache::attached(storage, &session.id),
     })
 }
 
-/// Refuses a package that cannot travel in one WebSocket message of `limit`.
+/// Refuses a package that cannot travel in one WebSocket message of `limit`,
+/// naming what takes the space.
 pub(super) fn fits(package: &Package, limit: usize) -> Result<()> {
     let size = serde_json::to_vec(package)?.len().saturating_add(ENVELOPE);
     if size <= limit {
         return Ok(());
     }
-    let work = package.bundle.as_ref().map_or(0, String::len);
-    let chat = serde_json::to_vec(&package.entries)?.len();
+    let mut parts = vec![
+        (
+            "commits and files",
+            package.bundle.as_ref().map_or(0, String::len),
+        ),
+        ("chat", serde_json::to_vec(&package.entries)?.len()),
+        (
+            "attachments",
+            package.media.iter().map(|media| media.data.len()).sum(),
+        ),
+        (
+            "HTML artifacts",
+            package
+                .artifacts
+                .iter()
+                .filter_map(|artifact| artifact.data.as_ref())
+                .map(String::len)
+                .sum(),
+        ),
+    ];
+    let counted: usize = parts.iter().map(|(_, size)| size).sum();
+    parts.push(("other", size.saturating_sub(counted)));
+    parts.sort_by_key(|(_, size)| std::cmp::Reverse(*size));
     bail!(
-        "This session is too large to move: it needs {} in one message and a server accepts at most {} (commits and files {}, chat {}). Remove large untracked files from the worktree or commit less binary data, then try again.",
+        "This session is too large to move: it needs {} in one message and a server accepts at most {}. By part: {}. Remove large attachments, artifacts or untracked files, or commit less binary data, then try again.",
         megabytes(size),
         megabytes(limit),
-        megabytes(work),
-        megabytes(chat)
+        parts
+            .iter()
+            .map(|(part, size)| format!("{part} {}", megabytes(*size)))
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
@@ -271,10 +341,21 @@ pub(super) fn import(
     session.title_attempted = true;
     super::rules::capture(&store.storage, &mut session)?;
     session.status = Status::Idle;
-    let restored = restore(package, &mut session, &store.home, cancel);
-    let branch = match restored {
-        Ok(branch) => branch,
+    let built = (|| -> Result<(String, Vec<Entry>)> {
+        let branch = restore(package, &mut session, &store.home, cancel)?;
+        let worktree = session
+            .workspace
+            .clone()
+            .context("The new worktree is missing")?;
+        let directory = super::media::directory(&store.storage, &session.id)?;
+        let entries = place_media(&package.media, &directory, &package.entries)?;
+        session.artifacts = place_artifacts(&package.artifacts, &worktree, &directory)?;
+        Ok((branch, entries))
+    })();
+    let (branch, entries) = match built {
+        Ok(built) => built,
         Err(error) => {
+            let _ = super::media::cleanup(&store.storage, &session.id);
             if session.workspace.is_some()
                 && let Err(cleanup) = super::workspace::discard(&session, &store.home, cancel)
             {
@@ -285,13 +366,18 @@ pub(super) fn import(
             return Err(error);
         }
     };
-    session.entries = package
-        .entries
+    // Pull request links are metadata; one that cannot be attached is reported.
+    let summary = session.summary();
+    let unattached: Vec<String> = package
+        .prs
         .iter()
-        .filter(|entry| !transient(entry))
-        .cloned()
+        .filter(|pr| {
+            super::pr_cache::attach(&store.storage, &summary, (*pr).clone(), cancel).is_err()
+        })
+        .map(|pr| pr.key.id())
         .collect();
-    session.note("system", note(package, &branch));
+    session.entries = entries;
+    session.note("system", note(package, &branch, &unattached));
     session.provider_context = provider::handoff(&session.entries, 0);
     Ok(session)
 }
@@ -589,7 +675,7 @@ fn restore(
     })
 }
 
-fn note(package: &Package, branch: &str) -> String {
+fn note(package: &Package, branch: &str, unattached: &[String]) -> String {
     let commits = match package.commits {
         0 => "no commits".to_owned(),
         1 => "1 commit".to_owned(),
@@ -600,10 +686,249 @@ fn note(package: &Package, branch: &str) -> String {
     } else {
         ""
     };
+    let count = |n: usize, one: &str, many: &str| match n {
+        1 => format!("1 {one}"),
+        n => format!("{n} {many}"),
+    };
+    let extras = [
+        (
+            package.media.len(),
+            count(package.media.len(), "attachment", "attachments"),
+        ),
+        (
+            package.artifacts.len(),
+            count(package.artifacts.len(), "HTML artifact", "HTML artifacts"),
+        ),
+        (
+            package.prs.len(),
+            count(
+                package.prs.len(),
+                "attached pull request",
+                "attached pull requests",
+            ),
+        ),
+    ]
+    .into_iter()
+    .filter(|(n, _)| *n > 0)
+    .map(|(_, text)| text)
+    .collect::<Vec<_>>();
+    let extras = if extras.is_empty() {
+        String::new()
+    } else {
+        format!(" It brought {}.", extras.join(", "))
+    };
+    let unattached = if unattached.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Could not attach {}; attach them again with difu_attach_pr.",
+            unattached.join(", ")
+        )
+    };
     format!(
-        "Moved here from {} (session {}). Branch {branch} has {commits} ahead of origin/main{files}. The next message continues this conversation on this server.",
+        "Moved here from {} (session {}). Branch {branch} has {commits} ahead of origin/main{files}.{extras}{unattached} The next message continues this conversation on this server.",
         package.computer, package.source
     )
+}
+
+/// The session's private media copies that the chat refers to.
+fn media(storage: &Storage, id: &str, entries: &[Entry]) -> Result<Vec<Media>> {
+    let directory = super::media::directory(storage, id)?;
+    let chat = serde_json::to_string(entries)?;
+    let canonical = directory.canonicalize()?;
+    let mut media = Vec::new();
+    for item in fs::read_dir(&directory)? {
+        let item = item?;
+        let name = item.file_name();
+        if !item.file_type()?.is_file() || name == "draft.json" {
+            continue;
+        }
+        // The chat stores the path it was given; look for both spellings.
+        let referenced = [directory.join(&name), canonical.join(&name)]
+            .into_iter()
+            .find(|path| {
+                path.to_str()
+                    .and_then(|path| serde_json::to_string(path).ok())
+                    .is_some_and(|quoted| {
+                        quoted
+                            .strip_prefix('"')
+                            .and_then(|quoted| quoted.strip_suffix('"'))
+                            .is_some_and(|escaped| chat.contains(escaped))
+                    })
+            });
+        if let Some(path) = referenced {
+            media.push(Media {
+                data: STANDARD.encode(fs::read(&path)?),
+                path,
+            });
+        }
+    }
+    media.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(media)
+}
+
+/// The session's artifact registrations, with the files the worktree changes
+/// do not carry: ignored files and files in other workspaces.
+fn artifacts(session: &Session, workspace: &Path, cancel: &Cancel) -> Result<Vec<MovedArtifact>> {
+    let current = workspace.canonicalize()?;
+    session
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            let root = artifact
+                .workspace
+                .clone()
+                .unwrap_or_else(|| workspace.to_owned());
+            let outside = root.canonicalize().map_or(true, |root| root != current);
+            let file = super::artifacts::resolve(&root, &artifact.path).ok();
+            // Exit 1: not ignored, so the scratch commit or HEAD has it.
+            let carried = !outside
+                && match artifact.path.to_str() {
+                    Some(path) => {
+                        process::run(
+                            repo::git(workspace).args(["check-ignore", "-q", "--", path]),
+                            None,
+                            cancel,
+                        )?
+                        .code
+                            == 1
+                    }
+                    None => false,
+                };
+            let data = match file {
+                Some(file) if !carried => Some(STANDARD.encode(fs::read(file)?)),
+                _ => None,
+            };
+            Ok(MovedArtifact {
+                path: artifact.path.clone(),
+                title: artifact.title.clone(),
+                outside,
+                data,
+            })
+        })
+        .collect()
+}
+
+/// A media file name from this computer's attachment directory.
+fn media_name(path: &Path) -> Option<&str> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| {
+            !name.is_empty()
+                && name.len() <= 255
+                && !name.starts_with('.')
+                && *name != "draft.json"
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c))
+        })
+}
+
+fn create(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .custom_flags(nix::libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("Cannot write {}", path.display()))?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+/// Every string in `value` with `from` replaced by `to`.
+fn rewrite(value: &mut Value, from: &str, to: &str) {
+    match value {
+        Value::String(text) if text.contains(from) => *text = text.replace(from, to),
+        Value::Array(items) => items.iter_mut().for_each(|item| rewrite(item, from, to)),
+        Value::Object(map) => map.values_mut().for_each(|item| rewrite(item, from, to)),
+        _ => {}
+    }
+}
+
+/// Stores the moved media as this session's private copies and points the
+/// chat (and so the handoff) at them.
+fn place_media(media: &[Media], directory: &Path, entries: &[Entry]) -> Result<Vec<Entry>> {
+    let mut value = serde_json::to_value(
+        entries
+            .iter()
+            .filter(|entry| !transient(entry))
+            .collect::<Vec<_>>(),
+    )?;
+    for item in media {
+        let name = media_name(&item.path)
+            .with_context(|| format!("Invalid attachment name {}", item.path.display()))?;
+        let target = directory.join(name);
+        let bytes = STANDARD
+            .decode(&item.data)
+            .context("A moved attachment is not valid base64")?;
+        create(&target, &bytes, 0o600)?;
+        if let (Some(from), Some(to)) = (item.path.to_str(), target.to_str()) {
+            rewrite(&mut value, from, to);
+        }
+    }
+    Ok(serde_json::from_value(value)?)
+}
+
+fn relative(path: &Path) -> bool {
+    path.components().next().is_some()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// Registers the moved artifacts: worktree files stay in the worktree (ignored
+/// ones are written back), files from other workspaces go to the session's
+/// attachment directory, which sandboxes can read.
+fn place_artifacts(
+    moved: &[MovedArtifact],
+    worktree: &Path,
+    directory: &Path,
+) -> Result<Vec<Artifact>> {
+    let worktree = worktree.canonicalize()?;
+    moved
+        .iter()
+        .enumerate()
+        .map(|(index, artifact)| {
+            ensure!(
+                relative(&artifact.path),
+                "Invalid artifact path {}",
+                artifact.path.display()
+            );
+            let root = if artifact.outside {
+                let root = directory.join("artifacts").join(index.to_string());
+                fs::create_dir_all(&root)?;
+                root.canonicalize()?
+            } else {
+                worktree.clone()
+            };
+            if let Some(data) = &artifact.data {
+                let file = root.join(&artifact.path);
+                let parent = file.parent().context("Invalid artifact path")?;
+                fs::create_dir_all(parent)?;
+                ensure!(
+                    parent.canonicalize()?.starts_with(&root),
+                    "Artifact {} would land outside its workspace",
+                    artifact.path.display()
+                );
+                if !file.exists() {
+                    let bytes = STANDARD
+                        .decode(data)
+                        .context("A moved artifact is not valid base64")?;
+                    create(&file, &bytes, 0o644)?;
+                }
+            }
+            Ok(Artifact {
+                path: artifact.path.clone(),
+                title: crate::model::clean(&artifact.title)
+                    .chars()
+                    .take(160)
+                    .collect(),
+                workspace: Some(root),
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -736,7 +1061,103 @@ pub(crate) mod tests {
         session.thread_id = Some("local-native-thread".into());
         session.note("userMessage", "Build the widget");
         session.note("agentMessage", "The widget is half done; next: the logo.");
+        extras(temp, home, &mut session)?;
         Ok(session)
+    }
+
+    /// The service storage of the computer whose home is `home`.
+    pub(crate) fn local_storage(home: &Path) -> Storage {
+        Storage {
+            config: home.join("config.json"),
+            cache: home.join("cache"),
+        }
+    }
+
+    pub(crate) fn png() -> Result<Vec<u8>> {
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2))
+            .write_to(&mut png, image::ImageFormat::Png)?;
+        Ok(png.into_inner())
+    }
+
+    /// What a session has besides its worktree: a pasted image and video the
+    /// chat refers to (plus an unreferenced copy and a composer draft), an
+    /// untracked, an ignored and an out-of-tree HTML artifact, and a pull
+    /// request attached by URL.
+    fn extras(temp: &Path, home: &Path, session: &mut Session) -> Result<()> {
+        let storage = local_storage(home);
+        let worktree = session.workspace.clone().context("worktree")?;
+        let mut image = super::super::media::store(&storage, &session.id, &png()?)?;
+        image.label = "image 1".into();
+        let directory = super::super::media::directory(&storage, &session.id)?;
+        let clip = directory.join("media-clip.mp4");
+        fs::write(&clip, b"video frames")?;
+        let video = super::super::media::Attachment {
+            label: "video 1".into(),
+            path: clip.clone(),
+            kind: super::super::media::Kind::Video,
+            hash: format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(b"video frames")
+            ),
+        };
+        fs::write(directory.join("media-unused.png"), png()?)?;
+        super::super::media::save_draft(&storage, &session.id, std::slice::from_ref(&image))?;
+        let prompt = super::super::Prompt::WithSkills {
+            text: "Match this [image 1] and [video 1]".into(),
+            skills: Vec::new(),
+            attachments: vec![image.clone(), video.clone()],
+        };
+        session.note("userMessage", prompt.text());
+        if let Some(entry) = session.entries.last_mut() {
+            entry.data = json!({
+                "prompt": prompt,
+                "attachments": [image, video],
+                "wire_text": format!("Match this\n[video 1] Local video path (not extracted into frames by difu): {}", clip.display()),
+            })
+            .into();
+        }
+
+        fs::write(worktree.join(".gitignore"), "build/\n")?;
+        fs::write(worktree.join("report.html"), "<h1>Report</h1>")?;
+        fs::create_dir_all(worktree.join("build"))?;
+        fs::write(worktree.join("build").join("out.html"), "<h1>Build</h1>")?;
+        let external = temp.join("external");
+        fs::create_dir_all(&external)?;
+        fs::write(external.join("notes.html"), "<h1>Notes</h1>")?;
+        let root = worktree.canonicalize()?;
+        for (path, title, workspace) in [
+            ("report.html", "Report", root.clone()),
+            ("build/out.html", "Build output", root),
+            ("notes.html", "Notes", external.canonicalize()?),
+        ] {
+            session.artifacts.push(Artifact {
+                path: path.into(),
+                title: title.into(),
+                workspace: Some(workspace),
+            });
+        }
+
+        super::super::pr_cache::attach(
+            &storage,
+            &session.summary(),
+            github::SessionPr {
+                summary: None,
+                key: crate::model::PrKey {
+                    owner: "acme".into(),
+                    repo: "tools".into(),
+                    number: 42,
+                },
+                state: "OPEN".into(),
+                draft: false,
+                conflicts: false,
+                head_branch: "widget-tools".into(),
+                head: "abc123".into(),
+                updated: "2026-11-01T00:00:00Z".into(),
+            },
+            &Cancel::default(),
+        )?;
+        Ok(())
     }
 
     /// A server's storage in server mode whose base clone of `REPOSITORY` came
@@ -775,7 +1196,7 @@ pub(crate) mod tests {
         let before = status(&worktree)?;
         let head = git(&worktree, &["rev-parse", "HEAD"])?;
 
-        let package = export(&session, &Cancel::default())?;
+        let package = export(&session, &local_storage(&local_home), &Cancel::default())?;
         // Exporting reads the worktree without changing it or leaving refs.
         assert_eq!(status(&worktree)?, before);
         assert_eq!(git(&worktree, &["rev-parse", "HEAD"])?, head);
@@ -787,7 +1208,53 @@ pub(crate) mod tests {
         assert_eq!(package.commits, 2);
         assert!(package.wip.is_some() && package.bundle.is_some());
         assert_eq!(package.mode.as_deref(), Some("plan"));
-        assert_eq!(package.entries.len(), 2);
+        assert_eq!(package.entries.len(), 3);
+        // Only the media the chat refers to travels; drafts stay behind.
+        let local_media = super::super::media::directory(&local_storage(&local_home), "one")?;
+        let mut names: Vec<_> = package
+            .media
+            .iter()
+            .filter_map(|media| media.path.file_name().and_then(|name| name.to_str()))
+            .collect();
+        names.sort_unstable();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"media-clip.mp4"));
+        assert!(
+            names
+                .iter()
+                .all(|name| name.starts_with("media-") && *name != "media-unused.png")
+        );
+        assert!(
+            package
+                .media
+                .iter()
+                .all(|media| media.path.starts_with(&local_media))
+        );
+        // Untracked artifacts come with the worktree; ignored and out-of-tree
+        // ones bring their files.
+        let artifacts: Vec<_> = package
+            .artifacts
+            .iter()
+            .map(|a| {
+                (
+                    a.path.to_string_lossy().into_owned(),
+                    a.outside,
+                    a.data.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            artifacts,
+            [
+                ("report.html".to_owned(), false, false),
+                ("build/out.html".to_owned(), false, true),
+                ("notes.html".to_owned(), true, true),
+            ]
+        );
+        assert_eq!(
+            package.prs.iter().map(|pr| pr.key.id()).collect::<Vec<_>>(),
+            ["acme/tools#42"]
+        );
         fits(&package, LIMIT)?;
 
         // Other work lands on main before the server prepares the worktree.
@@ -852,9 +1319,100 @@ pub(crate) mod tests {
         let note = texts.last().context("note")?;
         assert!(note.starts_with("Moved here from ") && note.contains("session one"));
         assert!(note.contains("2 commits ahead of origin/main and the uncommitted files"));
+        assert!(
+            note.contains("It brought 2 attachments, 3 HTML artifacts, 1 attached pull request."),
+            "{note}"
+        );
         let handoff = imported.provider_context.as_deref().context("handoff")?;
         assert!(handoff.starts_with("Difu conversation handoff."));
         assert!(handoff.contains("next: the logo") && handoff.contains("Moved here from"));
+
+        // Media: private copies in the server session's attachment directory
+        // (mounted into its sandbox), and the chat and handoff point at them.
+        let server_media = super::super::media::directory(&storage, "two")?;
+        let server_media_root = server_media.canonicalize()?;
+        assert!(!handoff.contains(&local_media.to_string_lossy().into_owned()));
+        assert!(handoff.contains(&server_media.to_string_lossy().into_owned()));
+        let message = imported
+            .entries
+            .iter()
+            .find(|entry| entry.text.contains("[image 1]"))
+            .context("message with media")?;
+        let attachments: Vec<super::super::media::Attachment> = serde_json::from_value(
+            message
+                .data
+                .get("attachments")
+                .cloned()
+                .context("attachments")?,
+        )?;
+        assert_eq!(attachments.len(), 2);
+        for attachment in &attachments {
+            assert_eq!(attachment.path.parent(), Some(server_media.as_path()));
+            super::super::media::validate(&storage, "two", attachment)?;
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&attachment.path)?.permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        let prompt: super::super::Prompt =
+            serde_json::from_value(message.data.get("prompt").cloned().context("prompt")?)?;
+        assert_eq!(prompt.attachments(), attachments.as_slice());
+        let clip = server_media.join("media-clip.mp4");
+        assert_eq!(fs::read(&clip)?, b"video frames");
+        assert!(
+            message
+                .data
+                .get("wire_text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.ends_with(&clip.to_string_lossy().into_owned()))
+        );
+        assert!(!server_media.join("media-unused.png").exists());
+        assert!(!server_media.join("draft.json").exists());
+
+        // Artifacts: the same registrations, each resolving to its file.
+        let listed: Vec<_> = imported
+            .artifacts
+            .iter()
+            .map(|artifact| -> Result<(String, String)> {
+                let file = super::super::artifacts::resolve(
+                    artifact
+                        .workspace
+                        .as_deref()
+                        .context("artifact workspace")?,
+                    &artifact.path,
+                )?;
+                Ok((artifact.title.clone(), fs::read_to_string(file)?))
+            })
+            .collect::<Result<_>>()?;
+        assert_eq!(
+            listed,
+            [
+                ("Report".to_owned(), "<h1>Report</h1>".to_owned()),
+                ("Build output".to_owned(), "<h1>Build</h1>".to_owned()),
+                ("Notes".to_owned(), "<h1>Notes</h1>".to_owned()),
+            ]
+        );
+        let canonical = moved.canonicalize()?;
+        let workspaces: Vec<_> = imported
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.workspace.clone())
+            .collect();
+        assert_eq!(workspaces.first(), Some(&Some(canonical.clone())));
+        assert_eq!(workspaces.get(1), Some(&Some(canonical)));
+        assert!(
+            workspaces
+                .get(2)
+                .and_then(Option::as_deref)
+                .is_some_and(|root| root.starts_with(&server_media_root))
+        );
+
+        // Pull requests attached by URL stay attached.
+        let links = super::super::pr_cache::snapshot(&storage, "two").links;
+        assert!(links.iter().any(|link| link.attached
+            && link.pr.key.id() == "acme/tools#42"
+            && link.workspace == moved));
         Ok(())
     }
 
@@ -878,6 +1436,7 @@ pub(crate) mod tests {
 
     #[test]
     fn busy_waiting_queued_moved_and_non_coding_sessions_cannot_move() -> Result<()> {
+        let temp = tempfile::tempdir()?;
         check(&idle())?;
         type Change = fn(&mut Session);
         let refusals: Vec<(&str, Change)> = vec![
@@ -917,7 +1476,7 @@ pub(crate) mod tests {
             change(&mut session);
             let error = check(&session).err().context(reason)?;
             assert!(format!("{error:#}").contains(reason), "{reason}: {error:#}");
-            assert!(export(&session, &Cancel::default()).is_err());
+            assert!(export(&session, &local_storage(temp.path()), &Cancel::default()).is_err());
         }
         Ok(())
     }
@@ -927,7 +1486,11 @@ pub(crate) mod tests {
         let temp = tempfile::tempdir()?;
         let origin = origin(temp.path())?;
         let session = local_session(temp.path(), &origin, &temp.path().join("mac"))?;
-        let package = export(&session, &Cancel::default())?;
+        let package = export(
+            &session,
+            &local_storage(&temp.path().join("mac")),
+            &Cancel::default(),
+        )?;
         fits(&package, LIMIT)?;
         let error = fits(&package, ENVELOPE).err().context("over the cap")?;
         let message = format!("{error:#}");
@@ -942,6 +1505,59 @@ pub(crate) mod tests {
         let mut huge = package;
         huge.bundle = Some("A".repeat(LIMIT));
         assert!(fits(&huge, LIMIT).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn the_size_error_breaks_the_package_down_largest_part_first() -> Result<()> {
+        let package = Package {
+            source: "one".into(),
+            computer: "Mac".into(),
+            title: "Large".into(),
+            title_manual: false,
+            provider: provider::Provider::Codex,
+            model: None,
+            effort: None,
+            mode: None,
+            preset: None,
+            prompt: "task".into(),
+            entries: vec![Entry {
+                kind: "userMessage".into(),
+                text: "C".repeat(512 << 10).into(),
+                ..Entry::default()
+            }],
+            repository: REPOSITORY.into(),
+            branch: "difu/agent-one".into(),
+            upstream: false,
+            head: "0".repeat(40),
+            wip: None,
+            bundle: Some("B".repeat(1 << 20)),
+            commits: 1,
+            media: vec![
+                Media {
+                    path: "/mac/attachments/one/media-a.png".into(),
+                    data: "M".repeat(2 << 20),
+                },
+                Media {
+                    path: "/mac/attachments/one/media-b.mov".into(),
+                    data: "M".repeat(1 << 20),
+                },
+            ],
+            artifacts: vec![MovedArtifact {
+                path: "report.html".into(),
+                title: "Report".into(),
+                outside: true,
+                data: Some("A".repeat(2 << 20)),
+            }],
+            prs: Vec::new(),
+        };
+        fits(&package, LIMIT)?;
+        let error = fits(&package, 4 << 20).err().context("over the cap")?;
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("This session is too large to move: it needs 6.6 MB in one message and a server accepts at most 4.0 MB. By part: attachments 3.0 MB, HTML artifacts 2.0 MB, commits and files 1.0 MB, chat 0.5 MB, other 0.1 MB."),
+            "{message}"
+        );
         Ok(())
     }
 
@@ -961,7 +1577,11 @@ pub(crate) mod tests {
         git(&worktree, &["add", "after.txt"])?;
         git(&worktree, &["commit", "-m", "After local main"])?;
         session.note("userMessage", "more");
-        let package = export(&session, &Cancel::default())?;
+        let package = export(
+            &session,
+            &local_storage(&temp.path().join("mac")),
+            &Cancel::default(),
+        )?;
         assert_eq!(package.commits, 1);
 
         let server_home = temp.path().join("server");
@@ -985,6 +1605,64 @@ pub(crate) mod tests {
                 .all(|line| line.ends_with("refs/heads/main"))
         );
         assert_eq!(git(&root, &["worktree", "list"])?.lines().count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_import_removes_its_worktree_branch_and_media() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let origin = origin(temp.path())?;
+        let session = local_session(temp.path(), &origin, &temp.path().join("mac"))?;
+        let mut package = export(
+            &session,
+            &local_storage(&temp.path().join("mac")),
+            &Cancel::default(),
+        )?;
+        // Media is written before the artifacts, so this fails after it.
+        package.artifacts.push(MovedArtifact {
+            path: "../escape.html".into(),
+            title: "Escape".into(),
+            outside: false,
+            data: Some(STANDARD.encode("<p>no</p>")),
+        });
+        let server_home = temp.path().join("server");
+        let storage = server_storage(&server_home, &origin)?;
+        let store = Store::fixture(server_home.clone(), Vec::new());
+        let root = crate::cloud::repos::ensure(&storage, REPOSITORY)?;
+        let error = import(
+            &package,
+            "two".into(),
+            root.clone(),
+            &store,
+            &Cancel::default(),
+        )
+        .err()
+        .context("invalid artifact")?;
+        assert!(
+            format!("{error:#}").contains("Invalid artifact path"),
+            "{error:#}"
+        );
+        assert!(!server_home.join("worktrees").join("two").exists());
+        assert!(
+            !server_home
+                .join("agents")
+                .join("attachments")
+                .join("two")
+                .exists()
+        );
+        assert!(!temp.path().join("escape.html").exists());
+        assert!(
+            git(
+                &root,
+                &["show-ref", "--verify", "refs/heads/difu/agent-one"]
+            )
+            .is_err()
+        );
+        assert!(
+            super::super::pr_cache::snapshot(&storage, "two")
+                .links
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -1017,7 +1695,11 @@ pub(crate) mod tests {
         )?;
         let mut session = idle();
         session.workspace = Some(worktree.clone());
-        let package = export(&session, &Cancel::default())?;
+        let package = export(
+            &session,
+            &local_storage(&temp.path().join("mac")),
+            &Cancel::default(),
+        )?;
         assert_eq!(package.repository, REPOSITORY);
         assert!(package.bundle.is_none() && package.wip.is_none());
         assert!(package.branch.is_empty() && !package.upstream);
@@ -1050,7 +1732,11 @@ pub(crate) mod tests {
         let temp = tempfile::tempdir()?;
         let origin = origin(temp.path())?;
         let session = local_session(temp.path(), &origin, &temp.path().join("mac"))?;
-        let package = export(&session, &Cancel::default())?;
+        let package = export(
+            &session,
+            &local_storage(&temp.path().join("mac")),
+            &Cancel::default(),
+        )?;
         let server_home = temp.path().join("server");
         let storage = server_storage(&server_home, &origin)?;
         let store = Store::fixture(server_home, Vec::new());
