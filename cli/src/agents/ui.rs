@@ -1007,10 +1007,9 @@ impl Ui {
                                 .outgoing
                                 .retain(|pending| !pending.observed(&session));
                         }
-                        // Provider defaults come from this computer's Codex
-                        // configuration, which does not describe a server.
+                        // Provider defaults come from the Codex configuration
+                        // where the session runs.
                         if !self.sessions.contains_key(&id)
-                            && !servers::is_server_session(&id)
                             && session.thread_id.is_none()
                             && session.provider == provider::Provider::Codex
                         {
@@ -1018,6 +1017,7 @@ impl Ui {
                                 Task::Defaults(id.clone()),
                                 Request::Defaults {
                                     cwd: session.job.root().clone(),
+                                    server: servers::server_name(&id).map(str::to_owned),
                                 },
                                 true,
                             );

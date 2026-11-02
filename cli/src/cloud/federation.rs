@@ -121,6 +121,9 @@ pub struct ServerStatus {
     pub problem: Option<String>,
     #[serde(default)]
     pub repositories: Vec<Repository>,
+    /// The server's saved new-session defaults, once read.
+    #[serde(default)]
+    pub defaults: Option<AgentDefaults>,
 }
 
 /// One of a server's repositories (`server.repos`); `path` is on the server.
@@ -156,23 +159,24 @@ pub fn target(mut request: Request, saved: impl Fn(&str) -> bool) -> Target {
     match &mut request {
         Request::NewAgent {
             server,
-            defaults,
             cwd,
             remember_repository,
+            ..
         } => {
             if let Some(name) = server.take() {
-                // The server applies its own defaults; only the repository the
-                // user picked from that server carries over.
-                *defaults = AgentDefaults {
-                    repository: defaults.repository.take(),
-                    ..AgentDefaults::default()
-                };
+                // The defaults were read from that server and edited in the
+                // new-session form; this computer's directory and saved
+                // repository do not apply there.
                 *cwd = PathBuf::new();
                 *remember_repository = false;
                 return Target::Server(name, request);
             }
         }
-        Request::RepositoryRules { server, .. } => {
+        Request::RepositoryRules { server, .. }
+        | Request::Defaults { server, .. }
+        | Request::AgentDefaults { server }
+        | Request::DefaultModel { server, .. }
+        | Request::Models { server } => {
             if let Some(name) = server.take() {
                 return Target::Server(name, request);
             }
@@ -229,6 +233,9 @@ fn session_id(request: &mut Request) -> Option<&mut String> {
         | Request::Launch { .. }
         | Request::NewAgent { .. }
         | Request::Defaults { .. }
+        | Request::AgentDefaults { .. }
+        | Request::DefaultModel { .. }
+        | Request::Models { .. }
         | Request::Remote { .. }
         | Request::RepositoryRules { .. }
         | Request::Servers
@@ -296,6 +303,8 @@ pub fn prefix_reply(server: &str, reply: Reply) -> Reply {
         | Reply::WorkspacePaths(_)
         | Reply::Skills { .. }
         | Reply::Defaults { .. }
+        | Reply::AgentDefaults(_)
+        | Reply::Models(_)
         | Reply::Remote(_)
         | Reply::RepositoryRules { .. }
         | Reply::Servers(_)
@@ -357,6 +366,7 @@ struct Link {
     sessions_at: Option<Instant>,
     repositories: Vec<Repository>,
     repositories_at: Option<Instant>,
+    defaults: Option<AgentDefaults>,
     /// Someone wants fresh data before the next regular poll.
     refresh: bool,
 }
@@ -480,6 +490,7 @@ impl Federation {
                     sessions_at: None,
                     repositories: Vec::new(),
                     repositories_at: None,
+                    defaults: None,
                     refresh: true,
                 },
             );
@@ -562,7 +573,7 @@ impl Federation {
     }
 
     /// Refreshes the cached sessions while someone lists them, and the
-    /// repositories when they are stale.
+    /// repositories and new-session defaults when they are stale.
     pub(crate) fn poll(&self, name: &str, generation: u64, remote: &Arc<dyn Remote>) {
         let (sessions, repos) = {
             let mut state = self.lock();
@@ -588,6 +599,10 @@ impl Federation {
             let reply = remote
                 .call("server.repos", serde_json::json!({}))
                 .and_then(|value| repositories(&value));
+            // `rpc` needs a matching version; the phone API above does not.
+            let defaults = usable(name, remote.as_ref())
+                .is_ok()
+                .then(|| remote.rpc(&Request::AgentDefaults { server: None }));
             if let Some(link) = self.lock().link(name, generation) {
                 match reply {
                     Ok(list) => {
@@ -595,6 +610,10 @@ impl Federation {
                         link.repositories_at = Some(Instant::now());
                     }
                     Err(error) => link.error = Some(format!("{error:#}")),
+                }
+                // Without them the new-session form starts from blank choices.
+                if let Some(Ok(Reply::AgentDefaults(defaults))) = defaults {
+                    link.defaults = Some(defaults);
                 }
             }
         }
@@ -686,6 +705,7 @@ impl Federation {
                         ),
                     },
                     repositories: link.repositories.clone(),
+                    defaults: link.defaults.clone(),
                 }
             })
             .collect();
@@ -874,6 +894,20 @@ pub(crate) mod tests {
                     root: repository.clone(),
                     rules: "server rules".into(),
                 },
+                Request::AgentDefaults { .. } => Reply::AgentDefaults(server_defaults()),
+                Request::DefaultModel { model, effort, .. } => {
+                    Reply::AgentDefaults(AgentDefaults {
+                        model: model.clone(),
+                        effort: effort.clone(),
+                        ..server_defaults()
+                    })
+                }
+                Request::Models { .. } => Reply::Models(server_models()),
+                Request::Defaults { cwd, .. } => Reply::Defaults {
+                    model: format!("codex-at-{}", cwd.display()),
+                    effort: "medium".into(),
+                    permissions: "{}".into(),
+                },
                 _ => Reply::Ok,
             })
         }
@@ -885,6 +919,32 @@ pub(crate) mod tests {
                 .push((id.into(), version, tx));
             Ok(Box::new(rx))
         }
+    }
+
+    /// What every fake server has saved for new sessions.
+    pub(crate) fn server_defaults() -> AgentDefaults {
+        AgentDefaults {
+            model: Some("server-model".into()),
+            effort: Some("high".into()),
+            repository: Some("/srv/difu/repos/acme/api".into()),
+            ..AgentDefaults::default()
+        }
+    }
+
+    /// The models every fake server's logins offer.
+    pub(crate) fn server_models() -> Vec<crate::model::ModelInfo> {
+        vec![
+            crate::model::ModelInfo {
+                id: "server-model".into(),
+                name: "Server Model".into(),
+                efforts: vec!["low".into(), "high".into()],
+            },
+            crate::model::ModelInfo {
+                id: "claude/opus".into(),
+                name: "Opus".into(),
+                efforts: vec!["max".into()],
+            },
+        ]
     }
 
     pub(crate) fn session(id: &str) -> Session {
@@ -1008,7 +1068,9 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn new_agents_and_rules_for_a_server_drop_local_choices() -> Result<()> {
+    fn new_agents_and_rules_for_a_server_keep_choices_but_not_local_paths() -> Result<()> {
+        // The new-session form reads these from the server and the user edits
+        // them there, so they carry over; this computer's directory does not.
         let defaults = AgentDefaults {
             provider: Some(crate::agents::provider::Provider::Claude),
             model: Some("opus".into()),
@@ -1042,8 +1104,16 @@ pub(crate) mod tests {
         assert!(!remember_repository);
         assert_eq!(defaults.repository, Some("/srv/difu/repos/acme/api".into()));
         assert_eq!(
-            (defaults.provider, defaults.model, defaults.effort),
-            (None, None, None)
+            (
+                defaults.provider,
+                defaults.model.as_deref(),
+                defaults.effort.as_deref()
+            ),
+            (
+                Some(crate::agents::provider::Provider::Claude),
+                Some("opus"),
+                Some("high")
+            )
         );
         let local = target(
             Request::NewAgent {
@@ -1072,6 +1142,156 @@ pub(crate) mod tests {
             anyhow::bail!("expected server rules");
         };
         assert_eq!(server, "box");
+        Ok(())
+    }
+
+    #[test]
+    fn session_panels_reach_the_server_running_the_session() -> Result<()> {
+        // Skills, MCP, permissions, usage, file paths and workspace changes
+        // read the session's machine, so they must reach the server.
+        let id = || "box:7".to_owned();
+        let requests = [
+            Request::Skills {
+                id: id(),
+                force: true,
+            },
+            Request::Mcp {
+                id: id(),
+                action: crate::agents::mcp::Action::Refresh,
+            },
+            Request::Permissions {
+                id: id(),
+                action: crate::agents::permissions::Action::Refresh,
+            },
+            Request::Usage { id: id() },
+            Request::WorkspacePaths { id: id() },
+            Request::RegisterWorktree {
+                id: id(),
+                path: "/srv/difu/worktrees/7".into(),
+                base: None,
+            },
+            Request::Repository {
+                id: id(),
+                repository: "/srv/difu/repos/acme/web".into(),
+            },
+        ];
+        for request in requests {
+            let label = format!("{request:?}");
+            let Target::Server(server, mut forwarded) = target(request, |name| name == "box")
+            else {
+                anyhow::bail!("{label} stayed on this computer");
+            };
+            assert_eq!(server, "box");
+            assert_eq!(
+                session_id(&mut forwarded).map(|id| id.as_str()),
+                Some("7"),
+                "{label}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn location_requests_naming_a_server_route_there_and_others_stay_local() -> Result<()> {
+        let saved = |name: &str| name == "box";
+        let Target::Server(server, Request::Defaults { cwd, server: None }) = target(
+            Request::Defaults {
+                cwd: "/srv/difu/repos/acme/api".into(),
+                server: Some("box".into()),
+            },
+            saved,
+        ) else {
+            anyhow::bail!("server Codex defaults");
+        };
+        assert_eq!(
+            (server.as_str(), cwd),
+            ("box", PathBuf::from("/srv/difu/repos/acme/api"))
+        );
+        assert!(matches!(
+            target(
+                Request::AgentDefaults {
+                    server: Some("box".into())
+                },
+                saved
+            ),
+            Target::Server(name, Request::AgentDefaults { server: None }) if name == "box"
+        ));
+        assert!(matches!(
+            target(Request::Models { server: Some("box".into()) }, saved),
+            Target::Server(name, Request::Models { server: None }) if name == "box"
+        ));
+        assert!(matches!(
+            target(
+                Request::DefaultModel {
+                    server: Some("box".into()),
+                    model: Some("m".into()),
+                    effort: None
+                },
+                saved
+            ),
+            Target::Server(name, Request::DefaultModel { server: None, model: Some(m), .. })
+                if name == "box" && m == "m"
+        ));
+        // Without a server they answer for this machine.
+        for request in [
+            Request::Defaults {
+                cwd: "/Users/me/code".into(),
+                server: None,
+            },
+            Request::AgentDefaults { server: None },
+            Request::Models { server: None },
+            Request::DefaultModel {
+                server: None,
+                model: None,
+                effort: None,
+            },
+        ] {
+            assert!(matches!(target(request, saved), Target::Local(_)));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn server_status_carries_the_server_defaults_and_forwards_location_requests() -> Result<()> {
+        let fake = Fake::new(Vec::new());
+        let (_dir, federation) = connected(vec![("box", fake.clone())])?;
+        let status = federation.servers();
+        let [status] = status.as_slice() else {
+            anyhow::bail!("one server");
+        };
+        assert_eq!(status.defaults, Some(server_defaults()));
+        let Route::Handled(reply) = federation.route(Request::Models {
+            server: Some("box".into()),
+        }) else {
+            anyhow::bail!("models are forwarded");
+        };
+        assert!(matches!(reply?, Reply::Models(models) if models == server_models()));
+        let Route::Handled(reply) = federation.route(Request::DefaultModel {
+            server: Some("box".into()),
+            model: Some("claude/opus".into()),
+            effort: None,
+        }) else {
+            anyhow::bail!("defaults are saved on the server");
+        };
+        assert!(matches!(
+            reply?,
+            Reply::AgentDefaults(defaults) if defaults.model.as_deref() == Some("claude/opus")
+        ));
+        assert!(matches!(
+            federation.route(Request::Models { server: None }),
+            Route::Local(Request::Models { server: None })
+        ));
+        let requests = fake.requests();
+        assert!(
+            requests
+                .iter()
+                .any(|r| matches!(r, Request::AgentDefaults { server: None }))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| matches!(r, Request::Models { server: None }))
+        );
         Ok(())
     }
 

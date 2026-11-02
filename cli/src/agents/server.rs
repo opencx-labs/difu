@@ -1516,7 +1516,37 @@ impl Service {
                 &self.store.get(&id)?,
                 &Cancel::default(),
             )?)),
-            Request::Defaults { cwd } => super::engine::defaults(&cwd),
+            Request::Defaults { cwd, server: None } => super::engine::defaults(&cwd),
+            Request::AgentDefaults { server: None } => Ok(Reply::AgentDefaults(
+                self.store.storage.load_config()?.agent_defaults,
+            )),
+            Request::DefaultModel {
+                server: None,
+                model,
+                effort,
+            } => {
+                let mut draft = self.store.storage.settings_draft()?;
+                draft.select_default_model(model, effort)?;
+                let config = self.store.storage.save_settings_draft(&mut draft)?;
+                Ok(Reply::AgentDefaults(config.agent_defaults))
+            }
+            Request::Models { server: None } => {
+                Ok(Reply::Models(provider::models(&Cancel::default())?))
+            }
+            Request::Defaults {
+                server: Some(server),
+                ..
+            }
+            | Request::AgentDefaults {
+                server: Some(server),
+            }
+            | Request::DefaultModel {
+                server: Some(server),
+                ..
+            }
+            | Request::Models {
+                server: Some(server),
+            } => anyhow::bail!("Server {server} is not connected"),
             Request::Remote { command } => Ok(Reply::Remote(self.remote.command(command)?)),
             Request::RepositoryRules {
                 server: None,
@@ -2090,6 +2120,73 @@ mod federation_tests {
             .err()
             .context("an unknown server cannot launch")?;
         assert!(format!("{error:#}").contains("box"));
+        Ok(())
+    }
+
+    #[test]
+    fn location_defaults_answer_here_or_on_the_named_server() -> Result<()> {
+        let fake = Fake::new(Vec::new());
+        let (_servers, federation) = connected(vec![("box", fake.clone())])?;
+        let (_temp, agents) = service(Some(federation))?;
+        agents.store.storage.update_config(|config| {
+            config.agent_defaults.model = Some("local-model".into());
+        })?;
+        let Reply::AgentDefaults(local) = agents.handle(Request::AgentDefaults { server: None })?
+        else {
+            anyhow::bail!("local defaults");
+        };
+        assert_eq!(local.model.as_deref(), Some("local-model"));
+        let Reply::AgentDefaults(remote) = agents.handle(Request::AgentDefaults {
+            server: Some("box".into()),
+        })?
+        else {
+            anyhow::bail!("server defaults");
+        };
+        assert_eq!(remote, crate::cloud::federation::tests::server_defaults());
+        // Saving here goes through the settings draft, so the provider follows.
+        let Reply::AgentDefaults(saved) = agents.handle(Request::DefaultModel {
+            server: None,
+            model: Some("claude/opus".into()),
+            effort: Some("max".into()),
+        })?
+        else {
+            anyhow::bail!("saved defaults");
+        };
+        let config = agents.store.storage.load_config()?.agent_defaults;
+        assert_eq!(saved, config);
+        assert_eq!(
+            (
+                config.model.as_deref(),
+                config.effort.as_deref(),
+                config.provider
+            ),
+            (
+                Some("claude/opus"),
+                Some("max"),
+                Some(provider::Provider::Claude)
+            )
+        );
+        // A server's Codex defaults come from that server.
+        let Reply::Defaults { model, .. } = agents.handle(Request::Defaults {
+            cwd: "/srv/difu/repos/acme/api".into(),
+            server: Some("box".into()),
+        })?
+        else {
+            anyhow::bail!("server Codex defaults");
+        };
+        assert_eq!(model, "codex-at-/srv/difu/repos/acme/api");
+        let (_alone_temp, alone) = service(None)?;
+        for request in [
+            Request::AgentDefaults {
+                server: Some("box".into()),
+            },
+            Request::Models {
+                server: Some("box".into()),
+            },
+        ] {
+            let error = alone.handle(request).err().context("unknown server")?;
+            assert!(format!("{error:#}").contains("box"));
+        }
         Ok(())
     }
 

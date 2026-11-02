@@ -42,6 +42,30 @@ impl Provider {
             .unwrap_or(model)
     }
 }
+/// Codex and Claude Code models installed on this machine, discovered in
+/// parallel; fails only when neither provider reports any.
+pub fn models(cancel: &crate::process::Cancel) -> Result<Vec<crate::model::ModelInfo>> {
+    let (codex, claude) = std::thread::scope(|scope| {
+        let codex = scope.spawn(|| crate::codex::models(cancel));
+        let claude = super::claude::models(cancel);
+        (
+            codex
+                .join()
+                .unwrap_or_else(|_| Err(anyhow::anyhow!("Codex model discovery stopped"))),
+            claude,
+        )
+    });
+    let mut models = Vec::new();
+    let mut errors = Vec::new();
+    for result in [codex, claude] {
+        match result {
+            Ok(options) => models.extend(options),
+            Err(error) => errors.push(format!("{error:#}")),
+        }
+    }
+    ensure!(!models.is_empty(), "{}", errors.join("; "));
+    Ok(models)
+}
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NativeSession {
     pub thread_id: Option<String>,

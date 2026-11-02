@@ -1010,8 +1010,31 @@ pub enum Request {
     WorkspacePaths {
         id: String,
     },
+    /// Codex's configured model, reasoning and permissions for `cwd`. `server`
+    /// names a saved cloud server (`cwd` is then a path on it); `None` is this
+    /// machine.
     Defaults {
         cwd: PathBuf,
+        #[serde(default)]
+        server: Option<String>,
+    },
+    /// The new-session defaults saved at a location: this machine (`None`) or a
+    /// saved cloud server.
+    AgentDefaults {
+        #[serde(default)]
+        server: Option<String>,
+    },
+    /// Saves a location's default model and reasoning for new sessions.
+    DefaultModel {
+        #[serde(default)]
+        server: Option<String>,
+        model: Option<String>,
+        effort: Option<String>,
+    },
+    /// The Codex and Claude Code models available at a location.
+    Models {
+        #[serde(default)]
+        server: Option<String>,
     },
     Skills {
         id: String,
@@ -1079,6 +1102,8 @@ pub enum Reply {
         effort: String,
         permissions: String,
     },
+    AgentDefaults(crate::storage::AgentDefaults),
+    Models(Vec<crate::model::ModelInfo>),
     Remote(remote::Status),
     RepositoryRules {
         root: PathBuf,

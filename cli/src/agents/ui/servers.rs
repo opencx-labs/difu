@@ -387,6 +387,7 @@ mod tests {
                     cloned: false,
                 },
             ],
+            defaults: None,
         }
     }
 
