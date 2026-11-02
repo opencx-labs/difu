@@ -455,16 +455,21 @@ impl Drop for Container {
 /// Removes a session's pod and anything still running in it, after the
 /// session is deleted, cleared or cleaned up. Failures are reported, not
 /// raised: a leftover pod holds no session data.
-pub(crate) fn remove_pod(storage: &Storage, session: &str) {
+pub(crate) fn remove_pod(storage: &Storage, runner: &dyn Runner, session: &str) {
     let server = storage
         .load_config()
         .is_ok_and(|config| config.server.enabled);
     if server
-        && installed(PODMAN)
-        && let Err(error) = remove_pod_with(&Podman, session)
+        && runner.available()
+        && let Err(error) = remove_pod_with(runner, session)
     {
         eprintln!("Sandbox cleanup for {session}: {error:#}");
     }
+}
+
+/// The real Podman, for the service's pod cleanup.
+pub(crate) fn podman() -> Arc<dyn Runner> {
+    Arc::new(Podman)
 }
 
 fn remove_pod_with(runner: &dyn Runner, session: &str) -> Result<()> {
@@ -744,12 +749,19 @@ impl Mount {
 /// without Podman.
 pub(crate) trait Runner: Send + Sync {
     fn podman(&self, args: &[OsString]) -> Result<process::Output>;
+    /// Whether Podman can run here at all.
+    fn available(&self) -> bool {
+        true
+    }
 }
 
 struct Podman;
 impl Runner for Podman {
     fn podman(&self, args: &[OsString]) -> Result<process::Output> {
         bounded(Command::new(PODMAN).args(args), TIMEOUT)
+    }
+    fn available(&self) -> bool {
+        installed(PODMAN)
     }
 }
 

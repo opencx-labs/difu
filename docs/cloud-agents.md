@@ -19,6 +19,11 @@ is in [remote-protocol.md](remote-protocol.md).
   the foreground (systemd), with remote control always on and *server mode*
   enabled. Each server is self-contained: its own Codex/Claude/GitHub logins,
   repositories, repository rules, sessions, sandboxes and paired devices.
+  A server never stops accepting its clients: turning remote control off is
+  refused from every path (`difu remote`, `rpc` from a full device, the
+  terminal app's `/remote-control` on the server) with a message pointing at
+  `difu remote forget`, `difu remote password --disable` or
+  `systemctl stop difu-agent`.
 * **Clients connect directly to each server.** A client keeps a list of servers
   (name, hosts, port, certificate fingerprint, device token). The Mac's local
   difu service holds these connections and merges server sessions into the
@@ -167,6 +172,10 @@ Permission prompts are unchanged.
   groups with SIGKILL, which `podman run` cannot forward). Deleting, clearing or
   cleaning up a session removes its pod, and leftover containers are swept when
   the service starts.
+* Deleting a session from any client (a Mac through `rpc`, a phone with
+  `session.delete`) is the same service request: it stops the agent and its
+  shells, removes the session's pod, its worktree (uncommitted files included),
+  attachments and saved session.
 * `difu sandbox build` builds `localhost/difu-sandbox:latest` from a bundled
   Containerfile (Ubuntu LTS with git, gh, build tools, Python, Node, ripgrep).
   A custom `config.server.sandbox.image` under `localhost/` is built from the

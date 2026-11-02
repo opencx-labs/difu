@@ -204,6 +204,8 @@ struct Service {
     launch_lock: Mutex<()>,
     /// Saved cloud servers; requests for their sessions are forwarded.
     federation: Option<Arc<crate::cloud::federation::Federation>>,
+    /// Removes a server session's sandbox pod; a fake in tests.
+    pods: Arc<dyn super::sandbox::Runner>,
 }
 
 pub fn home(storage: &Storage) -> Result<PathBuf> {
@@ -1324,7 +1326,7 @@ impl Service {
                         .lock()
                         .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
                     self.store.shells.stop_session(&self.store, &id)?;
-                    super::sandbox::remove_pod(&self.store.storage, &id);
+                    super::sandbox::remove_pod(&self.store.storage, self.pods.as_ref(), &id);
                     let previous = self.store.get(&id)?;
                     super::workspace::discard(&previous, &self.store.home, &Cancel::default())?;
                     let revision = previous.workspace_revision.saturating_add(1);
@@ -1446,7 +1448,7 @@ impl Service {
                         .lock()
                         .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
                     self.store.shells.stop_session(&self.store, &id)?;
-                    super::sandbox::remove_pod(&self.store.storage, &id);
+                    super::sandbox::remove_pod(&self.store.storage, self.pods.as_ref(), &id);
                     self.store.update(&id, |s| {
                         if s.status.active() {
                             s.status = Status::Interrupted;
@@ -1517,7 +1519,7 @@ impl Service {
                     .lock()
                     .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
                 self.store.shells.stop_session(&self.store, &id)?;
-                super::sandbox::remove_pod(&self.store.storage, &id);
+                super::sandbox::remove_pod(&self.store.storage, self.pods.as_ref(), &id);
                 super::workspace::cleanup(&session, &self.store.home, &Cancel::default())?;
                 self.store.update(&id, |s| {
                     s.archived = true;
@@ -1862,6 +1864,7 @@ pub fn run(storage: Storage) -> Result<()> {
         action_locks: Mutex::new(BTreeMap::new()),
         launch_lock: Mutex::new(()),
         federation: Some(federation),
+        pods: super::sandbox::podman(),
     });
     ensure_orchestrator(&service.store)?;
     let _pr_cache =
@@ -2103,6 +2106,7 @@ mod federation_tests {
             action_locks: Mutex::new(BTreeMap::new()),
             launch_lock: Mutex::new(()),
             federation: federation.map(Arc::new),
+            pods: super::sandbox::podman(),
         });
         Ok((temp, service))
     }
@@ -2600,6 +2604,7 @@ mod routed_queue_tests {
             action_locks: Mutex::new(BTreeMap::new()),
             launch_lock: Mutex::new(()),
             federation: None,
+            pods: super::sandbox::podman(),
         };
         let mut route = slack::Route {
             account: "account".into(),
@@ -2677,6 +2682,7 @@ mod routed_queue_tests {
             action_locks: Mutex::new(BTreeMap::new()),
             launch_lock: Mutex::new(()),
             federation: None,
+            pods: super::sandbox::podman(),
         };
         service.handle(Request::SlackControl {
             id: "worker".into(),
@@ -2828,6 +2834,7 @@ mod clear_tests {
             action_locks: Mutex::new(BTreeMap::new()),
             launch_lock: Mutex::new(()),
             federation: None,
+            pods: super::sandbox::podman(),
         };
         assert!(crate::github::store::load(&service.store.storage, &pr).is_none());
         let scope = crate::process::fixture::Scope::new(
@@ -3019,6 +3026,7 @@ mod clear_tests {
                 action_locks: Mutex::new(BTreeMap::new()),
                 launch_lock: Mutex::new(()),
                 federation: None,
+                pods: super::sandbox::podman(),
             });
 
             // Pause cleanup to observe progress before the clear request returns.
@@ -3174,6 +3182,7 @@ mod move_tests {
             action_locks: Mutex::new(BTreeMap::new()),
             launch_lock: Mutex::new(()),
             federation: federation.map(Arc::new),
+            pods: super::sandbox::podman(),
         })
     }
 
@@ -3417,6 +3426,133 @@ mod move_tests {
         assert!(session.entries.last().is_some_and(|e| e.kind == "error"
             && e.text.starts_with("Could not move this session to box")
             && e.text.contains("queued messages")));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod server_delete_tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    /// Records Podman calls instead of running Podman.
+    #[derive(Default)]
+    struct Pods(Mutex<Vec<String>>);
+    impl super::super::sandbox::Runner for Pods {
+        fn podman(&self, args: &[OsString]) -> Result<crate::process::Output> {
+            self.0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Pods lock failed"))?
+                .push(
+                    args.iter()
+                        .map(|arg| arg.to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            Ok(crate::process::Output {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                code: 0,
+            })
+        }
+    }
+
+    fn git(root: &std::path::Path, args: &[&str]) -> Result<String> {
+        crate::process::checked(
+            crate::repo::git(root)
+                .args([
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args),
+            &Cancel::default(),
+        )
+        .map(|s| s.trim().to_owned())
+    }
+
+    /// Phones (`session.delete`) and Macs (`rpc` through federation) both reach
+    /// the service as `Request::Delete`: on a server it removes the session's
+    /// sandbox pod, its worktree and its saved session.
+    #[test]
+    fn deleting_a_server_session_removes_its_pod_worktree_and_record() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let (origin, base, home) = (root.join("origin"), root.join("base"), root.join("home"));
+        for path in [&origin, &base] {
+            fs::create_dir(path)?;
+            git(path, &["init", "-b", "main"])?;
+            fs::write(path.join("tracked.txt"), "base\n")?;
+            git(path, &["add", "."])?;
+            git(path, &["commit", "-m", "base"])?;
+        }
+        git(
+            &base,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.to_str().context("origin")?,
+            ],
+        )?;
+        let id = "1791875325706-02acb407";
+        let mut session = Session::new(
+            id.into(),
+            Job::Coding(Launch {
+                repository: base.clone(),
+                isolated: true,
+                base: "origin/main".into(),
+                prompt: "Task".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        let cancel = Cancel::default();
+        super::super::workspace::inspect(&mut session, &cancel)?;
+        super::super::workspace::prepare(&mut session, &home, &cancel, |_| Ok(()))?;
+        let tree = home.join("worktrees").join(id);
+        assert_eq!(session.workspace.as_deref(), Some(tree.as_path()));
+        // Uncommitted work the sandbox left behind goes with the worktree.
+        fs::write(tree.join("untracked.txt"), "agent output\n")?;
+        session.status = Status::Idle;
+        let store = Arc::new(Store::fixture(home.clone(), vec![session]));
+        store.save(id)?;
+        store.storage.update_config(|config| {
+            config.server.enabled = true;
+            config.server.sandbox.enabled = true;
+        })?;
+        let pods = Arc::new(Pods::default());
+        let service = Service {
+            remote: super::remote::Remote::start(store.storage.clone()),
+            store: store.clone(),
+            workers: Mutex::new(BTreeMap::new()),
+            action_locks: Mutex::new(BTreeMap::new()),
+            launch_lock: Mutex::new(()),
+            federation: None,
+            pods: pods.clone(),
+        };
+        assert!(matches!(
+            service.handle(Request::Delete { id: id.into() })?,
+            Reply::Ok
+        ));
+        assert_eq!(
+            *pods
+                .0
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Pods lock failed"))?,
+            [format!("pod rm -f -t 0 difu-{id}")]
+        );
+        assert!(!tree.exists(), "The worktree was left behind");
+        assert!(!git(&base, &["worktree", "list"])?.contains(id));
+        assert!(!home.join(format!("{id}.json")).exists());
+        assert!(store.get(id).is_err());
+        let Reply::Sessions(sessions) = service.handle(Request::List)? else {
+            anyhow::bail!("Expected the session list");
+        };
+        assert!(sessions.iter().all(|summary| summary.id != id));
         Ok(())
     }
 }

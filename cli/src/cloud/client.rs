@@ -771,7 +771,8 @@ mod tests {
     }
     impl Drop for Fixture {
         fn drop(&mut self) {
-            let _ = self.remote.command(Command::Disable);
+            // Some fixtures run in server mode, which refuses `Disable`.
+            let _ = self.remote.shut_down();
         }
     }
 

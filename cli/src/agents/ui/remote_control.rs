@@ -1,6 +1,6 @@
 //! `/remote-control`: pair the difu iOS app by QR code and manage paired phones.
 use super::*;
-use crate::agents::remote::{Command, Status};
+use crate::agents::remote::{Command, SERVER_STAYS_ON, Status};
 use ratatui::style::Color;
 
 type Outcome = std::result::Result<Status, String>;
@@ -108,6 +108,8 @@ impl Ui {
         use crate::shortcuts::ids::*;
         let shortcut = self.shortcut(key);
         let enabled = self.remote.status.as_ref().is_some_and(|s| s.enabled);
+        // On a difu server the service refuses anyway; say why without asking.
+        let server = self.remote.status.as_ref().is_some_and(|s| s.server);
         let devices = self
             .remote
             .status
@@ -127,6 +129,9 @@ impl Ui {
                     self.clipboard = Some(link);
                     self.notice = Some(("Pairing link copied".into(), false));
                 }
+            }
+            Some(REMOTE_DISABLE) if enabled && server => {
+                self.remote.error = Some(SERVER_STAYS_ON.into())
             }
             Some(REMOTE_DISABLE) if enabled => self.remote_command(Command::Disable, false),
             Some(REMOTE_ENABLE) => {
@@ -199,14 +204,19 @@ impl Ui {
         let bindings = Bindings::new(&self.shortcut_config);
         let hint = |id| bindings.primary_hint_in(id, self.shortcut_context());
         let hint = if status.enabled {
+            // A server never turns remote control off.
+            let off = if status.server {
+                String::new()
+            } else {
+                format!(" · {} off", hint(REMOTE_DISABLE))
+            };
             format!(
-                "{} copy link · {}/{} select · {} forget · {} new code · {} off · Esc close",
+                "{} copy link · {}/{} select · {} forget · {} new code{off} · Esc close",
                 hint(REMOTE_COPY),
                 hint(NAVIGATION_UP),
                 hint(NAVIGATION_DOWN),
                 hint(REMOTE_REMOVE),
                 hint(REMOTE_ENABLE),
-                hint(REMOTE_DISABLE)
             )
         } else {
             format!("{} turn on · Esc close", hint(REMOTE_ENABLE))
@@ -430,6 +440,41 @@ mod tests {
         assert!(screen.contains('█'));
         ui.remote_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
         assert_eq!(ui.clipboard.as_deref(), Some("difu://pair?v=1&c=code"));
+        assert!(screen.contains(" off · Esc close"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_server_explains_that_remote_control_stays_on() -> anyhow::Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = Storage {
+            config: temp.path().join("config.json"),
+            cache: temp.path().join("cache"),
+        };
+        let mut ui = Ui::new(storage, &Config::default());
+        ui.modal = Some(Modal::Remote);
+        ui.remote.status = Some(Status {
+            enabled: true,
+            listening: true,
+            port: 3438,
+            hosts: vec!["203.0.113.7".into()],
+            server: true,
+            ..Default::default()
+        });
+        ui.remote_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(ui.remote.receiver.is_none(), "No request is sent");
+        assert_eq!(ui.remote.error.as_deref(), Some(SERVER_STAYS_ON));
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 40))?;
+        terminal.draw(|frame| ui.draw_modal(frame))?;
+        let screen: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(screen.contains("new code · Esc close"), "{screen}");
+        assert!(!screen.contains(" off · "));
         Ok(())
     }
 }
