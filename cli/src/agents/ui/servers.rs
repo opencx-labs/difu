@@ -4,6 +4,9 @@ use super::*;
 use crate::cloud::federation;
 
 pub(super) const UNAVAILABLE: &str = "Not available for server sessions";
+/// Marks server sessions in the sessions list, after the worktree tree. The
+/// emoji presentation selector makes it two cells wide, like the tree.
+pub(super) const CLOUD: &str = "\u{2601}\u{fe0f}";
 
 /// Server sessions have `<server>:<session>` ids; local ids never contain `:`.
 pub(super) fn is_server_session(id: &str) -> bool {

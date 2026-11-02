@@ -386,8 +386,9 @@ fixes a mismatch).
   port, fingerprint, device id and token.
 * The local agent service connects to every saved server as a `full` device and
   merges their sessions into `Request::List` replies. Server session ids are
-  namespaced as `<server name>:<session id>` and summaries carry `server` for a
-  sidebar badge. Requests for a namespaced id are forwarded with `rpc`; watches
+  namespaced as `<server name>:<session id>` and summaries carry `server`: the
+  sessions list shows a ☁️ after the worktree 🌳 and the server's name before
+  the repository when the row has room. Requests for a namespaced id are forwarded with `rpc`; watches
   with `rpc.watch`.
 * Every new session opens one form: **Location** (This Mac, then each saved
   server with its connection state or problem), **Repository**, **Model** and

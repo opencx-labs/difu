@@ -3918,6 +3918,35 @@ impl Ui {
             let icon_inset = usize::from(status_icons::WIDTH) + 1;
             let title_width = usize::from(row.width)
                 .saturating_sub(icon_inset + unicode_width::UnicodeWidthStr::width(pin));
+            // The repository, then a tree for a worktree and a cloud for a
+            // server session.
+            let place = format!(
+                "{}{}{}",
+                session
+                    .repository
+                    .as_ref()
+                    .unwrap_or(&session.workspace)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                if session.worktree { " 🌳" } else { "" },
+                if session.server.is_some() {
+                    format!(" {}", servers::CLOUD)
+                } else {
+                    String::new()
+                }
+            );
+            // In a narrow list the server's name gives way, so the icons stay.
+            let server_name = session
+                .server
+                .as_ref()
+                .map(|server| format!("{server} · "))
+                .filter(|name| {
+                    3 + unicode_width::UnicodeWidthStr::width(name.as_str())
+                        + unicode_width::UnicodeWidthStr::width(place.as_str())
+                        <= usize::from(row.width)
+                })
+                .unwrap_or_default();
             let mut lines = vec![
                 Line::from(Span::styled(
                     format!(
@@ -3937,26 +3966,14 @@ impl Ui {
                     Span::styled("   ", Style::default().fg(DIM)),
                     // Server sessions name their server, subtly, before the repository.
                     Span::styled(
-                        session
-                            .server
-                            .as_ref()
-                            .map(|server| format!("{server} · "))
-                            .unwrap_or_default(),
+                        server_name,
                         Style::default()
                             .fg(DIM)
                             .add_modifier(ratatui::style::Modifier::ITALIC),
                     ),
                     Span::styled(
                         format!(
-                            "{}{}{}",
-                            session
-                                .repository
-                                .as_ref()
-                                .unwrap_or(&session.workspace)
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy(),
-                            if session.worktree { " 🌳" } else { "" },
+                            "{place}{}",
                             if session.pending > 0 {
                                 format!(" · {} requests", session.pending)
                             } else if session.queued > 0 {
@@ -9898,6 +9915,69 @@ mod tests {
         ui.summaries = vec![session.summary()];
         let (screen, _) = draw(&mut ui, 120, 35)?;
         assert!(screen.contains("project") && !screen.contains("🌳"));
+        Ok(())
+    }
+
+    #[test]
+    fn sidebar_marks_server_sessions_with_a_cloud_after_the_worktree_tree() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        });
+        let mut session = crate::cloud::federation::tests::session("hetzner:1");
+        session.title = "Server task".into();
+        session.workspace = Some("/srv/difu/worktrees/1".into());
+        session.workspace_ready = true;
+        let mut summary = session.summary();
+        summary.server = Some("hetzner".into());
+        ui.summaries.push(summary);
+        ui.sessions.insert(session.id.clone(), session);
+        // Two cells, like the tree, so the rest of the row stays aligned.
+        assert_eq!(unicode_width::UnicodeWidthStr::width(servers::CLOUD), 2);
+        assert_eq!(unicode_width::UnicodeWidthStr::width("🌳"), 2);
+        for width in [120, 40] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 35))?;
+            terminal.draw(|f| ui.draw(f))?;
+            let buffer = terminal.backend().buffer();
+            let rows: Vec<Vec<String>> = (0..buffer.area.height)
+                .map(|y| {
+                    (0..buffer.area.width)
+                        .filter_map(|x| buffer.cell((x, y)).map(|c| c.symbol().to_owned()))
+                        .collect()
+                })
+                .collect();
+            // The server's name shows when the whole row fits.
+            let server = rows
+                .iter()
+                .find(|row| {
+                    let text = row.concat();
+                    text.contains("api") && text.contains("🌳") && !text.contains("project")
+                })
+                .context("server session row")?;
+            assert_eq!(
+                server.concat().contains("hetzner · api"),
+                width == 120,
+                "{width}: {}",
+                server.concat()
+            );
+            let tree = server
+                .iter()
+                .position(|cell| cell == "🌳")
+                .context("worktree tree")?;
+            // The tree's second cell, a space, then the cloud.
+            assert_eq!(
+                server.get(tree + 3).map(String::as_str),
+                Some(servers::CLOUD),
+                "{width}: {}",
+                server.concat()
+            );
+            let local = rows
+                .iter()
+                .find(|row| row.concat().contains("project"))
+                .context("local session row")?;
+            assert!(!local.concat().contains(servers::CLOUD));
+        }
         Ok(())
     }
 
