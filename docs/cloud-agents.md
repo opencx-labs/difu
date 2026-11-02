@@ -112,6 +112,17 @@ SSH as root, the bootstrap script runs four steps, each safe to repeat:
    such as `CLAUDE_CONFIG_DIR` arrive), reload systemd and restart the
    service.
 
+### Version drift
+
+On a computer, the terminal app replaces an older background service with its
+own version. On a server (`config.server.enabled`) it never does: systemd runs
+`difu serve` with `Restart=always` and the unit's environment, so a
+replacement started by a terminal app would fight systemd and run without that
+environment. A terminal app (or `--refresh-agent-service`) of a newer version
+keeps the server's service and warns once, naming both versions and
+`difu server upgrade`; with no service running it reports that the service is
+not running instead of starting one.
+
 ## Repositories
 
 * `config.server.repositories` lists `owner/name` entries. Each has one base

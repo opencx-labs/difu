@@ -142,7 +142,11 @@ fn main() -> Result<()> {
             difu::cpu::start();
         }
         return if args.refresh_agent_service {
-            difu::agents::client::refresh_running(&storage)
+            difu::agents::client::refresh_running(&storage)?;
+            if let Some(warning) = difu::agents::client::take_warning() {
+                eprintln!("Warning: {warning}");
+            }
+            Ok(())
         } else {
             difu::agents::server::run(storage)
         };
@@ -190,6 +194,9 @@ fn main() -> Result<()> {
     if let Some(Commands::Shell { session, action }) = &args.command {
         let storage = Storage::discover()?;
         difu::agents::client::ensure_running(&storage)?;
+        if let Some(warning) = difu::agents::client::take_warning() {
+            eprintln!("Warning: {warning}");
+        }
         match difu::agents::client::request(
             &storage,
             difu::agents::Request::ShellTool {
@@ -225,6 +232,9 @@ fn main() -> Result<()> {
     if let Some(Commands::AttachPr { url, session }) = &args.command {
         let storage = Storage::discover()?;
         difu::agents::client::ensure_running(&storage)?;
+        if let Some(warning) = difu::agents::client::take_warning() {
+            eprintln!("Warning: {warning}");
+        }
         let reply = difu::agents::client::request(
             &storage,
             difu::agents::Request::AttachPr {

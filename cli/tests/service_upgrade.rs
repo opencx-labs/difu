@@ -230,3 +230,39 @@ fn legacy_and_older_services_upgrade_once_and_preserve_interrupted_work() -> Res
     }
     Ok(())
 }
+
+/// On a server, systemd runs `difu serve`. A terminal app or installer of
+/// another difu version keeps that service and warns instead of replacing it.
+#[test]
+fn a_servers_older_service_is_kept_with_a_warning() -> Result<()> {
+    for version in ["legacy", "0.0.1"] {
+        let (_dir, storage) = storage()?;
+        fs::write(&storage.config, r#"{"server":{"enabled":true}}"#)?;
+        let mut old = fixture(&storage, version)?;
+        let _cleanup = Cleanup(storage.clone());
+        let before = daemon_pid(&storage)?;
+        let output = refresh(&storage).output()?;
+        ensure!(
+            output.status.success(),
+            "Refresh failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        ensure!(
+            stderr.contains("difu server upgrade"),
+            "Expected a warning, got {stderr}"
+        );
+        // The terminal app's own check behaves the same and warns once.
+        client::ensure_running(&storage)?;
+        client::ensure_running(&storage)?;
+        assert_eq!(daemon_pid(&storage)?, before);
+        assert!(
+            old.0.try_wait()?.is_none(),
+            "The server's service was stopped"
+        );
+    }
+    let warning = client::take_warning().context("Expected one warning")?;
+    ensure!(warning.contains("difu server upgrade"), "{warning}");
+    ensure!(client::take_warning().is_none(), "The warning repeats");
+    Ok(())
+}

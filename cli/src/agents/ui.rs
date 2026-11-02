@@ -708,6 +708,10 @@ impl Ui {
         if let Some(error) = self.cache_writer.error() {
             self.notice = Some((error, true));
         }
+        // A server's older service was kept rather than replaced.
+        if let Some(warning) = client::take_warning() {
+            self.notice = Some((warning, true));
+        }
         self.tick_watch(visible);
         self.tick_selection_click();
         self.tick_panels(visible);
