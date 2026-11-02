@@ -200,4 +200,192 @@ final class ServerModelTests: XCTestCase {
             ])
         XCTAssertEqual(calls[5].1, ["repository": nil, "model": nil, "effort": nil])
     }
+
+    func testServerDisk() throws {
+        let disk = try decode(
+            ServerDisk.self,
+            #"""
+            {"path":"/home/difu/.config/difu/agents","total":80000000000,"used":52000000000,"free":28000000000,
+             "status":"ok","measuredAt":1790000000000,"measuring":false,
+             "breakdown":{
+               "sessions":[
+                 {"id":"1790000000000-ab12cd34","title":"Fix login","archived":false,"active":true,"bytes":1234567,"buildOutputs":456789},
+                 {"id":"s2","title":"Old spike","archived":true,"active":false,"bytes":9000000,"buildOutputs":0}
+               ],
+               "repositories":9000000000,"attachments":12000000,"caches":340000000,
+               "sandbox":{"available":true,"images":3000000000,"containers":120000000,"volumes":0,"reclaimable":900000000},
+               "other":30000000000}}
+            """#)
+        XCTAssertEqual(disk.path, "/home/difu/.config/difu/agents")
+        XCTAssertEqual(disk.total, 80_000_000_000)
+        XCTAssertEqual(disk.used, 52_000_000_000)
+        XCTAssertEqual(disk.free, 28_000_000_000)
+        XCTAssertEqual(disk.status, .ok)
+        XCTAssertEqual(disk.measuredAt, 1_790_000_000_000)
+        XCTAssertFalse(disk.measuring)
+        XCTAssertEqual(disk.usedFraction, 0.65, accuracy: 0.0001)
+
+        let breakdown = disk.breakdown
+        XCTAssertEqual(breakdown.sessions.map(\.id), ["s2", "1790000000000-ab12cd34"], "biggest first")
+        let session = try XCTUnwrap(breakdown.sessions.last)
+        XCTAssertEqual(session.title, "Fix login")
+        XCTAssertFalse(session.archived)
+        XCTAssertTrue(session.active)
+        XCTAssertEqual(session.bytes, 1_234_567)
+        XCTAssertEqual(session.buildOutputs, 456_789)
+        XCTAssertEqual(breakdown.sessionsTotal, 10_234_567)
+        XCTAssertEqual(breakdown.repositories, 9_000_000_000)
+        XCTAssertEqual(breakdown.attachments, 12_000_000)
+        XCTAssertEqual(breakdown.caches, 340_000_000)
+        XCTAssertEqual(breakdown.other, 30_000_000_000)
+        XCTAssertTrue(breakdown.sandbox.available)
+        XCTAssertEqual(breakdown.sandbox.images, 3_000_000_000)
+        XCTAssertEqual(breakdown.sandbox.containers, 120_000_000)
+        XCTAssertEqual(breakdown.sandbox.volumes, 0)
+        XCTAssertEqual(breakdown.sandbox.reclaimable, 900_000_000)
+        XCTAssertEqual(breakdown.sandbox.total, 3_120_000_000)
+    }
+
+    func testServerDiskIsLenient() throws {
+        let disk = try decode(
+            ServerDisk.self,
+            #"""
+            {"total":8.0e10,"used":"52000000000","free":2.8e10,"status":"nearly-full","measuredAt":null,
+             "measuring":"1","future":{"x":1},
+             "breakdown":{
+               "sessions":[{"id":"a"},{"title":"No id","bytes":1},{"id":"b","title":"  ","bytes":5.5e9,"archived":1,"future":true}],
+               "repositories":-5,"sandbox":null,"extra":[1,2]}}
+            """#)
+        XCTAssertNil(disk.path)
+        XCTAssertEqual(disk.total, 80_000_000_000)
+        XCTAssertEqual(disk.used, 52_000_000_000)
+        XCTAssertEqual(disk.free, 28_000_000_000)
+        XCTAssertEqual(disk.status, .unknown)
+        XCTAssertNil(disk.measuredAt)
+        XCTAssertTrue(disk.measuring)
+        XCTAssertEqual(disk.breakdown.sessions.map(\.id), ["b", "a"], "id-less sessions are dropped")
+        let b = try XCTUnwrap(disk.breakdown.sessions.first)
+        XCTAssertEqual(b.bytes, 5_500_000_000)
+        XCTAssertTrue(b.archived)
+        XCTAssertFalse(b.active)
+        XCTAssertEqual(b.buildOutputs, 0)
+        XCTAssertEqual(b.displayTitle, "New session")
+        XCTAssertEqual(disk.breakdown.sessions.last?.bytes, 0)
+        XCTAssertEqual(disk.breakdown.repositories, 0, "negative sizes clamp to zero")
+        XCTAssertEqual(disk.breakdown.attachments, 0)
+        XCTAssertEqual(disk.breakdown.sandbox, SandboxDiskUsage())
+        XCTAssertFalse(disk.breakdown.sandbox.available)
+
+        let empty = try decode(ServerDisk.self, "{}")
+        XCTAssertEqual(empty.total, 0)
+        XCTAssertEqual(empty.usedFraction, 0)
+        XCTAssertEqual(empty.status, .unknown)
+        XCTAssertFalse(empty.measuring)
+        XCTAssertEqual(empty.breakdown, DiskBreakdown())
+        for action in DiskCleanAction.allCases {
+            XCTAssertFalse(empty.breakdown.canClean(action))
+        }
+
+        let huge = try decode(
+            ServerDisk.self,
+            #"{"total":18446744073709551615,"used":"9","status":"CRITICAL","measuredAt":1790000000,"breakdown":[]}"#)
+        XCTAssertEqual(huge.total, .max, "UInt64 sizes clamp to Int64")
+        XCTAssertEqual(huge.status, .critical)
+        XCTAssertEqual(huge.measuredAt, 1_790_000_000_000, "seconds become milliseconds")
+        XCTAssertEqual(huge.breakdown, DiskBreakdown())
+        XCTAssertEqual(DiskStatus(lenient: "low"), .low)
+    }
+
+    func testDiskCleanupExpectations() throws {
+        let disk = try decode(
+            ServerDisk.self,
+            #"""
+            {"total":100,"used":150,"free":0,"status":"critical","measuredAt":1790000000000,
+             "breakdown":{"sessions":[
+               {"id":"active-archived","archived":true,"active":true,"bytes":700,"buildOutputs":600},
+               {"id":"archived","title":"Old","archived":true,"bytes":300,"buildOutputs":100},
+               {"id":"idle","title":"Idle","bytes":900,"buildOutputs":400},
+               {"id":"busy","active":true,"bytes":1000,"buildOutputs":800},
+               {"id":"gone","archived":true,"bytes":0},
+               {"id":"big-archived","title":"Big","archived":true,"bytes":500}
+             ],"sandbox":{"available":false,"reclaimable":50}}}
+            """#)
+        XCTAssertEqual(disk.usedFraction, 1, "clamped")
+        XCTAssertEqual(
+            disk.breakdown.sessions.map(\.id),
+            ["busy", "idle", "active-archived", "big-archived", "archived", "gone"])
+
+        XCTAssertEqual(disk.breakdown.sessions(for: .archivedWorktrees).map(\.id), ["big-archived", "archived"])
+        XCTAssertEqual(disk.breakdown.expectedSpace(for: .archivedWorktrees), 800)
+        XCTAssertEqual(disk.breakdown.sessions(for: .buildOutputs).map(\.id), ["idle", "archived"])
+        XCTAssertEqual(disk.breakdown.expectedSpace(for: .buildOutputs), 500)
+        XCTAssertEqual(disk.breakdown.sessions(for: .sandbox), [])
+        XCTAssertEqual(disk.breakdown.expectedSpace(for: .sandbox), 0, "no Podman, nothing to prune")
+        XCTAssertTrue(disk.breakdown.canClean(.archivedWorktrees))
+        XCTAssertTrue(disk.breakdown.canClean(.buildOutputs))
+        XCTAssertFalse(disk.breakdown.canClean(.sandbox))
+
+        var podman = disk.breakdown
+        podman.sandbox.available = true
+        XCTAssertEqual(podman.expectedSpace(for: .sandbox), 50)
+        XCTAssertTrue(podman.canClean(.sandbox))
+        podman.sandbox.reclaimable = 0
+        XCTAssertFalse(podman.canClean(.sandbox))
+
+        let overflowing = try decode(
+            DiskBreakdown.self,
+            #"{"sessions":[{"id":"a","archived":true,"bytes":9223372036854775807},{"id":"b","archived":true,"bytes":9223372036854775807}]}"#)
+        XCTAssertEqual(overflowing.expectedSpace(for: .archivedWorktrees), .max, "sums saturate")
+        XCTAssertEqual(overflowing.sessionsTotal, .max)
+    }
+
+    func testDiskCleanResult() throws {
+        let result = try decode(
+            DiskCleanResult.self,
+            #"{"freed":2100000000,"summary":"Removed 3 archived worktrees (2.1 GB). Kept 1 with uncommitted or ignored files: Fix login.","future":1}"#)
+        XCTAssertEqual(result.freed, 2_100_000_000)
+        XCTAssertEqual(
+            result.summary,
+            "Removed 3 archived worktrees (2.1 GB). Kept 1 with uncommitted or ignored files: Fix login.")
+
+        let bare = try decode(DiskCleanResult.self, #"{"freed":1.5e3,"summary":null}"#)
+        XCTAssertEqual(bare.freed, 1500)
+        XCTAssertEqual(bare.summary, "")
+    }
+
+    func testDiskMethodsSendTheDocumentedParams() async throws {
+        XCTAssertEqual(DiskCleanAction.allCases.map(\.rawValue), ["archivedWorktrees", "buildOutputs", "sandbox"])
+        let recorder = CallRecorder()
+        let client = api(recorder, result: #"{"freed":10,"summary":"Done."}"#)
+        _ = try await client.disk()
+        _ = try await client.disk(refresh: true)
+        for action in DiskCleanAction.allCases {
+            let result = try await client.cleanDisk(action)
+            XCTAssertEqual(result.freed, 10)
+            XCTAssertEqual(result.summary, "Done.")
+        }
+        let calls = await recorder.calls
+        XCTAssertEqual(
+            calls.map(\.0),
+            ["server.disk", "server.disk", "server.disk.clean", "server.disk.clean", "server.disk.clean"])
+        XCTAssertEqual(calls[0].1, [:])
+        XCTAssertEqual(calls[1].1, ["refresh": true])
+        XCTAssertEqual(calls[2].1, ["action": "archivedWorktrees"])
+        XCTAssertEqual(calls[3].1, ["action": "buildOutputs"])
+        XCTAssertEqual(calls[4].1, ["action": "sandbox"])
+
+        let disk = try await api(recorder, result: #"{"total":10,"used":4,"free":6,"status":"low","measuring":true}"#).disk()
+        XCTAssertEqual(disk.status, .low)
+        XCTAssertTrue(disk.measuring)
+    }
+
+    func testOlderServersAndSlowCleanups() {
+        XCTAssertTrue(RemoteError.server("Unknown method `server.disk`; update difu on your computer").isUnknownMethod)
+        XCTAssertFalse(RemoteError.server("Only difu servers report disk space").isUnknownMethod)
+        XCTAssertFalse(RemoteError.notConnected.isUnknownMethod)
+        XCTAssertEqual(RemoteConnection.timeout(for: "server.disk"), 120)
+        XCTAssertGreaterThanOrEqual(RemoteConnection.timeout(for: "server.disk.clean"), 10 * 60)
+        XCTAssertEqual(Formatting.bytes(-1), Formatting.bytes(0))
+        XCTAssertFalse(Formatting.bytes(0).localizedCaseInsensitiveContains("zero"))
+    }
 }

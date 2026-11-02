@@ -1314,6 +1314,25 @@ may run the tests relevant to their change. `difu server list|remove|ssh|pair|up
 manage saved servers; on the server, `difu repos` and `difu remote` manage
 repositories, pairing, devices and the password.
 
+**Cmd+K → /cloud** lists every saved server: whether it is connected (or why
+not), its difu version (with `difu server upgrade <name>` when it differs from
+this Mac's), address, active and total sessions, GitHub, Codex and Claude Code
+logins, repositories, and a disk bar with free space colored by status. A server
+is **low** on disk below 15% or 20 GB free and **critical** below 5% or 5 GB.
+Press **Enter** on a server for what uses its space (session worktrees biggest
+first with their build outputs, repositories, attachments, caches, sandbox
+storage, other) and three cleanups, each confirmed with what it removes and the
+space it should free: **a** cleans archived sessions' worktrees (chats stay),
+**b** clears ignored build folders (`target`, `node_modules`, `dist`, …) in idle
+sessions, **p** prunes Podman and removes unused images except the sandbox image.
+**r** measures again. A low or critical server is marked next to its sessions and
+in the new-session form; while critical it refuses new sessions, moves and clones
+with a pointer to these cleanups, and running sessions continue. On the server,
+`difu disk` shows the same breakdown and `difu disk clean
+archived-worktrees|build-outputs|sandbox` runs a cleanup; `difu server list`
+shows each server's free space. The iPhone app shows the same in each server's
+settings.
+
 ## Slack control (macOS)
 
 Open **Cmd+K → `/slack`** to connect your Slack app. Enter its bot token

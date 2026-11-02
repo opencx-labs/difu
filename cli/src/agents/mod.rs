@@ -1080,6 +1080,21 @@ pub enum Request {
     },
     /// Saved cloud servers with their connection state and repositories.
     Servers,
+    /// Disk space where a location keeps its agent data: this machine in
+    /// server mode (`None`) or a saved cloud server. `refresh` measures what
+    /// uses the space again, in the background.
+    Disk {
+        #[serde(default)]
+        server: Option<String>,
+        #[serde(default)]
+        refresh: bool,
+    },
+    /// Frees disk space on a server (`None`: this machine in server mode).
+    DiskClean {
+        #[serde(default)]
+        server: Option<String>,
+        action: crate::cloud::disk::Action,
+    },
     /// Move a session on this computer to a saved cloud server; replies
     /// `Launched` with the new `<server>:<session>` id.
     Move {
@@ -1136,6 +1151,8 @@ pub enum Reply {
         rules: String,
     },
     Servers(Vec<crate::cloud::federation::ServerStatus>),
+    Disk(crate::cloud::disk::Report),
+    DiskCleaned(crate::cloud::disk::Cleaned),
     SessionPrs(pr_cache::Lookup),
     Attachment(media::Attachment),
     /// Base64 file contents.

@@ -78,8 +78,11 @@ The same protocol serves difu running on a Linux server (`difu serve`, port
   QR code, `welcome` and `server.info`.
 * Methods for every device: `device.unpair`, `server.devices`,
   `server.devices.forget`, `server.repos*`, `server.rules.*`, `server.login*`,
-  `server.logout`; the `device.paired` event; and `rpc`, `rpc.watch`,
-  `rpc.unwatch` for `full` devices only.
+  `server.logout`, `server.disk`, `server.disk.clean`; the `device.paired`
+  event; and `rpc`, `rpc.watch`, `rpc.unwatch` for `full` devices only.
+* While a server is critically low on disk, `agents.new` (and moves and clones)
+  fail with a message naming the free space; see
+  [cloud-agents.md](cloud-agents.md#disk-space).
 * Failed pairing attempts are rate-limited per client address, and wrong
   passwords also globally; token authentication is never limited.
 

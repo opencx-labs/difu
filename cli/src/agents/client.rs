@@ -88,6 +88,8 @@ pub fn request(storage: &Storage, request: Request) -> Result<Reply> {
         Request::Launch { .. } | Request::NewAgent { .. } => "create session".into(),
         Request::Move { id, server } => format!("move session {id} to {server}"),
         Request::Import { .. } => "import a moved session".into(),
+        Request::Disk { .. } => "read disk space".into(),
+        Request::DiskClean { .. } => "free disk space".into(),
         _ => "request session service data".into(),
     };
     let mut stream = UnixStream::connect(super::server::socket(storage)?)
@@ -102,6 +104,7 @@ pub fn request(storage: &Storage, request: Request) -> Result<Reply> {
             | Request::Clear { .. }
             | Request::Move { .. }
             | Request::Import { .. }
+            | Request::DiskClean { .. }
     ) {
         None
     } else if matches!(request, Request::Cpu { .. }) {

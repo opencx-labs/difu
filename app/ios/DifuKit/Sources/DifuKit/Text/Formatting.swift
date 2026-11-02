@@ -24,6 +24,11 @@ public enum Formatting {
         return elapsed(seconds: milliseconds / 1000)
     }
 
+    /// Disk sizes: `2.1 GB`, `340 MB`, `0 bytes`.
+    public static func bytes(_ count: Int64) -> String {
+        max(0, count).formatted(.byteCount(style: .file, spellsOutZero: false))
+    }
+
     /// Compact relative time: `now`, `5m`, `3h`, `2d`, then a short date.
     public static func relative(_ date: Date, now: Date = Date()) -> String {
         let seconds = Int(now.timeIntervalSince(date))

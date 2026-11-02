@@ -621,6 +621,36 @@ pub(super) fn entries() -> Vec<ActionSpec> {
             ],
         ),
         entry(
+            ids::CLOUD_REFRESH,
+            "Refresh cloud servers and measure disk again",
+            &[contexts::AGENT_CLOUD],
+            &[key(BindingKey::Character('r'), 0)],
+        ),
+        entry(
+            ids::CLOUD_CLEAN_ARCHIVED,
+            "Clean archived worktrees on a server",
+            &[contexts::AGENT_CLOUD],
+            &[key(BindingKey::Character('a'), 0)],
+        ),
+        entry(
+            ids::CLOUD_CLEAR_BUILDS,
+            "Clear build outputs on a server",
+            &[contexts::AGENT_CLOUD],
+            &[key(BindingKey::Character('b'), 0)],
+        ),
+        entry(
+            ids::CLOUD_PRUNE_SANDBOX,
+            "Prune sandbox images on a server",
+            &[contexts::AGENT_CLOUD],
+            &[key(BindingKey::Character('p'), 0)],
+        ),
+        entry(
+            ids::CLOUD_BACK,
+            "Back from a cloud server's details",
+            &[contexts::AGENT_CLOUD],
+            &[key(BindingKey::Left, 0), key(BindingKey::Backspace, 0)],
+        ),
+        entry(
             ids::USAGE_REFRESH,
             "Refresh usage",
             &[contexts::AGENT_USAGE],

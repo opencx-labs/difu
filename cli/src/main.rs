@@ -93,6 +93,11 @@ enum Commands {
         #[command(subcommand)]
         command: Option<difu::cloud::cli::ReposCommand>,
     },
+    /// Show this server's disk space and what uses it, or free space.
+    Disk {
+        #[command(subcommand)]
+        command: Option<difu::cloud::cli::DiskCommand>,
+    },
     /// Manage per-session sandboxes on this server.
     Sandbox {
         #[command(subcommand)]
@@ -174,6 +179,9 @@ fn main() -> Result<()> {
         }
         Some(Commands::Sandbox { command }) => {
             return difu::cloud::cli::sandbox(&Storage::discover()?, command);
+        }
+        Some(Commands::Disk { command }) => {
+            return difu::cloud::cli::disk(&Storage::discover()?, command);
         }
         _ => {}
     }
@@ -460,6 +468,42 @@ mod tests {
             vec!["difu", "session", "move", "", "hetzner"],
             vec!["difu", "session", "move", "1790-ab12", ""],
             vec!["difu", "session"],
+        ] {
+            assert!(Args::try_parse_from(argv.clone()).is_err(), "{argv:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn disk_shows_status_by_default_and_cleans_by_name() -> Result<()> {
+        use difu::cloud::{cli::DiskCommand, disk::Action};
+        let args = Args::try_parse_from(["difu", "disk"])?;
+        assert!(matches!(
+            args.command,
+            Some(Commands::Disk { command: None })
+        ));
+        let args = Args::try_parse_from(["difu", "disk", "status", "--refresh"])?;
+        assert!(matches!(
+            args.command,
+            Some(Commands::Disk {
+                command: Some(DiskCommand::Status { refresh: true })
+            })
+        ));
+        for (name, action) in [
+            ("archived-worktrees", Action::ArchivedWorktrees),
+            ("build-outputs", Action::BuildOutputs),
+            ("sandbox", Action::Sandbox),
+        ] {
+            let args = Args::try_parse_from(["difu", "disk", "clean", name])?;
+            assert!(
+                matches!(args.command, Some(Commands::Disk { command: Some(DiskCommand::Clean { action: parsed }) }) if parsed == action),
+                "{name}"
+            );
+        }
+        for argv in [
+            vec!["difu", "disk", "clean"],
+            vec!["difu", "disk", "clean", "everything"],
+            vec!["difu", "disk", "clean", "archivedWorktrees"],
         ] {
             assert!(Args::try_parse_from(argv.clone()).is_err(), "{argv:?}");
         }

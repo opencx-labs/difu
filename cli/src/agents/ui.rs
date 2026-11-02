@@ -4,6 +4,7 @@ mod browser;
 mod cache_io;
 mod changes;
 mod clearing;
+mod cloud;
 mod codex_plan_picker;
 mod commands;
 mod defaults;
@@ -294,6 +295,8 @@ pub enum Modal {
         selected: usize,
     },
     Remote,
+    /// `/cloud`: saved servers, their disk space and cleanups.
+    Cloud,
     Repository(Editor),
     ChangeRepository(Editor),
     Commands {
@@ -505,6 +508,7 @@ pub struct Ui {
     theme: usize,
     slack: slack::State,
     remote: remote_control::State,
+    cloud: cloud::State,
     model_completion: models::State,
     /// Saved cloud servers' new-session defaults, as last read from each.
     location_defaults: HashMap<String, crate::storage::AgentDefaults>,
@@ -616,6 +620,7 @@ impl Ui {
             theme: crate::theme::index(config.theme.as_deref()),
             slack: slack::State::default(),
             remote: remote_control::State::default(),
+            cloud: cloud::State::default(),
             model_completion: models::State::default(),
             location_defaults: HashMap::new(),
             launch_defaults: None,
@@ -727,6 +732,7 @@ impl Ui {
         self.tick_voice(visible);
         self.tick_slack();
         self.tick_remote();
+        self.tick_cloud(visible);
         self.tick_theme();
         if visible {
             self.tick_mcp();
@@ -2776,6 +2782,10 @@ impl Ui {
             self.remote_key(key);
             return;
         }
+        if matches!(self.modal, Some(Modal::Cloud)) {
+            self.cloud_key(key);
+            return;
+        }
         if self.question_or_queue_key(key) {
             return;
         }
@@ -3962,15 +3972,27 @@ impl Ui {
                     String::new()
                 }
             );
-            // In a narrow list the server's name gives way, so the icons stay.
+            // In a narrow list the server's name gives way, so the icons stay;
+            // a server short of disk space says so when there is room.
+            let fits = |name: &str| {
+                3 + unicode_width::UnicodeWidthStr::width(name)
+                    + unicode_width::UnicodeWidthStr::width(place.as_str())
+                    <= usize::from(row.width)
+            };
+            let disk = session
+                .server
+                .as_deref()
+                .and_then(|server| self.cloud.mark(server));
             let server_name = session
                 .server
                 .as_ref()
-                .map(|server| format!("{server} · "))
-                .filter(|name| {
-                    3 + unicode_width::UnicodeWidthStr::width(name.as_str())
-                        + unicode_width::UnicodeWidthStr::width(place.as_str())
-                        <= usize::from(row.width)
+                .and_then(|server| {
+                    let marked = disk
+                        .and_then(cloud::indicator)
+                        .map(|mark| format!("{server} · {mark} · "));
+                    marked
+                        .filter(|name| fits(name))
+                        .or_else(|| Some(format!("{server} · ")).filter(|name| fits(name)))
                 })
                 .unwrap_or_default();
             let mut lines = vec![
@@ -3994,7 +4016,9 @@ impl Ui {
                     Span::styled(
                         server_name,
                         Style::default()
-                            .fg(DIM)
+                            .fg(disk
+                                .filter(|status| *status != crate::cloud::disk::Status::Ok)
+                                .map_or(DIM, cloud::status_color))
                             .add_modifier(ratatui::style::Modifier::ITALIC),
                     ),
                     Span::styled(
@@ -4110,7 +4134,14 @@ impl Ui {
                         s.status.label()
                     },
                     servers::server_name(&s.id)
-                        .map(|server| format!(" · on {server}"))
+                        .map(|server| format!(
+                            " · on {server}{}",
+                            self.cloud
+                                .mark(server)
+                                .and_then(cloud::indicator)
+                                .map(|mark| format!(" ({mark})"))
+                                .unwrap_or_default()
+                        ))
                         .unwrap_or_default()
                 )
             })
@@ -4682,6 +4713,7 @@ impl Ui {
             Some(Modal::Tweaks { .. }) => "Tweaks · chat animations",
             Some(Modal::Theme { .. }) => "Theme",
             Some(Modal::Remote) => "Remote control · iPhone",
+            Some(Modal::Cloud) => "Cloud servers",
             Some(Modal::Repository(_)) => "Choose and remember your default repository",
             Some(Modal::ChangeRepository(_)) => "Change session repository",
             Some(Modal::Menu { .. }) => "Agent actions",
@@ -4864,6 +4896,10 @@ impl Ui {
         }
         if matches!(self.modal, Some(Modal::Remote)) {
             self.draw_remote(frame, area);
+            return;
+        }
+        if matches!(self.modal, Some(Modal::Cloud)) {
+            self.draw_cloud(frame, area);
             return;
         }
         if matches!(self.modal, Some(Modal::Mcp(_))) {
@@ -5240,6 +5276,7 @@ impl Ui {
                 | Modal::Tweaks { .. }
                 | Modal::Theme { .. }
                 | Modal::Remote
+                | Modal::Cloud
                 | Modal::Commands { .. }
                 | Modal::Status { .. }
                 | Modal::Mcp(_)
@@ -5303,6 +5340,10 @@ fn agent_help(query: &str, config: &Config) -> Vec<(String, &'static str)> {
             "Open or dismiss approval; use Actions to stop the agent",
         ),
         ("Cmd+K", "Search sessions, pull requests and commands"),
+        (
+            "/cloud",
+            "Cloud servers: connection, version, logins, disk space and cleanups",
+        ),
         (
             "Ctrl+↑ / ↓ in sessions",
             "Reorder within the pinned or unpinned group, or move a folder (saved)",

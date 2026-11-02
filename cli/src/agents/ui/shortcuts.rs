@@ -81,6 +81,7 @@ impl Ui {
                 }
                 Modal::Theme { .. } => AGENT_THEMES,
                 Modal::Remote => AGENT_REMOTE,
+                Modal::Cloud => AGENT_CLOUD,
                 Modal::Repository(_) => AGENT_REPOSITORY,
                 Modal::ChangeRepository(_) => AGENT_CHANGE_REPOSITORY,
                 Modal::Commands { .. } => AGENT_COMMANDS,

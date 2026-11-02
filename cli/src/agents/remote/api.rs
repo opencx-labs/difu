@@ -576,6 +576,8 @@ fn rpc_watch(inner: &Arc<Inner>, id: Value, params: &Value) {
 }
 
 fn new_session(inner: &Inner, params: &Value) -> Result<Value> {
+    // Before a repository is cloned for it.
+    crate::cloud::disk::guard(&inner.storage)?;
     let config = config(&inner.storage);
     let saved = config.agent_defaults;
     // A server also takes `owner/name`, adding and cloning it when needed.
@@ -944,6 +946,35 @@ mod tests {
                     "default": false,
                 }),
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_critically_full_server_refuses_new_sessions_before_cloning() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        storage.update_config(|config| config.server.enabled = true)?;
+        let home = super::super::super::server::home(&storage)?;
+        crate::cloud::disk::tests::pretend(&home, Some(crate::cloud::disk::tests::critical()));
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+        let connection = Connection::new(
+            super::super::Remote::start(storage.clone()),
+            "device".into(),
+            super::super::Access::Standard,
+            0,
+            sender,
+        );
+        let result = new_session(&connection.0, &json!({"repository": "owner/repo"}));
+        crate::cloud::disk::tests::pretend(&home, None);
+        let error = result.err().context("refused")?;
+        assert!(error.to_string().contains("Only 2.0 GB is free"), "{error}");
+        assert!(
+            storage.load_config()?.server.repositories.is_empty(),
+            "nothing listed or cloned"
         );
         Ok(())
     }

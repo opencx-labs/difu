@@ -45,6 +45,7 @@ pub const AGENT_MCP_TOOLS: Context = Context("AgentMcpTools");
 pub const AGENT_MCP_TOOL: Context = Context("AgentMcpTool");
 pub const AGENT_MCP: Context = Context("AgentMcp");
 pub const AGENT_REMOTE: Context = Context("AgentRemote");
+pub const AGENT_CLOUD: Context = Context("AgentCloud");
 pub const AGENT_RULES: Context = Context("AgentRules");
 pub const AGENT_SLACK_SECRET: Context = Context("AgentSlackSecret");
 pub const AGENT_SLACK_BUTTON: Context = Context("AgentSlackButton");
@@ -143,6 +144,7 @@ pub const ALL: &[Context] = &[
     AGENT_MCP_TOOLS,
     AGENT_MCP_TOOL,
     AGENT_REMOTE,
+    AGENT_CLOUD,
     AGENT_RULES,
     AGENT_SLACK,
     AGENT_SLACK_BUTTON,
@@ -225,6 +227,7 @@ pub const AGENT_GENERIC_MODALS: &[Context] = &[
     AGENT_TWEAKS,
     AGENT_THEMES,
     AGENT_REMOTE,
+    AGENT_CLOUD,
     AGENT_REPOSITORY,
     AGENT_CHANGE_REPOSITORY,
     AGENT_COMMANDS,

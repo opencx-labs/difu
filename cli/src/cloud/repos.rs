@@ -308,6 +308,7 @@ fn clone_with(
     }
     record(&root, name, |fetch| fetch.error = None)?;
     let result = (|| {
+        super::disk::guard(storage)?;
         ensure!(
             !destination.exists(),
             "{} exists but is not a Git clone; move it aside",
@@ -783,6 +784,29 @@ mod tests {
         ] {
             assert!(validate(name).is_err(), "{name:?} should be invalid");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn a_critically_full_server_refuses_clones_but_keeps_existing_ones() -> Result<()> {
+        let (dir, storage) = fixture()?;
+        storage.update_config(|config| config.server.enabled = true)?;
+        let (_work, clone) = listed_clone(dir.path(), &storage)?;
+        let home = crate::agents::server::home(&storage)?;
+        super::super::disk::tests::pretend(&home, Some(super::super::disk::tests::critical()));
+        let existing = ensure(&storage, "owner/repo");
+        let refused = ensure(&storage, "owner/new");
+        let recorded = list(&storage)?;
+        super::super::disk::tests::pretend(&home, None);
+        assert_eq!(existing?, clone, "a clone that exists is used as is");
+        let error = refused.err().context("cloning is refused")?;
+        assert!(error.to_string().contains("Only 2.0 GB is free"), "{error}");
+        assert!(!path(&storage, "owner/new")?.exists());
+        let new = recorded
+            .iter()
+            .find(|r| r.name == "owner/new")
+            .context("listed")?;
+        assert!(new.error.as_deref().is_some_and(|e| e.contains("/cloud")));
         Ok(())
     }
 

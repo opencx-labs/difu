@@ -7,6 +7,7 @@
 //! local `Request::List` never waits on the network.
 use super::{
     client::{self, Connection},
+    disk,
     servers::{self, SavedServer},
 };
 use crate::{
@@ -37,6 +38,12 @@ const LISTENING: Duration = Duration::from_secs(15);
 /// so a brief network drop does not reshuffle the sidebar.
 const STALE: Duration = Duration::from_secs(60);
 const REPOSITORIES_STALE: Duration = Duration::from_secs(10);
+/// A server's disk status is read again this often while it is wanted; the
+/// server answers from its own cached measurement.
+const DISK_STALE: Duration = Duration::from_secs(30);
+/// Login checks run `gh` and `codex` on the server, so they are read rarely
+/// (and again when the `/cloud` panel refreshes).
+const LOGINS_STALE: Duration = Duration::from_secs(5 * 60);
 const POLL: Duration = Duration::from_secs(1);
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
 /// Idle `rpc.watch` streams send heartbeats this often, like the local watch.
@@ -125,6 +132,46 @@ pub struct ServerStatus {
     /// The server's saved new-session defaults, once read.
     #[serde(default)]
     pub defaults: Option<AgentDefaults>,
+    #[serde(default)]
+    pub port: u16,
+    /// The server's coding sessions, once listed; `None` while they cannot be
+    /// used from here (e.g. the versions differ).
+    #[serde(default)]
+    pub sessions: Option<SessionCounts>,
+    /// GitHub, Codex and Claude Code on the server (`server.logins`).
+    #[serde(default)]
+    pub logins: Vec<Login>,
+    /// The server's disk space and what uses it (`server.disk`).
+    #[serde(default)]
+    pub disk: Option<disk::Report>,
+    /// Why `disk` could not be read, such as an older server.
+    #[serde(default)]
+    pub disk_problem: Option<String>,
+}
+
+impl ServerStatus {
+    /// The disk status when it is known.
+    pub fn disk_status(&self) -> Option<disk::Status> {
+        self.disk.as_ref().map(|report| report.status)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SessionCounts {
+    pub active: usize,
+    pub archived: usize,
+    pub total: usize,
+}
+
+/// One tool's login on a server, as `server.logins` reports it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Login {
+    pub tool: String,
+    pub logged_in: bool,
+    pub account: Option<String>,
+    pub detail: String,
 }
 
 /// One of a server's repositories (`server.repos`); `path` is on the server.
@@ -243,6 +290,8 @@ fn session_id(request: &mut Request) -> Option<&mut String> {
         | Request::Remote { .. }
         | Request::RepositoryRules { .. }
         | Request::Servers
+        | Request::Disk { .. }
+        | Request::DiskClean { .. }
         // The local service moves its own session; servers import it.
         | Request::Move { .. }
         | Request::Import { .. } => None,
@@ -398,6 +447,8 @@ pub fn prefix_reply(server: &str, reply: Reply) -> Reply {
         | Reply::Remote(_)
         | Reply::RepositoryRules { .. }
         | Reply::Servers(_)
+        | Reply::Disk(_)
+        | Reply::DiskCleaned(_)
         | Reply::SessionPrs(_)
         | Reply::Attachment(_)
         | Reply::ArtifactFile(_)
@@ -437,6 +488,21 @@ fn usable(name: &str, remote: &dyn Remote) -> Result<()> {
     Ok(())
 }
 
+/// A server without `server.disk` runs an older difu.
+fn disk_error(name: &str, error: anyhow::Error) -> anyhow::Error {
+    if format!("{error:#}").contains("Unknown method") {
+        anyhow::anyhow!(
+            "{name} runs an older difu without disk status; run `difu server upgrade {name}`"
+        )
+    } else {
+        error
+    }
+}
+
+fn report(value: Value) -> Result<disk::Report> {
+    serde_json::from_value(value).context("Unexpected disk status from the server")
+}
+
 fn repositories(value: &Value) -> Result<Vec<Repository>> {
     let list = value
         .get("repositories")
@@ -460,6 +526,11 @@ struct Link {
     repositories: Vec<Repository>,
     repositories_at: Option<Instant>,
     defaults: Option<AgentDefaults>,
+    disk: Option<disk::Report>,
+    disk_problem: Option<String>,
+    disk_at: Option<Instant>,
+    logins: Vec<Login>,
+    logins_at: Option<Instant>,
     /// Someone wants fresh data before the next regular poll.
     refresh: bool,
 }
@@ -589,6 +660,11 @@ impl Federation {
                     repositories: Vec::new(),
                     repositories_at: None,
                     defaults: None,
+                    disk: None,
+                    disk_problem: None,
+                    disk_at: None,
+                    logins: Vec::new(),
+                    logins_at: None,
                     refresh: true,
                 },
             );
@@ -671,9 +747,12 @@ impl Federation {
     }
 
     /// Refreshes the cached sessions while someone lists them, and the
-    /// repositories and new-session defaults when they are stale.
+    /// repositories, new-session defaults, disk status and logins when they
+    /// are stale.
     pub(crate) fn poll(&self, name: &str, generation: u64, remote: &Arc<dyn Remote>) {
-        let (sessions, repos) = {
+        let stale =
+            |at: Option<Instant>, limit: Duration| at.is_none_or(|at| at.elapsed() >= limit);
+        let (sessions, repos, disk, logins) = {
             let mut state = self.lock();
             let listening = state.listening();
             let Some(link) = state.link(name, generation) else {
@@ -683,12 +762,34 @@ impl Federation {
             let wanted = refresh || listening;
             (
                 wanted && usable(name, remote.as_ref()).is_ok(),
-                wanted
-                    && link
-                        .repositories_at
-                        .is_none_or(|at| at.elapsed() >= REPOSITORIES_STALE),
+                wanted && stale(link.repositories_at, REPOSITORIES_STALE),
+                wanted && stale(link.disk_at, DISK_STALE),
+                wanted && stale(link.logins_at, LOGINS_STALE),
             )
         };
+        // The phone API answers whatever version the server runs.
+        if disk {
+            let result = remote
+                .call("server.disk", serde_json::json!({}))
+                .and_then(report)
+                .map_err(|error| disk_error(name, error));
+            self.store_disk(name, generation, result);
+        }
+        if logins {
+            let result = remote
+                .call("server.logins", serde_json::json!({}))
+                .and_then(|value| {
+                    Ok(serde_json::from_value::<Vec<Login>>(
+                        value.get("logins").cloned().unwrap_or_default(),
+                    )?)
+                });
+            if let Some(link) = self.lock().link(name, generation) {
+                link.logins_at = Some(Instant::now());
+                if let Ok(logins) = result {
+                    link.logins = logins;
+                }
+            }
+        }
         if sessions {
             let reply = remote.rpc(&Request::List);
             self.store_sessions(name, remote, reply);
@@ -713,6 +814,19 @@ impl Federation {
                 if let Some(Ok(Reply::AgentDefaults(defaults))) = defaults {
                     link.defaults = Some(defaults);
                 }
+            }
+        }
+    }
+
+    fn store_disk(&self, name: &str, generation: u64, result: Result<disk::Report>) {
+        if let Some(link) = self.lock().link(name, generation) {
+            link.disk_at = Some(Instant::now());
+            match result {
+                Ok(report) => {
+                    link.disk = Some(report);
+                    link.disk_problem = None;
+                }
+                Err(error) => link.disk_problem = Some(format!("{error:#}")),
             }
         }
     }
@@ -804,6 +918,23 @@ impl Federation {
                     },
                     repositories: link.repositories.clone(),
                     defaults: link.defaults.clone(),
+                    port: link.saved.port,
+                    sessions: link.sessions_at.map(|_| SessionCounts {
+                        active: link
+                            .sessions
+                            .iter()
+                            .filter(|session| session.status.active())
+                            .count(),
+                        archived: link
+                            .sessions
+                            .iter()
+                            .filter(|session| session.archived)
+                            .count(),
+                        total: link.sessions.len(),
+                    }),
+                    logins: link.logins.clone(),
+                    disk: link.disk.clone(),
+                    disk_problem: link.disk_problem.clone(),
                 }
             })
             .collect();
@@ -854,8 +985,85 @@ impl Federation {
         self.lock().links.keys().cloned().collect()
     }
 
+    /// A saved server's live connection, whatever version it runs.
+    fn connected(&self, name: &str) -> Result<(Arc<dyn Remote>, u64)> {
+        let state = self.lock();
+        let link = state
+            .links
+            .get(name)
+            .with_context(|| format!("No saved server named {name}"))?;
+        let remote = link.live().with_context(|| match &link.error {
+            Some(error) => format!("Server {name} is not connected: {error}"),
+            None => format!("Server {name} is not connected yet"),
+        })?;
+        Ok((remote, link.generation))
+    }
+
+    /// A saved server's disk status, read now. `refresh` asks the server to
+    /// measure again and this computer to read its logins and repositories
+    /// again, as the `/cloud` panel's Refresh does.
+    pub fn disk(&self, name: &str, refresh: bool) -> Result<disk::Report> {
+        let (remote, generation) = self.connected(name)?;
+        if refresh {
+            if let Some(link) = self.lock().link(name, generation) {
+                link.logins_at = None;
+                link.repositories_at = None;
+                link.refresh = true;
+            }
+            self.wake.notify_all();
+        }
+        let result = remote
+            .call("server.disk", serde_json::json!({"refresh": refresh}))
+            .and_then(report)
+            .map_err(|error| disk_error(name, error));
+        match result {
+            Ok(report) => {
+                self.store_disk(name, generation, Ok(report.clone()));
+                Ok(report)
+            }
+            Err(error) => {
+                self.store_disk(name, generation, Err(anyhow::anyhow!("{error:#}")));
+                Err(error)
+            }
+        }
+    }
+
+    /// Runs a disk cleanup on a saved server, then reads its disk status and
+    /// sessions again.
+    pub fn clean(&self, name: &str, action: disk::Action) -> Result<disk::Cleaned> {
+        let (remote, generation) = self.connected(name)?;
+        let value = remote
+            .call("server.disk.clean", serde_json::json!({"action": action}))
+            .map_err(|error| disk_error(name, error))?;
+        let cleaned: disk::Cleaned =
+            serde_json::from_value(value).context("Unexpected cleanup reply from the server")?;
+        let result = remote
+            .call("server.disk", serde_json::json!({}))
+            .and_then(report);
+        self.store_disk(name, generation, result);
+        // Removed worktrees show in the sessions list.
+        if usable(name, remote.as_ref()).is_ok() {
+            let sessions = remote.rpc(&Request::List);
+            self.store_sessions(name, &remote, sessions);
+        }
+        Ok(cleaned)
+    }
+
     /// Answers requests for server sessions; hands everything else back.
     pub fn route(&self, request: Request) -> Route {
+        // Disk status and cleanups use the phone API, which works whatever
+        // version the server runs.
+        match request {
+            Request::Disk {
+                server: Some(name),
+                refresh,
+            } => return Route::Handled(self.disk(&name, refresh).map(Reply::Disk)),
+            Request::DiskClean {
+                server: Some(name),
+                action,
+            } => return Route::Handled(self.clean(&name, action).map(Reply::DiskCleaned)),
+            _ => {}
+        }
         let known = self.known();
         match target(request, |name| known.contains(name)) {
             Target::Local(request) => Route::Local(request),
@@ -951,6 +1159,10 @@ pub(crate) mod tests {
         pub sessions: Mutex<Vec<Session>>,
         pub requests: Mutex<Vec<Request>>,
         pub watches: Mutex<Vec<OpenWatch>>,
+        /// Phone-API calls: method and params.
+        pub calls: Mutex<Vec<(String, Value)>>,
+        /// What `server.disk` answers; `None` answers like an older server.
+        pub disk: Mutex<Option<Value>>,
     }
 
     impl Fake {
@@ -962,7 +1174,23 @@ pub(crate) mod tests {
                 sessions: Mutex::new(sessions),
                 requests: Mutex::new(Vec::new()),
                 watches: Mutex::new(Vec::new()),
+                calls: Mutex::new(Vec::new()),
+                disk: Mutex::new(Some(serde_json::json!({
+                    "path": "/srv/difu/agents", "total": 100_000_000_000u64,
+                    "used": 90_000_000_000u64, "free": 10_000_000_000u64, "status": "low",
+                    "measuredAt": 1, "measuring": false,
+                    "breakdown": {"sessions": [{"id": "1", "title": "Task", "archived": true, "active": false, "bytes": 4_000_000_000u64, "buildOutputs": 1_000_000_000u64}],
+                        "repositories": 1, "attachments": 2, "caches": 3,
+                        "sandbox": {"available": true, "images": 4, "containers": 5, "volumes": 6, "reclaimable": 7},
+                        "other": 8}
+                }))),
             })
+        }
+        pub(crate) fn calls(&self) -> Vec<(String, Value)> {
+            self.calls
+                .lock()
+                .map(|calls| calls.clone())
+                .unwrap_or_default()
         }
         pub(crate) fn new(sessions: Vec<Session>) -> Arc<Self> {
             Self::with_version(sessions, env!("CARGO_PKG_VERSION"))
@@ -985,11 +1213,32 @@ pub(crate) mod tests {
         fn closed(&self) -> bool {
             self.closed.load(Ordering::Relaxed)
         }
-        fn call(&self, method: &str, _params: Value) -> Result<Value> {
-            anyhow::ensure!(method == "server.repos", "unexpected {method}");
-            Ok(serde_json::json!({"repositories":[
-                {"name":"acme/api","path":"/srv/difu/repos/acme/api","cloned":true,"fetchedAt":1}
-            ],"refreshMinutes":10}))
+        fn call(&self, method: &str, params: Value) -> Result<Value> {
+            self.calls
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock"))?
+                .push((method.to_owned(), params.clone()));
+            match method {
+                "server.repos" => Ok(serde_json::json!({"repositories":[
+                    {"name":"acme/api","path":"/srv/difu/repos/acme/api","cloned":true,"fetchedAt":1}
+                ],"refreshMinutes":10})),
+                "server.disk" => self
+                    .disk
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("lock"))?
+                    .clone()
+                    .context("Unknown method `server.disk`; update difu on your computer"),
+                "server.disk.clean" => Ok(serde_json::json!({
+                    "freed": 4_000_000_000u64,
+                    "summary": format!("Cleaned {}", params.get("action").and_then(Value::as_str).unwrap_or_default()),
+                })),
+                "server.logins" => Ok(serde_json::json!({"logins": [
+                    {"tool": "github", "loggedIn": true, "account": "octocat", "detail": "Logged in"},
+                    {"tool": "codex", "loggedIn": false, "account": null, "detail": "Not logged in"},
+                    {"tool": "claude", "loggedIn": true, "account": null, "detail": "Token saved"}
+                ]})),
+                _ => anyhow::bail!("unexpected {method}"),
+            }
         }
         fn rpc(&self, request: &Request) -> Result<Reply> {
             self.requests
@@ -1523,6 +1772,150 @@ pub(crate) mod tests {
                 .iter()
                 .any(|r| matches!(r, Request::Models { server: None }))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn server_status_carries_disk_logins_session_counts_and_port() -> Result<()> {
+        let mut archived = session("2");
+        archived.archived = true;
+        let mut working = session("3");
+        working.status = Status::Running;
+        let fake = Fake::new(vec![session("1"), archived, working]);
+        let (_dir, federation) = connected(vec![("box", fake.clone())])?;
+        let status = federation.servers();
+        let [status] = status.as_slice() else {
+            anyhow::bail!("one server");
+        };
+        assert_eq!(
+            status.sessions,
+            Some(SessionCounts {
+                active: 1,
+                archived: 1,
+                total: 3
+            })
+        );
+        assert_eq!(status.port, server("box", "id-box").port);
+        assert_eq!(status.disk_status(), Some(disk::Status::Low));
+        assert_eq!(
+            status
+                .disk
+                .as_ref()
+                .map(|d| d.expected(disk::Action::ArchivedWorktrees)),
+            Some(4_000_000_000)
+        );
+        assert!(status.disk_problem.is_none());
+        let tools: Vec<(&str, bool)> = status
+            .logins
+            .iter()
+            .map(|login| (login.tool.as_str(), login.logged_in))
+            .collect();
+        assert_eq!(
+            tools,
+            vec![("github", true), ("codex", false), ("claude", true)]
+        );
+        // While listing, sessions refresh but fresh disk status, logins and
+        // repositories are not read again.
+        let calls = fake.calls().len();
+        let lists = fake.requests().len();
+        federation.list(Vec::new());
+        let generation = federation
+            .lock()
+            .links
+            .get("box")
+            .map(|link| link.generation)
+            .context("link")?;
+        federation.poll("box", generation, &federation.remote("box")?);
+        assert_eq!(fake.calls().len(), calls, "{:?}", fake.calls());
+        assert!(fake.requests().len() > lists);
+        Ok(())
+    }
+
+    #[test]
+    fn disk_requests_and_cleanups_use_the_phone_api_whatever_version() -> Result<()> {
+        let fake = Fake::with_version(vec![session("1")], "0.0.1");
+        let (_dir, federation) = connected(vec![("box", fake.clone())])?;
+        let Route::Handled(reply) = federation.route(Request::Disk {
+            server: Some("box".into()),
+            refresh: true,
+        }) else {
+            anyhow::bail!("disk status comes from the server");
+        };
+        let Reply::Disk(report) = reply? else {
+            anyhow::bail!("expected a disk reply");
+        };
+        assert_eq!(report.status, disk::Status::Low);
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|(method, params)| method == "server.disk"
+                    && params == &serde_json::json!({"refresh": true}))
+        );
+        let Route::Handled(reply) = federation.route(Request::DiskClean {
+            server: Some("box".into()),
+            action: disk::Action::BuildOutputs,
+        }) else {
+            anyhow::bail!("cleanups run on the server");
+        };
+        let Reply::DiskCleaned(cleaned) = reply? else {
+            anyhow::bail!("expected a cleanup reply");
+        };
+        assert_eq!(cleaned.freed, 4_000_000_000);
+        assert_eq!(cleaned.summary, "Cleaned buildOutputs");
+        assert!(
+            fake.calls()
+                .iter()
+                .any(|(method, params)| method == "server.disk.clean"
+                    && params == &serde_json::json!({"action": "buildOutputs"}))
+        );
+        assert!(
+            fake.requests().is_empty(),
+            "no rpc with a mismatched version"
+        );
+        assert!(matches!(
+            federation.route(Request::Disk {
+                server: None,
+                refresh: false
+            }),
+            Route::Local(Request::Disk { server: None, .. })
+        ));
+        let Route::Handled(missing) = federation.route(Request::Disk {
+            server: Some("nowhere".into()),
+            refresh: false,
+        }) else {
+            anyhow::bail!("unknown servers are answered");
+        };
+        assert!(missing.is_err_and(|e| e.to_string().contains("No saved server")));
+        Ok(())
+    }
+
+    #[test]
+    fn older_servers_report_a_disk_problem_not_a_connection_problem() -> Result<()> {
+        let fake = Fake::new(Vec::new());
+        if let Ok(mut disk) = fake.disk.lock() {
+            *disk = None;
+        }
+        let (_dir, federation) = connected(vec![("box", fake.clone())])?;
+        let status = federation.servers();
+        let [status] = status.as_slice() else {
+            anyhow::bail!("one server");
+        };
+        assert!(status.problem.is_none(), "{status:?}");
+        assert!(status.disk.is_none());
+        assert!(
+            status
+                .disk_problem
+                .as_deref()
+                .is_some_and(|p| p.contains("difu server upgrade box")),
+            "{status:?}"
+        );
+        let Route::Handled(reply) = federation.route(Request::Disk {
+            server: Some("box".into()),
+            refresh: false,
+        }) else {
+            anyhow::bail!("answered here");
+        };
+        assert!(reply.is_err_and(|e| e.to_string().contains("older difu")));
         Ok(())
     }
 

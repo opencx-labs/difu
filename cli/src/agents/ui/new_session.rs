@@ -95,6 +95,22 @@ fn path_text(path: &Path) -> String {
     path.display().to_string()
 }
 
+/// ` · disk low (12.0 GB free)` for a server short of space.
+fn disk_note(status: &ServerStatus) -> String {
+    status
+        .disk
+        .as_ref()
+        .and_then(|report| {
+            super::cloud::indicator(report.status).map(|mark| {
+                format!(
+                    " · {mark} ({} free)",
+                    crate::cloud::disk::human(report.free)
+                )
+            })
+        })
+        .unwrap_or_default()
+}
+
 fn server_detail(status: &ServerStatus) -> String {
     if let Some(problem) = &status.problem {
         return problem.clone();
@@ -105,13 +121,14 @@ fn server_detail(status: &ServerStatus) -> String {
         .filter(|repository| repository.cloned)
         .count();
     format!(
-        "{} · {cloned} {}",
+        "{} · {cloned} {}{}",
         status.hosts.first().map(String::as_str).unwrap_or("server"),
         if cloned == 1 {
             "repository"
         } else {
             "repositories"
-        }
+        },
+        disk_note(status)
     )
 }
 
@@ -514,7 +531,8 @@ impl Form {
                         ..
                     }),
                 ) => format!("{name} · {problem}"),
-                (Some(name), _) => name.clone(),
+                (Some(name), Some(status)) => format!("{name}{}", disk_note(status)),
+                (Some(name), None) => name.clone(),
             },
             REPOSITORY => match (&self.location, &self.repository) {
                 (None, None) => format!(
@@ -574,6 +592,17 @@ impl Form {
             .ok_or_else(|| format!("{server} is no longer saved"))?;
         if let Some(problem) = &status.problem {
             return Err(format!("{server}: {problem}"));
+        }
+        // The server refuses too; saying so here saves the round trip.
+        if let Some(report) = status
+            .disk
+            .as_ref()
+            .filter(|report| report.status == crate::cloud::disk::Status::Critical)
+        {
+            return Err(format!(
+                "{server}: {}",
+                crate::cloud::disk::refusal(&report.space())
+            ));
         }
         let Some(path) = &self.repository else {
             return Err(if status.repositories.is_empty() {
@@ -672,6 +701,7 @@ impl Ui {
             form.loading = None;
             crate::repaint::request();
             form.receive(result);
+            self.cloud.remember(&form.servers);
             for status in &form.servers {
                 if let Some(defaults) = &status.defaults {
                     self.location_defaults
@@ -1103,6 +1133,7 @@ pub(super) mod tests {
                 },
             ],
             defaults: Some(server_defaults()),
+            ..ServerStatus::default()
         }
     }
 
@@ -1340,6 +1371,49 @@ pub(super) mod tests {
         );
         press(&mut ui, KeyCode::Esc);
         assert!(ui.modal.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn servers_short_of_disk_say_so_and_a_critical_one_refuses_to_start() -> Result<()> {
+        let disk = |status, free| crate::cloud::disk::Report {
+            total: 100_000_000_000,
+            used: 100_000_000_000 - free,
+            free,
+            status,
+            ..Default::default()
+        };
+        let mut low = status("low", None);
+        low.disk = Some(disk(crate::cloud::disk::Status::Low, 12_000_000_000));
+        let mut full = status("full", None);
+        full.disk = Some(disk(crate::cloud::disk::Status::Critical, 2_000_000_000));
+        let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
+        open(&mut ui, vec![low, full]);
+        let details: Vec<String> = form(&ui)?
+            .choices(LOCATION, None)
+            .into_iter()
+            .map(|choice| choice.detail)
+            .collect();
+        assert!(
+            details
+                .iter()
+                .any(|d| d.ends_with("disk low (12.0 GB free)")),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d.ends_with("disk critical (2.0 GB free)")),
+            "{details:?}"
+        );
+        press(&mut ui, KeyCode::Down);
+        assert!(screen(&mut ui)?.contains("low · disk low (12.0 GB free)"));
+        press(&mut ui, KeyCode::Down);
+        press(&mut ui, KeyCode::Enter);
+        assert!(!ui.busy, "nothing is sent");
+        let error = form(&ui)?.error.clone().unwrap_or_default();
+        assert!(error.starts_with("full: Only 2.0 GB is free"), "{error}");
+        assert!(error.contains("/cloud"), "{error}");
         Ok(())
     }
 
