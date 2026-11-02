@@ -712,6 +712,26 @@ impl Federation {
         Ok(remote)
     }
 
+    /// `remote`, waiting up to `patience` while saved servers are still being
+    /// loaded or `name` is still connecting (right after the service starts).
+    pub fn remote_within(&self, name: &str, patience: Duration) -> Result<Arc<dyn Remote>> {
+        let deadline = Instant::now() + patience;
+        loop {
+            let connecting = {
+                let state = self.lock();
+                state.loaded.is_none()
+                    || state
+                        .links
+                        .get(name)
+                        .is_some_and(|link| link.live().is_none() && link.error.is_none())
+            };
+            if !connecting || Instant::now() >= deadline {
+                return self.remote(name);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     fn known(&self) -> BTreeSet<String> {
         self.lock().links.keys().cloned().collect()
     }
@@ -916,6 +936,33 @@ pub(crate) mod tests {
             }
         }
         Ok(federation)
+    }
+
+    #[test]
+    fn moves_wait_briefly_for_a_server_that_is_still_connecting() -> Result<()> {
+        let (_dir, connected) = connected(vec![("box", Fake::new(Vec::new()))])?;
+        assert!(connected.remote_within("box", Duration::ZERO).is_ok());
+        let error = connected
+            .remote_within("nowhere", Duration::from_secs(5))
+            .err()
+            .context("unknown server")?;
+        assert!(format!("{error:#}").contains("No saved server named nowhere"));
+
+        let (_dir, storage) = storage()?;
+        servers::save(&storage, server("box", "id-box"))?;
+        let connecting = Federation::new(storage, Box::new(|_| anyhow::bail!("unreachable")));
+        connecting.reload();
+        let started = Instant::now();
+        let error = connecting
+            .remote_within("box", Duration::from_millis(250))
+            .err()
+            .context("still connecting")?;
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        assert!(
+            format!("{error:#}").contains("not connected yet"),
+            "{error:#}"
+        );
+        Ok(())
     }
 
     #[test]

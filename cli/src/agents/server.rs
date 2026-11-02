@@ -420,7 +420,7 @@ impl Service {
         };
         super::moving::check(&session)?;
         // Connected, with full access and the same difu version.
-        federation.remote(server)?;
+        federation.remote_within(server, Duration::from_secs(10))?;
         self.stop_worker(id)?;
         let package = super::moving::export(&self.store.get(id)?, &Cancel::default())?;
         super::moving::fits(&package, super::moving::LIMIT)?;
