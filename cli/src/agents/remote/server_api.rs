@@ -1,9 +1,10 @@
 //! Server settings methods for paired clients (`server.repos.*`, `server.rules.*`,
-//! `server.logins`, `server.login.*`, `server.logout`); see docs/cloud-agents.md.
+//! `server.logins`, `server.login.*`, `server.logout`, `server.disk*`); see
+//! docs/cloud-agents.md.
 //! Returns `None` for methods this module does not own.
 use crate::{
-    agents::Reply,
-    cloud::{logins, repos},
+    agents::{Reply, Request},
+    cloud::{disk, logins, repos},
     storage::Storage,
 };
 use anyhow::{Context, Result, ensure};
@@ -13,6 +14,7 @@ use std::{path::PathBuf, thread};
 pub fn dispatch(storage: &Storage, method: &str, params: &Value) -> Option<Result<Value>> {
     let server_only = method.starts_with("server.repos")
         || method.starts_with("server.login")
+        || method.starts_with("server.disk")
         || method == "server.logout";
     let result = match method {
         _ if server_only && !super::api::config(storage).server.enabled => Err(anyhow::anyhow!(
@@ -49,6 +51,37 @@ pub fn dispatch(storage: &Storage, method: &str, params: &Value) -> Option<Resul
                 repos::refresh(storage, name.as_deref())
             })
         }),
+        "server.disk" => flag(params, "refresh").and_then(|refresh| {
+            match crate::agents::client::request(
+                storage,
+                Request::Disk {
+                    server: None,
+                    refresh,
+                },
+            )? {
+                Reply::Disk(report) => Ok(serde_json::to_value(report)?),
+                _ => anyhow::bail!("Unexpected disk reply"),
+            }
+        }),
+        "server.disk.clean" => text(params, "action").and_then(|name| {
+            let action: disk::Action = serde_json::from_value(json!(name)).with_context(|| {
+                format!(
+                    "Unknown cleanup `{name}`; expected archivedWorktrees, buildOutputs or sandbox"
+                )
+            })?;
+            match crate::agents::client::request(
+                storage,
+                Request::DiskClean {
+                    server: None,
+                    action,
+                },
+            )? {
+                Reply::DiskCleaned(cleaned) => {
+                    Ok(json!({"freed": cleaned.freed, "summary": cleaned.summary}))
+                }
+                _ => anyhow::bail!("Unexpected cleanup reply"),
+            }
+        }),
         "server.rules.get" => rules(storage, params, None),
         "server.rules.set" => {
             text(params, "rules").and_then(|text| rules(storage, params, Some(text)))
@@ -74,6 +107,15 @@ fn text(params: &Value, key: &str) -> Result<String> {
         .and_then(Value::as_str)
         .map(str::to_owned)
         .with_context(|| format!("Invalid or missing parameter `{key}`"))
+}
+
+/// An optional boolean, false when absent.
+fn flag(params: &Value, key: &str) -> Result<bool> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(value)) => Ok(*value),
+        Some(_) => anyhow::bail!("Invalid parameter `{key}`"),
+    }
 }
 
 fn optional(params: &Value, key: &str) -> Result<Option<String>> {
@@ -151,7 +193,13 @@ mod tests {
             cache: dir.path().join("cache"),
         };
         assert!(dispatch(&storage, "sessions.list", &json!({})).is_none());
-        for method in ["server.repos", "server.login.start", "server.logout"] {
+        for method in [
+            "server.repos",
+            "server.login.start",
+            "server.logout",
+            "server.disk",
+            "server.disk.clean",
+        ] {
             let error = call(&storage, method, json!({"tool": "codex"}))
                 .err()
                 .context("Expected a refusal")?;
@@ -170,6 +218,104 @@ mod tests {
             call(&storage, "server.rules.get", json!({"repository": path}))?,
             json!({"rules": "Use tabs."})
         );
+        Ok(())
+    }
+
+    /// Answers the next service request on the socket with `reply` and
+    /// returns the request.
+    fn answer(storage: &Storage, reply: Reply) -> Result<thread::JoinHandle<Result<Request>>> {
+        use std::{
+            io::{BufRead, BufReader, Write},
+            os::unix::net::UnixListener,
+        };
+        let listener = UnixListener::bind(crate::agents::server::socket(storage)?)?;
+        Ok(thread::spawn(move || -> Result<Request> {
+            let (mut stream, _) = listener.accept()?;
+            let mut line = String::new();
+            BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+            serde_json::to_writer(&mut stream, &reply)?;
+            stream.write_all(b"\n")?;
+            Ok(serde_json::from_str(&line)?)
+        }))
+    }
+
+    #[test]
+    fn disk_status_and_cleanups_reach_the_service_with_the_documented_shapes() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        storage.update_config(|config| config.server.enabled = true)?;
+        let report = disk::Report {
+            path: "/srv/difu/agents".into(),
+            total: 100,
+            used: 96,
+            free: 4,
+            status: disk::Status::Critical,
+            measured_at: Some(1),
+            measuring: true,
+            breakdown: disk::Breakdown {
+                sessions: vec![disk::SessionUsage {
+                    id: "1".into(),
+                    title: "Task".into(),
+                    archived: true,
+                    active: false,
+                    bytes: 50,
+                    build_outputs: 20,
+                }],
+                ..disk::Breakdown::default()
+            },
+        };
+        let served = answer(&storage, Reply::Disk(report))?;
+        let value = call(&storage, "server.disk", json!({"refresh": true}))?;
+        let request = served.join().map_err(|_| anyhow::anyhow!("socket"))??;
+        assert!(matches!(
+            request,
+            Request::Disk {
+                server: None,
+                refresh: true
+            }
+        ));
+        assert_eq!(value.get("status"), Some(&json!("critical")));
+        assert_eq!(value.get("measuredAt"), Some(&json!(1)));
+        assert_eq!(value.get("measuring"), Some(&json!(true)));
+        assert_eq!(
+            value.pointer("/breakdown/sessions/0/buildOutputs"),
+            Some(&json!(20))
+        );
+        for key in ["repositories", "attachments", "caches", "sandbox", "other"] {
+            assert!(
+                value.pointer(&format!("/breakdown/{key}")).is_some(),
+                "{key}"
+            );
+        }
+        fs::remove_file(crate::agents::server::socket(&storage)?)?;
+        let served = answer(
+            &storage,
+            Reply::DiskCleaned(disk::Cleaned {
+                freed: 7,
+                summary: "Done".into(),
+            }),
+        )?;
+        let value = call(
+            &storage,
+            "server.disk.clean",
+            json!({"action": "archivedWorktrees"}),
+        )?;
+        let request = served.join().map_err(|_| anyhow::anyhow!("socket"))??;
+        assert!(matches!(
+            request,
+            Request::DiskClean {
+                server: None,
+                action: disk::Action::ArchivedWorktrees
+            }
+        ));
+        assert_eq!(value, json!({"freed": 7, "summary": "Done"}));
+        for params in [json!({"action": "everything"}), json!({})] {
+            assert!(call(&storage, "server.disk.clean", params).is_err());
+        }
+        assert!(call(&storage, "server.disk", json!({"refresh": "yes"})).is_err());
         Ok(())
     }
 

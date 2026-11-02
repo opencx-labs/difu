@@ -295,7 +295,14 @@ pub fn list(storage: &Storage) -> Result<()> {
             let server = server.clone();
             let (tx, rx) = mpsc::channel();
             thread::spawn(move || {
-                let _ = tx.send(Connection::connect(&server).map(|c| c.welcome()));
+                let _ = tx.send(Connection::connect(&server).map(|c| {
+                    // Older servers have no disk status.
+                    let disk = c
+                        .call("server.disk", serde_json::json!({}))
+                        .ok()
+                        .and_then(|value| serde_json::from_value(value).ok());
+                    (c.welcome(), disk)
+                }));
             });
             rx
         })
@@ -304,13 +311,14 @@ pub fn list(storage: &Storage) -> Result<()> {
         "NAME".to_owned(),
         "HOSTS".to_owned(),
         "VERSION".to_owned(),
+        "DISK".to_owned(),
         "STATUS".to_owned(),
     ]];
     let mut warnings = Vec::new();
     for (server, check) in servers.iter().zip(checks) {
         let hosts = format!("{} (port {})", server.hosts.join(", "), server.port);
-        let (version, status) = match check.recv_timeout(CONNECT_TIMEOUT) {
-            Ok(Ok(welcome)) => {
+        let (version, disk, status) = match check.recv_timeout(CONNECT_TIMEOUT) {
+            Ok(Ok((welcome, disk))) => {
                 if let Some(warning) = version_warning(&server.name, &welcome.version) {
                     warnings.push(warning);
                 }
@@ -321,12 +329,29 @@ pub fn list(storage: &Storage) -> Result<()> {
                 } else {
                     "connected".to_owned()
                 };
-                (welcome.version, status)
+                if disk
+                    .as_ref()
+                    .is_some_and(|d: &super::disk::Report| d.status != super::disk::Status::Ok)
+                {
+                    warnings.push(format!(
+                        "{} is running low on disk space; free some in Cmd+K → /cloud",
+                        server.name
+                    ));
+                }
+                (welcome.version, disk_cell(disk.as_ref()), status)
             }
-            Ok(Err(error)) => ("-".to_owned(), format!("unreachable: {error:#}")),
-            Err(_) => ("-".to_owned(), "unreachable: timed out".to_owned()),
+            Ok(Err(error)) => (
+                "-".to_owned(),
+                "-".to_owned(),
+                format!("unreachable: {error:#}"),
+            ),
+            Err(_) => (
+                "-".to_owned(),
+                "-".to_owned(),
+                "unreachable: timed out".to_owned(),
+            ),
         };
-        rows.push([server.name.clone(), hosts, version, status]);
+        rows.push([server.name.clone(), hosts, version, disk, status]);
     }
     print!("{}", table(&rows));
     for warning in warnings {
@@ -335,8 +360,23 @@ pub fn list(storage: &Storage) -> Result<()> {
     Ok(())
 }
 
-fn table(rows: &[[String; 4]]) -> String {
-    let mut widths = [0usize; 4];
+/// Free space, with the status when it is not ok.
+fn disk_cell(report: Option<&super::disk::Report>) -> String {
+    match report {
+        None => "-".into(),
+        Some(report) if report.status == super::disk::Status::Ok => {
+            format!("{} free", super::disk::human(report.free))
+        }
+        Some(report) => format!(
+            "{} free ({})",
+            super::disk::human(report.free),
+            report.status.label()
+        ),
+    }
+}
+
+fn table<const N: usize>(rows: &[[String; N]]) -> String {
+    let mut widths = [0usize; N];
     for row in rows {
         for (width, cell) in widths.iter_mut().zip(row) {
             *width = (*width).max(cell.chars().count());
@@ -587,6 +627,26 @@ pub(crate) mod tests {
         assert_eq!(
             text,
             "NAME  HOSTS  VERSION  STATUS\nbox   h :1   1.0.0    connected\n"
+        );
+        let report = |free, status| super::super::disk::Report {
+            free,
+            status,
+            ..Default::default()
+        };
+        assert_eq!(disk_cell(None), "-");
+        assert_eq!(
+            disk_cell(Some(&report(
+                28_400_000_000,
+                super::super::disk::Status::Ok
+            ))),
+            "28.4 GB free"
+        );
+        assert_eq!(
+            disk_cell(Some(&report(
+                3_000_000_000,
+                super::super::disk::Status::Critical
+            ))),
+            "3.0 GB free (critical)"
         );
         Ok(())
     }

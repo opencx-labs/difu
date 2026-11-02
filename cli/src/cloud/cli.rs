@@ -104,6 +104,22 @@ pub enum SandboxCommand {
     Status,
 }
 
+/// Run on a server: disk space and cleanups.
+#[derive(Clone, Debug, Subcommand)]
+pub enum DiskCommand {
+    /// Show free space and what uses it (the default).
+    Status {
+        /// Measure what uses the space again first.
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Free space on this server.
+    Clean {
+        #[arg(value_enum)]
+        action: super::disk::Action,
+    },
+}
+
 pub fn server(storage: &Storage, command: ServerCommand) -> Result<()> {
     match command {
         ServerCommand::Add {
@@ -139,6 +155,10 @@ pub fn remote(storage: &Storage, command: RemoteCommand) -> Result<()> {
 
 pub fn repos(storage: &Storage, command: ReposCommand) -> Result<()> {
     super::repos::command(storage, command)
+}
+
+pub fn disk(storage: &Storage, command: Option<DiskCommand>) -> Result<()> {
+    super::disk::command(storage, command)
 }
 
 pub fn sandbox(storage: &Storage, command: SandboxCommand) -> Result<()> {

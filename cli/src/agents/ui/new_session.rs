@@ -1103,6 +1103,7 @@ pub(super) mod tests {
                 },
             ],
             defaults: Some(server_defaults()),
+            ..ServerStatus::default()
         }
     }
 

@@ -206,6 +206,8 @@ struct Service {
     federation: Option<Arc<crate::cloud::federation::Federation>>,
     /// Removes a server session's sandbox pod; a fake in tests.
     pods: Arc<dyn super::sandbox::Runner>,
+    /// Disk status and cleanups on a server, started on first use.
+    disk: std::sync::OnceLock<Arc<crate::cloud::disk::Monitor>>,
 }
 
 pub fn home(storage: &Storage) -> Result<PathBuf> {
@@ -403,6 +405,239 @@ impl Service {
         self.start(&id, None)?;
         Ok(id)
     }
+    /// Disk status and cleanups for this server's data.
+    fn disk(&self) -> Arc<crate::cloud::disk::Monitor> {
+        self.disk
+            .get_or_init(|| {
+                let store = Arc::downgrade(&self.store);
+                Arc::new(crate::cloud::disk::Monitor::new(
+                    self.store.home.clone(),
+                    self.store.storage.cache.clone(),
+                    self.pods.clone(),
+                    Box::new(move || {
+                        let store = store.upgrade()?;
+                        let sessions = store.sessions.lock().ok()?;
+                        Some(
+                            sessions
+                                .values()
+                                .filter(|s| matches!(s.job, Job::Coding(_)) && !s.orchestrator)
+                                .map(|s| crate::cloud::disk::SessionInfo {
+                                    id: s.id.clone(),
+                                    title: s.title.clone(),
+                                    archived: s.archived,
+                                    active: s.status.active() || s.turn_id.is_some(),
+                                })
+                                .collect(),
+                        )
+                    }),
+                ))
+            })
+            .clone()
+    }
+    fn action_lock(&self, id: &str) -> Result<Arc<Mutex<()>>> {
+        Ok(self
+            .action_locks
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Action lock failed"))?
+            .entry(id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone())
+    }
+    /// The difu-owned worktree a session still uses, if any.
+    fn managed_worktree(&self, session: &Session) -> Option<PathBuf> {
+        let owned = self.store.home.join("worktrees").join(&session.id);
+        (matches!(&session.job, Job::Coding(launch) if launch.isolated)
+            && !session.orchestrator
+            && !session.workspace_removed
+            && session.workspace.as_ref() == Some(&owned)
+            && fs::symlink_metadata(&owned).is_ok_and(|meta| meta.is_dir()))
+        .then_some(owned)
+    }
+    /// Nothing runs in the session: no turn, no preparation, no open shell.
+    fn idle(&self, session: &Session) -> bool {
+        !session.status.active()
+            && session.turn_id.is_none()
+            && session.workspace_ready
+            && !session.clearing
+            && !session.switching_workspace
+            && session.deletion_progress.is_none()
+            && self.store.shells.list(&session.id).is_ok_and(|shells| {
+                shells
+                    .iter()
+                    .all(|shell| shell.get("closed").and_then(Value::as_bool) == Some(true))
+            })
+    }
+    /// Deletes a session's ignored build outputs under its action lock, when
+    /// it is idle. `None` when it was busy.
+    fn clear_outputs(&self, id: &str) -> Result<Option<(usize, u64, Vec<String>)>> {
+        let lock = self.action_lock(id)?;
+        let _guard = lock
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session action lock failed"))?;
+        let session = self.store.get(id)?;
+        let Some(worktree) = self.managed_worktree(&session) else {
+            return Ok(Some((0, 0, Vec::new())));
+        };
+        if !self.idle(&session) {
+            return Ok(None);
+        }
+        let outputs = crate::cloud::disk::build_outputs(&worktree, &Cancel::default())?;
+        let (freed, errors) = crate::cloud::disk::remove_outputs(&worktree, &outputs);
+        Ok(Some((outputs.len() - errors.len(), freed, errors)))
+    }
+    fn titles(titles: &[String]) -> String {
+        const SHOWN: usize = 5;
+        let mut text = titles
+            .iter()
+            .take(SHOWN)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if titles.len() > SHOWN {
+            text.push_str(&format!(" and {} more", titles.len() - SHOWN));
+        }
+        text
+    }
+    /// Sessions with a difu-owned worktree, filtered.
+    fn worktree_sessions(&self, keep: impl Fn(&Session) -> bool) -> Result<Vec<(String, String)>> {
+        Ok(self
+            .store
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session lock failed"))?
+            .values()
+            .filter(|s| keep(s) && self.managed_worktree(s).is_some())
+            .map(|s| (s.id.clone(), s.title.clone()))
+            .collect())
+    }
+    fn clean_build_outputs(&self) -> Result<crate::cloud::disk::Cleaned> {
+        use crate::cloud::disk::human;
+        let (mut freed, mut directories, mut sessions) = (0u64, 0usize, 0usize);
+        let (mut busy, mut problems) = (Vec::new(), Vec::new());
+        for (id, title) in self.worktree_sessions(|_| true)? {
+            match self.clear_outputs(&id) {
+                Ok(Some((cleared, bytes, errors))) => {
+                    freed += bytes;
+                    directories += cleared;
+                    sessions += usize::from(cleared > 0);
+                    problems.extend(errors.into_iter().map(|e| format!("{title}: {e}")));
+                }
+                Ok(None) => busy.push(title),
+                Err(error) => problems.push(format!("{title}: {error:#}")),
+            }
+        }
+        let mut summary = if directories == 0 {
+            "No build outputs to clear.".to_owned()
+        } else {
+            format!(
+                "Cleared {directories} build output {} in {sessions} {} ({} freed).",
+                if directories == 1 {
+                    "folder"
+                } else {
+                    "folders"
+                },
+                if sessions == 1 { "session" } else { "sessions" },
+                human(freed)
+            )
+        };
+        if !busy.is_empty() {
+            summary.push_str(&format!(
+                " Skipped {} running: {}.",
+                busy.len(),
+                Self::titles(&busy)
+            ));
+        }
+        if let Some(first) = problems.first() {
+            summary.push_str(&format!(
+                " {} could not be cleared ({first}).",
+                problems.len()
+            ));
+        }
+        Ok(crate::cloud::disk::Cleaned { freed, summary })
+    }
+    fn clean_archived(&self) -> Result<crate::cloud::disk::Cleaned> {
+        use crate::cloud::disk::human;
+        let mut freed = 0u64;
+        let (mut removed, mut active, mut protected, mut failed) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for (id, title) in self.worktree_sessions(|s| s.archived)? {
+            let session = self.store.get(&id)?;
+            let Some(worktree) = self.managed_worktree(&session) else {
+                continue;
+            };
+            if session.status.active() || session.turn_id.is_some() {
+                active.push(title);
+                continue;
+            }
+            let before = crate::cloud::disk::usage(&worktree);
+            // Rebuildable outputs alone never keep a worktree.
+            let cleared = match self.clear_outputs(&id) {
+                Ok(Some((_, bytes, _))) => bytes,
+                _ => 0,
+            };
+            match self.handle(Request::Cleanup { id }) {
+                Ok(_) => {
+                    freed += before;
+                    removed.push(title);
+                }
+                Err(error) => {
+                    freed += cleared;
+                    let message = format!("{error:#}");
+                    if message.contains("protected") {
+                        protected.push(title);
+                    } else {
+                        failed.push(format!("{title}: {message}"));
+                    }
+                }
+            }
+        }
+        let mut summary = if removed.is_empty() {
+            "No archived worktrees were removed.".to_owned()
+        } else {
+            format!(
+                "Removed {} archived {} ({} freed); their chats stay.",
+                removed.len(),
+                if removed.len() == 1 {
+                    "worktree"
+                } else {
+                    "worktrees"
+                },
+                human(freed)
+            )
+        };
+        if !protected.is_empty() {
+            summary.push_str(&format!(
+                " Kept {} with uncommitted, untracked or ignored files: {}.",
+                protected.len(),
+                Self::titles(&protected)
+            ));
+        }
+        if !active.is_empty() {
+            summary.push_str(&format!(
+                " Skipped {} active: {}.",
+                active.len(),
+                Self::titles(&active)
+            ));
+        }
+        if let Some(first) = failed.first() {
+            summary.push_str(&format!(" {} failed ({first}).", failed.len()));
+        }
+        Ok(crate::cloud::disk::Cleaned { freed, summary })
+    }
+    fn clean_disk(
+        &self,
+        action: crate::cloud::disk::Action,
+    ) -> Result<crate::cloud::disk::Cleaned> {
+        use crate::cloud::disk::Action;
+        self.disk().cleaning(|| match action {
+            Action::ArchivedWorktrees => self.clean_archived(),
+            Action::BuildOutputs => self.clean_build_outputs(),
+            Action::Sandbox => {
+                let config = self.store.storage.load_config()?;
+                crate::cloud::disk::prune_sandbox(self.pods.as_ref(), config.server.sandbox.image())
+            }
+        })
+    }
     /// Moves a session on this computer to a saved server (`Request::Move`).
     /// The local session keeps its chat and worktree, is archived, and refuses
     /// further messages with a pointer to the server session.
@@ -466,6 +701,7 @@ impl Service {
             self.store.storage.load_config()?.server.enabled,
             "Sessions can move only to a difu server (`difu serve`)"
         );
+        crate::cloud::disk::guard(&self.store.storage)?;
         let root = crate::cloud::repos::ensure(&self.store.storage, &package.repository)?;
         let id = self.new_id()?;
         let session =
@@ -629,6 +865,34 @@ impl Service {
                     .map(|federation| federation.servers())
                     .unwrap_or_default(),
             )),
+            Request::Disk {
+                server: Some(server),
+                ..
+            }
+            | Request::DiskClean {
+                server: Some(server),
+                ..
+            } => anyhow::bail!("Server {server} is not connected"),
+            Request::Disk {
+                server: None,
+                refresh,
+            } => {
+                ensure!(
+                    crate::cloud::disk::server_mode(&self.store.storage),
+                    "This computer is not a difu server; disk status is only available on servers"
+                );
+                Ok(Reply::Disk(self.disk().report(refresh)?))
+            }
+            Request::DiskClean {
+                server: None,
+                action,
+            } => {
+                ensure!(
+                    crate::cloud::disk::server_mode(&self.store.storage),
+                    "This computer is not a difu server; disk cleanups are only available on servers"
+                );
+                Ok(Reply::DiskCleaned(self.clean_disk(action)?))
+            }
             Request::AttachPr { id, url } => {
                 super::pr_attachments::handle(
                     &self.store,
@@ -707,6 +971,7 @@ impl Service {
                 server: None,
             } => {
                 defaults.validate()?;
+                crate::cloud::disk::guard(&self.store.storage)?;
                 let root = match super::workspace::repository(
                     defaults.repository.as_deref().unwrap_or(&cwd),
                     &Cancel::default(),
@@ -1869,6 +2134,7 @@ pub fn run(storage: Storage) -> Result<()> {
         launch_lock: Mutex::new(()),
         federation: Some(federation),
         pods: super::sandbox::podman(),
+        disk: std::sync::OnceLock::new(),
     });
     ensure_orchestrator(&service.store)?;
     let _pr_cache =
@@ -1885,6 +2151,7 @@ pub fn run(storage: Storage) -> Result<()> {
         .is_ok_and(|config| config.server.enabled)
     {
         crate::cloud::repos::start(service.store.storage.clone(), stopped.clone());
+        service.disk().start();
     }
     let mut saved = BTreeMap::new();
     let mut flushed = Instant::now();
@@ -2111,6 +2378,7 @@ mod federation_tests {
             launch_lock: Mutex::new(()),
             federation: federation.map(Arc::new),
             pods: super::sandbox::podman(),
+            disk: std::sync::OnceLock::new(),
         });
         Ok((temp, service))
     }
@@ -2609,6 +2877,7 @@ mod routed_queue_tests {
             launch_lock: Mutex::new(()),
             federation: None,
             pods: super::sandbox::podman(),
+            disk: std::sync::OnceLock::new(),
         };
         let mut route = slack::Route {
             account: "account".into(),
@@ -2687,6 +2956,7 @@ mod routed_queue_tests {
             launch_lock: Mutex::new(()),
             federation: None,
             pods: super::sandbox::podman(),
+            disk: std::sync::OnceLock::new(),
         };
         service.handle(Request::SlackControl {
             id: "worker".into(),
@@ -2839,6 +3109,7 @@ mod clear_tests {
             launch_lock: Mutex::new(()),
             federation: None,
             pods: super::sandbox::podman(),
+            disk: std::sync::OnceLock::new(),
         };
         assert!(crate::github::store::load(&service.store.storage, &pr).is_none());
         let scope = crate::process::fixture::Scope::new(
@@ -3031,6 +3302,7 @@ mod clear_tests {
                 launch_lock: Mutex::new(()),
                 federation: None,
                 pods: super::sandbox::podman(),
+                disk: std::sync::OnceLock::new(),
             });
 
             // Pause cleanup to observe progress before the clear request returns.
@@ -3187,6 +3459,7 @@ mod move_tests {
             launch_lock: Mutex::new(()),
             federation: federation.map(Arc::new),
             pods: super::sandbox::podman(),
+            disk: std::sync::OnceLock::new(),
         })
     }
 
@@ -3229,6 +3502,34 @@ mod move_tests {
             skills: Vec::new(),
             attachments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_critically_full_server_refuses_imports_and_the_session_stays() -> Result<()> {
+        let pair = pair()?;
+        let server_home = crate::agents::server::home(&pair.server.store.storage)?;
+        crate::cloud::disk::tests::pretend(
+            &server_home,
+            Some(crate::cloud::disk::tests::critical()),
+        );
+        let result = pair.local.handle(Request::Move {
+            id: "one".into(),
+            server: "box".into(),
+        });
+        crate::cloud::disk::tests::pretend(&server_home, None);
+        let error = format!("{:#}", result.err().context("refused")?);
+        assert!(error.contains("Only 2.0 GB is free"), "{error}");
+        let local = pair.local.store.get("one")?;
+        assert!(!local.archived && local.moved_to.is_none());
+        let Reply::Sessions(sessions) = pair.server.handle(Request::List)? else {
+            anyhow::bail!("server list");
+        };
+        assert!(
+            sessions.iter().all(|s| s.kind == "Orchestrator"),
+            "{sessions:?}"
+        );
+        let _ = &pair.temp;
+        Ok(())
     }
 
     #[test]
@@ -3554,6 +3855,7 @@ mod server_delete_tests {
             launch_lock: Mutex::new(()),
             federation: None,
             pods: pods.clone(),
+            disk: std::sync::OnceLock::new(),
         };
         assert!(matches!(
             service.handle(Request::Delete { id: id.into() })?,
@@ -3574,6 +3876,217 @@ mod server_delete_tests {
             anyhow::bail!("Expected the session list");
         };
         assert!(sessions.iter().all(|summary| summary.id != id));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod disk_tests {
+    use super::*;
+    use crate::cloud::disk::{self, Action, tests::Podman};
+
+    fn git(root: &std::path::Path, args: &[&str]) -> Result<String> {
+        crate::cloud::disk::tests::git(root, args).map(|s| s.trim().to_owned())
+    }
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        home: PathBuf,
+        service: Service,
+    }
+
+    /// A server-mode service whose sessions have real worktrees with an
+    /// ignored `target/` build output each.
+    fn fixture(sessions: &[(&str, bool, Status)]) -> Result<Fixture> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let (origin, base, home) = (root.join("origin"), root.join("base"), root.join("home"));
+        for path in [&origin, &base] {
+            fs::create_dir(path)?;
+            git(path, &["init", "-b", "main"])?;
+            fs::write(path.join(".gitignore"), "target/\n")?;
+            fs::write(path.join("tracked.txt"), "base\n")?;
+            git(path, &["add", "."])?;
+            git(path, &["commit", "-m", "base"])?;
+        }
+        git(
+            &base,
+            &[
+                "remote",
+                "add",
+                "origin",
+                origin.to_str().context("origin")?,
+            ],
+        )?;
+        let cancel = Cancel::default();
+        let mut prepared = Vec::new();
+        for (id, archived, status) in sessions {
+            let mut session = Session::new(
+                (*id).into(),
+                Job::Coding(Launch {
+                    repository: base.clone(),
+                    isolated: true,
+                    base: "origin/main".into(),
+                    prompt: "Task".into(),
+                    model: None,
+                    effort: None,
+                }),
+            );
+            session.title = format!("Session {id}");
+            super::super::workspace::inspect(&mut session, &cancel)?;
+            super::super::workspace::prepare(&mut session, &home, &cancel, |_| Ok(()))?;
+            let tree = home.join("worktrees").join(id);
+            fs::create_dir_all(tree.join("target/debug"))?;
+            fs::write(tree.join("target/debug/app"), vec![b'x'; 50_000])?;
+            session.archived = *archived;
+            session.status = *status;
+            prepared.push(session);
+        }
+        let store = Arc::new(Store::fixture(home.clone(), prepared));
+        store
+            .storage
+            .update_config(|config| config.server.enabled = true)?;
+        let service = Service {
+            remote: super::remote::Remote::start(store.storage.clone()),
+            store,
+            workers: Mutex::new(BTreeMap::new()),
+            action_locks: Mutex::new(BTreeMap::new()),
+            launch_lock: Mutex::new(()),
+            federation: None,
+            pods: Podman::replying(&[]),
+            disk: std::sync::OnceLock::new(),
+        };
+        Ok(Fixture {
+            _temp: temp,
+            home,
+            service,
+        })
+    }
+
+    fn clean(service: &Service, action: Action) -> Result<disk::Cleaned> {
+        match service.handle(Request::DiskClean {
+            server: None,
+            action,
+        })? {
+            Reply::DiskCleaned(cleaned) => Ok(cleaned),
+            _ => anyhow::bail!("expected a cleanup reply"),
+        }
+    }
+
+    #[test]
+    fn archived_worktrees_go_but_chats_active_and_dirty_worktrees_stay() -> Result<()> {
+        let fixture = fixture(&[
+            ("archived", true, Status::Idle),
+            ("dirty", true, Status::Completed),
+            ("busy", true, Status::Running),
+            ("current", false, Status::Idle),
+        ])?;
+        let tree = |id: &str| fixture.home.join("worktrees").join(id);
+        fs::write(tree("dirty").join("notes.txt"), "keep me\n")?;
+        let cleaned = clean(&fixture.service, Action::ArchivedWorktrees)?;
+        let summary = &cleaned.summary;
+        assert!(summary.contains("Removed 1 archived worktree"), "{summary}");
+        assert!(summary.contains("Kept 1 with uncommitted"), "{summary}");
+        assert!(summary.contains("Session dirty"), "{summary}");
+        assert!(
+            summary.contains("Skipped 1 active: Session busy"),
+            "{summary}"
+        );
+        assert!(cleaned.freed >= 50_000, "{}", cleaned.freed);
+        assert!(!tree("archived").exists());
+        let archived = fixture.service.store.get("archived")?;
+        assert!(archived.workspace_removed, "the chat stays, marked");
+        // Build outputs were cleared first; the untracked file kept the worktree.
+        assert!(tree("dirty").join("notes.txt").is_file());
+        assert!(!tree("dirty").join("target").exists());
+        assert!(tree("busy").join("target/debug/app").is_file());
+        assert!(tree("current").join("target/debug/app").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn build_outputs_are_cleared_only_in_idle_sessions() -> Result<()> {
+        let fixture = fixture(&[
+            ("idle", false, Status::Idle),
+            ("busy", false, Status::Running),
+        ])?;
+        let tree = |id: &str| fixture.home.join("worktrees").join(id);
+        let cleaned = clean(&fixture.service, Action::BuildOutputs)?;
+        assert!(
+            cleaned
+                .summary
+                .contains("Cleared 1 build output folder in 1 session"),
+            "{}",
+            cleaned.summary
+        );
+        assert!(cleaned.summary.contains("Skipped 1 running: Session busy"));
+        assert!(cleaned.freed >= 50_000);
+        assert!(!tree("idle").join("target").exists());
+        assert!(tree("idle").join("tracked.txt").is_file());
+        assert_eq!(git(&tree("idle"), &["status", "--porcelain"])?, "");
+        assert!(tree("busy").join("target/debug/app").is_file());
+        // Nothing left: a second run says so.
+        let again = clean(&fixture.service, Action::BuildOutputs)?;
+        assert!(
+            again.summary.starts_with("No build outputs"),
+            "{}",
+            again.summary
+        );
+        assert_eq!(again.freed, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn disk_status_is_for_servers_and_reports_live_space() -> Result<()> {
+        let fixture = fixture(&[("one", false, Status::Idle)])?;
+        let Reply::Disk(report) = fixture.service.handle(Request::Disk {
+            server: None,
+            refresh: false,
+        })?
+        else {
+            anyhow::bail!("expected a disk reply");
+        };
+        assert_eq!(report.path, fixture.home);
+        assert!(report.total > 0);
+        fixture
+            .service
+            .store
+            .storage
+            .update_config(|config| config.server.enabled = false)?;
+        for request in [
+            Request::Disk {
+                server: None,
+                refresh: true,
+            },
+            Request::DiskClean {
+                server: None,
+                action: Action::Sandbox,
+            },
+        ] {
+            let error = fixture.service.handle(request).err().context("refused")?;
+            assert!(error.to_string().contains("not a difu server"), "{error}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_critically_full_server_refuses_new_sessions_but_not_running_ones() -> Result<()> {
+        let fixture = fixture(&[("busy", false, Status::Running)])?;
+        let storage = fixture.service.store.storage.clone();
+        let home = crate::agents::server::home(&storage)?;
+        disk::tests::pretend(&home, Some(disk::tests::critical()));
+        let refused = fixture.service.handle(Request::NewAgent {
+            defaults: crate::storage::AgentDefaults::default(),
+            cwd: fixture.home.clone(),
+            remember_repository: false,
+            server: None,
+        });
+        disk::tests::pretend(&home, None);
+        let error = refused.err().context("refused")?;
+        assert!(error.to_string().contains("Only 2.0 GB is free"), "{error}");
+        assert!(error.to_string().contains("running sessions continue"));
+        let busy = fixture.service.store.get("busy")?;
+        assert_eq!(busy.status, Status::Running, "never interrupted");
         Ok(())
     }
 }
