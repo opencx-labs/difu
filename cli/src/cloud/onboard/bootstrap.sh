@@ -64,6 +64,19 @@ as_difu() {
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" "$@")
 }
 
+# Runs Claude Code as the difu user. Once difu moved its config into
+# ~/.claude (~/.claude.json is then a link), it shares the service's
+# CLAUDE_CONFIG_DIR and so its lock; before that, ~/.claude.json is the file.
+as_claude() {
+  local home
+  home=$(difu_home)
+  if [ -L "$home/.claude.json" ]; then
+    as_difu env CLAUDE_CONFIG_DIR="$home/.claude" "$@"
+  else
+    as_difu "$@"
+  fi
+}
+
 require_debian() {
   [ "$(id -u)" = 0 ] || fail "The setup must run as root."
   local id='' like='' pretty=''
@@ -255,13 +268,13 @@ step_tools() {
   quiet as_difu "$home/.local/bin/codex" --version
   # Claude Code: Anthropic's native installer, then its own updater.
   if [ ! -x "$home/.local/bin/claude" ]; then
-    quiet as_difu bash -c 'set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash'
+    quiet as_claude bash -c 'set -o pipefail; curl -fsSL https://claude.ai/install.sh | bash'
     [ -x "$home/.local/bin/claude" ] || fail "The Claude Code installer finished without $home/.local/bin/claude."
-  elif ! try as_difu "$home/.local/bin/claude" update; then
+  elif ! try as_claude "$home/.local/bin/claude" update; then
     say "Warning: Claude Code could not update itself (details in $LOG); keeping the installed version."
   fi
   say "Codex: $(as_difu "$home/.local/bin/codex" --version 2>/dev/null | head -n 1 || true)"
-  say "Claude Code: $(as_difu "$home/.local/bin/claude" --version 2>/dev/null | head -n 1 || true)"
+  say "Claude Code: $(as_claude "$home/.local/bin/claude" --version 2>/dev/null | head -n 1 || true)"
   share_claude_config "$home"
 }
 

@@ -89,8 +89,9 @@ fn share_with(home: &Path, wait: Duration) -> Result<Option<String>> {
 }
 
 /// Moves a regular `~/.claude.json` into the shared directory under Claude
-/// Code's own lock. When both files exist, the more recently written one
-/// wins and the other is kept as a backup; nothing is ever deleted.
+/// Code's own lock. When both files exist (a Claude Code with the variable
+/// ran before the move), they are combined; both originals are kept as
+/// backups and nothing is ever deleted.
 fn migrate(home: &Path, legacy: &Path, wait: Duration) -> Result<Option<String>> {
     let shared = dir(home).join(FILE);
     let _lock = Lock::acquire(&lock_path(&shared), wait)?;
@@ -118,30 +119,54 @@ fn migrate(home: &Path, legacy: &Path, wait: Duration) -> Result<Option<String>>
         Err(error) => {
             return Err(error).with_context(|| format!("Cannot inspect {}", shared.display()));
         }
-        Ok(existing) if modified(&metadata) > modified(&existing) => {
-            let older = unused(&dir(home).join(format!("{FILE}.difu-backup-{stamp}")));
-            copy_private(&shared, &older)?;
-            replace(&shared, &fs::read(legacy)?)?;
+        Ok(existing) => {
+            let kept = unused(&dir(home).join(format!("{FILE}.difu-backup-{stamp}")));
+            copy_private(&shared, &kept)?;
+            let (legacy_text, shared_text) = (fs::read(legacy)?, fs::read(&shared)?);
+            let (older, newer) = if modified(&metadata) > modified(&existing) {
+                (&shared_text, &legacy_text)
+            } else {
+                (&legacy_text, &shared_text)
+            };
+            replace(&shared, &combine(older, newer))?;
             format!(
-                "Both {} and {} existed; kept the newer {} as the shared file. Backups: {} and {}",
+                "Both {} and {} existed; combined them in {} (the newer one wins where they \
+                 differ). The originals are kept at {} and {}",
                 legacy.display(),
                 shared.display(),
-                legacy.display(),
+                shared.display(),
                 backup.display(),
-                older.display()
+                kept.display()
             )
         }
-        Ok(_) => format!(
-            "Both {} and {} existed; kept the newer {}. The older {} is kept at {}",
-            legacy.display(),
-            shared.display(),
-            shared.display(),
-            legacy.display(),
-            backup.display()
-        ),
     };
     link(home, legacy)?;
     Ok(Some(note))
+}
+
+/// Both configs in one, so neither one's accounts, MCP servers or projects
+/// are lost: the newer config's settings win, and settings that are maps
+/// (`projects`, `mcpServers`, ...) are merged entry by entry. Anything that
+/// is not a JSON object is replaced by the newer file as it is.
+fn combine(older: &[u8], newer: &[u8]) -> Vec<u8> {
+    use serde_json::Value;
+    let (Ok(Value::Object(mut base)), Ok(Value::Object(top))) = (
+        serde_json::from_slice::<Value>(older),
+        serde_json::from_slice::<Value>(newer),
+    ) else {
+        return newer.to_vec();
+    };
+    for (key, value) in top {
+        match (base.get_mut(&key), value) {
+            (Some(Value::Object(entries)), Value::Object(newer_entries)) => {
+                entries.extend(newer_entries);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
+    }
+    serde_json::to_vec_pretty(&Value::Object(base)).unwrap_or_else(|_| newer.to_vec())
 }
 
 fn modified(metadata: &fs::Metadata) -> SystemTime {
@@ -326,35 +351,66 @@ mod tests {
     }
 
     #[test]
-    fn when_both_exist_the_newer_wins_and_the_other_is_kept() -> Result<()> {
+    fn when_both_exist_they_are_combined_and_both_are_kept() -> Result<()> {
+        // A session ran with CLAUDE_CONFIG_DIR before the move, creating a
+        // small new config next to the real one.
+        let real = r#"{"oauthAccount":{"emailAddress":"a@example.com"},"numStartups":40,"projects":{"/srv/a":{"hasTrustDialogAccepted":true}},"mcpServers":{"docs":{"command":"docs"}}}"#;
+        let fresh = r#"{"numStartups":1,"projects":{"/srv/b":{"hasTrustDialogAccepted":true}}}"#;
         for legacy_newer in [true, false] {
             let (_temp, home) = temp_home()?;
             let legacy = home.join(".claude.json");
             let shared = home.join(".claude/.claude.json");
             ensure_dir(&home)?;
-            fs::write(&legacy, r#"{"from":"home"}"#)?;
-            fs::write(&shared, r#"{"from":"shared"}"#)?;
+            let (legacy_text, shared_text) = if legacy_newer {
+                (fresh, real)
+            } else {
+                (real, fresh)
+            };
+            fs::write(&legacy, legacy_text)?;
+            fs::write(&shared, shared_text)?;
             set_modified(&legacy, if legacy_newer { 10 } else { 600 })?;
             set_modified(&shared, if legacy_newer { 600 } else { 10 })?;
             let note = share(&home)?.context("Expected a note")?;
-            assert!(note.contains("Both"), "{note}");
-            let winner = if legacy_newer { "home" } else { "shared" };
+            assert!(note.contains("combined"), "{note}");
+            let combined: serde_json::Value = serde_json::from_str(&fs::read_to_string(&shared)?)?;
             assert_eq!(
-                fs::read_to_string(&shared)?,
-                format!(r#"{{"from":"{winner}"}}"#)
+                combined.pointer("/oauthAccount/emailAddress"),
+                Some(&serde_json::json!("a@example.com"))
+            );
+            assert!(combined.pointer("/mcpServers/docs").is_some());
+            assert!(combined.pointer("/projects/~1srv~1a").is_some());
+            assert!(combined.pointer("/projects/~1srv~1b").is_some());
+            // The newer file's own settings win.
+            assert_eq!(
+                combined.get("numStartups"),
+                Some(&serde_json::json!(1)),
+                "{combined}"
             );
             assert!(fs::symlink_metadata(&legacy)?.file_type().is_symlink());
-            // Both originals survive somewhere.
-            let mut kept: Vec<String> = backups(&home)?
+            // Both originals survive as backups.
+            let kept: Vec<String> = backups(&home)?
                 .into_iter()
                 .chain(backups(&home.join(".claude"))?)
                 .map(fs::read_to_string)
                 .collect::<io::Result<_>>()?;
-            kept.push(fs::read_to_string(&shared)?);
-            assert!(kept.contains(&r#"{"from":"home"}"#.to_owned()));
-            assert!(kept.contains(&r#"{"from":"shared"}"#.to_owned()));
+            assert!(kept.contains(&real.to_owned()) && kept.contains(&fresh.to_owned()));
         }
         Ok(())
+    }
+
+    #[test]
+    fn configs_that_are_not_json_objects_are_replaced_by_the_newer() {
+        assert_eq!(combine(b"{\"a\":1}", b"not json"), b"not json");
+        assert_eq!(combine(b"[1]", b"{\"a\":1}"), b"{\"a\":1}");
+        let merged: serde_json::Value = serde_json::from_slice(&combine(
+            br#"{"a":1,"m":{"x":1}}"#,
+            br#"{"b":2,"m":{"y":2}}"#,
+        ))
+        .unwrap_or_default();
+        assert_eq!(
+            merged,
+            serde_json::json!({"a": 1, "b": 2, "m": {"x": 1, "y": 2}})
+        );
     }
 
     #[test]

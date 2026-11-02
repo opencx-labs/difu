@@ -318,10 +318,14 @@ On a server every writer uses one directory instead:
   starts (before any session runs), under Claude Code's own lock, keeps the
   original as `~/.claude.json.difu-backup-<time>`, and leaves `~/.claude.json`
   as a symlink to `.claude/.claude.json`, so a Claude Code started without the
-  variable (an installer, `claude update`) still reads the same file and
-  replaces it atomically through the link. Starting a sandbox repeats the check.
-  If both files exist, the more recently written one becomes the shared file
-  and the other is kept as a backup. A symlink the user made is left alone.
+  variable still reads the same file and replaces it atomically through the
+  link. Starting a sandbox repeats the check. If both files exist (a Claude
+  Code with the variable ran first), they are combined: the newer file's
+  settings win and map settings such as `projects` and `mcpServers` are merged
+  entry by entry; both originals are kept as backups. A symlink the user made
+  is left alone.
+* Server setup and `difu server upgrade` run the Claude Code installer and
+  `claude update` with the same variable once the file has moved.
 * Ordinary installations are unchanged: only server mode sets the variable.
 
 ## Wire protocol additions

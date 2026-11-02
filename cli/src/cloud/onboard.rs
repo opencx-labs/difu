@@ -1514,6 +1514,17 @@ mod tests {
         }
     }
 
+    /// One shell function from the bootstrap script, to run on its own.
+    fn bootstrap_function(name: &str) -> Result<&'static str> {
+        let start = BOOTSTRAP
+            .find(&format!("\n{name}() {{"))
+            .with_context(|| format!("no {name} in the bootstrap script"))?;
+        BOOTSTRAP
+            .get(start + 1..)
+            .and_then(|rest| rest.find("\n}\n").and_then(|end| rest.get(..end + 3)))
+            .with_context(|| format!("unterminated {name}"))
+    }
+
     fn run_bash(script: &str, args: &[&str]) -> Result<Output> {
         let mut child = Command::new("bash")
             .args(args)
@@ -1863,13 +1874,7 @@ mod tests {
             eprintln!("Skipping the sandbox setting test: jq is not installed");
             return Ok(());
         }
-        let start = BOOTSTRAP
-            .find("sandbox_enabled() {")
-            .context("no sandbox_enabled")?;
-        let body = BOOTSTRAP
-            .get(start..)
-            .and_then(|rest| rest.find("\n}\n").and_then(|end| rest.get(..end + 3)))
-            .context("unterminated sandbox_enabled")?;
+        let body = bootstrap_function("sandbox_enabled")?;
         let directory = tempfile::tempdir()?;
         let config = directory.path().join("config.json");
         for (contents, enabled) in [
@@ -1900,13 +1905,7 @@ mod tests {
 
     #[test]
     fn ssh_logins_share_the_services_claude_code_config_once() -> Result<()> {
-        let start = BOOTSTRAP
-            .find("share_claude_config() {")
-            .context("no share_claude_config")?;
-        let body = BOOTSTRAP
-            .get(start..)
-            .and_then(|rest| rest.find("\n}\n").and_then(|end| rest.get(..end + 3)))
-            .context("unterminated share_claude_config")?;
+        let body = bootstrap_function("share_claude_config")?;
         let home = tempfile::tempdir()?;
         fs::write(home.path().join(".profile"), "PATH=\"$HOME/bin:$PATH\"\n")?;
         for _ in 0..2 {
@@ -1930,6 +1929,36 @@ mod tests {
             1,
             "{profile}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn claude_code_in_the_setup_shares_the_config_only_once_it_moved() -> Result<()> {
+        let body = bootstrap_function("as_claude")?;
+        let home = tempfile::tempdir()?;
+        let home_path = home.path().to_string_lossy().into_owned();
+        let run = || -> Result<String> {
+            let output = run_bash(
+                &format!(
+                    "set -eu\nunset CLAUDE_CONFIG_DIR\ntest_home=$1\ndifu_home() {{ printf '%s' \"$test_home\"; }}\n\
+                     as_difu() {{ \"$@\"; }}\n{body}\
+                     as_claude sh -c 'printf %s \"${{CLAUDE_CONFIG_DIR:-unset}}\"'\n"
+                ),
+                &["-s", &home_path],
+            )?;
+            ensure!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        };
+        // Before the move, ~/.claude.json is the real file.
+        fs::write(home.path().join(".claude.json"), "{}")?;
+        assert_eq!(run()?, "unset");
+        fs::remove_file(home.path().join(".claude.json"))?;
+        std::os::unix::fs::symlink(".claude/.claude.json", home.path().join(".claude.json"))?;
+        assert_eq!(run()?, format!("{home_path}/.claude"));
         Ok(())
     }
 
