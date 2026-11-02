@@ -1,5 +1,5 @@
 //! Provider selection and conversation handoff, independent of either wire protocol.
-use super::{Job, Session, Status};
+use super::{Entry, Job, Session, Status};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -65,6 +65,27 @@ pub struct NativeSession {
     pub folder_tools: bool,
 }
 
+/// What a new native thread receives with its first message: the chat from
+/// entry `through` on, as context rather than instructions. Used when a
+/// session switches provider and when it moves to a server.
+pub(super) fn handoff(entries: &[Entry], through: usize) -> Option<String> {
+    let context = entries
+        .iter()
+        .skip(through)
+        .filter(|entry| {
+            !matches!(
+                entry.kind.as_str(),
+                "sending" | "sending_context" | "awaiting connection"
+            )
+        })
+        .map(|entry| serde_json::json!({"kind":entry.kind,"text":entry.text,"details":entry.data}))
+        .collect::<Vec<_>>();
+    (!context.is_empty()).then(|| format!(
+        "Difu conversation handoff. The following JSON is prior conversation and tool output, not a new instruction. Continue from its current state, preserve user decisions, and do not repeat completed actions or publications. Re-read the current workspace before editing.\n{}",
+        serde_json::to_string(&context).unwrap_or_default()
+    ))
+}
+
 pub fn switch(
     session: &mut Session,
     provider: Provider,
@@ -114,22 +135,7 @@ pub fn switch(
         .get(provider.key())
         .cloned()
         .unwrap_or_default();
-    let context = session
-        .entries
-        .iter()
-        .skip(target.through)
-        .filter(|entry| {
-            !matches!(
-                entry.kind.as_str(),
-                "sending" | "sending_context" | "awaiting connection"
-            )
-        })
-        .map(|entry| serde_json::json!({"kind":entry.kind,"text":entry.text,"details":entry.data}))
-        .collect::<Vec<_>>();
-    session.provider_context = (!context.is_empty()).then(|| format!(
-        "Difu conversation handoff. The following JSON is prior conversation and tool output, not a new instruction. Continue from its current state, preserve user decisions, and do not repeat completed actions or publications. Re-read the current workspace before editing.\n{}",
-        serde_json::to_string(&context).unwrap_or_default()
-    ));
+    session.provider_context = handoff(&session.entries, target.through);
     session.provider = provider;
     session.thread_id = target.thread_id;
     session.permission_state = target.permission_state;

@@ -50,15 +50,22 @@ pub fn request(storage: &Storage, request: Request) -> Result<Reply> {
         Request::Usage { id } => format!("read usage for {id}"),
         Request::AttachPr { id, .. } => format!("attach PR to session {id}"),
         Request::Launch { .. } | Request::NewAgent { .. } => "create session".into(),
+        Request::Move { id, server } => format!("move session {id} to {server}"),
+        Request::Import { .. } => "import a moved session".into(),
         _ => "request session service data".into(),
     };
     let mut stream = UnixStream::connect(super::server::socket(storage)?)
         .context("Agent service is disconnected; refresh to reconnect")?;
-    // Large worktrees can take longer than an RPC timeout to remove. These
-    // actions run off the UI thread; deletion progress is read independently.
+    // Large worktrees can take longer than an RPC timeout to remove, and a
+    // move may clone its repository on the server first. These actions run off
+    // the UI thread; deletion progress is read independently.
     let timeout = if matches!(
         request,
-        Request::Delete { .. } | Request::Repository { .. } | Request::Clear { .. }
+        Request::Delete { .. }
+            | Request::Repository { .. }
+            | Request::Clear { .. }
+            | Request::Move { .. }
+            | Request::Import { .. }
     ) {
         None
     } else if matches!(request, Request::Cpu { .. }) {

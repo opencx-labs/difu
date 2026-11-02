@@ -359,23 +359,26 @@ impl Service {
         );
         Ok(())
     }
-    fn insert_session(
-        &self,
-        mut job: Job,
-        empty: bool,
-        defaults: Option<&crate::storage::AgentDefaults>,
-    ) -> Result<String> {
+    fn new_id(&self) -> Result<String> {
         let entropy = tempfile::Builder::new()
             .prefix("id-")
             .tempfile_in(&self.store.home)?;
-        let id = format!(
+        Ok(format!(
             "{}-{}",
             chrono::Utc::now().timestamp_millis(),
             storage::hash(entropy.path().as_os_str().as_encoded_bytes())
                 .chars()
                 .take(8)
                 .collect::<String>()
-        );
+        ))
+    }
+    fn insert_session(
+        &self,
+        mut job: Job,
+        empty: bool,
+        defaults: Option<&crate::storage::AgentDefaults>,
+    ) -> Result<String> {
+        let id = self.new_id()?;
         if let Job::Coding(launch) = &mut job {
             launch.isolated = true;
         }
@@ -397,6 +400,134 @@ impl Service {
             .insert(id.clone(), session);
         self.start(&id, None)?;
         Ok(id)
+    }
+    /// Moves a session on this computer to a saved server (`Request::Move`).
+    /// The local session keeps its chat and worktree, is archived, and refuses
+    /// further messages with a pointer to the server session.
+    fn move_session(&self, id: &str, server: &str) -> Result<String> {
+        let federation = self
+            .federation
+            .as_ref()
+            .context("This difu service cannot reach saved servers")?;
+        let session = match self.store.get(id) {
+            Ok(session) => session,
+            Err(_) if crate::cloud::federation::split(id).is_some() => {
+                anyhow::bail!(
+                    "{id} already runs on a server; only sessions on this computer can move"
+                )
+            }
+            Err(error) => return Err(error),
+        };
+        super::moving::check(&session)?;
+        // Connected, with full access and the same difu version.
+        federation.remote(server)?;
+        self.stop_worker(id)?;
+        let package = super::moving::export(&self.store.get(id)?, &Cancel::default())?;
+        super::moving::fits(&package, super::moving::LIMIT)?;
+        let moved = match federation.forward(
+            server,
+            &Request::Import {
+                package: Box::new(package),
+            },
+        )? {
+            Reply::Launched(moved) => moved,
+            Reply::Error(error) => anyhow::bail!("{error}"),
+            _ => anyhow::bail!("{server} did not create the session"),
+        };
+        let _shell_lifecycle = self
+            .store
+            .shells
+            .lifecycle
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Shell lifecycle lock failed"))?;
+        self.store.shells.stop_session(&self.store, id)?;
+        self.store.update(id, |s| {
+            s.moved_to = Some(moved.clone());
+            s.move_scheduled = None;
+            s.archived = true;
+            super::plan::invalidate(s);
+            s.note(
+                "system",
+                format!("Moved to {server} as {moved}. The conversation continues there; this copy is archived and its worktree is kept."),
+            );
+        })?;
+        self.store.save(id)?;
+        Ok(moved)
+    }
+    /// Creates a server session from a moved one (`Request::Import`).
+    fn import_session(&self, package: &super::moving::Package) -> Result<String> {
+        ensure!(
+            self.store.storage.load_config()?.server.enabled,
+            "Sessions can move only to a difu server (`difu serve`)"
+        );
+        let root = crate::cloud::repos::ensure(&self.store.storage, &package.repository)?;
+        let id = self.new_id()?;
+        let session =
+            super::moving::import(package, id.clone(), root, &self.store, &Cancel::default())?;
+        storage::atomic_json(&self.store.home.join(format!("{id}.json")), &session)?;
+        self.store
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session lock failed"))?
+            .insert(id.clone(), session);
+        self.store.changed.notify_all();
+        // The provider starts with the first message, which carries the handoff.
+        Ok(id)
+    }
+    /// Runs the moves `difu_move_to_server` scheduled once their turn has
+    /// ended. A turn that failed or was interrupted cancels its move.
+    fn scheduled_moves(self: &Arc<Self>) -> Result<Vec<thread::JoinHandle<()>>> {
+        let due: Vec<(String, String, Status)> = self
+            .store
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session lock failed"))?
+            .values()
+            .filter(|s| s.turn_id.is_none() && !s.status.active())
+            .filter_map(|s| {
+                s.move_scheduled
+                    .clone()
+                    .map(|server| (s.id.clone(), server, s.status))
+            })
+            .collect();
+        let mut moves = Vec::new();
+        for (id, server, status) in due {
+            let finished = matches!(status, Status::Idle | Status::Completed);
+            self.store.update(&id, |s| {
+                s.move_scheduled = None;
+                if !finished {
+                    s.note(
+                        "system",
+                        format!("Move to {server} cancelled because the turn did not finish"),
+                    );
+                }
+            })?;
+            if !finished {
+                self.store.save(&id)?;
+                continue;
+            }
+            let service = self.clone();
+            moves.push(
+                thread::Builder::new()
+                    .name("difu-move-session".into())
+                    .spawn(move || {
+                        let request = Request::Move {
+                            id: id.clone(),
+                            server: server.clone(),
+                        };
+                        if let Err(error) = service.handle(request) {
+                            let message =
+                                format!("Could not move this session to {server}: {error:#}");
+                            let _ = service.store.update(&id, |s| {
+                                s.error = Some(message.clone());
+                                s.note("error", message);
+                            });
+                            let _ = service.store.save(&id);
+                        }
+                    })?,
+            );
+        }
+        Ok(moves)
     }
     fn handle(&self, request: Request) -> Result<Reply> {
         let request = match &self.federation {
@@ -423,6 +554,7 @@ impl Service {
             | Request::AttachPr { id, .. }
             | Request::Permissions { id, .. }
             | Request::Usage { id }
+            | Request::Move { id, .. }
             | Request::Rename { id, .. } => Some(id.clone()),
             _ => None,
         };
@@ -574,6 +706,11 @@ impl Service {
             }
             Request::Control { id, control } => {
                 let session = self.store.get(&id)?;
+                if let Some(moved) = &session.moved_to {
+                    anyhow::bail!(
+                        "This session moved to {moved}; continue it there. This copy keeps its chat and worktree but takes no more messages."
+                    );
+                }
                 ensure!(
                     !session.workspace_removed,
                     "This worktree was explicitly removed. Launch a new session from its retained branch to continue coding."
@@ -1390,6 +1527,8 @@ impl Service {
                 server: Some(server),
                 ..
             } => anyhow::bail!("Server {server} is not connected"),
+            Request::Move { id, server } => Ok(Reply::Launched(self.move_session(&id, &server)?)),
+            Request::Import { package } => Ok(Reply::Launched(self.import_session(&package)?)),
             Request::Skills { id, force } => {
                 let session = self.store.get(&id)?;
                 ensure!(
@@ -1454,6 +1593,8 @@ fn reset_workspace(s: &mut Session, candidate: Session, revision: u64) {
 /// learned: the next message starts a new native thread with no handoff context.
 fn clear_conversation(s: &mut Session) {
     super::plan::invalidate(s);
+    s.moved_to = None;
+    s.move_scheduled = None;
     s.entries.clear();
     s.subagents.clear();
     s.slack_route = None;
@@ -1682,6 +1823,9 @@ pub fn run(storage: Storage) -> Result<()> {
             continue;
         }
         flushed = Instant::now();
+        if let Err(error) = service.scheduled_moves() {
+            eprintln!("Scheduled moves: {error:#}");
+        }
         for session in service.store.list()? {
             if saved.get(&session.id) != Some(&session.version) {
                 service.store.save(&session.id)?;
@@ -2557,6 +2701,298 @@ mod clear_tests {
                 1
             );
         }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod move_tests {
+    use super::super::moving::tests::{git, local_session, origin, server_storage};
+    use super::*;
+    use crate::cloud::federation::{Remote, Replies};
+
+    /// A server reached in-process; requests and replies cross JSON as they
+    /// do over `rpc`.
+    struct Loopback(Arc<Service>);
+
+    impl Remote for Loopback {
+        fn version(&self) -> String {
+            env!("CARGO_PKG_VERSION").into()
+        }
+        fn full(&self) -> bool {
+            true
+        }
+        fn closed(&self) -> bool {
+            false
+        }
+        fn call(&self, method: &str, _params: Value) -> Result<Value> {
+            ensure!(method == "server.repos", "unexpected {method}");
+            Ok(serde_json::json!({"repositories": []}))
+        }
+        fn rpc(&self, request: &Request) -> Result<Reply> {
+            let request: Request = serde_json::from_slice(&serde_json::to_vec(request)?)?;
+            let reply = self.0.handle(request)?;
+            Ok(serde_json::from_slice(&serde_json::to_vec(&reply)?)?)
+        }
+        fn watch(&self, _id: &str, _version: Option<u64>) -> Result<Box<dyn Replies>> {
+            anyhow::bail!("not watched in these tests")
+        }
+    }
+
+    fn service(
+        store: Arc<Store>,
+        federation: Option<crate::cloud::federation::Federation>,
+    ) -> Arc<Service> {
+        Arc::new(Service {
+            remote: super::remote::Remote::start(store.storage.clone()),
+            store,
+            workers: Mutex::new(BTreeMap::new()),
+            action_locks: Mutex::new(BTreeMap::new()),
+            launch_lock: Mutex::new(()),
+            federation: federation.map(Arc::new),
+        })
+    }
+
+    /// This computer with session `one` and saved server `box`, a server-mode
+    /// service with a base clone of the session's repository.
+    struct Pair {
+        temp: tempfile::TempDir,
+        local: Arc<Service>,
+        server: Arc<Service>,
+    }
+
+    fn pair() -> Result<Pair> {
+        let temp = tempfile::tempdir()?;
+        let origin = origin(temp.path())?;
+        let local_home = temp.path().join("mac");
+        let session = local_session(temp.path(), &origin, &local_home)?;
+        let server_home = temp.path().join("server");
+        server_storage(&server_home, &origin)?;
+        let server = service(Arc::new(Store::fixture(server_home, Vec::new())), None);
+        let store = Arc::new(Store::fixture(local_home, vec![session]));
+        let federation = crate::cloud::federation::tests::linked(
+            store.storage.clone(),
+            BTreeMap::from([(
+                "box".to_owned(),
+                Arc::new(Loopback(server.clone())) as Arc<dyn Remote>,
+            )]),
+        )?;
+        let local = service(store, Some(federation));
+        Ok(Pair {
+            temp,
+            local,
+            server,
+        })
+    }
+
+    fn message(text: &str) -> Control {
+        Control::Message {
+            text: text.into(),
+            queue: false,
+            skills: Vec::new(),
+            attachments: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn moving_continues_the_session_on_the_server_and_retires_the_local_copy() -> Result<()> {
+        let pair = pair()?;
+        let Reply::Launched(moved) = pair.local.handle(Request::Move {
+            id: "one".into(),
+            server: "box".into(),
+        })?
+        else {
+            anyhow::bail!("expected the server session");
+        };
+        let (server, id) = crate::cloud::federation::split(&moved).context("namespaced")?;
+        assert_eq!(server, "box");
+
+        let local = pair.local.store.get("one")?;
+        assert!(local.archived);
+        assert_eq!(local.moved_to.as_deref(), Some(moved.as_str()));
+        assert!(local.entries.last().is_some_and(
+            |e| e.kind == "system" && e.text.starts_with(&format!("Moved to box as {moved}"))
+        ));
+        // The local worktree stays; difu never deletes it on a move.
+        assert!(
+            local
+                .workspace
+                .as_deref()
+                .is_some_and(|path| path.join("feature.rs").exists())
+        );
+        let refused = pair
+            .local
+            .handle(Request::Control {
+                id: "one".into(),
+                control: message("keep going"),
+            })
+            .err()
+            .context("a moved session takes no messages")?;
+        assert!(format!("{refused:#}").contains(&moved), "{refused:#}");
+        let again = pair
+            .local
+            .handle(Request::Move {
+                id: "one".into(),
+                server: "box".into(),
+            })
+            .err()
+            .context("a session moves once")?;
+        assert!(format!("{again:#}").contains("already moved"), "{again:#}");
+
+        let imported = pair.server.store.get(id)?;
+        assert!(pair.server.store.home.join(format!("{id}.json")).exists());
+        assert!(imported.provider_context.is_some() && imported.thread_id.is_none());
+        assert!(
+            imported
+                .entries
+                .iter()
+                .any(|e| e.text == "Build the widget")
+        );
+        let worktree = imported.workspace.clone().context("server worktree")?;
+        assert_eq!(
+            git(&worktree, &["rev-parse", "HEAD"])?,
+            git(
+                local.workspace.as_deref().context("local worktree")?,
+                &["rev-parse", "HEAD"]
+            )?
+        );
+        // The sidebar lists the new server session at once.
+        let Reply::Sessions(list) = pair.local.handle(Request::List)? else {
+            anyhow::bail!("sessions");
+        };
+        assert!(list.iter().any(|summary| summary.id == moved));
+        let Reply::Session(read) = pair.local.handle(Request::Read {
+            id: moved.clone(),
+            version: None,
+        })?
+        else {
+            anyhow::bail!("server session");
+        };
+        assert_eq!(read.id, moved);
+        Ok(())
+    }
+
+    #[test]
+    fn busy_unknown_and_refused_moves_leave_the_local_session_as_it_was() -> Result<()> {
+        let pair = pair()?;
+        pair.local.store.update("one", |s| {
+            s.status = Status::Running;
+            s.turn_id = Some("turn".into());
+        })?;
+        let busy = pair
+            .local
+            .handle(Request::Move {
+                id: "one".into(),
+                server: "box".into(),
+            })
+            .err()
+            .context("busy")?;
+        assert!(format!("{busy:#}").contains("current turn"), "{busy:#}");
+        pair.local.store.update("one", |s| {
+            s.status = Status::Idle;
+            s.turn_id = None;
+        })?;
+        for (id, server, reason) in [
+            ("one", "nowhere", "No saved server named nowhere"),
+            ("box:1", "box", "only sessions on this computer"),
+        ] {
+            let error = pair
+                .local
+                .handle(Request::Move {
+                    id: id.into(),
+                    server: server.into(),
+                })
+                .err()
+                .context(reason)?;
+            assert!(format!("{error:#}").contains(reason), "{error:#}");
+        }
+        // A computer that is not a server never imports.
+        pair.server
+            .store
+            .storage
+            .update_config(|config| config.server.enabled = false)?;
+        let error = pair
+            .local
+            .handle(Request::Move {
+                id: "one".into(),
+                server: "box".into(),
+            })
+            .err()
+            .context("not a server")?;
+        assert!(
+            format!("{error:#}").contains("only to a difu server"),
+            "{error:#}"
+        );
+        let local = pair.local.store.get("one")?;
+        assert!(!local.archived && local.moved_to.is_none());
+        assert!(pair.server.store.list()?.is_empty());
+        assert!(!pair.temp.path().join("server").join("worktrees").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn scheduled_moves_wait_for_the_turn_and_interrupted_turns_cancel_them() -> Result<()> {
+        let pair = pair()?;
+        pair.local.store.update("one", |s| {
+            s.move_scheduled = Some("box".into());
+            s.status = Status::Running;
+            s.turn_id = Some("turn".into());
+        })?;
+        assert!(pair.local.scheduled_moves()?.is_empty());
+        assert!(pair.local.store.get("one")?.move_scheduled.is_some());
+
+        pair.local.store.update("one", |s| {
+            s.status = Status::Interrupted;
+            s.turn_id = None;
+        })?;
+        assert!(pair.local.scheduled_moves()?.is_empty());
+        let cancelled = pair.local.store.get("one")?;
+        assert!(cancelled.move_scheduled.is_none() && cancelled.moved_to.is_none());
+        assert!(
+            cancelled
+                .entries
+                .last()
+                .is_some_and(|e| e.text.contains("cancelled because the turn did not finish"))
+        );
+
+        pair.local.store.update("one", |s| {
+            s.status = Status::Idle;
+            s.move_scheduled = Some("box".into());
+        })?;
+        for handle in pair.local.scheduled_moves()? {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("move thread panicked"))?;
+        }
+        let moved = pair.local.store.get("one")?;
+        assert!(moved.archived && moved.move_scheduled.is_none());
+        assert!(
+            moved
+                .moved_to
+                .as_deref()
+                .is_some_and(|id| id.starts_with("box:"))
+        );
+        assert_eq!(pair.server.store.list()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn a_failed_scheduled_move_is_reported_in_the_chat() -> Result<()> {
+        let pair = pair()?;
+        pair.local.store.update("one", |s| {
+            s.move_scheduled = Some("box".into());
+            s.queue.push("later".into());
+        })?;
+        for handle in pair.local.scheduled_moves()? {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("move thread panicked"))?;
+        }
+        let session = pair.local.store.get("one")?;
+        assert!(session.moved_to.is_none() && !session.archived);
+        assert!(session.entries.last().is_some_and(|e| e.kind == "error"
+            && e.text.starts_with("Could not move this session to box")
+            && e.text.contains("queued messages")));
         Ok(())
     }
 }

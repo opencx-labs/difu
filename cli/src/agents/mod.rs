@@ -10,6 +10,7 @@ mod guidance;
 mod management;
 pub mod mcp;
 pub mod media;
+pub mod moving;
 pub mod notifications;
 mod orchestrator;
 mod peers;
@@ -435,6 +436,13 @@ pub struct Session {
     /// Realtime voice is connected to this session's thread.
     #[serde(default)]
     pub voice: bool,
+    /// The `<server>:<session>` this session moved to; it takes no more messages.
+    #[serde(default)]
+    pub moved_to: Option<String>,
+    /// The saved server `difu_move_to_server` moves this session to once its
+    /// turn ends. Never persisted, so a restart never replays a move.
+    #[serde(skip)]
+    pub move_scheduled: Option<String>,
 }
 impl Session {
     pub fn new(id: String, job: Job) -> Self {
@@ -525,6 +533,8 @@ impl Session {
             result: None,
             guide: None,
             voice: false,
+            moved_to: None,
+            move_scheduled: None,
         }
     }
     /// Freeze completed output and pending-request origins before another UI or
@@ -1021,6 +1031,17 @@ pub enum Request {
     },
     /// Saved cloud servers with their connection state and repositories.
     Servers,
+    /// Move a session on this computer to a saved cloud server; replies
+    /// `Launched` with the new `<server>:<session>` id.
+    Move {
+        id: String,
+        server: String,
+    },
+    /// Create a server session from a moved session (sent by `Move` over `rpc`);
+    /// replies `Launched` with the new session's id.
+    Import {
+        package: Box<moving::Package>,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {

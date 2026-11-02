@@ -45,6 +45,7 @@ Client side (your Mac):
 | `difu server ssh <name>` | Open a shell on the server as the `difu` user. |
 | `difu server pair <name>` | Show a phone pairing QR for that server in this terminal. |
 | `difu server upgrade <name>` | Install this computer's difu version on the server and restart it. |
+| `difu session move <session> <server>` | Move a session on this computer to a saved server; prints the new `<server>:<id>`. See *Moving a session to a server*. |
 
 Server side (run on the server, usually over SSH):
 
@@ -148,6 +149,100 @@ Permission prompts are unchanged.
 * Sessions are always worktrees, exactly as on a local difu. Worktrees share the
   base clone's object store and refs, so a sandbox could rewrite another session's
   branch refs (not its files); this is accepted, as it is locally.
+
+## Moving a session to a server
+
+A coding session on this computer can continue on a saved server. The server
+gets the conversation, the branch with its commits and the uncommitted files,
+and continues them as a new server session. The local session is archived,
+keeps its chat and its worktree (a move never deletes it), and refuses new
+messages with a pointer to the server session.
+
+Three ways to start a move:
+
+* `difu session move <session> <server>` prints the new session's id, e.g.
+  `hetzner:1790000100000-ef56ab78`.
+* **Move to server…** in the session actions menu, then a saved server. difu
+  opens the server session when the move finishes.
+* The agent tool `difu_move_to_server` with `{"server": "<name>"}`, offered to
+  Codex (a dynamic tool) and Claude Code (the difu MCP server) in local coding
+  sessions, not on servers. Its description and instructions allow it only when
+  the user explicitly asks, and it moves only the calling session. A session
+  cannot move mid-turn, so the tool *schedules* the move and the agent ends its
+  turn; the service runs the move once the turn has ended (status Ready) and
+  reports the outcome in the chat (`Moved to <server> as <server>:<id>`, or an
+  error entry). A turn that fails or is interrupted cancels the move. Scheduled
+  moves are not persisted, so a service restart never replays one.
+
+What moves:
+
+| | |
+| --- | --- |
+| Chat | Every entry except transient sending markers, restored as is. |
+| Settings | Title, provider, model, effort, first prompt, the permission mode (restored as the starting mode when the provider has it) and the Codex preset. |
+| Repository | `owner/name` from the `origin` remote, which must be on GitHub. The server lists and clones it first when needed, as for new sessions. |
+| Branch | The local branch name when it is free on the server, otherwise the managed `difu/agent-<id>`. Tracking `origin/<branch>` (as after `git push -u`) is restored, so pushes keep updating the branch and its pull request. |
+| Commits | The commits on the branch that are not on `origin/main`, as a `git bundle`. |
+| Uncommitted files | Modified, deleted and untracked files (binary-safe) as a scratch commit on top of HEAD, built with a temporary index so the local worktree and index do not change. They come back as unstaged changes and untracked files; staged changes become unstaged and ignored files stay behind. |
+
+A session cannot move while a turn is running, with pending questions or
+approvals, with queued messages, while archived, preparing, clearing or being
+deleted, after its worktree was removed, after it already moved, on a server, or
+without a GitHub `origin` and an `origin/main`.
+
+On the server the session gets a normal difu worktree exactly like a new session
+(fetched `origin/main`, `<data>/worktrees/<id>` on `difu/agent-<id>`). Then the
+bundle's objects are unpacked (`git bundle unbundle`, with object checks, no ref
+changes), the branch is reset to the moved HEAD and the scratch commit's tree is
+read into the worktree and the index reset to HEAD. If the server's clone lacks
+the commits the bundle builds on (say, this computer's `origin/main` has commits
+GitHub does not), the import fails and removes the worktree and branch it made.
+The new session waits, idle, without a provider thread. Its first message starts
+one and carries the prior conversation the way a provider switch does
+(`provider_context`: the chat as JSON context, not instructions), followed by a
+system entry saying where the session came from. Sandboxing follows the server's
+configuration, as for any session.
+
+### Wire format
+
+The terminal app asks its local service with `Request::Move`; the local service
+exports the session, sends `Request::Import` over the server's `rpc` (forwarded
+like other server requests, full access and equal versions required) and records
+the result.
+
+```json
+{"Move": {"id": "1790000000000-ab12cd34", "server": "hetzner"}}
+→ {"Launched": "hetzner:1790000100000-ef56ab78"}
+
+{"Import": {"package": {
+  "source": "1790000000000-ab12cd34", "computer": "Ali's MacBook Pro",
+  "title": "Widget work", "title_manual": true,
+  "provider": "claude", "model": "claude/opus", "effort": "high",
+  "mode": "plan", "preset": null, "prompt": "Build the widget",
+  "entries": [{"id": "…", "kind": "userMessage", "text": "Build the widget", "data": null}],
+  "repository": "acme/widgets", "branch": "difu/agent-1790000000000-ab12cd34", "upstream": true,
+  "head": "<sha>", "wip": "<sha> | null", "bundle": "<base64 git bundle> | null", "commits": 2
+}}}
+→ {"Launched": "1790000100000-ef56ab78"}
+```
+
+* `head` is the worktree's HEAD; `wip`, when present, is the scratch commit (its
+  parent is `head`) whose tree is the worktree with its uncommitted files.
+* `bundle` holds the commits from `origin/main` up to `wip` (or `head`) under one
+  ref, `refs/difu/move/<source>`; it is `null` when there are none. `commits`
+  counts the branch's own commits for the server's note.
+* Only a server-mode service imports; anything else answers with an error.
+* A move travels in one WebSocket message: the serialized package plus a 64 KiB
+  envelope must fit in 48 MiB. A larger session is refused before anything is
+  sent, with its size, the size of its commits and files, and the size of its
+  chat.
+
+Not moved: image and video attachments referenced in the chat (they stay on this
+computer), HTML artifacts, explicitly attached pull requests (the server finds a
+pull request for the preserved branch on its own), shells and their output, and
+ignored files. The handoff contains the whole chat, which for very long sessions
+can be large for the provider, as with provider switching. Moving a server
+session back to a computer or on to another server is not supported.
 
 ## Wire protocol additions
 
@@ -299,6 +394,7 @@ fixes a mismatch).
 * Features that need the session's files on this machine (attachments, local
   file paths, HTML artifact previews) say they are unavailable for server
   sessions.
+* A local session can move to a saved server (*Moving a session to a server*).
 * The phone API of a Mac hides relayed server sessions, because phones connect to
   servers directly.
 

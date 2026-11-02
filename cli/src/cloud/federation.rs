@@ -231,7 +231,10 @@ fn session_id(request: &mut Request) -> Option<&mut String> {
         | Request::Defaults { .. }
         | Request::Remote { .. }
         | Request::RepositoryRules { .. }
-        | Request::Servers => None,
+        | Request::Servers
+        // The local service moves its own session; servers import it.
+        | Request::Move { .. }
+        | Request::Import { .. } => None,
     }
 }
 
@@ -250,6 +253,7 @@ fn changes_list(request: &Request) -> bool {
             | Request::Delete { .. }
             | Request::RegisterWorktree { .. }
             | Request::AttachPr { .. }
+            | Request::Import { .. }
     )
 }
 
@@ -721,7 +725,8 @@ impl Federation {
         }
     }
 
-    fn forward(&self, name: &str, request: &Request) -> Result<Reply> {
+    /// Sends `request` to a saved server; replies come back namespaced.
+    pub(crate) fn forward(&self, name: &str, request: &Request) -> Result<Reply> {
         let remote = self.remote(name)?;
         let reply = prefix_reply(name, remote.rpc(request)?);
         if changes_list(request) && !matches!(reply, Reply::Error(_)) {
@@ -884,21 +889,25 @@ pub(crate) mod tests {
         servers: Vec<(&str, Arc<Fake>)>,
     ) -> Result<(tempfile::TempDir, Federation)> {
         let (dir, storage) = storage()?;
-        let fakes: BTreeMap<String, Arc<Fake>> = servers
-            .iter()
-            .map(|(name, fake)| ((*name).to_owned(), fake.clone()))
+        let remotes = servers
+            .into_iter()
+            .map(|(name, fake)| (name.to_owned(), fake as Arc<dyn Remote>))
             .collect();
-        for (name, _) in &servers {
+        Ok((dir, linked(storage, remotes)?))
+    }
+
+    /// Saves a server per remote in `storage` and connects a federation to
+    /// them, without background threads.
+    pub(crate) fn linked(
+        storage: Storage,
+        remotes: BTreeMap<String, Arc<dyn Remote>>,
+    ) -> Result<Federation> {
+        for name in remotes.keys() {
             servers::save(&storage, server(name, &format!("id-{name}")))?;
         }
         let federation = Federation::new(
             storage,
-            Box::new(move |saved| {
-                fakes
-                    .get(&saved.name)
-                    .map(|fake| fake.clone() as Arc<dyn Remote>)
-                    .context("unreachable")
-            }),
+            Box::new(move |saved| remotes.get(&saved.name).cloned().context("unreachable")),
         );
         for (name, generation) in federation.reload() {
             let saved = federation.saved(&name, generation).context("saved")?;
@@ -906,7 +915,7 @@ pub(crate) mod tests {
                 federation.poll(&name, generation, &remote);
             }
         }
-        Ok((dir, federation))
+        Ok(federation)
     }
 
     #[test]
