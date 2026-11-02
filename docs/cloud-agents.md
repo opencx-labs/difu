@@ -45,7 +45,7 @@ Client side (your Mac):
 | --- | --- |
 | `difu server add <ip> [--name N] [--user root] [--ssh-port 22] [--tailscale] [--no-sandbox]` | One-time onboarding with the root password (or your SSH key). See *Onboarding*. |
 | `difu server join <host[:port]> [--name N]` | Pair this computer with an already configured server using its server password. No onboarding. |
-| `difu server list` | Saved servers and whether they are reachable. |
+| `difu server list` | Saved servers, whether they are reachable, and each one's free disk space. |
 | `difu server remove <name>` | Revoke this computer on the server (when reachable) and forget it locally. |
 | `difu server ssh <name>` | Open a shell on the server as the `difu` user. |
 | `difu server pair <name>` | Show a phone pairing QR for that server in this terminal. |
@@ -64,6 +64,7 @@ Server side (run on the server, usually over SSH):
 | `difu remote config [--host H]... [--clear-hosts] [--port P]` | Addresses to advertise to clients (public IP, DNS or Tailscale name) and a fixed port. |
 | `difu repos [list]` / `difu repos add [owner/name]` / `difu repos remove owner/name` / `difu repos refresh [owner/name]` | Server repositories. `add` without a name opens a picker built from `gh repo list`. |
 | `difu sandbox build` / `difu sandbox status` | Build (or pull) the configured sandbox image / show runtime, image and running sandboxes. |
+| `difu disk [status [--refresh]]` / `difu disk clean <archived-worktrees\|build-outputs\|sandbox>` | Free disk space and what uses it / run a cleanup. See *Disk space*. |
 
 ## Onboarding (`difu server add`)
 
@@ -197,6 +198,98 @@ Permission prompts are unchanged.
 * Sessions are always worktrees, exactly as on a local difu. Worktrees share the
   base clone's object store and refs, so a sandbox could rewrite another session's
   branch refs (not its files); this is accepted, as it is locally.
+
+## Disk space
+
+A server's sessions, worktrees, base clones and sandbox images share one disk,
+and a full disk breaks every session at once. Each server reports its own disk
+space; clients only display what the server says.
+
+* **Free space** is `statvfs` of the filesystem holding difu's agent data
+  (`<data>/agents`, the `path` in `server.disk`), read on every request:
+  `total`, `used`, and `free` (what difu can still use).
+* **Status**: `low` when free space is below 15% **or** 20 GB, `critical` below
+  5% **or** 5 GB, otherwise `ok` (constants in `cli/src/cloud/disk.rs`).
+* **Breakdown**, measured on a background thread when the service starts, every
+  5 minutes, after every cleanup and when a client asks (`refresh`); requests
+  only read the last measurement and its `measuredAt`. Sizes are allocated
+  blocks like `du -x`: symlinks are never followed, other filesystems are
+  skipped and hard links count once.
+  * `sessions`: each coding session's worktree (`<data>/agents/worktrees/<id>`)
+    with its title, archived and active flags, biggest first, and
+    `buildOutputs`, the part a `buildOutputs` cleanup could clear. Worktrees
+    without a session count as other.
+  * `repositories` (base clones), `attachments` (pasted media), `caches`
+    (difu's cache directory).
+  * `sandbox`: `podman system df --format json` (images, containers, volumes,
+    and what Podman counts as reclaimable), when Podman is installed.
+  * `other`: everything else on the filesystem (the system, logs, CLIs).
+
+### Cleanups
+
+Each cleanup is explicit, runs on the server one at a time, and reports the
+bytes it freed and a summary. Running sessions are never interrupted.
+
+| Action | What it does |
+| --- | --- |
+| `archivedWorktrees` | For every archived, inactive session with a difu-owned worktree: clear its build outputs (as below), then remove the worktree with the same per-session cleanup as the session's own "Clean up worktree" (pod removed, worktree removed with `git worktree remove` without `--force`, attachments removed). The chat, branch and commits stay. Worktrees that still hold modified, untracked or other ignored files are kept and named in the summary; active sessions are skipped. |
+| `buildOutputs` | In idle sessions only (no turn, not preparing, clearing or being deleted, no open shell), under the session's action lock: delete the outermost directories named `target`, `node_modules`, `.next`, `.turbo`, `dist`, `build`, `.venv`, `__pycache__` or `.gradle` inside its difu-owned worktree, only where `git check-ignore` says Git ignores them and `git ls-files` finds no tracked file under them. The walk never enters symlinks, and each directory is checked again before removal to be a real directory whose canonical path is inside the worktree. |
+| `sandbox` | `podman system prune -f` (stopped containers, dangling images, unused networks, build cache; not volumes), then `podman rmi` (without `--force`) of every image no container uses, except the configured sandbox image. |
+
+### Guardrails
+
+While a server is `critical` it refuses work that needs space: new sessions
+(`NewAgent`, phone `agents.new`, checked before a repository is cloned for
+them), imports from moves, and repository clones (`difu repos add`,
+`server.repos.add`, the background refresh of a missing clone, launching on an
+unlisted repository). The message names the free space and points at the
+cleanups:
+
+> Only 3.1 GB is free on this server (4% of 80 GB), so difu is not starting new
+> sessions, moves or clones. Free up space in Cmd+K → /cloud or with `difu disk
+> clean` on the server; running sessions continue.
+
+Ordinary installations (not server mode) are never refused.
+
+### Wire format
+
+Phone API, server mode only (like `server.repos`), for every paired device:
+
+```json
+{"method": "server.disk", "params": {"refresh": false}}
+→ {"path": "/home/difu/.config/difu/agents", "total": 80000000000, "used": 52000000000,
+   "free": 28000000000, "status": "ok", "measuredAt": 1790000000000, "measuring": false,
+   "breakdown": {
+     "sessions": [{"id": "1790000000000-ab12cd34", "title": "Fix login", "archived": true,
+                   "active": false, "bytes": 4100000000, "buildOutputs": 3200000000}],
+     "repositories": 9000000000, "attachments": 12000000, "caches": 340000000,
+     "sandbox": {"available": true, "images": 3000000000, "containers": 120000000,
+                 "volumes": 0, "reclaimable": 900000000},
+     "other": 30000000000}}
+
+{"method": "server.disk.clean", "params": {"action": "archivedWorktrees"}}
+→ {"freed": 4000000000, "summary": "Removed 3 archived worktrees (4.0 GB freed); their chats stay. Kept 1 with uncommitted, untracked or ignored files: Widget."}
+```
+
+* Bytes are integers. `measuredAt` is `null` (and the breakdown empty) until the
+  first measurement finishes; `measuring` is true while one runs. `refresh`
+  starts one and answers at once.
+* `action` is `archivedWorktrees`, `buildOutputs` or `sandbox`. A cleanup can
+  take minutes; clients should wait for the reply rather than time out early.
+* The phone API asks the service with `Request::Disk {server: null, refresh}` →
+  `Reply::Disk(report)` and `Request::DiskClean {server: null, action}` →
+  `Reply::DiskCleaned({freed, summary})`.
+
+A Mac's local service reads `server.disk` with `server.repos` while a terminal
+app is open, at most every 30 seconds (the server answers from its cached
+measurement), and `server.logins` every 5 minutes, into `Request::Servers`
+(`disk`, `diskProblem`, `logins`, session counts, port). The terminal app's
+`Request::Disk {server: "<name>", refresh}` and `Request::DiskClean {server:
+"<name>", action}` are answered by the local service with these phone-API calls
+on its connection, so they work whatever difu version the server runs; an older
+server without `server.disk` shows "runs an older difu without disk status; run
+`difu server upgrade <name>`". After a cleanup the local service reads the disk
+status and session list again.
 
 ## Moving a session to a server
 
@@ -454,10 +547,12 @@ servers by `server.id`.
 | `server.login.start` | `{"tool":"github"\|"codex"}` | `{"url","code","message"}` for a device-code login that finishes in the background; poll `server.logins`. |
 | `server.login.token` | `{"tool":"claude","token"}` | `{}`; stores a `claude setup-token` token for the service. |
 | `server.logout` | `{"tool"}` | `{}` |
+| `server.disk` | `{"refresh"?}` | Disk space, status and breakdown; see *Disk space*. |
+| `server.disk.clean` | `{"action"}` | `{"freed","summary"}`; `action` is `archivedWorktrees`, `buildOutputs` or `sandbox`. |
 
-`server.repos*` and `server.login*`/`server.logout*` require server mode, so a
-phone paired with a Mac cannot change the Mac's logins; `server.rules.*` work
-everywhere. `agents.repositories` on a server returns the server repositories
+`server.repos*`, `server.login*`/`server.logout*` and `server.disk*` require
+server mode, so a phone paired with a Mac cannot change the Mac's logins;
+`server.rules.*` work everywhere. `agents.repositories` on a server returns the server repositories
 (`name` is `owner/name`). `agents.new` accepts `repository` as a path or
 `owner/name` (an unlisted name is added and cloned first); `base` is reserved and
 currently ignored.
@@ -555,6 +650,21 @@ Three service requests exist for clients whose sessions live elsewhere:
   trips, so a distant server makes the pane less responsive than a local one.
   `difu_shell` runs on the server like every agent tool.
 * A local session can move to a saved server (*Moving a session to a server*).
+* **Cmd+K → `/cloud`** (also `/cloud <name>`) shows every saved server from
+  `Request::Servers`: connection state or problem, difu version (a mismatch
+  suggests `difu server upgrade <name>`), address, active/total sessions,
+  GitHub/Codex/Claude Code logins, repositories, and a disk bar colored by
+  status. Enter opens a server's breakdown (sessions biggest first) and actions:
+  Refresh (`r`, `Request::Disk` with `refresh`, which also rereads logins and
+  repositories), Clean archived worktrees (`a`), Clear build outputs (`b`) and
+  Prune sandbox images (`p`), each confirmed with what it removes and the space
+  it should free before `Request::DiskClean`, then the summary. Without saved
+  servers it explains `difu server add` and `difu server join`.
+* A low or critical server is marked where its sessions appear: the server name
+  in the sessions list turns yellow or red (with "disk low"/"disk critical" when
+  the row has room), the conversation title says "on <server> (disk low)", and
+  the new-session form's Location shows the free space. The form refuses a
+  critical server with the server's message before sending anything.
 * The phone API of a Mac hides relayed server sessions, because phones connect to
   servers directly.
 
@@ -569,9 +679,10 @@ Three service requests exist for clients whose sessions live elsewhere:
 * The session screen shows the session's PRs (`SessionSummary.prs`) as chips;
   tapping one opens the PR screen on the same server. Photos are sent with
   `session.send` straight to the server running the session.
-* Per-server settings: logins (status, device-code login, Claude token), server
-  repositories (add from `server.repos.available`, remove, refresh mains),
-  repository rules, paired devices (revoke).
+* Per-server settings: disk space (bar, status, breakdown, and the three
+  cleanups with confirmations), logins (status, device-code login, Claude
+  token), server repositories (add from `server.repos.available`, remove,
+  refresh mains), repository rules, paired devices (revoke).
 * Face ID / passcode app lock when opening and after 5 minutes in the background.
 * "Forget" calls `device.unpair` before deleting the credential.
 * `device.paired` events show a banner with a Revoke action.
