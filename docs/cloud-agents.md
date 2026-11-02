@@ -134,6 +134,9 @@ Permission prompts are unchanged.
   * the server's logins mounted (`~/.codex`, `~/.claude`, `~/.claude.json`,
     `~/.config/gh`), and `~/.gitconfig` plus the host's CLI binaries
     (`~/.local/bin`, Claude's versions directory) mounted read-only;
+  * the session's attachment directory (`<data>/agents/attachments/<id>`)
+    mounted read-only, so Codex can read images sent from a Mac or a phone by
+    path and the agent can open mentioned videos;
   * secrets passed by variable name only, so they never appear in `ps`.
 * CPU and memory limits from `config.server.sandbox` apply to the whole pod, one
   budget per session.
@@ -378,13 +381,18 @@ call's `error`; `Request::Watch` must use `rpc.watch`. Clients must check that t
 server's `version` equals their own before using `rpc` (`difu server upgrade`
 fixes a mismatch).
 
-One service request exists for clients whose sessions live elsewhere:
+Two service requests exist for clients whose sessions live elsewhere:
 
 * `{"SessionPrs": {"id", "history"}}` → `{"SessionPrs": {"links", "branch", "error"}}`:
   the session's attached and discovered PRs, refreshed by the server with its
   worktree and `gh` under the same two-minute lease as its background refresh
   (`history` also checks closed and merged PRs, as opening a session does). On
   a failed refresh `links` are the cached ones and `error` says why.
+* `{"UploadAttachment": {"id", "label", "kind": "Image"|"Video", "extension", "data": "<base64>"}}`
+  → `{"Attachment": {"label", "path", "kind", "hash"}}`: stores pasted media as
+  the session's private copy on the server (images are checked like a paste),
+  at most 32 MB per file so the request stays within the WebSocket message
+  cap. The reply is sent in `Control::Message*` `attachments`.
 
 ## Clients
 
@@ -418,9 +426,14 @@ One service request exists for clients whose sessions live elsewhere:
   computer's GitHub store. The PR panel is the embedded review app and uses
   this computer's `gh` by `owner/repo#number`, like any pull request in
   Reviews; its Diff and Guide tabs need a local clone.
-* Features that need the session's files on this machine (attachments, local
-  file paths, HTML artifact previews) say they are unavailable for server
-  sessions.
+* Pasted images and videos stay private copies on the Mac (drafts included,
+  under `attachments/<server>@<session>`) until Send. The local service then
+  uploads each one with `UploadAttachment` and sends the message with the
+  server's copies. A file over 32 MB fails the send with a clear error before
+  anything reaches the server. Deleting or cleaning up the session removes the
+  Mac's copies.
+* Features that open the session's files on this machine (local file paths,
+  HTML artifact previews) say they are unavailable for server sessions.
 * A local session can move to a saved server (*Moving a session to a server*).
 * The phone API of a Mac hides relayed server sessions, because phones connect to
   servers directly.

@@ -66,7 +66,7 @@ mod tests {
 
     #[test]
     fn server_sessions_show_a_badge_and_refuse_local_file_features() -> Result<()> {
-        let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
+        let (mut ui, dir, _) = shortcut_tests::fixture(None)?;
         let mut session = crate::cloud::federation::tests::session("hetzner:1");
         session.title = "Server task".into();
         let mut summary = session.summary();
@@ -78,15 +78,32 @@ mod tests {
         ui.focus = Focus::List;
         let text = screen(&mut ui)?;
         assert!(text.contains("hetzner · api"), "{text}");
-        ui.attach(None);
-        assert_eq!(
-            ui.notice.as_ref().map(|(n, error)| (n.as_str(), *error)),
-            Some((UNAVAILABLE, true))
-        );
-        assert!(ui.media_pending.is_none());
-        ui.notice = None;
+        // Pasted media is a private copy on this computer until Send uploads
+        // it, and the draft keeps it like a local session's.
+        let shot = dir.path().join("shot.png");
+        image::RgbaImage::new(2, 2).save(&shot)?;
+        ui.attach(Some(vec![shot]));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ui.media_pending.is_some() {
+            anyhow::ensure!(Instant::now() < deadline, "attachment never read");
+            thread::sleep(Duration::from_millis(5));
+            ui.tick_media();
+        }
+        assert!(ui.notice.is_none(), "{:?}", ui.notice);
+        let position = ui.positions.get("hetzner:1").context("position")?;
+        assert_eq!(position.draft.text(), "[image 1] ");
+        let copy = position.attachments.first().context("copy")?.clone();
+        let local = crate::agents::media::directory(&ui.storage, "hetzner:1")?;
+        assert_eq!(copy.path.parent(), Some(local.as_path()));
+        assert!(local.ends_with("hetzner@1"));
+        crate::agents::media::validate(&ui.storage, "hetzner:1", &copy)?;
+        ui.cache_writer.flush()?;
+        ui.positions.remove("hetzner:1");
         ui.restore_media("hetzner:1");
         assert!(ui.notice.is_none(), "no attachment restore error");
+        let restored = ui.positions.get("hetzner:1").context("restored")?;
+        assert_eq!(restored.attachments, vec![copy]);
+        assert_eq!(restored.draft.text(), "[image 1]");
         ui.sessions
             .get_mut("hetzner:1")
             .context("session")?

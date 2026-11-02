@@ -2633,10 +2633,15 @@ impl Ui {
             && let Some(cwd) = self
                 .selected
                 .as_ref()
-                .filter(|id| !servers::is_server_session(id))
-                .and_then(|id| self.sessions.get(id))
-                .and_then(|s| s.workspace.as_deref())
-            && let Some(paths) = super::media::paths(text, cwd)
+                .filter(|id| {
+                    servers::is_server_session(id)
+                        || self
+                            .sessions
+                            .get(*id)
+                            .is_some_and(|s| s.workspace.is_some())
+                })
+                .and_then(|id| self.paste_directory(id))
+            && let Some(paths) = super::media::paths(text, &cwd)
         {
             self.attach(Some(paths));
             return;

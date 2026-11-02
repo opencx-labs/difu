@@ -30,16 +30,28 @@ impl Position {
     }
 }
 impl Ui {
+    /// Where relative paths in pasted text point: the session's workspace, or
+    /// for a server session (whose workspace is on the server) the directory
+    /// difu was started in. Pasted media of a server session stays on this
+    /// computer until Send uploads it.
+    pub(super) fn paste_directory(&self, id: &str) -> Option<std::path::PathBuf> {
+        let session = self.sessions.get(id)?;
+        if servers::is_server_session(id) {
+            return std::env::current_dir().ok().or_else(dirs::home_dir);
+        }
+        Some(
+            session
+                .workspace
+                .clone()
+                .unwrap_or_else(|| session.job.root().clone()),
+        )
+    }
     pub(super) fn restore_media(&mut self, id: &str) {
         let p = self.positions.entry(id.to_owned()).or_default();
         if p.media_loaded {
             return;
         }
         p.media_loaded = true;
-        // Attachment drafts are files on this computer; server sessions have none.
-        if servers::is_server_session(id) {
-            return;
-        }
         match super::super::media::load_draft(&self.storage, id) {
             Ok(attachments) => {
                 for a in &attachments {
@@ -77,17 +89,10 @@ impl Ui {
         let Some(id) = self.selected.clone() else {
             return;
         };
-        if self.unavailable_for_server(&id) {
-            return;
-        }
         self.restore_media(&id);
-        let Some(session) = self.sessions.get(&id) else {
+        let Some(cwd) = self.paste_directory(&id) else {
             return;
         };
-        let cwd = session
-            .workspace
-            .clone()
-            .unwrap_or_else(|| session.job.root().clone());
         let storage = self.storage.clone();
         let (tx, rx) = mpsc::channel();
         self.media_pending = Some((id.clone(), rx));
@@ -105,10 +110,7 @@ impl Ui {
         // Keep metadata for undo in memory, but persist/send only tokens still in the draft.
         for (id, position) in &mut self.positions {
             let active = position.active_attachments();
-            if position.media_loaded
-                && active != position.saved_attachments
-                && !servers::is_server_session(id)
-            {
+            if position.media_loaded && active != position.saved_attachments {
                 match save_draft(&self.cache_writer, &self.storage, id, &active) {
                     Ok(()) => position.saved_attachments = active,
                     Err(error) => {

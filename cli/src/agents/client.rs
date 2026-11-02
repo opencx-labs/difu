@@ -1,4 +1,4 @@
-use super::{Job, Reply, Request, Session, Status};
+use super::{Control, Job, Reply, Request, Session, Status};
 use crate::{process::Cancel, storage::Storage};
 use anyhow::{Context, Result, ensure};
 use std::{
@@ -70,6 +70,15 @@ pub fn request(storage: &Storage, request: Request) -> Result<Reply> {
         None
     } else if matches!(request, Request::Cpu { .. }) {
         Some(Duration::from_secs(2))
+    } else if matches!(
+        request,
+        Request::Control {
+            control: Control::MessageWithAttachments { .. },
+            ..
+        }
+    ) {
+        // A server session's attachments are uploaded before the message.
+        Some(Duration::from_secs(10 * 60))
     } else {
         Some(Duration::from_secs(65))
     };

@@ -15,7 +15,9 @@
 //!   workspace and its repository's Git common directory (so worktree metadata
 //!   resolves), the server logins (read-write, so tokens can refresh) and the
 //!   host's Git identity and CLI binaries (read-only) are mounted at identical
-//!   absolute paths, with `HOME` set to the host home.
+//!   absolute paths, with `HOME` set to the host home. So is the session's
+//!   attachment directory (read-only): Codex reads pasted and uploaded images
+//!   by path, and videos are mentioned by path.
 //! * User mapping: rootless Podman's default mapping, pinned with `--user 0:0`
 //!   so an image's `USER` cannot change it. Container root is the host user that
 //!   runs difu (`difu` on a server) and has no privileges outside the
@@ -99,6 +101,8 @@ pub(crate) struct Sandbox {
     memory: String,
     home: PathBuf,
     workspace: PathBuf,
+    /// The session's attachment directory (`media::directory`).
+    attachments: Option<PathBuf>,
 }
 
 impl Sandbox {
@@ -106,7 +110,7 @@ impl Sandbox {
     /// installation.
     pub(crate) fn for_session(storage: &Storage, session: &Session) -> Result<Option<Self>> {
         let config = storage.load_config()?;
-        let Some(sandbox) = Self::decide(&config.server, session, dirs::home_dir().as_deref())?
+        let Some(mut sandbox) = Self::decide(&config.server, session, dirs::home_dir().as_deref())?
         else {
             return Ok(None);
         };
@@ -114,6 +118,8 @@ impl Sandbox {
             installed(PODMAN),
             "Sandboxing is enabled on this server, but Podman is not installed. Install podman, or turn sandboxing off (server.sandbox.enabled in config.json) to run agents directly on the server"
         );
+        // Created now, so media sent later appears inside the running sandbox.
+        sandbox.attachments = Some(super::media::directory(storage, &session.id)?);
         Ok(Some(sandbox))
     }
 
@@ -141,6 +147,7 @@ impl Sandbox {
                 .workspace
                 .clone()
                 .unwrap_or_else(|| launch.repository.clone()),
+            attachments: None,
         }))
     }
 
@@ -310,6 +317,12 @@ impl Sandbox {
                     read_only: true,
                 });
             }
+        }
+        if let Some(attachments) = self.attachments.as_ref().filter(|path| path.is_dir()) {
+            candidates.push(Mount {
+                path: attachments.clone(),
+                read_only: true,
+            });
         }
         arrange(candidates)
     }
@@ -927,6 +940,7 @@ mod tests {
             memory: String::new(),
             home: "/home/difu".into(),
             workspace: "/srv/worktrees/1791-abc".into(),
+            attachments: None,
         }
     }
 
@@ -1270,9 +1284,11 @@ mod tests {
         fs::create_dir_all(home.join(".local/bin"))?;
         fs::write(home.join(".claude.json"), "{}")?;
         fs::write(home.join(".gitconfig"), "")?;
+        let attachments = root.join("difu/agents/attachments/1791-abc");
         let sandbox = Sandbox {
             home: home.clone(),
             workspace: worktree.clone(),
+            attachments: Some(attachments.clone()),
             ..sandbox()
         };
         let writable = |path: PathBuf| Mount {
@@ -1283,17 +1299,22 @@ mod tests {
             path,
             read_only: true,
         };
-        assert_eq!(
-            sandbox.mounts(&worktree),
-            [
-                writable(worktree.clone()),
-                writable(repository.join(".git")),
-                writable(home.join(".codex")),
-                writable(home.join(".claude.json")),
-                read_only(home.join(".gitconfig")),
-                read_only(home.join(".local/bin")),
-            ]
-        );
+        let expected = [
+            writable(worktree.clone()),
+            writable(repository.join(".git")),
+            writable(home.join(".codex")),
+            writable(home.join(".claude.json")),
+            read_only(home.join(".gitconfig")),
+            read_only(home.join(".local/bin")),
+        ];
+        // A missing attachment directory is not mounted (Podman would fail).
+        assert_eq!(sandbox.mounts(&worktree), expected);
+        // Media sent to the session is readable inside, but cannot be changed.
+        fs::create_dir_all(&attachments)?;
+        let mounts = sandbox.mounts(&worktree);
+        assert_eq!(mounts.get(..expected.len()), Some(expected.as_slice()));
+        assert_eq!(mounts.last(), Some(&read_only(attachments.clone())));
+        assert_eq!(mounts.len(), expected.len() + 1);
         // In the base clone itself, its `.git` is already inside the mount.
         let base = Sandbox {
             workspace: repository.clone(),
@@ -1563,8 +1584,11 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let workspace = temp.path().canonicalize()?.join("workspace");
         let home = temp.path().canonicalize()?.join("home");
+        let attachments = temp.path().canonicalize()?.join("attachments");
         fs::create_dir_all(&workspace)?;
         fs::create_dir_all(&home)?;
+        fs::create_dir_all(&attachments)?;
+        fs::write(attachments.join("media-1.png"), "uploaded")?;
         let session = format!(
             "test-{}-{:x}",
             std::process::id(),
@@ -1578,6 +1602,7 @@ mod tests {
             memory: String::new(),
             home: home.clone(),
             workspace: workspace.clone(),
+            attachments: Some(attachments.clone()),
         };
         let exists = |kind: &str, name: &str| -> Result<bool> {
             Ok(podman.podman(&os([kind, "exists", name]))?.code == 0)
@@ -1585,7 +1610,12 @@ mod tests {
         let result = (|| -> Result<()> {
             let mut command = Command::new("sh");
             command
-                .args(["-c", "pwd; echo \"$HOME $DIFU_SECRET\"; cat > out.txt"])
+                .args([
+                    "-c",
+                    "pwd; echo \"$HOME $DIFU_SECRET\"; cat \"$1/media-1.png\"; echo; touch \"$1/new\" 2>/dev/null || echo read-only; cat > out.txt",
+                    "sh",
+                ])
+                .arg(&attachments)
                 .current_dir(&workspace)
                 .env("DIFU_SECRET", "forwarded");
             let (mut wrapped, container) = sandbox.command(Role::Shell, &command)?;
@@ -1612,7 +1642,11 @@ mod tests {
             ensure!(status.success(), "podman run failed: {errors}");
             assert_eq!(
                 output,
-                format!("{}\n{} forwarded\n", workspace.display(), home.display())
+                format!(
+                    "{}\n{} forwarded\nuploaded\nread-only\n",
+                    workspace.display(),
+                    home.display()
+                )
             );
             assert_eq!(
                 fs::read_to_string(workspace.join("out.txt"))?,

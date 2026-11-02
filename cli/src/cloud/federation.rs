@@ -10,10 +10,11 @@ use super::{
     servers::{self, SavedServer},
 };
 use crate::{
-    agents::{Reply, Request, Summary},
+    agents::{Control, Reply, Request, Summary, media},
     storage::{AgentDefaults, Storage},
 };
 use anyhow::{Context, Result};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -207,6 +208,7 @@ fn session_id(request: &mut Request) -> Option<&mut String> {
         | Request::Read { id, .. }
         | Request::AttachPr { id, .. }
         | Request::SessionPrs { id, .. }
+        | Request::UploadAttachment { id, .. }
         | Request::Control { id, .. }
         | Request::Voice { id, .. }
         | Request::Repository { id, .. }
@@ -246,9 +248,71 @@ fn session_id(request: &mut Request) -> Option<&mut String> {
     }
 }
 
+/// A server session's message refers to private copies on this computer
+/// (`media`): upload each to the server and send the server's copies instead.
+/// The request already carries the server's session id.
+fn upload(
+    storage: &Storage,
+    server: &str,
+    remote: &dyn Remote,
+    request: &mut Request,
+) -> Result<()> {
+    let Request::Control {
+        id,
+        control:
+            Control::Message { attachments, .. } | Control::MessageWithAttachments { attachments, .. },
+    } = request
+    else {
+        return Ok(());
+    };
+    let local = namespace(server, id);
+    for attachment in attachments.iter_mut() {
+        *attachment = upload_attachment(storage, &local, id, remote, attachment)?;
+    }
+    Ok(())
+}
+
+fn upload_attachment(
+    storage: &Storage,
+    local: &str,
+    id: &str,
+    remote: &dyn Remote,
+    attachment: &media::Attachment,
+) -> Result<media::Attachment> {
+    let label = &attachment.label;
+    let size = std::fs::metadata(&attachment.path)
+        .with_context(|| format!("{label} is missing; paste it again"))?
+        .len();
+    anyhow::ensure!(
+        usize::try_from(size).is_ok_and(|size| size <= media::UPLOAD_LIMIT),
+        "{label} is {:.1} MB; attachments for server sessions must be {} MB or smaller",
+        size as f64 / f64::from(1u32 << 20),
+        media::UPLOAD_LIMIT >> 20
+    );
+    media::validate(storage, local, attachment).with_context(|| format!("Cannot send {label}"))?;
+    let bytes = std::fs::read(&attachment.path)?;
+    let extension = attachment
+        .path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default();
+    match remote.rpc(&Request::UploadAttachment {
+        id: id.to_owned(),
+        label: label.clone(),
+        kind: attachment.kind.clone(),
+        extension: extension.to_owned(),
+        data: STANDARD.encode(&bytes),
+    }) {
+        Ok(Reply::Attachment(uploaded)) => Ok(uploaded),
+        Ok(Reply::Error(error)) => anyhow::bail!("Cannot upload {label}: {error}"),
+        Ok(_) => anyhow::bail!("Unexpected reply while uploading {label}"),
+        Err(error) => Err(error.context(format!("Cannot upload {label}"))),
+    }
+}
+
 /// Keeps what a server answered where this computer's terminal app looks for
 /// it, as the local service would have: PR states and published diffs in the
-/// GitHub store.
+/// GitHub store, and no attachment copies for a deleted session.
 fn remember(storage: &Storage, server: &str, request: &Request, reply: &Reply) {
     let result = match (request, reply) {
         (Request::SessionPrs { .. }, Reply::SessionPrs(lookup)) => lookup
@@ -257,6 +321,9 @@ fn remember(storage: &Storage, server: &str, request: &Request, reply: &Reply) {
             .try_for_each(|link| crate::github::store::session(storage, &link.pr)),
         (Request::PrChanges { pr, .. }, Reply::Changes(patch)) => {
             crate::github::store::diff(storage, pr, patch)
+        }
+        (Request::Delete { id } | Request::Cleanup { id }, Reply::Ok) => {
+            media::cleanup(storage, &namespace(server, id))
         }
         _ => Ok(()),
     };
@@ -329,6 +396,7 @@ pub fn prefix_reply(server: &str, reply: Reply) -> Reply {
         | Reply::RepositoryRules { .. }
         | Reply::Servers(_)
         | Reply::SessionPrs(_)
+        | Reply::Attachment(_)
         | Reply::Error(_)) => reply,
     }
 }
@@ -789,6 +857,21 @@ impl Federation {
     /// Sends `request` to a saved server; replies come back namespaced.
     pub(crate) fn forward(&self, name: &str, request: &Request) -> Result<Reply> {
         let remote = self.remote(name)?;
+        // Only messages with attachments are copied, to swap in the server's paths.
+        let uploaded = match request {
+            Request::Control {
+                control:
+                    Control::Message { attachments, .. }
+                    | Control::MessageWithAttachments { attachments, .. },
+                ..
+            } if !attachments.is_empty() => {
+                let mut copy = request.clone();
+                upload(&self.storage, name, remote.as_ref(), &mut copy)?;
+                Some(copy)
+            }
+            _ => None,
+        };
+        let request = uploaded.as_ref().unwrap_or(request);
         let reply = prefix_reply(name, remote.rpc(request)?);
         remember(&self.storage, name, request, &reply);
         if changes_list(request) && !matches!(reply, Reply::Error(_)) {
@@ -930,6 +1013,24 @@ pub(crate) mod tests {
                     effort: "medium".into(),
                     permissions: "{}".into(),
                 },
+                // The server keeps its own copy and names it by its own path.
+                Request::UploadAttachment {
+                    id,
+                    label,
+                    kind,
+                    extension,
+                    data,
+                } => Reply::Attachment(media::Attachment {
+                    label: label.clone(),
+                    path: format!("/srv/difu/agents/attachments/{id}/media-{label}.{extension}")
+                        .replace(' ', "-")
+                        .into(),
+                    kind: kind.clone(),
+                    hash: format!(
+                        "{:x}",
+                        <sha2::Sha256 as sha2::Digest>::digest(STANDARD.decode(data)?)
+                    ),
+                }),
                 Request::SessionPrs { .. } => Reply::SessionPrs(lookup()),
                 Request::PrChanges { .. } => Reply::Changes(PATCH.into()),
                 _ => Reply::Ok,
@@ -1142,6 +1243,19 @@ pub(crate) mod tests {
             saved,
         ) else {
             anyhow::bail!("expected a server PR lookup");
+        };
+        assert_eq!(id, "1");
+        let Target::Server(_, Request::UploadAttachment { id, .. }) = target(
+            Request::UploadAttachment {
+                id: "box:1".into(),
+                label: "image 1".into(),
+                kind: media::Kind::Image,
+                extension: "png".into(),
+                data: String::new(),
+            },
+            saved,
+        ) else {
+            anyhow::bail!("expected a server upload");
         };
         assert_eq!(id, "1");
         let lookup = Reply::SessionPrs(lookup());
@@ -1504,6 +1618,195 @@ pub(crate) mod tests {
         Ok(())
     }
 
+    /// A message's attachments as the terminal app sends them: private copies
+    /// in this computer's attachment directory for `box:1`.
+    fn pasted(federation: &Federation, files: &[(&str, &[u8])]) -> Result<Vec<media::Attachment>> {
+        let dir = tempfile::tempdir()?;
+        let mut paths = Vec::new();
+        for (name, bytes) in files {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes)?;
+            paths.push(path);
+        }
+        let media::Paste::Attachments(mut copies) =
+            media::files(&federation.storage, "box:1", paths)?
+        else {
+            anyhow::bail!("expected media");
+        };
+        for (index, copy) in copies.iter_mut().enumerate() {
+            copy.label = match copy.kind {
+                media::Kind::Image => format!("image {}", index + 1),
+                media::Kind::Video => format!("video {}", index + 1),
+            };
+        }
+        Ok(copies)
+    }
+
+    fn png() -> Result<Vec<u8>> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2))
+            .write_to(&mut bytes, image::ImageFormat::Png)?;
+        Ok(bytes.into_inner())
+    }
+
+    #[test]
+    fn server_session_messages_upload_local_attachments_first() -> Result<()> {
+        let fake = Fake::new(vec![session("1")]);
+        let (_dir, federation) = connected(vec![("box", fake.clone())])?;
+        let image = png()?;
+        let copies = pasted(&federation, &[("shot.png", &image), ("clip.mp4", b"video")])?;
+        let Route::Handled(reply) = federation.route(Request::Control {
+            id: "box:1".into(),
+            control: Control::MessageWithAttachments {
+                text: "compare [image 1] with [video 2]".into(),
+                queue: true,
+                skills: Vec::new(),
+                attachments: copies.clone(),
+            },
+        }) else {
+            anyhow::bail!("expected forwarding");
+        };
+        assert!(matches!(reply?, Reply::Ok));
+        let requests = fake.requests();
+        let uploads: Vec<_> = requests
+            .iter()
+            .filter_map(|request| match request {
+                Request::UploadAttachment {
+                    id,
+                    label,
+                    kind,
+                    extension,
+                    data,
+                } => Some((id.as_str(), label.as_str(), kind, extension.as_str(), data)),
+                _ => None,
+            })
+            .collect();
+        let [first, second] = uploads.as_slice() else {
+            anyhow::bail!("two uploads: {requests:?}");
+        };
+        assert_eq!(
+            (first.0, first.1, first.2, first.3),
+            ("1", "image 1", &media::Kind::Image, "png")
+        );
+        assert_eq!(STANDARD.decode(first.4)?, image);
+        assert_eq!(
+            (second.1, second.2, second.3),
+            ("video 2", &media::Kind::Video, "mp4")
+        );
+        assert_eq!(STANDARD.decode(second.4)?, b"video");
+        // The message itself follows the uploads and names the server's copies.
+        let [
+            ..,
+            Request::UploadAttachment { .. },
+            Request::Control {
+                id,
+                control:
+                    Control::MessageWithAttachments {
+                        text,
+                        queue,
+                        attachments,
+                        ..
+                    },
+            },
+            Request::List,
+        ] = requests.as_slice()
+        else {
+            anyhow::bail!("message after the uploads: {requests:?}");
+        };
+        assert_eq!(
+            (id.as_str(), text.as_str(), *queue),
+            ("1", "compare [image 1] with [video 2]", true)
+        );
+        assert_eq!(attachments.len(), 2);
+        for (sent, copy) in attachments.iter().zip(&copies) {
+            assert!(
+                sent.path.starts_with("/srv/difu/agents/attachments/1"),
+                "{sent:?}"
+            );
+            assert_eq!(
+                (&sent.label, &sent.kind, &sent.hash),
+                (&copy.label, &copy.kind, &copy.hash)
+            );
+        }
+        // Messages without media and other servers' replies pass unchanged.
+        let Route::Handled(reply) = federation.route(Request::Control {
+            id: "box:1".into(),
+            control: Control::Message {
+                text: "plain".into(),
+                queue: false,
+                skills: Vec::new(),
+                attachments: Vec::new(),
+            },
+        }) else {
+            anyhow::bail!("expected forwarding");
+        };
+        assert!(matches!(reply?, Reply::Ok));
+        assert_eq!(
+            fake.requests().len(),
+            requests.len() + 2,
+            "message and list refresh only"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_or_tampered_attachments_fail_before_reaching_the_server() -> Result<()> {
+        let fake = Fake::new(vec![session("1")]);
+        let (_dir, federation) = connected(vec![("box", fake.clone())])?;
+        let copies = pasted(&federation, &[("big.mov", b"x")])?;
+        let big = copies.first().context("copy")?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&big.path)?
+            .set_len(u64::try_from(media::UPLOAD_LIMIT + (1 << 20))?)?;
+        let send = |attachments: Vec<media::Attachment>| {
+            let Route::Handled(reply) = federation.route(Request::Control {
+                id: "box:1".into(),
+                control: Control::MessageWithAttachments {
+                    text: "look".into(),
+                    queue: false,
+                    skills: Vec::new(),
+                    attachments,
+                },
+            }) else {
+                anyhow::bail!("expected forwarding");
+            };
+            Ok(format!("{:#}", reply.err().context("the send must fail")?))
+        };
+        let error = send(copies.clone())?;
+        assert!(
+            error.contains("video 1 is 33.0 MB") && error.contains("32 MB or smaller"),
+            "{error}"
+        );
+        // A copy that changed after pasting, or that belongs to another
+        // session, is refused like a local session's.
+        let changed = pasted(&federation, &[("shot.png", &png()?)])?;
+        std::fs::write(&changed.first().context("copy")?.path, b"changed")?;
+        let error = send(changed)?;
+        assert!(error.contains("Cannot send image 1"), "{error}");
+        let source = tempfile::tempdir()?;
+        let path = source.path().join("other.png");
+        std::fs::write(&path, png()?)?;
+        let media::Paste::Attachments(mut other) =
+            media::files(&federation.storage, "box:2", vec![path])?
+        else {
+            anyhow::bail!("expected media");
+        };
+        for copy in &mut other {
+            copy.label = "image 1".into();
+        }
+        let error = send(other)?;
+        assert!(error.contains("does not belong to this session"), "{error}");
+        assert!(
+            fake.requests().iter().all(|r| !matches!(
+                r,
+                Request::UploadAttachment { .. } | Request::Control { .. }
+            )),
+            "nothing reached the server"
+        );
+        Ok(())
+    }
+
     #[test]
     fn server_pr_lookups_and_diffs_are_kept_where_the_terminal_reads_them() -> Result<()> {
         let fake = Fake::new(vec![session("1")]);
@@ -1539,6 +1842,21 @@ pub(crate) mod tests {
             .and_then(|pr| pr.diff)
             .context("stored diff")?;
         assert_eq!(diff.value, PATCH);
+        Ok(())
+    }
+
+    #[test]
+    fn deleting_a_server_session_removes_its_local_attachment_copies() -> Result<()> {
+        let fake = Fake::new(vec![session("1")]);
+        let (_dir, federation) = connected(vec![("box", fake)])?;
+        let copies = pasted(&federation, &[("shot.png", &png()?)])?;
+        let copy = copies.first().context("copy")?;
+        assert!(copy.path.is_file());
+        let Route::Handled(reply) = federation.route(Request::Delete { id: "box:1".into() }) else {
+            anyhow::bail!("expected forwarding");
+        };
+        assert!(matches!(reply?, Reply::Ok));
+        assert!(!copy.path.exists());
         Ok(())
     }
 

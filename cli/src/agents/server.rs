@@ -645,6 +645,35 @@ impl Service {
                     &Cancel::default(),
                 )))
             }
+            Request::UploadAttachment {
+                id,
+                label,
+                kind,
+                extension,
+                data,
+            } => {
+                ensure!(
+                    matches!(self.store.get(&id)?.job, Job::Coding(_)),
+                    "Attachments are available for coding sessions"
+                );
+                // Base64 is a third larger than the file it carries.
+                ensure!(
+                    data.len() / 4 * 3 <= super::media::UPLOAD_LIMIT + 3,
+                    "{label} is larger than {} MB",
+                    super::media::UPLOAD_LIMIT >> 20
+                );
+                let bytes =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data)
+                        .context("Attachment is not valid base64")?;
+                Ok(Reply::Attachment(super::media::upload(
+                    &self.store.storage,
+                    &id,
+                    &label,
+                    kind,
+                    &extension,
+                    &bytes,
+                )?))
+            }
             Request::Watch { .. } => anyhow::bail!("Watch requires a streaming connection"),
             Request::Read { id, version } => self.store.inspect(&id, |session| {
                 if version == Some(session.version) {
@@ -2109,6 +2138,47 @@ mod federation_tests {
                 .iter()
                 .all(|r| !matches!(r, Request::Read { id, .. } if id == "local"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn uploaded_media_lands_in_the_sessions_attachments() -> Result<()> {
+        use base64::{Engine, engine::general_purpose::STANDARD};
+        let (_temp, service) = service(None)?;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(2, 2))
+            .write_to(&mut png, image::ImageFormat::Png)?;
+        let png = png.into_inner();
+        let upload = |id: &str, data: String| Request::UploadAttachment {
+            id: id.into(),
+            label: "image 2".into(),
+            kind: super::super::media::Kind::Image,
+            extension: "png".into(),
+            data,
+        };
+        let Reply::Attachment(stored) = service.handle(upload("local", STANDARD.encode(&png)))?
+        else {
+            anyhow::bail!("expected the stored copy");
+        };
+        assert_eq!(stored.label, "image 2");
+        assert_eq!(std::fs::read(&stored.path)?, png);
+        // Exactly what sending the message checks before the agent sees it.
+        super::super::media::validate(&service.store.storage, "local", &stored)?;
+        for (id, data, expected) in [
+            ("missing", STANDARD.encode(&png), "Session not found"),
+            ("local", "not base64!".into(), "not valid base64"),
+            (
+                "local",
+                "A".repeat((super::super::media::UPLOAD_LIMIT / 3 + 2) * 4),
+                "larger than 32 MB",
+            ),
+        ] {
+            let error = service
+                .handle(upload(id, data))
+                .err()
+                .context("the upload must fail")?;
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+        }
         Ok(())
     }
 

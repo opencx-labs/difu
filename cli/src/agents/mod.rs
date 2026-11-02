@@ -941,6 +941,18 @@ pub enum Request {
         id: String,
         history: bool,
     },
+    /// Store pasted media on the machine running the session (a server
+    /// session's attachments are uploaded on Send); the reply is the private
+    /// copy to send with the message.
+    UploadAttachment {
+        id: String,
+        label: String,
+        kind: media::Kind,
+        /// The original file's extension, e.g. `png`.
+        extension: String,
+        /// Base64 file contents.
+        data: String,
+    },
     Launch {
         job: Box<Job>,
     },
@@ -1118,6 +1130,7 @@ pub enum Reply {
     },
     Servers(Vec<crate::cloud::federation::ServerStatus>),
     SessionPrs(pr_cache::Lookup),
+    Attachment(media::Attachment),
     Error(String),
 }
 
