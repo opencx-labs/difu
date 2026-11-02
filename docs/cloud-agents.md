@@ -378,6 +378,14 @@ call's `error`; `Request::Watch` must use `rpc.watch`. Clients must check that t
 server's `version` equals their own before using `rpc` (`difu server upgrade`
 fixes a mismatch).
 
+One service request exists for clients whose sessions live elsewhere:
+
+* `{"SessionPrs": {"id", "history"}}` → `{"SessionPrs": {"links", "branch", "error"}}`:
+  the session's attached and discovered PRs, refreshed by the server with its
+  worktree and `gh` under the same two-minute lease as its background refresh
+  (`history` also checks closed and merged PRs, as opening a session does). On
+  a failed refresh `links` are the cached ones and `error` says why.
+
 ## Clients
 
 ### Mac
@@ -402,6 +410,14 @@ fixes a mismatch).
   for a directory), `AgentDefaults`, `DefaultModel` (saves a location's default
   model, so Alt+M on a server session sets that server's default) and `Models`
   (the Codex and Claude Code models that location's logins offer).
+* Pull requests: the server is the source of truth. The terminal asks it for a
+  visible server session's PRs (`SessionPrs`, every 15 s; the server only asks
+  GitHub every two minutes), so badges, the chat footer and the Option+D diff
+  selector work as for a local session. Published diffs (`PrChanges`) come
+  from the server's `gh`; the local service caches PR states and diffs in this
+  computer's GitHub store. The PR panel is the embedded review app and uses
+  this computer's `gh` by `owner/repo#number`, like any pull request in
+  Reviews; its Diff and Guide tabs need a local clone.
 * Features that need the session's files on this machine (attachments, local
   file paths, HTML artifact previews) say they are unavailable for server
   sessions.

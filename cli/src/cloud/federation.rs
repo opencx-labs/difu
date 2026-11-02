@@ -206,6 +206,7 @@ fn session_id(request: &mut Request) -> Option<&mut String> {
         | Request::Watch { id, .. }
         | Request::Read { id, .. }
         | Request::AttachPr { id, .. }
+        | Request::SessionPrs { id, .. }
         | Request::Control { id, .. }
         | Request::Voice { id, .. }
         | Request::Repository { id, .. }
@@ -242,6 +243,25 @@ fn session_id(request: &mut Request) -> Option<&mut String> {
         // The local service moves its own session; servers import it.
         | Request::Move { .. }
         | Request::Import { .. } => None,
+    }
+}
+
+/// Keeps what a server answered where this computer's terminal app looks for
+/// it, as the local service would have: PR states and published diffs in the
+/// GitHub store.
+fn remember(storage: &Storage, server: &str, request: &Request, reply: &Reply) {
+    let result = match (request, reply) {
+        (Request::SessionPrs { .. }, Reply::SessionPrs(lookup)) => lookup
+            .links
+            .iter()
+            .try_for_each(|link| crate::github::store::session(storage, &link.pr)),
+        (Request::PrChanges { pr, .. }, Reply::Changes(patch)) => {
+            crate::github::store::diff(storage, pr, patch)
+        }
+        _ => Ok(()),
+    };
+    if let Err(error) = result {
+        eprintln!("Server {server}: {error:#}");
     }
 }
 
@@ -308,6 +328,7 @@ pub fn prefix_reply(server: &str, reply: Reply) -> Reply {
         | Reply::Remote(_)
         | Reply::RepositoryRules { .. }
         | Reply::Servers(_)
+        | Reply::SessionPrs(_)
         | Reply::Error(_)) => reply,
     }
 }
@@ -769,6 +790,7 @@ impl Federation {
     pub(crate) fn forward(&self, name: &str, request: &Request) -> Result<Reply> {
         let remote = self.remote(name)?;
         let reply = prefix_reply(name, remote.rpc(request)?);
+        remember(&self.storage, name, request, &reply);
         if changes_list(request) && !matches!(reply, Reply::Error(_)) {
             let sessions = remote.rpc(&Request::List);
             self.store_sessions(name, &remote, sessions);
@@ -908,6 +930,8 @@ pub(crate) mod tests {
                     effort: "medium".into(),
                     permissions: "{}".into(),
                 },
+                Request::SessionPrs { .. } => Reply::SessionPrs(lookup()),
+                Request::PrChanges { .. } => Reply::Changes(PATCH.into()),
                 _ => Reply::Ok,
             })
         }
@@ -945,6 +969,51 @@ pub(crate) mod tests {
                 efforts: vec!["max".into()],
             },
         ]
+    }
+
+    const PATCH: &str =
+        "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n";
+
+    fn pr(number: u64, state: &str) -> crate::github::SessionPr {
+        crate::github::SessionPr {
+            summary: None,
+            key: crate::model::PrKey {
+                owner: "acme".into(),
+                repo: "api".into(),
+                number,
+            },
+            state: state.into(),
+            draft: false,
+            conflicts: false,
+            head_branch: "difu/agent-1".into(),
+            head: String::new(),
+            updated: "2026-11-01T00:00:00Z".into(),
+        }
+    }
+
+    /// What a server answers for its session's PRs: one discovered on the
+    /// session's branch and one attached from another repository.
+    fn lookup() -> crate::agents::pr_cache::Lookup {
+        let mut attached = pr(7, "MERGED");
+        attached.key.repo = "web".into();
+        crate::agents::pr_cache::Lookup {
+            links: vec![
+                crate::agents::pr_cache::SessionLink {
+                    workspace: "/srv/difu/agents/worktrees/1".into(),
+                    pr: pr(42, "OPEN"),
+                    workspace_revision: 0,
+                    attached: false,
+                },
+                crate::agents::pr_cache::SessionLink {
+                    workspace: "/srv/difu/agents/worktrees/1".into(),
+                    pr: attached,
+                    workspace_revision: 0,
+                    attached: true,
+                },
+            ],
+            branch: Some("difu/agent-1".into()),
+            error: None,
+        }
     }
 
     pub(crate) fn session(id: &str) -> Session {
@@ -1064,6 +1133,21 @@ pub(crate) mod tests {
             target(Request::List, saved),
             Target::Local(Request::List)
         ));
+        // PR lookups and uploads act on the server's session.
+        let Target::Server(_, Request::SessionPrs { id, history: true }) = target(
+            Request::SessionPrs {
+                id: "box:1".into(),
+                history: true,
+            },
+            saved,
+        ) else {
+            anyhow::bail!("expected a server PR lookup");
+        };
+        assert_eq!(id, "1");
+        let lookup = Reply::SessionPrs(lookup());
+        assert!(
+            matches!(prefix_reply("box", lookup), Reply::SessionPrs(l) if l == super::tests::lookup())
+        );
         Ok(())
     }
 
@@ -1417,6 +1501,44 @@ pub(crate) mod tests {
             status.repositories.first().map(|r| r.name.as_str()),
             Some("acme/api")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn server_pr_lookups_and_diffs_are_kept_where_the_terminal_reads_them() -> Result<()> {
+        let fake = Fake::new(vec![session("1")]);
+        let (_dir, federation) = connected(vec![("box", fake.clone())])?;
+        let Route::Handled(reply) = federation.route(Request::SessionPrs {
+            id: "box:1".into(),
+            history: true,
+        }) else {
+            anyhow::bail!("expected forwarding");
+        };
+        let Reply::SessionPrs(found) = reply? else {
+            anyhow::bail!("PR lookup");
+        };
+        assert_eq!(found, lookup());
+        assert!(fake.requests().iter().any(|r| matches!(
+            r,
+            Request::SessionPrs { id, history: true } if id == "1"
+        )));
+        // The badges' PR states survive a restart of the terminal app.
+        let stored = crate::github::store::load(&federation.storage, &pr(42, "OPEN").key)
+            .and_then(|pr| pr.session)
+            .context("stored PR")?;
+        assert_eq!(stored.state, "OPEN");
+        // A published diff from the server opens instantly next time.
+        let Route::Handled(reply) = federation.route(Request::PrChanges {
+            id: "box:1".into(),
+            pr: pr(42, "OPEN").key,
+        }) else {
+            anyhow::bail!("expected forwarding");
+        };
+        assert!(matches!(reply?, Reply::Changes(patch) if patch == PATCH));
+        let diff = crate::github::store::load(&federation.storage, &pr(42, "OPEN").key)
+            .and_then(|pr| pr.diff)
+            .context("stored diff")?;
+        assert_eq!(diff.value, PATCH);
         Ok(())
     }
 

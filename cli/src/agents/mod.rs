@@ -934,6 +934,13 @@ pub enum Request {
         id: String,
         url: String,
     },
+    /// The session's attached and discovered PRs, refreshed by the machine
+    /// running it (a terminal app asks this for server sessions); `history`
+    /// also checks closed and merged PRs.
+    SessionPrs {
+        id: String,
+        history: bool,
+    },
     Launch {
         job: Box<Job>,
     },
@@ -1110,6 +1117,7 @@ pub enum Reply {
         rules: String,
     },
     Servers(Vec<crate::cloud::federation::ServerStatus>),
+    SessionPrs(pr_cache::Lookup),
     Error(String),
 }
 

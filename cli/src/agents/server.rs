@@ -632,6 +632,19 @@ impl Service {
                 )?;
                 Ok(Reply::Ok)
             }
+            Request::SessionPrs { id, history } => {
+                let session = self.store.get(&id)?;
+                ensure!(
+                    matches!(session.job, Job::Coding(_)) && !session.orchestrator,
+                    "Pull requests belong to coding sessions"
+                );
+                Ok(Reply::SessionPrs(super::pr_cache::lookup(
+                    &self.store.storage,
+                    &session.summary(),
+                    history,
+                    &Cancel::default(),
+                )))
+            }
             Request::Watch { .. } => anyhow::bail!("Watch requires a streaming connection"),
             Request::Read { id, version } => self.store.inspect(&id, |session| {
                 if version == Some(session.version) {
@@ -2095,6 +2108,32 @@ mod federation_tests {
             fake.requests()
                 .iter()
                 .all(|r| !matches!(r, Request::Read { id, .. } if id == "local"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pr_lookups_answer_for_coding_sessions_without_extra_github_requests() -> Result<()> {
+        let (_temp, service) = service(None)?;
+        // Archived sessions are not polled, so this asks GitHub nothing.
+        service
+            .store
+            .update("local", |session| session.archived = true)?;
+        let Reply::SessionPrs(lookup) = service.handle(Request::SessionPrs {
+            id: "local".into(),
+            history: false,
+        })?
+        else {
+            anyhow::bail!("expected a PR lookup");
+        };
+        assert_eq!(lookup, super::super::pr_cache::Lookup::default());
+        assert!(
+            service
+                .handle(Request::SessionPrs {
+                    id: "missing".into(),
+                    history: false,
+                })
+                .is_err()
         );
         Ok(())
     }
