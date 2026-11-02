@@ -145,9 +145,9 @@ Permission prompts are unchanged.
   the service starts.
 * `difu sandbox build` builds `localhost/difu-sandbox:latest` from a bundled
   Containerfile (Ubuntu LTS with git, gh, build tools, Python, Node, ripgrep).
-* Known v1 limit: sandboxes share the base clone's object store and refs, so a
-  sandbox could rewrite another session's branch refs (not its files). Per-session
-  `git clone --reference` clones are the planned follow-up.
+* Sessions are always worktrees, exactly as on a local difu. Worktrees share the
+  base clone's object store and refs, so a sandbox could rewrite another session's
+  branch refs (not its files); this is accepted, as it is locally.
 
 ## Wire protocol additions
 

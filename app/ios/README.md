@@ -101,7 +101,7 @@ the background. Turn it off in **Settings › Security**.
 | Path | What it is |
 | --- | --- |
 | `Difu/` | The SwiftUI app (a synchronized folder: new files are picked up automatically). |
-| `Config/Info.plist` | Camera, Face ID, Local Network and ATS keys, and the `difu://` URL scheme. Merged with the keys Xcode generates. ATS is relaxed (`NSAllowsArbitraryLoads`) because difu servers use self-signed certificates on arbitrary hosts, which the app pins itself; the app makes no other web requests. |
+| `Config/Info.plist` | Camera, Face ID, Local Network and ATS keys, and the `difu://` URL scheme. Merged with the keys Xcode generates. ATS is relaxed (`NSAllowsArbitraryLoads`) because difu servers use self-signed certificates on arbitrary hosts, which the app pins itself; the app makes no other web requests. For App Store or TestFlight review, the justification is: "connects only to user-owned servers at user-entered addresses, using self-signed certificates pinned by SHA-256 fingerprint." |
 | `DifuKit/` | Swift package with everything that doesn't need UIKit: protocol models, pairing links, addresses and password pairing, the saved-server Keychain store, the pinned WebSocket client, transcript delta application, Markdown and diff helpers. Builds and tests on macOS. |
 | `DifuKit/Sources/difu-remote-probe/` | A command-line client for testing a real difu from the Mac. |
 
