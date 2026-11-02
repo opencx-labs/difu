@@ -418,12 +418,19 @@ pub fn pair(storage: &Storage, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Brings a saved server up to this computer's difu: the binary, Codex and
+/// Claude Code, the sandbox image when sandboxing is on (the bundled
+/// Containerfile may have changed), and `difu-agent.service`, which then
+/// restarts. Every step is safe to repeat.
 pub fn upgrade(storage: &Storage, name: &str) -> Result<()> {
     let access = access(storage, name)?;
     let remote = Remote::saved(&access);
     let login = Login::Key(access.key.clone());
     let root = Ssh::new(&remote, "root", &login);
-    println!("Installing difu {VERSION} on {name}");
+    println!(
+        "Upgrading {name} to difu {VERSION}: difu, Codex and Claude Code, the sandbox image \
+         (when sandboxing is on) and difu-agent.service"
+    );
     let output = root.output("uname -m", None)?;
     ensure!(
         output.status.success(),
@@ -437,8 +444,9 @@ pub fn upgrade(storage: &Storage, name: &str) -> Result<()> {
     let target = release_target(arch.unwrap_or_default())?;
     // Only the keys step reads the public key.
     let public_key = read_public_key(&access.key).unwrap_or_default();
+    // The image step reads whether sandboxing is on from the server itself.
     let bootstrap = Bootstrap {
-        steps: vec![Step::Difu, Step::Restart],
+        steps: Step::upgrade(),
         target,
         public_key: &public_key,
         ssh_port: access.port,
@@ -796,8 +804,8 @@ enum Step {
     Difu,
     Tools,
     Sandbox,
+    Image,
     Service,
-    Restart,
 }
 
 impl Step {
@@ -813,8 +821,8 @@ impl Step {
             Self::Difu => "difu",
             Self::Tools => "tools",
             Self::Sandbox => "sandbox",
+            Self::Image => "image",
             Self::Service => "service",
-            Self::Restart => "restart",
         }
     }
 
@@ -826,6 +834,13 @@ impl Step {
         }
         steps.extend([Self::Difu, Self::Tools, Self::Sandbox, Self::Service]);
         steps
+    }
+
+    /// `difu server upgrade`: new binary, updated agent CLIs, a fresh sandbox
+    /// image, then the current unit and a restart. Never the sandbox step,
+    /// which would change whether sandboxing is on.
+    fn upgrade() -> Vec<Self> {
+        vec![Self::Difu, Self::Tools, Self::Image, Self::Service]
     }
 }
 
@@ -1745,7 +1760,7 @@ mod tests {
             Step::setup(false),
             Step::setup(true),
             vec![Step::Lockdown],
-            vec![Step::Difu, Step::Restart],
+            Step::upgrade(),
         ] {
             let script = bootstrap(steps, "ssh-ed25519 AAAA difu").render()?;
             let output = run_bash(&script, &["-n"])?;
@@ -1779,8 +1794,8 @@ mod tests {
             Step::Difu,
             Step::Tools,
             Step::Sandbox,
+            Step::Image,
             Step::Service,
-            Step::Restart,
         ] {
             assert!(
                 BOOTSTRAP.contains(&format!("step_{}() {{", step.name())),
@@ -1801,6 +1816,84 @@ mod tests {
             "EnvironmentFile=-@HOME@/.config/difu/server.env",
         ] {
             assert!(UNIT.lines().any(|candidate| candidate == line), "{line}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn upgrades_refresh_the_tools_image_and_unit_without_touching_settings() -> Result<()> {
+        assert_eq!(
+            Step::upgrade(),
+            [Step::Difu, Step::Tools, Step::Image, Step::Service]
+        );
+        // The sandbox step writes server.sandbox.enabled; upgrades keep it.
+        assert!(!Step::upgrade().contains(&Step::Sandbox));
+        assert!(!Step::setup(true).contains(&Step::Image));
+        let script = bootstrap(Step::upgrade(), "").render()?;
+        assert!(
+            script
+                .lines()
+                .any(|line| line == "DIFU_STEPS='difu tools image service'"),
+            "{script}"
+        );
+        // The service step installs the current unit, then restarts it.
+        let service = BOOTSTRAP
+            .split("step_service() {")
+            .nth(1)
+            .and_then(|rest| rest.split("\n}\n").next())
+            .context("no service step")?;
+        for part in [
+            "/etc/systemd/system/difu-agent.service",
+            "daemon-reload",
+            "restart_service",
+        ] {
+            assert!(service.contains(part), "{part}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn the_image_step_follows_the_servers_sandbox_setting() -> Result<()> {
+        let jq = Command::new("jq")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !jq.is_ok_and(|status| status.success()) {
+            eprintln!("Skipping the sandbox setting test: jq is not installed");
+            return Ok(());
+        }
+        let start = BOOTSTRAP
+            .find("sandbox_enabled() {")
+            .context("no sandbox_enabled")?;
+        let body = BOOTSTRAP
+            .get(start..)
+            .and_then(|rest| rest.find("\n}\n").and_then(|end| rest.get(..end + 3)))
+            .context("unterminated sandbox_enabled")?;
+        let directory = tempfile::tempdir()?;
+        let config = directory.path().join("config.json");
+        for (contents, enabled) in [
+            (None, false),
+            (Some(""), false),
+            (Some("{}"), false),
+            (Some("not json"), false),
+            (Some(r#"{"server":{"sandbox":{"enabled":false}}}"#), false),
+            (
+                Some(r#"{"server":{"enabled":true,"sandbox":{"enabled":true}}}"#),
+                true,
+            ),
+        ] {
+            match contents {
+                Some(contents) => fs::write(&config, contents)?,
+                None => {
+                    let _ = fs::remove_file(&config);
+                }
+            }
+            let output = run_bash(
+                &format!("{body}sandbox_enabled \"$1\"\n"),
+                &["-s", &config.to_string_lossy()],
+            )?;
+            assert_eq!(output.status.success(), enabled, "{contents:?}");
         }
         Ok(())
     }

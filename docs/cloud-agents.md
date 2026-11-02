@@ -44,7 +44,7 @@ Client side (your Mac):
 | `difu server remove <name>` | Revoke this computer on the server (when reachable) and forget it locally. |
 | `difu server ssh <name>` | Open a shell on the server as the `difu` user. |
 | `difu server pair <name>` | Show a phone pairing QR for that server in this terminal. |
-| `difu server upgrade <name>` | Install this computer's difu version on the server and restart it. |
+| `difu server upgrade <name>` | Install this computer's difu version on the server, update Codex and Claude Code, rebuild the sandbox image when sandboxing is on, refresh `difu-agent.service` and restart it. Safe to repeat. |
 | `difu session move <session> <server>` | Move a session on this computer to a saved server; prints the new `<server>:<id>`. See *Moving a session to a server*. |
 
 Server side (run on the server, usually over SSH):
@@ -89,6 +89,23 @@ Server side (run on the server, usually over SSH):
 8. Pick server repositories from the server's `gh repo list`; clone them.
 9. Advertise the address used to connect (`difu remote config --host <ip>`), pair
    this Mac as a **full** device, save the server, and print a phone pairing QR.
+
+## Upgrades (`difu server upgrade`)
+
+Run from the computer that set the server up (it needs difu's SSH key). Over
+SSH as root, the bootstrap script runs four steps, each safe to repeat:
+
+1. `difu`: download this computer's difu release for the server, verify its
+   checksum and install it.
+2. `tools`: install the latest Codex build and run `claude update` (a failed
+   download keeps the installed CLI and says so), print both versions.
+3. `image`: when the server's `config.server.sandbox.enabled` is on, rebuild
+   the sandbox image (or pull a custom registry image) because the bundled
+   Containerfile may have changed; running sandboxes keep their image. The
+   setting itself is never changed.
+4. `service`: install the current `difu-agent.service` (so new unit settings
+   such as `CLAUDE_CONFIG_DIR` arrive), reload systemd and restart the
+   service.
 
 ## Repositories
 

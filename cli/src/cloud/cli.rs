@@ -41,7 +41,7 @@ pub enum ServerCommand {
     Ssh { name: String },
     /// Show a phone pairing QR code for a server.
     Pair { name: String },
-    /// Install this computer's difu version on a server and restart it.
+    /// Upgrade a server to this difu: binary, Codex, Claude Code, sandbox image and service.
     Upgrade { name: String },
 }
 
