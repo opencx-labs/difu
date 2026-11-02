@@ -446,6 +446,9 @@ Two service requests exist for clients whose sessions live elsewhere:
   pairing, `standard` access).
 * While active, connect to every saved server; one combined session list with a
   server badge; New Session picks a server, then its repositories.
+* The session screen shows the session's PRs (`SessionSummary.prs`) as chips;
+  tapping one opens the PR screen on the same server. Photos are sent with
+  `session.send` straight to the server running the session.
 * Per-server settings: logins (status, device-code login, Claude token), server
   repositories (add from `server.repos.available`, remove, refresh mains),
   repository rules, paired devices (revoke).

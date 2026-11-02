@@ -1,7 +1,11 @@
 //! Display-ready session projections for the phone. Provider-specific entry
 //! shapes are normalized here, reusing the terminal's labels, so the app only
 //! renders. Tool output is shortened; `session.entry` returns a full row.
-use super::super::{Entry, Job, Pending, Session, Summary, orchestrator, ui::transcript};
+use super::super::{
+    Entry, Job, Pending, Session, Summary, orchestrator,
+    pr_cache::{SessionLink, SessionLinks},
+    ui::transcript,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
@@ -37,10 +41,55 @@ pub struct SessionSummary {
     pub pending: usize,
     pub queued: usize,
     pub can_read_changes: bool,
+    /// Attached and discovered pull requests, current open ones first.
+    pub prs: Vec<PrView>,
+}
+
+/// A session's pull request, as the terminal's badges show it.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrView {
+    /// `owner/name`; `pr.overview` and `pr.diff` take it with `number`.
+    pub repo: String,
+    pub number: u64,
+    pub title: Option<String>,
+    /// `OPEN`, `MERGED` or `CLOSED`; empty until GitHub was asked.
+    pub state: String,
+    /// `Open`, `Draft`, `Has conflicts`, `Merged`, `Closed` or `Unknown`.
+    pub label: &'static str,
+    pub draft: bool,
+    pub conflicts: bool,
+    /// Attached explicitly (possibly from another repository) rather than
+    /// discovered from the session's branch.
+    pub attached: bool,
+    pub url: String,
+    pub head_branch: Option<String>,
+}
+
+impl PrView {
+    pub fn new(link: &SessionLink) -> Self {
+        let pr = &link.pr;
+        Self {
+            repo: pr.key.repository(),
+            number: pr.key.number,
+            title: pr
+                .summary
+                .as_ref()
+                .map(|summary| summary.title.clone())
+                .filter(|title| !title.is_empty()),
+            state: pr.state.clone(),
+            label: pr.label(),
+            draft: pr.draft,
+            conflicts: pr.conflicts,
+            attached: link.attached,
+            url: pr.key.url(),
+            head_branch: (!pr.head_branch.is_empty()).then(|| pr.head_branch.clone()),
+        }
+    }
 }
 
 impl SessionSummary {
-    pub fn new(summary: &Summary, pinned: &BTreeSet<String>) -> Self {
+    pub fn new(summary: &Summary, pinned: &BTreeSet<String>, prs: &[SessionLink]) -> Self {
         Self {
             id: summary.id.clone(),
             title: summary.title.clone(),
@@ -61,6 +110,7 @@ impl SessionSummary {
             pending: summary.pending,
             queued: summary.queued,
             can_read_changes: summary.can_read_changes,
+            prs: prs.iter().map(PrView::new).collect(),
         }
     }
 }
@@ -77,6 +127,7 @@ pub fn summaries(
     list: &[Summary],
     pinned: &BTreeSet<String>,
     order: &[String],
+    prs: &SessionLinks,
 ) -> Vec<SessionSummary> {
     let positions: HashMap<_, _> = order.iter().enumerate().map(|(i, id)| (id, i)).collect();
     let mut sessions: Vec<_> = list
@@ -93,7 +144,7 @@ pub fn summaries(
     });
     sessions
         .into_iter()
-        .map(|s| SessionSummary::new(s, pinned))
+        .map(|s| SessionSummary::new(s, pinned, prs.get(&s.id).map_or(&[], Vec::as_slice)))
         .collect()
 }
 
@@ -152,12 +203,17 @@ pub struct Cache(HashMap<String, (Entry, bool, EntryView)>);
 impl SessionView {
     #[cfg(test)]
     pub fn new(session: &Session, pinned: &BTreeSet<String>) -> Self {
-        Self::cached(session, pinned, &mut Cache::default())
+        Self::cached(session, pinned, &[], &mut Cache::default())
     }
 
-    pub fn cached(session: &Session, pinned: &BTreeSet<String>, cache: &mut Cache) -> Self {
+    pub fn cached(
+        session: &Session,
+        pinned: &BTreeSet<String>,
+        prs: &[SessionLink],
+        cache: &mut Cache,
+    ) -> Self {
         let header = Header {
-            summary: SessionSummary::new(&session.summary(), pinned),
+            summary: SessionSummary::new(&session.summary(), pinned, prs),
             version: session.version,
             provider: session.provider,
             model: session.model.clone(),
@@ -848,11 +904,11 @@ mod tests {
         let mut session = session();
         session.note("agentMessage", "first");
         let mut cache = Cache::default();
-        let before = SessionView::cached(&session, &BTreeSet::new(), &mut cache);
+        let before = SessionView::cached(&session, &BTreeSet::new(), &[], &mut cache);
         if let Some(entry) = session.entries.get_mut(0) {
             entry.text.push_str(" edit");
         }
-        let after = SessionView::cached(&session, &BTreeSet::new(), &mut cache);
+        let after = SessionView::cached(&session, &BTreeSet::new(), &[], &mut cache);
         assert_ne!(before.entries, after.entries);
         assert_eq!(
             after.entries.first().map(|e| e.text.as_str()),
@@ -935,6 +991,87 @@ mod tests {
     }
 
     #[test]
+    fn summaries_and_views_carry_the_sessions_prs() -> anyhow::Result<()> {
+        let session = session();
+        let link = |number: u64, attached: bool, title: &str| SessionLink {
+            workspace: "/tmp/repo".into(),
+            workspace_revision: 0,
+            attached,
+            pr: crate::github::SessionPr {
+                summary: Some(crate::model::PrSummary {
+                    key: crate::model::PrKey {
+                        owner: "opencx-labs".into(),
+                        repo: "difu".into(),
+                        number,
+                    },
+                    title: title.into(),
+                    author: "octocat".into(),
+                    updated: String::new(),
+                    created: String::new(),
+                    stats: None,
+                    stats_error: false,
+                    metadata: None,
+                    draft: false,
+                }),
+                key: crate::model::PrKey {
+                    owner: "opencx-labs".into(),
+                    repo: "difu".into(),
+                    number,
+                },
+                state: if attached { "MERGED" } else { "OPEN" }.into(),
+                draft: false,
+                conflicts: !attached,
+                head_branch: if attached { "" } else { "feature" }.into(),
+                head: String::new(),
+                updated: String::new(),
+            },
+        };
+        let links = vec![link(45, false, "Fix login redirect"), link(7, true, "")];
+        let prs = SessionLinks::from([(session.id.clone(), links.clone())]);
+        let mut other = session.clone();
+        other.id = "2-b".into();
+        let list = summaries(
+            &[session.summary(), other.summary()],
+            &BTreeSet::new(),
+            &[],
+            &prs,
+        );
+        let value = serde_json::to_value(&list)?;
+        let rows = value.as_array().context("list")?;
+        let with = rows
+            .iter()
+            .find(|row| row.get("id") == Some(&json!("1-a")))
+            .context("session with PRs")?;
+        assert_eq!(
+            with.get("prs"),
+            Some(&json!([
+                {"repo": "opencx-labs/difu", "number": 45, "title": "Fix login redirect",
+                 "state": "OPEN", "label": "Has conflicts", "draft": false, "conflicts": true,
+                 "attached": false, "url": "https://github.com/opencx-labs/difu/pull/45",
+                 "headBranch": "feature"},
+                {"repo": "opencx-labs/difu", "number": 7, "title": null,
+                 "state": "MERGED", "label": "Merged", "draft": false, "conflicts": false,
+                 "attached": true, "url": "https://github.com/opencx-labs/difu/pull/7",
+                 "headBranch": null}
+            ]))
+        );
+        let without = rows
+            .iter()
+            .find(|row| row.get("id") == Some(&json!("2-b")))
+            .context("session without PRs")?;
+        assert_eq!(without.get("prs"), Some(&json!([])));
+        // A watched session's view and its deltas carry them at the top level.
+        let mut cache = Cache::default();
+        let before = SessionView::cached(&session, &BTreeSet::new(), &[], &mut cache);
+        let after = SessionView::cached(&session, &BTreeSet::new(), &links, &mut cache);
+        let view = serde_json::to_value(&after)?;
+        assert_eq!(view.pointer("/prs/0/number"), Some(&json!(45)));
+        let delta = serde_json::to_value(after.delta(&before))?;
+        assert_eq!(delta.pointer("/session/prs/1/attached"), Some(&json!(true)));
+        Ok(())
+    }
+
+    #[test]
     fn list_order_matches_the_terminal() {
         let summary = |id: &str| {
             let mut session = session();
@@ -948,7 +1085,7 @@ mod tests {
             summary("orchestrator"),
         ];
         let pinned = BTreeSet::from(["1-a".to_owned()]);
-        let ids: Vec<_> = summaries(&list, &pinned, &[])
+        let ids: Vec<_> = summaries(&list, &pinned, &[], &SessionLinks::new())
             .into_iter()
             .map(|s| s.id)
             .collect();

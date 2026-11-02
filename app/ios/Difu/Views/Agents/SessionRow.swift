@@ -62,6 +62,14 @@ struct SessionRow: View {
                     if summary.archived {
                         Pill(text: "Archived", systemImage: "archivebox")
                     }
+                    if let pr = summary.prs.first {
+                        let style = SessionPrStyle(pr)
+                        let more = summary.prs.count > 1 ? " +\(summary.prs.count - 1)" : ""
+                        Pill(text: "#\(pr.number)\(more)", systemImage: style.icon, color: style.color)
+                            .lineLimit(1)
+                            .fixedSize()
+                            .accessibilityLabel("Pull request \(pr.number), \(pr.label)")
+                    }
                     if let server {
                         ServerBadge(server: server)
                     }
