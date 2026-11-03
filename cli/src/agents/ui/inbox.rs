@@ -798,37 +798,38 @@ impl Ui {
                             }
                             body.extend(question);
                         }
-                        body.push(Line::default());
-                        let sending =
-                            self.question_send
-                                .as_ref()
-                                .is_some_and(|(session, request, _, _)| {
+                        if focused {
+                            body.push(Line::default());
+                            let sending = self.question_send.as_ref().is_some_and(
+                                |(session, request, _, _)| {
                                     session == &id && request == &item.key.request
-                                });
-                        let row = lines.len() + body.len();
-                        body.push(Line::from(Span::styled(
-                            if sending {
-                                "  Sending answer…".into()
-                            } else {
-                                format!(
-                                    "  [ Send answer · {} ]",
-                                    bindings.primary_hint_in(
-                                        crate::shortcuts::ids::QUESTION_SUBMIT,
-                                        crate::shortcuts::contexts::AGENT_INBOX_QUESTION
+                                },
+                            );
+                            let row = lines.len() + body.len();
+                            body.push(Line::from(Span::styled(
+                                if sending {
+                                    "  Sending answer…".into()
+                                } else {
+                                    format!(
+                                        "  [ Send answer · {} ]",
+                                        bindings.primary_hint_in(
+                                            crate::shortcuts::ids::QUESTION_SUBMIT,
+                                            crate::shortcuts::contexts::AGENT_INBOX_QUESTION
+                                        )
                                     )
-                                )
-                            },
-                            Style::default().fg(GREEN),
-                        )));
-                        if !sending {
-                            hits.push((
-                                row,
-                                1,
-                                Action::InboxItem(
-                                    item.key.clone(),
-                                    Some(Box::new(Action::SubmitQuestion(false))),
-                                ),
-                            ));
+                                },
+                                Style::default().fg(GREEN),
+                            )));
+                            if !sending {
+                                hits.push((
+                                    row,
+                                    1,
+                                    Action::InboxItem(
+                                        item.key.clone(),
+                                        Some(Box::new(Action::SubmitQuestion(false))),
+                                    ),
+                                ));
+                            }
                         }
                     } else {
                         let description = item
