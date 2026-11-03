@@ -3908,12 +3908,17 @@ impl Ui {
             );
             offset += height;
             visible_pr_sessions.push(session.id.clone());
+            let display_status = if session.active_subagents {
+                Status::Running
+            } else {
+                session.status
+            };
             let color = if deleting {
                 DIM
             } else if clearing {
                 ACCENT
             } else {
-                status_icons::color(session.status)
+                status_icons::color(display_status)
             };
             let elapsed = if session.status.active() {
                 session
@@ -3939,7 +3944,7 @@ impl Ui {
             } else {
                 format!(
                     "{}{}{}",
-                    session.status.label(),
+                    display_status.label(),
                     elapsed,
                     if session.archived { " · archived" } else { "" }
                 )
@@ -4091,7 +4096,7 @@ impl Ui {
                     self.status_icons.draw(
                         frame,
                         Rect::new(row.x, row.y, status_icons::WIDTH, 1).intersection(row),
-                        status_icons::display_status(session.status, session.pending > 0),
+                        status_icons::display_status(display_status, session.pending > 0),
                         self.preferences.motion.sidebar() && self.tweaks.agent_reply_cps > 0,
                         self.modal.is_none() && self.notice.is_none(),
                     );
@@ -5564,6 +5569,89 @@ mod tests {
         assert!(!text.contains("Context detail 00"));
         Ok(())
     }
+    #[test]
+    fn child_activity_updates_sidebar_and_footer_without_hiding_requests() -> Result<()> {
+        use super::super::subagents::{State, Subagent};
+        let dir = tempfile::tempdir()?;
+        let mut ui = state(Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        });
+        still(&mut ui);
+        ui.drilled = true;
+        ui.sessions
+            .get_mut("one")
+            .context("session")?
+            .subagents
+            .push(Subagent::new(provider::Provider::Codex, "child"));
+        let mut terminal = Terminal::new(TestBackend::new(130, 35))?;
+        for child_state in [
+            State::Starting,
+            State::Running,
+            State::Completed,
+            State::Interrupted,
+            State::Failed,
+            State::Closed,
+            State::Unknown,
+        ] {
+            let session = ui.sessions.get_mut("one").context("session")?;
+            session.subagents.first_mut().context("child")?.state = child_state;
+            ui.summaries = vec![session.summary()];
+            for requests in [0, 1] {
+                ui.summaries.first_mut().context("summary")?.pending = requests;
+                terminal.draw(|frame| ui.draw(frame))?;
+                let sidebar = ui
+                    .hits
+                    .iter()
+                    .find_map(|(rect, action)| {
+                        matches!(action, Action::Select(id) if id == "one").then_some(*rect)
+                    })
+                    .context("sidebar")?;
+                let buffer = terminal.backend().buffer();
+                let text: String = sidebar
+                    .positions()
+                    .filter_map(|position| buffer.cell(position))
+                    .map(|cell| cell.symbol())
+                    .collect();
+                assert_eq!(text.contains("Working"), child_state.active());
+                assert_eq!(text.contains("Ready"), !child_state.active());
+                let icon = buffer.cell((sidebar.x, sidebar.y)).context("status icon")?;
+                assert_eq!(
+                    icon.symbol(),
+                    if requests > 0 {
+                        "✋\u{fe0e}"
+                    } else if child_state.active() {
+                        "🏃\u{fe0e}"
+                    } else {
+                        "●"
+                    }
+                );
+                let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                assert_eq!(text.contains("subagents 1 · Working"), child_state.active());
+                assert_eq!(
+                    ui.sessions.get("one").context("parent")?.status,
+                    Status::Idle
+                );
+            }
+        }
+        // The sidebar gets child activity even for a session whose full chat
+        // has not been loaded on this client.
+        ui.sessions.clear();
+        let summary = ui.summaries.first_mut().context("summary")?;
+        summary.active_subagents = true;
+        summary.pending = 0;
+        terminal.draw(|frame| ui.draw_list(frame, frame.area()))?;
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Working"));
+        Ok(())
+    }
+
     #[test]
     fn subagents_badge_picker_and_read_only_pane_share_helper_controls() -> Result<()> {
         let dir = tempfile::tempdir()?;

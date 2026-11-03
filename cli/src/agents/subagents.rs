@@ -786,6 +786,29 @@ mod tests {
         }}})
     }
     #[test]
+    fn summaries_report_child_activity_without_changing_parent_state() -> anyhow::Result<()> {
+        use super::super::{Status, Summary};
+        use anyhow::Context;
+        let mut s = session();
+        s.status = Status::Idle;
+        s.subagents.push(Subagent::new(Provider::Codex, "child"));
+        let summary = s.summary();
+        assert!(summary.active_subagents);
+        assert_eq!(summary.status, Status::Idle);
+        let mut saved = serde_json::to_value(&summary)?;
+        let restored: Summary = serde_json::from_value(saved.clone())?;
+        assert!(restored.active_subagents);
+        saved
+            .as_object_mut()
+            .context("summary")?
+            .remove("active_subagents");
+        let legacy: Summary = serde_json::from_value(saved)?;
+        assert!(!legacy.active_subagents);
+        assert_eq!(legacy.status, Status::Idle);
+        Ok(())
+    }
+
+    #[test]
     fn subagent_activity_tracks_lifecycle_without_finishing_the_parent() {
         let mut s = session();
         let started = activity("parent-thread", "badge", "/root/badge_check", "started");
