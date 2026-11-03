@@ -449,6 +449,50 @@ pub(super) fn vanish(
     }
 }
 
+/// An exit that releases each rendered row after its last tile has flipped away.
+/// Equal time per row keeps short and blank rows from collapsing in a single jump.
+#[derive(Clone, Copy)]
+pub(super) struct Collapse {
+    started: Instant,
+    duration: Duration,
+}
+
+impl Collapse {
+    pub(super) fn new(started: Instant, duration: Duration) -> Self {
+        Self { started, duration }
+    }
+
+    pub(super) fn done(&self, now: Instant) -> bool {
+        now >= self.started + self.duration + SETTLE
+    }
+
+    pub(super) fn apply(&self, rows: &mut Vec<Line<'static>>, now: Instant) {
+        let count = rows.len().max(1);
+        let step = self.duration.div_f64(count as f64);
+        let mut remaining = 0;
+        for (row, line) in rows.iter_mut().enumerate() {
+            let started = self.started
+                + self
+                    .duration
+                    .mul_f64((count - row - 1) as f64 / count as f64);
+            if now >= started + step + SETTLE {
+                break;
+            }
+            remaining += 1;
+            let total = glyphs(std::slice::from_ref(line)).len();
+            vanish(
+                std::slice::from_mut(line),
+                |i| {
+                    started + step.mul_f64(total.saturating_sub(i + 1) as f64 / total.max(1) as f64)
+                },
+                now,
+                self.started,
+            );
+        }
+        rows.truncate(remaining);
+    }
+}
+
 /// [`glyphs`] row by row.
 fn row_glyphs(lines: &[Line]) -> Vec<Vec<char>> {
     lines
@@ -1133,6 +1177,37 @@ pub(super) fn apply(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn collapse_releases_one_row_at_a_time_including_blank_and_unicode_rows() {
+        let started = Instant::now();
+        let collapse = Collapse::new(started, Duration::from_millis(600));
+        let original = vec![
+            Line::from("First"),
+            Line::default(),
+            Line::from("世界 last"),
+        ];
+        let mut rows = original.clone();
+        collapse.apply(&mut rows, started);
+        assert_eq!(rows.len(), original.len());
+        assert_eq!(rows.first(), original.first());
+        collapse.apply(&mut rows, started + Duration::from_millis(90));
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.last().map(Line::width),
+            original.last().map(Line::width)
+        );
+        assert_ne!(rows.last(), original.last());
+        for (ms, count) in [(379, 3), (380, 2), (579, 2), (580, 1), (779, 1), (780, 0)] {
+            let mut rows = original.clone();
+            collapse.apply(&mut rows, started + Duration::from_millis(ms));
+            assert_eq!(rows.len(), count, "at {ms} ms");
+            assert_eq!(
+                collapse.done(started + Duration::from_millis(ms)),
+                count == 0
+            );
+        }
+    }
 
     #[test]
     fn selection_flaps_keep_background_colors_out_of_terminal_foregrounds() -> anyhow::Result<()> {
