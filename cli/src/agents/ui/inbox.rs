@@ -27,8 +27,9 @@ struct Section {
     id: String,
     title: String,
     items: Vec<Item>,
-    answered: usize,
     cards: Vec<Card>,
+    rows: Vec<Line<'static>>,
+    leaving: Option<flap::Collapse>,
 }
 
 #[derive(Default)]
@@ -49,10 +50,9 @@ pub(super) struct State {
 impl State {
     pub fn animating(&self) -> bool {
         self.visible
-            && self
-                .sections
-                .iter()
-                .any(|section| section.cards.iter().any(|card| card.leaving.is_some()))
+            && self.sections.iter().any(|section| {
+                section.leaving.is_some() || section.cards.iter().any(|card| card.leaving.is_some())
+            })
     }
 }
 
@@ -214,7 +214,9 @@ impl Ui {
             return;
         }
         let tweaks = self.preferences.motion.tweaks(self.tweaks);
-        let duration = Duration::from_millis(u64::from(tweaks.capped(tweaks.input_clear_ms)));
+        let duration =
+            Duration::from_millis(u64::from(tweaks.capped(tweaks.input_clear_ms))).mul_f64(0.8);
+        let animate = !duration.is_zero() && self.preferences.motion.screen();
         self.inbox.sections.retain(|section| {
             self.summaries
                 .iter()
@@ -244,17 +246,27 @@ impl Ui {
                 continue;
             };
             section.title.clone_from(&summary.title);
-            section.answered += section
-                .items
-                .iter()
-                .filter(|old| !pending.iter().any(|new| new.key == old.key))
-                .count();
+            if pending.is_empty() {
+                if !animate || section.rows.is_empty() {
+                    section.leaving = None;
+                } else if !section.items.is_empty() {
+                    // Keep the last rendered box intact as focus advances, then
+                    // collapse its contents, borders, and title together.
+                    section.leaving = Some(flap::Collapse::new(now, duration));
+                } else if section.leaving.is_some_and(|leaving| leaving.done(now)) {
+                    section.leaving = None;
+                }
+                section.items.clear();
+                section.cards.clear();
+                continue;
+            }
+            section.leaving = None;
             section.cards.retain_mut(|card| {
                 if pending.iter().any(|item| item.key == card.key) {
                     card.leaving = None;
                     return true;
                 }
-                if duration.is_zero() || !self.preferences.motion.screen() || card.rows.is_empty() {
+                if !animate || card.rows.is_empty() {
                     return false;
                 }
                 !card
@@ -281,14 +293,6 @@ impl Ui {
             .collect();
         self.inbox.sending.retain(|key| keys.contains(key));
         let current = self.inbox.active.clone();
-        if current.as_ref().is_some_and(|key| keys.contains(key)) {
-            if self.modal.is_none()
-                && let Some(key) = current
-            {
-                self.focus_inbox_item(key);
-            }
-            return;
-        }
         let next = current
             .as_ref()
             .and_then(|key| {
@@ -310,6 +314,19 @@ impl Ui {
             })
             .or_else(|| keys.first())
             .cloned();
+        // Resolve the next session before removing a completed box, including
+        // when motion is disabled and the box disappears immediately.
+        self.inbox
+            .sections
+            .retain(|section| !section.items.is_empty() || section.leaving.is_some());
+        if current.as_ref().is_some_and(|key| keys.contains(key)) {
+            if self.modal.is_none()
+                && let Some(key) = current
+            {
+                self.focus_inbox_item(key);
+            }
+            return;
+        }
         if let Some(key) = next {
             self.focus_inbox_item(key);
             if self.inbox.animating() {
@@ -717,6 +734,12 @@ impl Ui {
             let Some(section) = self.inbox.sections.get(index) else {
                 continue;
             };
+            if let Some(leaving) = section.leaving {
+                let mut rows = section.rows.clone();
+                leaving.apply(&mut rows, now);
+                lines.extend(rows);
+                continue;
+            }
             let id = section.id.clone();
             let active = self
                 .inbox
@@ -724,16 +747,7 @@ impl Ui {
                 .as_ref()
                 .is_some_and(|key| key.session == id)
                 && self.focus != Focus::List;
-            let complete = section.items.is_empty();
-            let title = format!(
-                "{} · {}",
-                section.title,
-                if complete {
-                    format!("{} resolved", section.answered)
-                } else {
-                    format!("{} pending", section.items.len())
-                }
-            );
+            let title = format!("{} · {} pending", section.title, section.items.len());
             let header = lines.len();
             let border = if active { ACCENT } else { DIM };
             lines.push(section_header(&title, area.width, border));
@@ -909,14 +923,11 @@ impl Ui {
                 Style::default().fg(border),
             )));
             lines.push(Line::default());
+            if let Some(section) = self.inbox.sections.get_mut(index) {
+                section.rows = lines.get(header..).unwrap_or_default().to_vec();
+            }
         }
-        if self.inbox.sections.is_empty()
-            || self
-                .inbox
-                .sections
-                .iter()
-                .all(|s| s.items.is_empty() && s.cards.is_empty())
-        {
+        if self.inbox.sections.is_empty() {
             lines.push(Line::default());
             lines.push(Line::from(Span::styled(
                 if count > 0 {
@@ -1381,20 +1392,12 @@ mod tests {
                 .sections
                 .get(1)
                 .context("section")?
-                .cards
-                .iter()
-                .all(|card| card.leaving.is_some())
+                .leaving
+                .is_some()
         );
         assert_eq!(ui.selected.as_deref(), Some("three"));
         ui.sync_inbox_at(Instant::now() + Duration::from_secs(2));
-        assert!(
-            ui.inbox
-                .sections
-                .get(1)
-                .context("section")?
-                .items
-                .is_empty()
-        );
+        assert!(!ui.inbox.sections.iter().any(|section| section.id == "two"));
         terminal.draw(|frame| {
             let area = frame.area();
             ui.draw_inbox(frame, area);
@@ -1406,7 +1409,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        assert!(screen.contains("Session two · 2 resolved"));
+        assert!(!screen.contains("Session two"));
         assert!(!screen.contains("git status"));
         Ok(())
     }
@@ -1532,20 +1535,138 @@ mod tests {
             }
             ui.sync_inbox();
             assert!(!ui.inbox.animating());
-            assert!(
-                ui.inbox
-                    .sections
-                    .first()
-                    .context("section")?
-                    .cards
-                    .is_empty()
-            );
+            assert!(!ui.inbox.sections.iter().any(|section| section.id == "one"));
             assert_eq!(ui.selected.as_deref(), Some("two"));
             assert_eq!(
                 ui.focused_editor().map(Editor::text).as_deref(),
                 Some("Keep the next answer")
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn last_answer_collapses_the_session_box_while_the_next_session_stays_focused() -> Result<()> {
+        for height in [20, 60] {
+            let dir = tempfile::tempdir()?;
+            let mut ui = fixture(dir.path());
+            ui.tweaks.input_clear_ms = 1200;
+            ui.tweaks.max_animation_ms = 0;
+            ui.open_questions_inbox();
+            ui.paste("An answer\nwith another line\nand one more line");
+            let mut terminal = Terminal::new(TestBackend::new(100, height))?;
+            let start = Instant::now();
+            terminal.draw(|frame| ui.draw_inbox_at(frame, frame.area(), start))?;
+            let scroll = ui.inbox.scroll;
+            let before = text_position(terminal.backend().buffer(), "Question for two").ok();
+            ui.sessions
+                .get_mut("one")
+                .context("session")?
+                .pending
+                .clear();
+            ui.sync_inbox_at(start);
+            assert_eq!(ui.selected.as_deref(), Some("two"));
+            assert!(ui.inbox.animating());
+            let mut previous = before.map(|(_, y)| y);
+            let mut moves = 0;
+            for ms in (0..=1500).step_by(25) {
+                let now = start + Duration::from_millis(ms);
+                ui.sync_inbox_at(now);
+                ui.hits.clear();
+                terminal.draw(|frame| ui.draw_inbox_at(frame, frame.area(), now))?;
+                assert_eq!(ui.selected.as_deref(), Some("two"));
+                assert!(!ui.hits.iter().any(|(_, action)| {
+                    matches!(action, Action::InboxItem(key, _) if key.session == "one")
+                }));
+                if ms == 0 {
+                    assert_eq!(ui.inbox.scroll, scroll);
+                    assert_eq!(
+                        text_position(terminal.backend().buffer(), "Question for two").ok(),
+                        before
+                    );
+                }
+                if let Ok((x, y)) = text_position(terminal.backend().buffer(), "Question for two") {
+                    assert_eq!(
+                        terminal
+                            .backend()
+                            .buffer()
+                            .cell((x, y))
+                            .context("next question")?
+                            .fg,
+                        ACCENT
+                    );
+                    if let Some(previous) = previous {
+                        assert!(
+                            y <= previous && previous - y <= 1,
+                            "question jumped from {previous} to {y}"
+                        );
+                        moves += usize::from(y < previous);
+                    }
+                    previous = Some(y);
+                }
+            }
+            assert!(moves > 1);
+            assert!(!ui.inbox.animating());
+            assert!(!ui.inbox.sections.iter().any(|section| section.id == "one"));
+            assert_eq!(
+                text_position(terminal.backend().buffer(), "Session two · 1 pending")?.1,
+                3
+            );
+            assert!(text_position(terminal.backend().buffer(), "Session one").is_err());
+            ui.paste("Next answer");
+            assert_eq!(
+                ui.focused_editor().map(Editor::text).as_deref(),
+                Some("Next answer")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_new_question_cancels_the_session_exit_and_all_caught_up_waits_for_the_box() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = fixture(dir.path());
+        ui.sessions.retain(|id, _| id == "one");
+        ui.summaries.retain(|summary| summary.id == "one");
+        ui.open_questions_inbox();
+        let mut terminal = Terminal::new(TestBackend::new(100, 40))?;
+        let start = Instant::now();
+        terminal.draw(|frame| ui.draw_inbox_at(frame, frame.area(), start))?;
+        let pending = std::mem::take(&mut ui.sessions.get_mut("one").context("session")?.pending);
+        ui.summaries.first_mut().context("summary")?.pending = 0;
+        ui.sync_inbox_at(start);
+        terminal.draw(|frame| ui.draw_inbox_at(frame, frame.area(), start))?;
+        assert!(ui.inbox.active.is_none());
+        assert!(ui.inbox.animating());
+        assert!(text_position(terminal.backend().buffer(), "All caught up").is_err());
+
+        ui.sessions.get_mut("one").context("session")?.pending = pending;
+        ui.sync_inbox_at(start + Duration::from_millis(50));
+        assert!(!ui.inbox.animating());
+        assert_eq!(ui.selected.as_deref(), Some("one"));
+        terminal.draw(|frame| ui.draw_inbox_at(frame, frame.area(), start))?;
+        text_position(terminal.backend().buffer(), "Question for one")?;
+        ui.paste("Answer after reopening");
+        assert_eq!(
+            ui.focused_editor().map(Editor::text).as_deref(),
+            Some("Answer after reopening")
+        );
+
+        ui.sessions
+            .get_mut("one")
+            .context("session")?
+            .pending
+            .clear();
+        ui.sync_inbox_at(start + Duration::from_millis(100));
+        // The question-specific timing is 400ms plus 180ms settling at the
+        // default 500ms cap, slightly faster than the previous 680ms exit.
+        let done = start + Duration::from_millis(700);
+        ui.sync_inbox_at(done);
+        assert!(!ui.inbox.animating());
+        assert!(ui.inbox.sections.is_empty());
+        terminal.draw(|frame| ui.draw_inbox_at(frame, frame.area(), done))?;
+        text_position(terminal.backend().buffer(), "All caught up")?;
+        assert!(text_position(terminal.backend().buffer(), "Session one").is_err());
         Ok(())
     }
 
