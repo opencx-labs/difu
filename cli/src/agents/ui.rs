@@ -156,6 +156,7 @@ pub struct Position {
     transcript_viewport: Option<(u16, u16, u64)>,
     keep_transcript_position: bool,
     question_height: Option<u16>,
+    question_size: inline_questions::Size,
     question_reflow: Option<inline_questions::Reflow>,
     question_scroll: bool,
     pub answers: HashMap<String, questions::Draft>,
@@ -3425,6 +3426,7 @@ impl Ui {
     pub(super) fn settle_flips(&mut self) {
         let second = Duration::from_secs(1);
         for position in self.positions.values_mut() {
+            position.question_size.settle();
             for board in [&mut position.activity, &mut position.waiting]
                 .into_iter()
                 .chain(position.boards.values_mut())
@@ -4121,6 +4123,10 @@ impl Ui {
         self.prs.visible.extend(visible_pr_sessions);
     }
     fn draw_conversation(&mut self, frame: &mut Frame, rect: Rect) {
+        self.draw_conversation_at(frame, rect, Instant::now());
+    }
+
+    fn draw_conversation_at(&mut self, frame: &mut Frame, rect: Rect, now: Instant) {
         if self.draw_folder_overview(frame, rect) {
             return;
         }
@@ -4266,7 +4272,14 @@ impl Ui {
             0
         };
         let question_open = self.question_panel();
-        let reclaimed = self.reconcile_question_space(&id, question_open, composer_height);
+        let (composer_height, reclaimed) = self.reconcile_question_space(
+            &id,
+            question_open,
+            composer_height,
+            area.height.saturating_sub(5),
+            footer_height,
+            now,
+        );
         let Some(session) = self.sessions.get(&id) else {
             return;
         };
@@ -4555,7 +4568,7 @@ impl Ui {
                 composer_height,
             );
             if self.question_panel() {
-                self.draw_inline_question(frame, composer);
+                self.draw_inline_question_at(frame, composer, now);
                 return;
             }
             if matches!(self.modal, Some(Modal::Commands { .. })) {
