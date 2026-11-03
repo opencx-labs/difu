@@ -643,6 +643,9 @@ impl Session {
             && !self.pending.iter().any(|p| p.id == "difu-missing-guidance")
             && (!self.queue.is_empty() || self.pending_steering().next().is_some())
     }
+    pub fn has_active_subagents(&self) -> bool {
+        self.subagents.iter().any(|agent| agent.state.active())
+    }
     pub fn summary(&self) -> Summary {
         Summary {
             id: self.id.clone(),
@@ -654,6 +657,7 @@ impl Session {
             }
             .into(),
             status: self.status,
+            active_subagents: self.has_active_subagents(),
             clearing: self.clearing,
             archived: self.archived,
             updated: self.updated,
@@ -692,6 +696,9 @@ pub struct Summary {
     pub title: String,
     pub kind: String,
     pub status: Status,
+    /// Display activity independently of the parent's run state.
+    #[serde(default)]
+    pub active_subagents: bool,
     #[serde(default)]
     pub clearing: bool,
     pub archived: bool,

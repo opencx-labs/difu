@@ -109,7 +109,15 @@ impl Ui {
             && !session.subagents.is_empty()
         {
             items.push((
-                format!(" subagents {} ", session.subagents.len()),
+                format!(
+                    " subagents {}{} ",
+                    session.subagents.len(),
+                    if session.has_active_subagents() {
+                        " · Working"
+                    } else {
+                        ""
+                    }
+                ),
                 Focus::Subagents,
                 crate::ui::option_style(self.focus == Focus::Subagents),
             ));
