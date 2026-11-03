@@ -79,6 +79,9 @@ impl Ui {
             self.question_flip.settle_leaving();
         }
         for position in self.positions.values_mut() {
+            if !motion.screen() || self.tweaks.agent_reply_cps == 0 {
+                position.question_size.settle();
+            }
             if !motion.reply() || self.tweaks.agent_reply_cps == 0 {
                 position.reply = None;
                 position.boards.clear();

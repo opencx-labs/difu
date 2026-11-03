@@ -6,6 +6,67 @@ type QuestionLines = (
     Vec<(usize, usize, Action)>,
 );
 
+/// The inline panel and footer's displayed height, independent of text animation.
+#[derive(Default)]
+pub(super) struct Size {
+    shown: u16,
+    target: u16,
+    resizing: Option<Resize>,
+}
+
+struct Resize {
+    from: u16,
+    started: Instant,
+    duration: Duration,
+}
+
+impl Size {
+    pub(super) fn animating(&self) -> bool {
+        self.resizing.is_some()
+    }
+
+    pub(super) fn settle(&mut self) {
+        self.shown = self.target;
+        self.resizing = None;
+    }
+
+    fn show(
+        &mut self,
+        target: u16,
+        maximum: u16,
+        tweaks: crate::storage::Tweaks,
+        now: Instant,
+    ) -> u16 {
+        self.shown = self.shown.min(maximum);
+        if self.target != target {
+            self.target = target;
+            self.resizing = Some(Resize {
+                from: self.shown,
+                started: now,
+                duration: Duration::from_millis(u64::from(
+                    tweaks.capped(u32::from(self.shown.abs_diff(target)) * 30),
+                )),
+            });
+        }
+        if let Some(resize) = &self.resizing {
+            let elapsed = now.saturating_duration_since(resize.started);
+            if elapsed >= resize.duration {
+                self.settle();
+            } else {
+                let rows = (f64::from(resize.from.abs_diff(target)) * elapsed.as_secs_f64()
+                    / resize.duration.as_secs_f64()) as u16;
+                self.shown = if target >= resize.from {
+                    resize.from.saturating_add(rows)
+                } else {
+                    resize.from.saturating_sub(rows)
+                }
+                .min(maximum);
+            }
+        }
+        self.shown
+    }
+}
+
 /// Release the question's old space gradually while keeping the chat at its end.
 pub(super) struct Reflow {
     rows: u16,
@@ -103,31 +164,57 @@ impl Flip {
 }
 
 impl Ui {
-    pub(super) fn reconcile_question_space(&mut self, id: &str, open: bool, height: u16) -> u16 {
+    pub(super) fn reconcile_question_space(
+        &mut self,
+        id: &str,
+        open: bool,
+        height: u16,
+        maximum: u16,
+        footer: u16,
+        now: Instant,
+    ) -> (u16, u16) {
         let position = self.positions.entry(id.to_owned()).or_default();
         position.question_scroll = false;
+        let animate = self.preferences.motion.screen() && self.tweaks.agent_reply_cps > 0;
+        let height = if open && animate {
+            // Footer badges move out of the composer when questions open.
+            // Include that row so the chat's edge does not jump on opening.
+            position
+                .question_size
+                .show(
+                    height.saturating_add(footer),
+                    maximum.saturating_add(footer),
+                    self.tweaks,
+                    now,
+                )
+                .saturating_sub(footer)
+        } else {
+            position.question_size.target = height.saturating_add(footer);
+            position.question_size.settle();
+            height
+        };
         let remaining = if open {
             let changed = position.question_height.replace(height) != Some(height);
             position.question_reflow = None;
             if !changed {
-                return 0;
+                return (height, 0);
             }
             0
         } else {
             if let Some(previous) = position.question_height.take() {
                 position.question_reflow = Some(Reflow {
                     rows: previous.saturating_sub(height),
-                    started: Instant::now(),
+                    started: now,
                     duration: Duration::from_millis(u64::from(self.tweaks.capped(220))),
                 });
             }
             let Some(reflow) = &position.question_reflow else {
-                return 0;
+                return (height, 0);
             };
             if self.preferences.motion.level == crate::settings::Motion::Full
                 && self.tweaks.agent_reply_cps > 0
             {
-                reflow.remaining(Instant::now())
+                reflow.remaining(now)
             } else {
                 0
             }
@@ -138,7 +225,7 @@ impl Ui {
         if remaining == 0 {
             position.question_reflow = None;
         }
-        remaining
+        (height, remaining)
     }
 
     fn question_note_key(&self) -> Option<(String, usize, usize)> {
@@ -883,14 +970,37 @@ impl Ui {
         }
     }
     pub(super) fn draw_inline_question(&mut self, frame: &mut Frame, area: Rect) {
-        let now = Instant::now();
+        self.draw_inline_question_at(frame, area, Instant::now());
+    }
+
+    pub(super) fn draw_inline_question_at(&mut self, frame: &mut Frame, area: Rect, now: Instant) {
         let available = area.height.saturating_sub(2) as usize;
+        // Keep the same content rows throughout the resize. Revealing against
+        // each intermediate height would scroll the answer past the question
+        // on opening, then move it back as more rows become available.
+        let scroll_available = self
+            .selected
+            .as_ref()
+            .and_then(|id| self.positions.get(id))
+            .filter(|position| position.question_size.animating())
+            .map_or(available, |position| {
+                usize::from(
+                    position
+                        .question_size
+                        .target
+                        .saturating_sub(self.session_footer_height() + 2),
+                )
+            });
         let rows_area = Rect::new(area.x, area.y, area.width, available as u16);
         let shown = self
             .question_lines(area.width)
             .map(|(lines, cursor, hits)| {
-                let scroll = self.question_scroll(lines.len(), cursor, &hits, available);
-                let rows: Vec<_> = lines.into_iter().skip(scroll).take(available).collect();
+                let scroll = self.question_scroll(lines.len(), cursor, &hits, scroll_available);
+                let rows: Vec<_> = lines
+                    .into_iter()
+                    .skip(scroll)
+                    .take(scroll_available)
+                    .collect();
                 (rows, cursor, hits, scroll)
             });
         let key = match (&self.modal, &self.selected) {
@@ -903,7 +1013,7 @@ impl Ui {
         let tweaks = self.preferences.motion.tweaks(self.tweaks);
         let flip = &mut self.question_flip;
         if let Some((rows, ..)) = &shown {
-            flip.drawn.clone_from(rows);
+            flip.drawn = rows.iter().take(available).cloned().collect();
         }
         // The answered question stays away until its answer is through.
         if flip.leaving.as_ref().is_some_and(|leaving| {
@@ -993,6 +1103,9 @@ impl Ui {
         *scroll
     }
     fn draw_question_bar(&mut self, frame: &mut Frame, area: Rect) {
+        if area.is_empty() {
+            return;
+        }
         use crate::shortcuts::{Bindings, ids::*};
         let bindings = Bindings::new(&self.shortcut_config);
         let active_hint = |id| bindings.primary_hint_in(id, self.shortcut_context());
@@ -1033,6 +1146,214 @@ impl Ui {
             Action::SubmitQuestion(false),
             false,
         );
+    }
+}
+
+#[cfg(test)]
+mod panel_size_tests {
+    use super::*;
+    use anyhow::{Context, Result};
+    use ratatui::{Terminal, backend::TestBackend};
+    use serde_json::json;
+
+    fn fixture(root: &std::path::Path) -> Ui {
+        let mut ui = Ui::new(
+            Storage {
+                config: root.join("config.json"),
+                cache: root.join("cache"),
+            },
+            &Config::default(),
+        );
+        let mut session = Session::new(
+            "one".into(),
+            Job::Coding(Launch {
+                repository: root.into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: "Sample".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.status = Status::Idle;
+        session
+            .subagents
+            .push(crate::agents::subagents::Subagent::new(
+                crate::agents::provider::Provider::Codex,
+                "child",
+            ));
+        session.note(
+            "agentMessage",
+            (0..80)
+                .map(|i| format!("Stable chat row {i}\n\n"))
+                .collect::<String>(),
+        );
+        session.pending.push(Pending {
+            id: json!("request"), method: "item/tool/requestUserInput".into(), responded: true,
+            params: json!({"difuAsync":true,"questions":[
+                {"id":"a","question":"Tall question\nSecond line\nThird line\nFourth line\nFifth line\nSixth line","options":[{"label":"Small"},{"label":"Large"}]},
+                {"id":"b","question":"Short question","options":[]}
+            ]}),
+        });
+        ui.summaries.push(session.summary());
+        ui.sessions.insert("one".into(), session);
+        ui.selected = Some("one".into());
+        ui.drilled = true;
+        ui.focus = Focus::Composer;
+        // Isolate height animation from the already-covered text flip.
+        ui.preferences.motion.reply_tool = false;
+        let position = ui.positions.entry("one".into()).or_default();
+        position.follow = true;
+        position.draft.insert("Unsent composer draft");
+        ui
+    }
+
+    fn draw(ui: &mut Ui, terminal: &mut Terminal<TestBackend>, now: Instant) -> Result<(u16, u16)> {
+        ui.hits.clear();
+        terminal.draw(|frame| ui.draw_conversation_at(frame, frame.area(), now))?;
+        let position = ui.positions.get("one").context("position")?;
+        assert_eq!(
+            position.conversation,
+            ui.conversation_lines.saturating_sub(ui.conversation_height)
+        );
+        let buffer = terminal.backend().buffer();
+        let row = buffer
+            .content
+            .chunks(usize::from(buffer.area.width))
+            .position(|cells| {
+                cells
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>()
+                    .contains("Stable chat row 79")
+            })
+            .context("latest chat stays visible")? as u16;
+        let header = ui
+            .hits
+            .iter()
+            .find_map(|(rect, action)| matches!(action, Action::Pending).then_some(rect.y))
+            .context("question header")?;
+        assert!(row < header);
+        if let Some(Modal::Approval { scroll, .. }) = &ui.modal {
+            assert_eq!(*scroll, 0, "opening must not scroll past the question");
+            for (rect, action) in &ui.hits {
+                if matches!(action, Action::QuestionChoice(_) | Action::QuestionNote(_)) {
+                    assert!(rect.y > header && rect.bottom() <= buffer.area.bottom());
+                }
+            }
+        }
+        Ok((position.question_size.shown, row))
+    }
+
+    #[test]
+    fn opening_and_switching_resize_row_by_row_and_keep_the_chat_at_the_panel_edge() -> Result<()> {
+        for height in [24, 40] {
+            let dir = tempfile::tempdir()?;
+            let mut ui = fixture(dir.path());
+            let mut terminal = Terminal::new(TestBackend::new(100, height))?;
+            let start = Instant::now();
+            let mut previous = draw(&mut ui, &mut terminal, start)?;
+            for (phase, question) in [0, 1, 0].into_iter().enumerate() {
+                ui.open_question(question);
+                let phase_start = start + Duration::from_secs(phase as u64);
+                let mut moves = 0;
+                for ms in (0..=600).step_by(10) {
+                    let current = draw(
+                        &mut ui,
+                        &mut terminal,
+                        phase_start + Duration::from_millis(ms),
+                    )?;
+                    if ms == 0 {
+                        assert_eq!(
+                            current, previous,
+                            "switching starts at the displayed height"
+                        );
+                        assert!(
+                            ui.positions
+                                .get("one")
+                                .context("position")?
+                                .question_size
+                                .animating()
+                        );
+                        assert_eq!(ui.redraw_interval(), Some(crate::repaint::FRAME_INTERVAL));
+                    }
+                    assert!(current.0.abs_diff(previous.0) <= 1);
+                    assert!(current.1.abs_diff(previous.1) <= 1);
+                    assert_eq!(
+                        i32::from(current.0) - i32::from(previous.0),
+                        i32::from(previous.1) - i32::from(current.1)
+                    );
+                    moves += usize::from(current.0 != previous.0);
+                    previous = current;
+                }
+                assert!(moves > 1);
+                assert!(
+                    !ui.positions
+                        .get("one")
+                        .context("position")?
+                        .question_size
+                        .animating()
+                );
+            }
+            assert_eq!(
+                ui.positions.get("one").context("position")?.draft.text(),
+                "Unsent composer draft"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rapid_switches_use_the_displayed_height_and_disabled_motion_settles_it() -> Result<()> {
+        for setting in 0..4 {
+            let dir = tempfile::tempdir()?;
+            let mut ui = fixture(dir.path());
+            let mut terminal = Terminal::new(TestBackend::new(100, 40))?;
+            let start = Instant::now();
+            draw(&mut ui, &mut terminal, start)?;
+            ui.open_question(0);
+            draw(&mut ui, &mut terminal, start)?;
+            let now = start + Duration::from_millis(120);
+            let partial = draw(&mut ui, &mut terminal, now)?;
+            ui.open_question(1);
+            assert_eq!(draw(&mut ui, &mut terminal, now)?, partial);
+            ui.paste("Answer during resize");
+            assert_eq!(
+                ui.selected_question_answer().as_deref(),
+                Some("Answer during resize")
+            );
+            let mut config = Config::default();
+            match setting {
+                0 => config.preferences.motion.level = crate::settings::Motion::Off,
+                1 => config.preferences.motion.level = crate::settings::Motion::Reduced,
+                2 => config.preferences.motion.screen_transition = false,
+                _ => config.tweaks.agent_reply_cps = 0,
+            }
+            ui.preview_visual_settings(&config);
+            draw(&mut ui, &mut terminal, now)?;
+            let size = &ui.positions.get("one").context("position")?.question_size;
+            assert!(!size.animating());
+            assert_eq!(size.shown, size.target);
+            assert_eq!(
+                ui.selected_question_answer().as_deref(),
+                Some("Answer during resize")
+            );
+            ui.open_question(0);
+            draw(&mut ui, &mut terminal, now)?;
+            assert!(
+                !ui.positions
+                    .get("one")
+                    .context("position")?
+                    .question_size
+                    .animating()
+            );
+            ui.open_question(1);
+            assert_eq!(
+                ui.selected_question_answer().as_deref(),
+                Some("Answer during resize")
+            );
+        }
+        Ok(())
     }
 }
 
