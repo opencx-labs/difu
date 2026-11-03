@@ -1423,10 +1423,10 @@ mod tests {
                 .pending
                 .first_mut()
                 .context("request")?
-                .params["questions"] = json!([
+                .params.as_object_mut().context("params")?.insert("questions".into(), json!([
                 {"id":"a", "question":"First question\nwith several lines\nthat should shrink\none row at a time."},
                 {"id":"b", "question":"Next question stays readable"}
-            ]);
+                ]));
             ui.open_questions_inbox();
             let answered = ui.inbox.active.clone().context("active")?;
             ui.paste("An answer\nwith another line\nand one more line");
@@ -1442,7 +1442,10 @@ mod tests {
                 .pending
                 .first_mut()
                 .context("request")?
-                .params["difuAnswers"] = json!({"a":"done"});
+                .params
+                .as_object_mut()
+                .context("params")?
+                .insert("difuAnswers".into(), json!({"a":"done"}));
             ui.sync_inbox_at(start);
             assert_eq!(ui.inbox.active.as_ref().and_then(|key| key.field), Some(1));
             assert!(ui.inbox.animating());
