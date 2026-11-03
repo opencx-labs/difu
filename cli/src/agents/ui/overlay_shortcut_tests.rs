@@ -604,6 +604,8 @@ fn compact_question_and_main_help_show_effective_submit_hint_at_native_widths() 
                 .pending
                 .push(pending(true));
             ui.open_question(0);
+            native_text(&mut ui, width)?;
+            ui.settle_flips();
             let screen = native_text(&mut ui, width)?;
             assert!(
                 screen.contains(if custom { "F12 submit" } else { "Enter submit" }),

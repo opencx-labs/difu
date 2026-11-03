@@ -4560,7 +4560,7 @@ impl Ui {
                 self.hits.push((activity_area, Action::Queue));
             }
         }
-        if composer_height > 0 {
+        if composer_height > 0 || question_open {
             let composer = Rect::new(
                 area.x,
                 area.bottom().saturating_sub(composer_height),

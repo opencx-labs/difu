@@ -996,7 +996,11 @@ impl Ui {
             .question_lines(area.width)
             .map(|(lines, cursor, hits)| {
                 let scroll = self.question_scroll(lines.len(), cursor, &hits, scroll_available);
-                let rows: Vec<_> = lines.into_iter().skip(scroll).take(available).collect();
+                let rows: Vec<_> = lines
+                    .into_iter()
+                    .skip(scroll)
+                    .take(scroll_available)
+                    .collect();
                 (rows, cursor, hits, scroll)
             });
         let key = match (&self.modal, &self.selected) {
@@ -1009,7 +1013,7 @@ impl Ui {
         let tweaks = self.preferences.motion.tweaks(self.tweaks);
         let flip = &mut self.question_flip;
         if let Some((rows, ..)) = &shown {
-            flip.drawn.clone_from(rows);
+            flip.drawn = rows.iter().take(available).cloned().collect();
         }
         // The answered question stays away until its answer is through.
         if flip.leaving.as_ref().is_some_and(|leaving| {
@@ -1099,6 +1103,9 @@ impl Ui {
         *scroll
     }
     fn draw_question_bar(&mut self, frame: &mut Frame, area: Rect) {
+        if area.is_empty() {
+            return;
+        }
         use crate::shortcuts::{Bindings, ids::*};
         let bindings = Bindings::new(&self.shortcut_config);
         let active_hint = |id| bindings.primary_hint_in(id, self.shortcut_context());
