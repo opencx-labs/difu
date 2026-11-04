@@ -182,4 +182,19 @@ final class ThemeTests: XCTestCase {
         XCTAssertEqual(try colors("ansi"), ["30d158", "050805"])
         XCTAssertEqual(try colors("ansi-light"), ["34c759", "ffffff"])
     }
+
+    /// `scripts/app-icons.sh` renders an icon set per theme into the app's asset catalog.
+    func testEveryThemeHasAnAppIconSet() throws {
+        let catalog = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().appendingPathComponent("Difu/Assets.xcassets")
+        let sets = try FileManager.default.contentsOfDirectory(atPath: catalog.path)
+            .filter { $0.hasPrefix("AppIcon-") && $0.hasSuffix(".appiconset") }
+            .map { String($0.dropLast(".appiconset".count)) }
+        XCTAssertEqual(Set(sets), Set(ThemeCatalog.all.compactMap(\.iconName)))
+        for name in sets {
+            let png = catalog.appendingPathComponent("\(name).appiconset/\(name).png")
+            XCTAssertTrue(FileManager.default.fileExists(atPath: png.path), name)
+        }
+    }
 }
