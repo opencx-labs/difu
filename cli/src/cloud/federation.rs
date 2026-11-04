@@ -292,6 +292,7 @@ fn session_id(request: &mut Request) -> Option<&mut String> {
         | Request::Servers
         | Request::Disk { .. }
         | Request::DiskClean { .. }
+        | Request::Environment { .. }
         // The local service moves its own session; servers import it.
         | Request::Move { .. }
         | Request::Import { .. } => None,
@@ -449,6 +450,7 @@ pub fn prefix_reply(server: &str, reply: Reply) -> Reply {
         | Reply::Servers(_)
         | Reply::Disk(_)
         | Reply::DiskCleaned(_)
+        | Reply::Environment(_)
         | Reply::SessionPrs(_)
         | Reply::Attachment(_)
         | Reply::ArtifactFile(_)
@@ -486,6 +488,17 @@ fn usable(name: &str, remote: &dyn Remote) -> Result<()> {
         "{name} runs difu {version} and this computer runs difu {ours}. Run `difu server upgrade {name}` to use it from here."
     );
     Ok(())
+}
+
+/// A server without `server.environment.*` runs an older difu.
+fn environment_error(name: &str, error: anyhow::Error) -> anyhow::Error {
+    if format!("{error:#}").contains("Unknown method") {
+        anyhow::anyhow!(
+            "{name} runs an older difu without environment profiles; run `difu server upgrade {name}`"
+        )
+    } else {
+        error
+    }
 }
 
 /// A server without `server.disk` runs an older difu.
@@ -1049,11 +1062,45 @@ impl Federation {
         Ok(cleaned)
     }
 
+    /// Reads, or replaces with `profile`, a repository's environment profile
+    /// on a saved server through its phone API (`server.environment.*`).
+    pub fn environment(
+        &self,
+        name: &str,
+        repository: &str,
+        profile: Option<&crate::cloud::environments::Profile>,
+    ) -> Result<crate::cloud::environments::View> {
+        let (remote, _) = self.connected(name)?;
+        let value = match profile {
+            None => remote.call(
+                "server.environment.get",
+                serde_json::json!({"repository": repository}),
+            ),
+            Some(profile) => remote.call(
+                "server.environment.set",
+                serde_json::json!({"repository": repository, "profile": profile}),
+            ),
+        }
+        .map_err(|error| environment_error(name, error))?;
+        serde_json::from_value(value).context("Unexpected environment reply from the server")
+    }
+
     /// Answers requests for server sessions; hands everything else back.
     pub fn route(&self, request: Request) -> Route {
-        // Disk status and cleanups use the phone API, which works whatever
-        // version the server runs.
+        // Disk status, cleanups and environment profiles use the phone API,
+        // which works whatever version the server runs.
         match request {
+            Request::Environment {
+                server: Some(name),
+                repository,
+                profile,
+                ..
+            } => {
+                return Route::Handled(
+                    self.environment(&name, &repository, profile.as_ref())
+                        .map(Reply::Environment),
+                );
+            }
             Request::Disk {
                 server: Some(name),
                 refresh,
@@ -1232,6 +1279,17 @@ pub(crate) mod tests {
                 "server.disk.clean" => Ok(serde_json::json!({
                     "freed": 4_000_000_000u64,
                     "summary": format!("Cleaned {}", params.get("action").and_then(Value::as_str).unwrap_or_default()),
+                })),
+                "server.environment.get" => Ok(serde_json::json!({
+                    "repository": params.get("repository").cloned().unwrap_or_default(),
+                    "profile": {"tools": {"node": "24"}, "setup": [], "env": {}, "notes": [],
+                        "history": [{"at": 1, "by": "Codex in session 1", "summary": "node 24"}]},
+                    "detected": [{"tool": "node", "version": "24", "source": ".nvmrc"}],
+                })),
+                "server.environment.set" => Ok(serde_json::json!({
+                    "repository": params.get("repository").cloned().unwrap_or_default(),
+                    "profile": params.get("profile").cloned().unwrap_or_default(),
+                    "detected": [],
                 })),
                 "server.logins" => Ok(serde_json::json!({"logins": [
                     {"tool": "github", "loggedIn": true, "account": "octocat", "detail": "Logged in"},
@@ -1942,6 +2000,88 @@ pub(crate) mod tests {
             anyhow::bail!("unknown servers are answered");
         };
         assert!(missing.is_err_and(|e| e.to_string().contains("No saved server")));
+        Ok(())
+    }
+
+    #[test]
+    fn environment_profiles_use_the_phone_api_whatever_version() -> Result<()> {
+        let fake = Fake::with_version(vec![session("1")], "0.0.1");
+        let (_dir, federation) = connected(vec![("box", fake.clone())])?;
+        let Route::Handled(reply) = federation.route(Request::Environment {
+            server: Some("box".into()),
+            repository: "acme/api".into(),
+            profile: None,
+            by: None,
+        }) else {
+            anyhow::bail!("environment profiles come from the server");
+        };
+        let Reply::Environment(view) = reply? else {
+            anyhow::bail!("expected an environment reply");
+        };
+        assert_eq!(view.repository, "acme/api");
+        assert_eq!(
+            view.profile.tools.get("node").map(String::as_str),
+            Some("24")
+        );
+        assert_eq!(view.profile.history.len(), 1);
+        assert_eq!(
+            view.detected.first().map(|d| d.source.as_str()),
+            Some(".nvmrc")
+        );
+        let profile = crate::cloud::environments::Profile {
+            setup: vec!["pnpm install".into()],
+            ..Default::default()
+        };
+        let Route::Handled(reply) = federation.route(Request::Environment {
+            server: Some("box".into()),
+            repository: "acme/api".into(),
+            profile: Some(profile.clone()),
+            by: None,
+        }) else {
+            anyhow::bail!("saved on the server");
+        };
+        let Reply::Environment(saved) = reply? else {
+            anyhow::bail!("expected an environment reply");
+        };
+        assert_eq!(saved.profile.setup, profile.setup);
+        let calls = fake.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|(method, params)| method == "server.environment.get"
+                    && params == &serde_json::json!({"repository": "acme/api"}))
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|(method, params)| method == "server.environment.set"
+                    && params.pointer("/profile/setup/0")
+                        == Some(&serde_json::json!("pnpm install")))
+        );
+        assert!(
+            fake.requests().is_empty(),
+            "no rpc with a mismatched version"
+        );
+        assert!(matches!(
+            federation.route(Request::Environment {
+                server: None,
+                repository: "acme/api".into(),
+                profile: None,
+                by: None,
+            }),
+            Route::Local(Request::Environment { server: None, .. })
+        ));
+        // An older server has no such methods.
+        let error = environment_error(
+            "box",
+            anyhow::anyhow!(
+                "Unknown method `server.environment.get`; update difu on your computer"
+            ),
+        );
+        assert!(
+            error.to_string().contains("difu server upgrade box"),
+            "{error}"
+        );
         Ok(())
     }
 

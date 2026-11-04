@@ -5,6 +5,7 @@ pub mod claude_config;
 pub mod cli;
 pub mod client;
 pub mod disk;
+pub mod environments;
 pub mod federation;
 pub mod logins;
 pub mod onboard;

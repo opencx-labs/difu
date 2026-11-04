@@ -4,6 +4,14 @@
 # a container from this image. The agent CLIs are not installed here: difu
 # mounts the server's own ~/.local/bin and Claude Code's versions directory
 # read-only, so the sandbox always runs the server's CLI versions and logins.
+#
+# Toolchains are not baked in either. mise (https://mise.jdx.dev) installs the
+# versions each repository declares (.nvmrc, .tool-versions, mise.toml,
+# .python-version, rust-toolchain.toml, ...) and its environment profile names
+# into the server's shared cache, which difu mounts at /opt/difu/toolchains in
+# every sandbox with mise's shims first on PATH. corepack provides pnpm and
+# yarn as package.json's packageManager asks. The Ubuntu Node and Python below
+# are only the fallback for repositories that declare nothing.
 FROM docker.io/library/ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -19,6 +27,7 @@ RUN apt-get update \
         curl \
         gh \
         git \
+        gnupg \
         jq \
         libssl-dev \
         nodejs \
@@ -29,4 +38,16 @@ RUN apt-get update \
         python3-venv \
         ripgrep \
         unzip \
+        xz-utils \
+        zstd \
     && rm -rf /var/lib/apt/lists/*
+
+# mise itself, outside the mounted home directory; its data (installs, shims)
+# lives in the shared cache (MISE_DATA_DIR).
+RUN curl -fsSL https://mise.run | MISE_INSTALL_PATH=/usr/local/bin/mise sh \
+    && mise --version
+
+# corepack for every Node, including ones that no longer bundle it.
+RUN npm install -g corepack \
+    && corepack --version \
+    && npm cache clean --force

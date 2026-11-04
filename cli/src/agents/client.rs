@@ -90,6 +90,8 @@ pub fn request(storage: &Storage, request: Request) -> Result<Reply> {
         Request::Import { .. } => "import a moved session".into(),
         Request::Disk { .. } => "read disk space".into(),
         Request::DiskClean { .. } => "free disk space".into(),
+        Request::Environment { profile: None, .. } => "read an environment profile".into(),
+        Request::Environment { .. } => "save an environment profile".into(),
         _ => "request session service data".into(),
     };
     let mut stream = UnixStream::connect(super::server::socket(storage)?)

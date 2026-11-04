@@ -51,6 +51,9 @@ pub(super) fn tools(session: &Session) -> Vec<Value> {
         if !session.server_mode {
             tools.push(super::moving::tool());
         }
+        if super::environment::offered(session) {
+            tools.push(super::environment::tool());
+        }
         tools
     }
 }

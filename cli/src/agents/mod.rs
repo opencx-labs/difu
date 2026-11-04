@@ -6,6 +6,7 @@ pub mod connections;
 pub mod effective;
 mod elicitation;
 mod engine;
+mod environment;
 pub mod folders;
 mod guidance;
 mod management;
@@ -332,6 +333,10 @@ pub struct Session {
     /// `SERVER_VALIDATION_RULE` applies.
     #[serde(default)]
     pub server_mode: bool,
+    /// The last environment preparation's outcome (`environment`), shown to
+    /// the agent in its instructions; `None` before the first one.
+    #[serde(default)]
+    pub environment: Option<String>,
     /// New sessions inherit provider policy; missing fields preserve legacy setup.
     #[serde(default)]
     pub native_setup: bool,
@@ -481,6 +486,7 @@ impl Session {
             provider_context: None,
             repository_rules: String::new(),
             server_mode: false,
+            environment: None,
             native_setup: true,
             job,
             status: Status::Starting,
@@ -1145,6 +1151,19 @@ pub enum Request {
         server: Option<String>,
         action: crate::cloud::disk::Action,
     },
+    /// Reads (`profile: None`) or replaces a server repository's environment
+    /// profile (`server`: a saved cloud server; `None`: this machine in server
+    /// mode). `repository` is `owner/name` or a path in its base clone; `by`
+    /// names who changed it, for the profile's history.
+    Environment {
+        #[serde(default)]
+        server: Option<String>,
+        repository: String,
+        #[serde(default)]
+        profile: Option<crate::cloud::environments::Profile>,
+        #[serde(default)]
+        by: Option<String>,
+    },
     /// Move a session on this computer to a saved cloud server; replies
     /// `Launched` with the new `<server>:<session>` id.
     Move {
@@ -1204,6 +1223,7 @@ pub enum Reply {
     Servers(Vec<crate::cloud::federation::ServerStatus>),
     Disk(crate::cloud::disk::Report),
     DiskCleaned(crate::cloud::disk::Cleaned),
+    Environment(crate::cloud::environments::View),
     SessionPrs(pr_cache::Lookup),
     Attachment(media::Attachment),
     /// Base64 file contents.

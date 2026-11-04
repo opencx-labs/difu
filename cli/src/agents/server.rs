@@ -47,6 +47,22 @@ impl Store {
     pub fn get(&self, id: &str) -> Result<Session> {
         self.inspect(id, Clone::clone)
     }
+    /// Every session's id.
+    pub(super) fn ids(&self) -> Result<Vec<String>> {
+        Ok(self
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session store lock failed"))?
+            .keys()
+            .cloned()
+            .collect())
+    }
+    #[cfg(test)]
+    pub(super) fn insert(&self, session: Session) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.insert(session.id.clone(), session);
+        }
+    }
     /// Read only the needed fields; idle checks must not copy conversation history.
     pub(super) fn inspect<T>(&self, id: &str, read: impl FnOnce(&Session) -> T) -> Result<T> {
         let sessions = self
@@ -1063,7 +1079,22 @@ impl Service {
             | Request::DiskClean {
                 server: Some(server),
                 ..
+            }
+            | Request::Environment {
+                server: Some(server),
+                ..
             } => anyhow::bail!("Server {server} is not connected"),
+            Request::Environment {
+                server: None,
+                repository,
+                profile,
+                by,
+            } => Ok(Reply::Environment(super::environment::request(
+                &self.store,
+                &repository,
+                profile,
+                by,
+            )?)),
             Request::Disk {
                 server: None,
                 refresh,

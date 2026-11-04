@@ -68,10 +68,24 @@ pub fn validate(name: &str) -> Result<(&str, &str)> {
     valid.with_context(|| format!("Invalid repository `{name}`; expected owner/name"))
 }
 
-fn root(storage: &Storage) -> Result<PathBuf> {
+/// Where base clones (and their fetch status and environment profiles) live.
+pub(crate) fn root(storage: &Storage) -> Result<PathBuf> {
     let root = crate::agents::server::home(storage)?.join("repos");
     fs::create_dir_all(&root)?;
     Ok(root)
+}
+
+/// The `owner/name` whose base clone is `path` (or contains it), if any.
+pub fn name_of(storage: &Storage, path: &Path) -> Option<String> {
+    let root = root(storage).ok()?;
+    let root = root.canonicalize().unwrap_or(root);
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    let mut parts = path.strip_prefix(&root).ok()?.components();
+    let owner = parts.next()?.as_os_str().to_str()?;
+    let repo = parts.next()?.as_os_str().to_str()?;
+    let name = format!("{owner}/{repo}");
+    validate(&name).ok()?;
+    Some(name)
 }
 
 /// Where the base clone of `owner/name` lives (whether or not it exists yet).
@@ -89,7 +103,7 @@ fn now() -> i64 {
 }
 
 /// Waits for an exclusive lock on `path` until `cancel` fires.
-fn lock(path: &Path, cancel: &Cancel) -> Result<Flock<File>> {
+pub(crate) fn lock(path: &Path, cancel: &Cancel) -> Result<Flock<File>> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -137,7 +151,7 @@ fn record(root: &Path, name: &str, change: impl FnOnce(&mut Fetch)) -> Result<()
 
 /// Runs `work` with a cancel that fires after `limit` or with `outer`, so a
 /// stalled network operation cannot hold its locks forever.
-pub(super) fn bounded<T>(
+pub(crate) fn bounded<T>(
     limit: Duration,
     outer: &Cancel,
     work: impl FnOnce(&Cancel) -> Result<T>,

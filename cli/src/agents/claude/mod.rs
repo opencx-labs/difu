@@ -182,6 +182,9 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                 super::moving::TOOL => {
                     super::moving::schedule(store, id, args).map(|value| value.to_string())
                 }
+                super::environment::TOOL => {
+                    super::environment::handle(store, id, args).map(|value| value.to_string())
+                }
                 name if super::session_tools::TOOLS.contains(&name) => {
                     super::session_tools::handle(store, id, name, args, |session| {
                         account_usage(session, &Cancel::default())
@@ -228,6 +231,7 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                     super::shells::TOOL,
                     super::folders::TOOL,
                     super::moving::TOOL,
+                    super::environment::TOOL,
                 ]
                 .contains(&name)
                 && !super::session_tools::TOOLS.contains(&name)
@@ -1117,6 +1121,8 @@ pub(super) fn run(
         store.save(id)
     })?;
     super::guidance::confirm(store, id, &session, &controls, cancel)?;
+    // Install the repository's tools and run its setup before the agent starts.
+    super::environment::prepare(store, id, cancel);
     session = store.get(id)?;
     let mut rpc = connect(store, id, &session, cancel)?;
     let mut decoder = events::Decoder::default();

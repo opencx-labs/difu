@@ -507,8 +507,25 @@ impl Ui {
             Some(CLOUD_CLEAN_ARCHIVED) => self.cloud_confirm(Action::ArchivedWorktrees),
             Some(CLOUD_CLEAR_BUILDS) => self.cloud_confirm(Action::BuildOutputs),
             Some(CLOUD_PRUNE_SANDBOX) => self.cloud_confirm(Action::Sandbox),
+            Some(CLOUD_ENVIRONMENT) => self.cloud_environment(),
             _ => {}
         }
+    }
+
+    /// Opens the selected server's repository environments.
+    fn cloud_environment(&mut self) {
+        let Some(status) = self.cloud.selected() else {
+            return;
+        };
+        let (name, repositories) = (
+            status.name.clone(),
+            status
+                .repositories
+                .iter()
+                .map(|repository| repository.name.clone())
+                .collect(),
+        );
+        self.open_environment(name, repositories);
     }
 
     fn cloud_hint(&self, id: crate::shortcuts::ActionId) -> String {
@@ -539,7 +556,7 @@ impl Ui {
             "Esc close".to_owned()
         } else if self.cloud.detail {
             format!(
-                "{}/{} select · {} run · {} refresh · {}/{}/{} clean · {} back · Esc close",
+                "{}/{} select · {} run · {} refresh · {}/{}/{} clean · {} environments · {} back · Esc close",
                 hint(NAVIGATION_UP),
                 hint(NAVIGATION_DOWN),
                 hint(NAVIGATION_ACTIVATE),
@@ -547,11 +564,12 @@ impl Ui {
                 hint(CLOUD_CLEAN_ARCHIVED),
                 hint(CLOUD_CLEAR_BUILDS),
                 hint(CLOUD_PRUNE_SANDBOX),
+                hint(CLOUD_ENVIRONMENT),
                 hint(CLOUD_BACK),
             )
         } else {
             format!(
-                "{}/{} select · {} details · {} refresh · {}/{}/{} clean · Esc close",
+                "{}/{} select · {} details · {} refresh · {}/{}/{} clean · {} environments · Esc close",
                 hint(NAVIGATION_UP),
                 hint(NAVIGATION_DOWN),
                 hint(NAVIGATION_ACTIVATE),
@@ -559,6 +577,7 @@ impl Ui {
                 hint(CLOUD_CLEAN_ARCHIVED),
                 hint(CLOUD_CLEAR_BUILDS),
                 hint(CLOUD_PRUNE_SANDBOX),
+                hint(CLOUD_ENVIRONMENT),
             )
         };
         frame.render_widget(Paragraph::new(text).style(Style::default().fg(DIM)), footer);
@@ -837,7 +856,7 @@ impl Ui {
         }
         let breakdown = &report.breakdown;
         // Actions and the fixed rows below the sessions.
-        let reserved = lines.len() + 8 + 2 + Action::ALL.len() + 3;
+        let reserved = lines.len() + 8 + 2 + Action::ALL.len() + 4;
         let shown = height
             .saturating_sub(reserved)
             .min(breakdown.sessions.len());
@@ -919,6 +938,16 @@ impl Ui {
                 selected(index + 1),
             ));
         }
+        lines.push(Line::from(vec![
+            Span::styled("  Environments ", Style::default().fg(TEXT)),
+            Span::styled(
+                format!(
+                    "{} · tools, setup commands, variables and notes each repository's sandboxes get",
+                    self.cloud_hint(CLOUD_ENVIRONMENT)
+                ),
+                dim,
+            ),
+        ]));
         lines.push(Line::default());
         self.cloud_status_lines(&mut lines);
         lines
@@ -1311,6 +1340,34 @@ mod tests {
                 .as_ref()
                 .is_some_and(|(text, _)| text.contains("difu server upgrade old"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn the_environment_key_opens_the_servers_repository_environments() -> Result<()> {
+        let (mut ui, _dir, _) = fixture(None)?;
+        ready(&mut ui);
+        let text = screen(&mut ui, 160, 44)?;
+        assert!(text.contains("e environments"), "{text}");
+        ui.cloud.detail = true;
+        let text = screen(&mut ui, 160, 44)?;
+        assert!(text.contains("Environments"), "{text}");
+        let request = request_at_boundary_with(&mut ui, |ui| {
+            ui.key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE))
+        })?;
+        assert!(matches!(
+            request,
+            Request::Environment {
+                server: Some(ref server),
+                ref repository,
+                profile: None,
+                ..
+            } if server == "hetzner" && repository == "acme/api"
+        ));
+        let Some(Modal::RepositoryRules(form)) = &ui.modal else {
+            anyhow::bail!("the environment editor opened");
+        };
+        assert!(form.environment());
         Ok(())
     }
 

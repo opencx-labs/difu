@@ -645,6 +645,12 @@ pub(super) fn entries() -> Vec<ActionSpec> {
             &[key(BindingKey::Character('p'), 0)],
         ),
         entry(
+            ids::CLOUD_ENVIRONMENT,
+            "Edit a server's repository environments",
+            &[contexts::AGENT_CLOUD],
+            &[key(BindingKey::Character('e'), 0)],
+        ),
+        entry(
             ids::CLOUD_BACK,
             "Back from a cloud server's details",
             &[contexts::AGENT_CLOUD],

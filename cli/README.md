@@ -307,7 +307,8 @@ conversation, and they also run after the turn. On purpose, no tool changes
 permission modes, presets or approvals, so an agent can never loosen its own
 permissions. UI-only commands (`/cpu`, `/settings`, `/theme`, …) have no tool. A
 server session's tools run on its server. They are available in new Codex threads
-and in Claude sessions.
+and in Claude sessions. Server sessions also get **difu_environment**, which
+reads and records the repository's environment profile (see *Cloud servers*).
 
 Press **n** (or `/new`) to open an empty session immediately while its isolated Git
 worktree is created in the background. The composer stays enabled and shows the
@@ -1389,6 +1390,27 @@ with a pointer to these cleanups, and running sessions continue. On the server,
 archived-worktrees|build-outputs|sandbox` runs a cleanup; `difu server list`
 shows each server's free space. The iPhone app shows the same in each server's
 settings.
+
+**Environments.** Each server remembers what each repository's sandboxes need:
+its **environment profile** of tools and versions (`node = 24`, `pnpm = 9`,
+`python = 3.12`), setup commands (`pnpm install --frozen-lockfile`), non-secret
+variables and notes for agents. The sandbox image ships
+[mise](https://mise.jdx.dev) and corepack, and every sandbox on a server shares
+one toolchain cache (mise installs, corepack, pnpm, npm, yarn, pip, uv, cargo
+and Go caches), so a runtime downloads once per server. Before a session's
+agent starts, difu installs the versions the repository's own files declare
+(`.nvmrc`, `.tool-versions`, `mise.toml`, `.python-version`,
+`rust-toolchain.toml`, `go.mod`, `package.json` `packageManager`) plus the
+profile's tools for anything they leave out, enables corepack and runs the
+setup commands, skipping setup when the lockfiles, commands and tools have not
+changed in that worktree. Progress and failures appear in the chat; a failure
+never blocks the session, and the agent is told what failed. Versions the
+repository declares are remembered in the profile automatically, and agents
+read and extend it with the **difu_environment** tool when they find something
+missing, so the next session starts ready; other running sessions of the
+repository are told. Secrets are refused. Edit profiles in **/cloud** (**e** on
+a server) or on the iPhone under the server's **Repositories**. Run `difu
+server upgrade <name>` once so an existing server rebuilds its image with mise.
 
 ## Slack control (macOS)
 

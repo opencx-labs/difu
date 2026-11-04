@@ -570,12 +570,19 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
         "pr.comment" | "pr.review" | "pr.merge" | "pr.close" | "pr.ready" => {
             reviews::act(method, params)
         }
-        _ => match resources::dispatch(&inner.storage, &inner.shell_input, method, params)
-            .or_else(|| super::server_api::dispatch(&inner.storage, method, params))
-        {
-            Some(result) => result,
-            None => anyhow::bail!("Unknown method `{method}`; update difu on your computer"),
-        },
+        _ => {
+            // Only changes record who made them.
+            let device = method
+                .starts_with("server.environment")
+                .then(|| device_name(inner))
+                .flatten();
+            match resources::dispatch(&inner.storage, &inner.shell_input, method, params).or_else(
+                || super::server_api::dispatch(&inner.storage, method, params, device.as_deref()),
+            ) {
+                Some(result) => result,
+                None => anyhow::bail!("Unknown method `{method}`; update difu on your computer"),
+            }
+        }
     }
 }
 
@@ -626,6 +633,18 @@ fn answer(inner: &Inner, params: &Value) -> Result<Value> {
             answer,
         },
     )
+}
+
+/// The calling device's name, for the history of what it changes.
+fn device_name(inner: &Inner) -> Option<String> {
+    inner
+        .remote
+        .status()
+        .ok()?
+        .devices
+        .into_iter()
+        .find(|device| device.id == inner.device)
+        .map(|device| device.name)
 }
 
 fn devices(inner: &Inner) -> Result<Vec<Value>> {

@@ -4730,6 +4730,9 @@ impl Ui {
             Some(Modal::Transcript { .. }) => "Message",
             Some(Modal::InstallBrowser { .. }) => "Optional HTML preview · Esc cancels",
             Some(Modal::AgentDefaults(_)) => "New agent defaults",
+            Some(Modal::RepositoryRules(ref form)) if form.environment() => {
+                "Repository environment"
+            }
             Some(Modal::RepositoryRules(_)) => "Repository rules",
             Some(Modal::NewSession(_)) => "New session",
             Some(Modal::Slack(_)) => "Slack setup",
@@ -4814,8 +4817,13 @@ impl Ui {
                 hint(crate::shortcuts::ids::NAVIGATION_NEXT_FOCUS),
                 hint(crate::shortcuts::ids::NAVIGATION_PREVIOUS_FOCUS)
             )),
-            Some(Modal::RepositoryRules(_)) => Some(format!(
-                "Repository rules · {}/{} fields",
+            Some(Modal::RepositoryRules(ref form)) => Some(format!(
+                "{} · {}/{} fields",
+                if form.environment() {
+                    "Repository environment"
+                } else {
+                    "Repository rules"
+                },
                 hint(crate::shortcuts::ids::NAVIGATION_NEXT_FOCUS),
                 hint(crate::shortcuts::ids::NAVIGATION_PREVIOUS_FOCUS)
             )),
