@@ -9,7 +9,7 @@ let package = Package(
         .executable(name: "difu-remote-probe", targets: ["difu-remote-probe"]),
     ],
     targets: [
-        .target(name: "DifuKit"),
+        .target(name: "DifuKit", resources: [.process("Resources")]),
         .executableTarget(name: "difu-remote-probe", dependencies: ["DifuKit"]),
         .testTarget(name: "DifuKitTests", dependencies: ["DifuKit"]),
     ],

@@ -750,6 +750,113 @@ mod tests {
         }
     }
 
+    /// Every role in palette order, so the iPhone's copy lists them like this file.
+    const ALL_ROLES: [Role; ROLES] = [
+        Role::Background,
+        Role::Panel,
+        Role::Text,
+        Role::Dim,
+        Role::Border,
+        Role::Accent,
+        Role::OnAccent,
+        Role::Green,
+        Role::Purple,
+        Role::Yellow,
+        Role::Red,
+        Role::AddBg,
+        Role::RemoveBg,
+        Role::UserMessage,
+        Role::UserMessageText,
+        Role::Keyword,
+        Role::String,
+        Role::Number,
+        Role::Comment,
+        Role::FocusedEntry,
+        Role::SelectedCode,
+        Role::FocusedCode,
+    ];
+
+    /// `#rrggbb`, `terminal` for the terminal's own colour, the name of one of
+    /// its 16 colours, or `index:<n>` for a 256-colour palette entry.
+    fn json_color(color: Color) -> String {
+        let name = match color {
+            Color::Reset => "terminal",
+            Color::Black => "black",
+            Color::Red => "red",
+            Color::Green => "green",
+            Color::Yellow => "yellow",
+            Color::Blue => "blue",
+            Color::Magenta => "magenta",
+            Color::Cyan => "cyan",
+            Color::Gray => "gray",
+            Color::DarkGray => "dark-gray",
+            Color::LightRed => "light-red",
+            Color::LightGreen => "light-green",
+            Color::LightYellow => "light-yellow",
+            Color::LightBlue => "light-blue",
+            Color::LightMagenta => "light-magenta",
+            Color::LightCyan => "light-cyan",
+            Color::White => "white",
+            Color::Rgb(r, g, b) => return format!("#{r:02x}{g:02x}{b:02x}"),
+            Color::Indexed(index) => return format!("index:{index}"),
+        };
+        name.to_string()
+    }
+
+    /// The themes as the iPhone app reads them (DifuKit's `themes.json`).
+    fn themes_json() -> anyhow::Result<String> {
+        let mut entries = Vec::new();
+        for theme in themes() {
+            let mut colors = Vec::new();
+            for role in ALL_ROLES {
+                let name = format!("{role:?}");
+                let mut chars = name.chars();
+                let key: String = chars
+                    .next()
+                    .map(|first| first.to_ascii_lowercase())
+                    .into_iter()
+                    .chain(chars)
+                    .collect();
+                colors.push(format!(
+                    "        \"{key}\": \"{}\"",
+                    json_color(theme.color(role))
+                ));
+            }
+            entries.push(format!(
+                "    {{\n      \"id\": {},\n      \"name\": {},\n      \"description\": {},\n      \"colors\": {{\n{}\n      }}\n    }}",
+                serde_json::to_string(theme.id)?,
+                serde_json::to_string(theme.name)?,
+                serde_json::to_string(theme.description)?,
+                colors.join(",\n"),
+            ));
+        }
+        Ok(format!(
+            "{{\n  \"themes\": [\n{}\n  ]\n}}\n",
+            entries.join(",\n")
+        ))
+    }
+
+    #[test]
+    fn iphone_themes_json_matches_the_themes() -> anyhow::Result<()> {
+        let indexes: std::collections::BTreeSet<usize> =
+            ALL_ROLES.iter().map(|role| *role as usize).collect();
+        anyhow::ensure!(indexes.len() == ROLES, "ALL_ROLES repeats a role");
+
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../app/ios/DifuKit/Sources/DifuKit/Resources/themes.json");
+        let expected = themes_json()?;
+        if std::env::var_os("DIFU_UPDATE_THEMES_JSON").is_some() {
+            std::fs::write(&path, &expected)?;
+        }
+        let actual = std::fs::read_to_string(&path).unwrap_or_default();
+        anyhow::ensure!(
+            actual == expected,
+            "{} doesn't match src/theme.rs. Regenerate it from cli/ with:\n  DIFU_UPDATE_THEMES_JSON=1 cargo test iphone_themes_json",
+            path.display()
+        );
+        Ok(())
+    }
+
     #[test]
     fn high_contrast_resolves_muted_roles_without_mutating_cached_cells() {
         select(0);
