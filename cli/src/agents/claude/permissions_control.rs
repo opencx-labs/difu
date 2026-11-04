@@ -123,6 +123,20 @@ pub(super) fn reload(
         return Ok(());
     }
     rpc.stop()?;
+    // A restarted conversation gets a summary of what its handoff leaves out.
+    if let Some(through) = session.summarize_through {
+        let entries = session.entries.get(..through).unwrap_or_default();
+        let context =
+            crate::agents::summary::earlier(&session, entries, cancel).map(|(summary, start)| {
+                crate::agents::provider::summarized_handoff(entries, start, &summary)
+            });
+        store.update(id, |s| {
+            s.summarize_through = None;
+            if context.is_some() {
+                s.provider_context = context;
+            }
+        })?;
+    }
     let replacement = connect(store, id, &session, cancel)?;
     *rpc = replacement;
     *decoder = events::Decoder::default();

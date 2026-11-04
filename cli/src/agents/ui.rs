@@ -1583,7 +1583,15 @@ impl Ui {
             "Repository rules",
             "Permissions and mode · Shift+Tab",
             "Move to folder · F",
-            "Move to server…",
+            if self
+                .selected
+                .as_deref()
+                .is_some_and(servers::is_server_session)
+            {
+                "Move to this computer"
+            } else {
+                "Move to server…"
+            },
         ];
         if self.plan_available() {
             entries.push("Review completed plan");

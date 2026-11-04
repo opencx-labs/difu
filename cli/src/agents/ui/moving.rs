@@ -1,5 +1,6 @@
 //! "Move to server…": moves the selected session from this computer to a saved
-//! cloud server (`Request::Move`) and opens the new server session.
+//! cloud server (`Request::Move`) and opens the new server session. On a server
+//! session the entry is "Move to this computer" (`Request::MoveHere`).
 use super::*;
 
 impl Ui {
@@ -9,7 +10,10 @@ impl Ui {
             return;
         };
         if servers::is_server_session(&id) {
-            self.notice = Some(("This session already runs on a server".into(), true));
+            self.busy = true;
+            self.notice = Some(("Moving this session to this computer…".into(), false));
+            // Like a launch, success opens the new local session.
+            self.task(Task::Launch, Request::MoveHere { id }, true);
             return;
         }
         match crate::cloud::servers::load(&self.storage) {
@@ -118,7 +122,7 @@ mod tests {
     fn entry(ui: &Ui) -> Result<usize> {
         ui.menu_entries()
             .iter()
-            .position(|label| label == "Move to server…")
+            .position(|label| label == "Move to server…" || label == "Move to this computer")
             .context("move entry")
     }
 
@@ -172,16 +176,19 @@ mod tests {
                 .is_some_and(|(text, error)| !*error && text == "Moving this session to home…")
         );
 
-        // Server sessions are already on a server.
+        // Server sessions move to this computer instead.
         ui.busy = false;
         ui.select("box:7".into());
-        ui.menu_action(entry(&ui)?);
-        assert!(ui.modal.is_none());
         assert!(
-            ui.notice
-                .as_ref()
-                .is_some_and(|(text, _)| text.contains("already runs on a server"))
+            ui.menu_entries()
+                .iter()
+                .any(|label| label == "Move to this computer")
         );
+        ui.menu_action(entry(&ui)?);
+        assert!(ui.modal.is_none() && ui.busy);
+        assert!(ui.notice.as_ref().is_some_and(
+            |(text, error)| !*error && text == "Moving this session to this computer…"
+        ));
         Ok(())
     }
 }

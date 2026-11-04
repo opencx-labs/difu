@@ -209,6 +209,16 @@ impl Inner {
         client::request(&self.storage, request)
     }
     fn control(&self, id: String, control: Control) -> Result<Value> {
+        if matches!(
+            control,
+            Control::Message { .. } | Control::MessageWithAttachments { .. }
+        ) {
+            // A phone, not a computer: nothing can move to it.
+            let _ = self.request(Request::Sender {
+                id: id.clone(),
+                computer: None,
+            });
+        }
         self.request(Request::Control { id, control })?;
         Ok(json!({}))
     }
@@ -360,6 +370,20 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
                 !matches!(request, Request::Watch { .. }),
                 "Use `rpc.watch` to follow a session"
             );
+            if let Request::Control {
+                id,
+                control: Control::Message { .. } | Control::MessageWithAttachments { .. },
+            } = &request
+            {
+                // A computer's difu: `difu_move_to_computer` can move the session there.
+                let _ = inner.request(Request::Sender {
+                    id: id.clone(),
+                    computer: Some(crate::agents::moving::Computer {
+                        id: inner.device.clone(),
+                        name: device_name(inner).unwrap_or_else(|| "the user's computer".into()),
+                    }),
+                });
+            }
             Ok(json!({"reply": inner.request(request)?}))
         }
         "rpc.unwatch" => {

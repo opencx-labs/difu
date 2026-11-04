@@ -856,6 +856,7 @@ mod tests {
         );
         assert_eq!(session.error.as_deref(), Some("Prompt is too long"));
         assert!(session.thread_id.is_none() && session.permission_state.reload_pending);
+        assert!(session.summarize_through.is_some());
         assert!(!session.permission_state.claude_turn_attempted);
         assert_eq!(session.queue, vec![prompt.clone()]);
         let handoff = session.provider_context.clone().context("handoff")?;

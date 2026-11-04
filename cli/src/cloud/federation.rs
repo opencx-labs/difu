@@ -26,7 +26,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::PathBuf,
     sync::{
         Arc, Condvar, Mutex, MutexGuard,
@@ -342,7 +342,12 @@ fn session_id(request: &mut Request) -> Option<&mut String> {
         | Request::Environment { .. }
         // The local service moves its own session; servers import it.
         | Request::Move { .. }
-        | Request::Import { .. } => None,
+        | Request::Import { .. }
+        // The local service takes a server session; it names the server itself.
+        | Request::MoveHere { .. }
+        | Request::Export { .. }
+        | Request::Exported { .. }
+        | Request::Sender { .. } => None,
     }
 }
 
@@ -455,6 +460,7 @@ fn changes_list(request: &Request) -> bool {
             | Request::RegisterWorktree { .. }
             | Request::AttachPr { .. }
             | Request::Import { .. }
+            | Request::Exported { .. }
     )
 }
 
@@ -508,6 +514,7 @@ pub fn prefix_reply(server: &str, reply: Reply) -> Reply {
         | Reply::SessionPrs(_)
         | Reply::Attachment(_)
         | Reply::ArtifactFile(_)
+        | Reply::Exported(_)
         | Reply::Error(_)) => reply,
     }
 }
@@ -802,6 +809,8 @@ impl Link {
 #[derive(Default)]
 struct State {
     links: BTreeMap<String, Link>,
+    /// Server sessions offered to `returning`'s caller, and when.
+    returning: HashMap<String, Instant>,
     /// Modification time of the `servers.json` last loaded (`Some(None)`: none).
     loaded: Option<Option<SystemTime>>,
     listed: Option<Instant>,
@@ -1293,6 +1302,46 @@ impl Federation {
         }
         sort(&mut local);
         local
+    }
+
+    /// Server sessions whose agent asked to move to this computer
+    /// (`difu_move_to_computer`) and whose turn is over, by namespaced id. Each
+    /// is offered at most once a minute, so a move under way (or one that just
+    /// failed) does not start again.
+    pub fn returning(&self) -> Vec<String> {
+        let mut state = self.lock();
+        let State {
+            links, returning, ..
+        } = &mut *state;
+        returning.retain(|_, at| at.elapsed() < Duration::from_secs(60));
+        let mut due = Vec::new();
+        for link in links.values() {
+            if link.live().is_none() {
+                continue;
+            }
+            for summary in &link.sessions {
+                if summary.return_to.as_deref() == Some(link.saved.device.as_str())
+                    && !summary.status.active()
+                    && !returning.contains_key(&summary.id)
+                {
+                    returning.insert(summary.id.clone(), Instant::now());
+                    due.push(summary.id.clone());
+                }
+            }
+        }
+        due
+    }
+
+    /// This computer's latest copy of a server session's summary.
+    pub fn summary(&self, id: &str) -> Option<Summary> {
+        let (server, _) = split(id)?;
+        self.lock()
+            .links
+            .get(server)?
+            .sessions
+            .iter()
+            .find(|summary| summary.id == id)
+            .cloned()
     }
 
     /// Saved servers with their state and repositories, for the server picker.

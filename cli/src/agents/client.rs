@@ -88,6 +88,8 @@ pub fn request(storage: &Storage, request: Request) -> Result<Reply> {
         Request::Launch { .. } | Request::NewAgent { .. } => "create session".into(),
         Request::Move { id, server } => format!("move session {id} to {server}"),
         Request::Import { .. } => "import a moved session".into(),
+        Request::MoveHere { id } => format!("move session {id} to this computer"),
+        Request::Export { .. } | Request::Exported { .. } => "move a session to a computer".into(),
         Request::Disk { .. } => "read disk space".into(),
         Request::DiskClean { .. } => "free disk space".into(),
         Request::Environment { profile: None, .. } => "read an environment profile".into(),
@@ -106,6 +108,8 @@ pub fn request(storage: &Storage, request: Request) -> Result<Reply> {
             | Request::Clear { .. }
             | Request::Move { .. }
             | Request::Import { .. }
+            | Request::MoveHere { .. }
+            | Request::Export { .. }
             | Request::DiskClean { .. }
     ) {
         None
