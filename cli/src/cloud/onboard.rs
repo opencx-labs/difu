@@ -1933,6 +1933,53 @@ mod tests {
     }
 
     #[test]
+    fn setup_checks_survive_producers_that_die_of_sigpipe() -> Result<()> {
+        // Like a real `sshd -T`, the stand-ins keep writing after the line
+        // the check looks for, far more than a pipe buffers.
+        let sshd = |answer: &str| {
+            format!(
+                "sshd() {{ printf 'port 22\\npasswordauthentication {answer}\\n'; seq 1 200000; }}\n"
+            )
+        };
+        let run = |script: String| run_bash(&format!("set -Eeuo pipefail\n{script}"), &["-s"]);
+        // The old check: grep -q exits at the match, sshd dies of SIGPIPE and
+        // pipefail fails the pipeline, so the warning showed on every server.
+        let naive = run(format!(
+            "{}sshd -T 2>/dev/null | grep -qx 'passwordauthentication no'\n",
+            sshd("no")
+        ))?;
+        assert!(!naive.status.success(), "the SIGPIPE was not reproduced");
+        let check = bootstrap_function("password_logins_off")?;
+        for (stand_in, off) in [
+            (sshd("no"), true),
+            (sshd("yes"), false),
+            ("sshd() { return 1; }\n".to_owned(), false),
+        ] {
+            let output = run(format!("{stand_in}{check}password_logins_off\n"))?;
+            assert_eq!(output.status.success(), off, "{stand_in}");
+        }
+        let groups = bootstrap_function("in_group")?;
+        let id = "id() { printf 'difu sudo'; seq -f ' group%g' 1 200000 | tr -d '\\n'; printf '\\n'; }\n";
+        for (group, member) in [
+            ("sudo", true),
+            ("difu", true),
+            ("sud", false),
+            ("wheel", false),
+        ] {
+            let output = run(format!("{id}{groups}in_group difu {group}\n"))?;
+            assert_eq!(output.status.success(), member, "{group}");
+        }
+        // No other check pipes into a reader that stops early.
+        for line in BOOTSTRAP.lines().map(str::trim) {
+            assert!(
+                line.starts_with('#') || !(line.contains("| grep -q") || line.contains("| head")),
+                "{line}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn claude_code_in_the_setup_shares_the_config_only_once_it_moved() -> Result<()> {
         let body = bootstrap_function("as_claude")?;
         let home = tempfile::tempdir()?;
