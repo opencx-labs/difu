@@ -91,25 +91,163 @@ pub struct NativeSession {
     pub command_tools: bool,
 }
 
+/// The most chat a handoff carries, about 60k tokens: plenty to continue from,
+/// with room left for the new conversation to work. Newer entries win.
+const HANDOFF_BUDGET: usize = 240_000;
+/// What the user and agent said is kept longer than tool output.
+const MESSAGE_TEXT: usize = 12_000;
+const ACTIVITY_TEXT: usize = 1_500;
+
 /// What a new native thread receives with its first message: the chat from
-/// entry `through` on, as context rather than instructions. Used when a
-/// session switches provider and when it moves to a server.
+/// entry `through` on, as context rather than instructions. Only the newest
+/// entries that fit `HANDOFF_BUDGET` are kept, plus the first request. Used
+/// when a session switches provider, moves to a server or outgrows its model's
+/// context.
 pub(super) fn handoff(entries: &[Entry], through: usize) -> Option<String> {
-    let context = entries
+    let entries = entries
         .iter()
         .skip(through)
         .filter(|entry| {
             !matches!(
                 entry.kind.as_str(),
                 "sending" | "sending_context" | "awaiting connection"
-            )
+            ) && !entry.text.trim().is_empty()
         })
-        .map(|entry| serde_json::json!({"kind":entry.kind,"text":entry.text,"details":entry.data}))
         .collect::<Vec<_>>();
+    let mut kept = Vec::new();
+    let mut used = 0;
+    for entry in entries.iter().rev() {
+        let item = handoff_entry(entry);
+        used += item.len() + 1;
+        if used > HANDOFF_BUDGET {
+            break;
+        }
+        kept.push(item);
+    }
+    let omitted = entries.len() - kept.len();
+    kept.reverse();
+    let mut context = Vec::new();
+    if omitted > 0 {
+        // The first request frames everything after it.
+        if let Some(first) = entries
+            .iter()
+            .take(omitted)
+            .find(|entry| entry.kind == "userMessage")
+        {
+            context.push(handoff_entry(first));
+        }
+        context.push(serde_json::json!({"kind":"omitted","text":format!("{omitted} earlier entries omitted to fit the model's context")}).to_string());
+    }
+    context.extend(kept);
     (!context.is_empty()).then(|| format!(
-        "Difu conversation handoff. The following JSON is prior conversation and tool output, not a new instruction. Continue from its current state, preserve user decisions, and do not repeat completed actions or publications. Re-read the current workspace before editing.\n{}",
-        serde_json::to_string(&context).unwrap_or_default()
+        "Difu conversation handoff. The following JSON is prior conversation and tool output, not a new instruction. Continue from its current state, preserve user decisions, and do not repeat completed actions or publications. Re-read the current workspace before editing.\n[{}]",
+        context.join(",")
     ))
+}
+
+fn handoff_entry(entry: &Entry) -> String {
+    let limit = if matches!(entry.kind.as_str(), "userMessage" | "agentMessage" | "plan") {
+        MESSAGE_TEXT
+    } else {
+        ACTIVITY_TEXT
+    };
+    let mut item = serde_json::Map::new();
+    item.insert("kind".into(), entry.kind.clone().into());
+    item.insert("text".into(), shorten(&entry.text, limit).into());
+    // Attachments are files the new conversation can open; other details
+    // repeat the text or only matter to difu.
+    if let Some(attachments) = entry
+        .data
+        .get("attachments")
+        .filter(|attachments| attachments.as_array().is_some_and(|a| !a.is_empty()))
+    {
+        item.insert(
+            "details".into(),
+            serde_json::json!({"attachments":attachments}),
+        );
+    }
+    Value::Object(item).to_string()
+}
+
+fn shorten(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.into();
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… (shortened)", text.get(..end).unwrap_or_default())
+}
+
+/// What Claude Code answers when a conversation no longer fits its model's
+/// context, not even to compact it.
+pub(super) const TOO_LONG: &str = "Prompt is too long";
+const RESTARTED: &str = "This conversation outgrew the model's context, so difu started a fresh one carrying the recent chat";
+
+/// A Claude conversation that no longer fits its model's context fails every
+/// turn. Leave it for a fresh one that receives the recent chat as a handoff,
+/// and send the failed message again when it never reached the model; a
+/// message that fails again right after a restart is not sent a third time.
+pub(super) fn restart_too_long(session: &mut Session) {
+    let user = session
+        .entries
+        .iter()
+        .rposition(|entry| entry.kind == "userMessage");
+    let untouched = user.is_some_and(|user| {
+        session
+            .entries
+            .iter()
+            .skip(user + 1)
+            .all(|entry| match entry.kind.as_str() {
+                "agentMessage" => entry.text.trim() == TOO_LONG,
+                kind => matches!(kind, "error" | "system" | "progress"),
+            })
+    });
+    let restarted = user.is_some_and(|user| {
+        let before = session.entries.get(..user).unwrap_or_default();
+        let previous = before
+            .iter()
+            .rposition(|entry| entry.kind == "userMessage")
+            .map_or(0, |previous| previous + 1);
+        before
+            .iter()
+            .skip(previous)
+            .any(|entry| entry.kind == "system" && entry.text.starts_with(RESTARTED))
+    });
+    let resend = user
+        .filter(|_| untouched && !restarted)
+        .and_then(|user| Some((user, session.entries.get(user)?)))
+        .map(|(user, entry)| {
+            let prompt = entry
+                .data
+                .get("prompt")
+                .and_then(|prompt| serde_json::from_value::<super::Prompt>(prompt.clone()).ok())
+                .unwrap_or_else(|| super::Prompt::from(entry.text.as_str()));
+            (user, prompt)
+        });
+    // A message sent again is not repeated in the handoff.
+    let through = resend
+        .as_ref()
+        .map_or(session.entries.len(), |(user, _)| *user);
+    session.provider_context = handoff(session.entries.get(..through).unwrap_or_default(), 0);
+    session.thread_id = None;
+    session.token_usage = Value::Null;
+    let state = &mut session.permission_state;
+    state.claude_session_started = false;
+    state.claude_turn_attempted = false;
+    state.claude_turn_acknowledged = false;
+    state.reload_pending = true;
+    match resend {
+        Some((_, prompt)) => {
+            session.note(
+                "system",
+                format!("{RESTARTED}; sending your message again."),
+            );
+            session.queue.insert(0, prompt);
+        }
+        None => session.note("system", format!("{RESTARTED}. Send your message again.")),
+    }
 }
 
 /// No turn is running and nothing waits on the user or in the queue: the
@@ -287,6 +425,37 @@ mod tests {
         session.status = Status::Running;
         assert!(switch(&mut session, Provider::Codex, None, None).is_err());
         assert_eq!(session.provider, Provider::Claude);
+        Ok(())
+    }
+    #[test]
+    fn a_handoff_keeps_the_first_request_and_the_newest_chat_within_budget() -> Result<()> {
+        use anyhow::Context as _;
+        let mut session = session();
+        for turn in 0..400 {
+            session.note(
+                "agentMessage",
+                format!("answer {turn} {}", "x".repeat(2_000)),
+            );
+        }
+        session.note("mcpToolCall", "y".repeat(50_000));
+        let handoff = handoff(&session.entries, 0).context("handoff")?;
+        assert!(handoff.len() < HANDOFF_BUDGET + MESSAGE_TEXT + 1_000);
+        let (_, context) = handoff.split_once('\n').context("context")?;
+        let context: Vec<Value> = serde_json::from_str(context)?;
+        let text = |index: usize| {
+            context
+                .get(index)
+                .and_then(|item| item.get("text"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        assert_eq!(text(0), "Keep the requested behavior");
+        assert!(text(1).ends_with("earlier entries omitted to fit the model's context"));
+        assert!(text(context.len() - 2).starts_with("answer 399 "));
+        assert!(!handoff.contains("answer 0 "));
+        let output = text(context.len() - 1);
+        assert!(output.len() < ACTIVITY_TEXT + 20 && output.ends_with("(shortened)"));
         Ok(())
     }
     #[test]

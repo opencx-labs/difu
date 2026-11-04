@@ -653,9 +653,14 @@ the result.
   artifacts, commits and files, chat, and other.
 
 Not moved: shells and their output, ignored files that are not artifacts, and
-the composer draft. The handoff contains the whole chat, which for very long
-sessions can be large for the provider, as with provider switching. Moving a
-server session back to a computer or on to another server is not supported.
+the composer draft. As with provider switching, the handoff carries the newest
+chat that fits about 240 KB (roughly 60k tokens), plus the first request, with
+long messages and tool output shortened, so a long session's first message on
+the server fits the model. If a Claude conversation still outgrows its model's
+context ("Prompt is too long"), the service starts a fresh one carrying the same
+kind of handoff and sends the failed message again once, provided it never
+reached the model. Moving a server session back to a computer or on to another
+server is not supported.
 
 ### Claude Code's shared config
 
