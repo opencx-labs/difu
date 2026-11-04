@@ -3,7 +3,9 @@
 //! renders. Tool output is shortened; `session.entry` returns a full row.
 use super::super::{
     Entry, Job, Pending, Session, Summary, orchestrator,
+    permissions::{self, CodexPreset},
     pr_cache::{SessionLink, SessionLinks},
+    provider::Provider,
     ui::transcript,
 };
 use serde::Serialize;
@@ -180,6 +182,62 @@ pub struct Header {
     pub activity: Option<Activity>,
     pub queue: Vec<Queued>,
     pub pending: Vec<PendingView>,
+    /// The mode chip: the session's permission mode (and Codex approval
+    /// preset); `None` outside coding sessions.
+    pub permission_mode: Option<PermissionMode>,
+}
+
+/// A coding session's permission mode as the terminal's mode indicator shows
+/// it: ids with their labels, and what waits for the next turn.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionMode {
+    pub id: Option<String>,
+    pub label: Option<String>,
+    pub pending: Option<String>,
+    pub pending_label: Option<String>,
+    pub preset: Option<CodexPreset>,
+    pub preset_label: Option<&'static str>,
+    pub pending_preset: Option<CodexPreset>,
+    pub pending_preset_label: Option<&'static str>,
+}
+
+impl PermissionMode {
+    pub fn new(session: &Session) -> Option<Self> {
+        if !matches!(session.job, Job::Coding(_)) {
+            return None;
+        }
+        let state = &session.permission_state;
+        let provider = session.provider;
+        let id = state.mode.clone().or_else(|| {
+            (provider == Provider::Claude)
+                .then(|| session.permissions.get("permissionMode"))
+                .flatten()
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        let label = |id: &String| {
+            permissions::mode_choices(provider)
+                .into_iter()
+                .find(|choice| &choice.id == id)
+                .map_or_else(|| id.clone(), |choice| choice.label)
+        };
+        let codex = provider == Provider::Codex;
+        let preset = codex
+            .then(|| permissions::detected_preset(&session.permissions))
+            .flatten();
+        let pending_preset = state.pending_preset.filter(|_| codex);
+        Some(Self {
+            label: id.as_ref().map(label),
+            id,
+            pending_label: state.pending_mode.as_ref().map(label),
+            pending: state.pending_mode.clone(),
+            preset_label: preset.map(|preset| preset.label()),
+            preset,
+            pending_preset_label: pending_preset.map(|preset| preset.label()),
+            pending_preset,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -250,6 +308,7 @@ impl SessionView {
                 .iter()
                 .map(|p| PendingView::new(session, p))
                 .collect(),
+            permission_mode: PermissionMode::new(session),
         };
         let active = session.status.active();
         let mut next = HashMap::new();
@@ -868,6 +927,58 @@ mod tests {
         );
         session.status = Status::Idle;
         session
+    }
+
+    #[test]
+    fn the_mode_chip_shows_the_mode_preset_and_what_waits() -> Result<(), anyhow::Error> {
+        let mut claude = session();
+        claude.provider = Provider::Claude;
+        claude.permission_state.pending_mode = Some("auto".into());
+        let starting = serde_json::to_value(SessionView::new(&claude, &BTreeSet::new()))?;
+        assert_eq!(
+            starting.get("permissionMode"),
+            Some(
+                &json!({"id": null, "label": null, "pending": "auto", "pendingLabel": "Auto",
+                         "preset": null, "presetLabel": null,
+                         "pendingPreset": null, "pendingPresetLabel": null})
+            )
+        );
+        claude.permission_state.pending_mode = None;
+        claude.permission_state.mode = Some("default".into());
+        let manual = PermissionMode::new(&claude).context("chip")?;
+        assert_eq!(manual.label.as_deref(), Some("Manual"));
+        // Codex: its mode with the approval preset it runs with.
+        let mut codex = session();
+        codex.permission_state.mode = Some("default".into());
+        codex.permissions = json!({"sandbox": {"type": "workspaceWrite"},
+            "approvalPolicy": "on-request", "approvalsReviewer": "auto_review"});
+        codex.permission_state.pending_preset = Some(CodexPreset::ReadOnly);
+        let chip = PermissionMode::new(&codex).context("chip")?;
+        assert_eq!(
+            (chip.label.as_deref(), chip.preset, chip.preset_label),
+            (
+                Some("Regular"),
+                Some(CodexPreset::Auto),
+                Some("Approve for me")
+            )
+        );
+        assert_eq!(chip.pending_preset_label, Some("Read Only"));
+        let value = serde_json::to_value(&chip)?;
+        assert_eq!(value.get("preset"), Some(&json!("Auto")));
+        // Reviews and guides have no mode.
+        let mut guide = session();
+        guide.job = Job::Conflict {
+            root: "/tmp/repo".into(),
+            key: crate::model::PrKey {
+                owner: "acme".into(),
+                repo: "api".into(),
+                number: 1,
+            },
+            head: "abc".into(),
+            model: Default::default(),
+        };
+        assert_eq!(PermissionMode::new(&guide), None);
+        Ok(())
     }
 
     #[test]

@@ -21,6 +21,9 @@ pub struct AgentDefaults {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub isolated: bool,
+    /// The approval preset Codex sessions start with; `None` is automatic
+    /// ("Approve for me" on a server, Codex's configured policy elsewhere).
+    pub codex_preset: Option<crate::agents::permissions::CodexPreset>,
 }
 impl Default for AgentDefaults {
     fn default() -> Self {
@@ -31,6 +34,7 @@ impl Default for AgentDefaults {
             model: None,
             effort: None,
             isolated: true,
+            codex_preset: None,
         }
     }
 }

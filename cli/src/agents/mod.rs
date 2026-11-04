@@ -3,6 +3,7 @@ pub(crate) mod artifacts;
 mod claude;
 pub mod client;
 pub mod connections;
+pub mod effective;
 mod elicitation;
 mod engine;
 pub mod folders;
@@ -978,7 +979,15 @@ pub enum Request {
     },
     Launch {
         job: Box<Job>,
+        /// A coding job's blank model, effort, starting mode and preset come
+        /// from this machine's effective new-session defaults, as for
+        /// `NewAgent` (sessions agents start).
+        #[serde(default)]
+        effective_defaults: bool,
     },
+    /// A new coding session; `defaults` holds the client's choices, and blank
+    /// model, effort, starting mode and preset come from the location's
+    /// effective new-session defaults.
     NewAgent {
         defaults: crate::storage::AgentDefaults,
         cwd: PathBuf,
@@ -1060,8 +1069,8 @@ pub enum Request {
         #[serde(default)]
         server: Option<String>,
     },
-    /// The new-session defaults saved at a location: this machine (`None`) or a
-    /// saved cloud server.
+    /// The new-session defaults at a location, saved and effective
+    /// (`Reply::AgentDefaults`): this machine (`None`) or a saved cloud server.
     AgentDefaults {
         #[serde(default)]
         server: Option<String>,
@@ -1159,7 +1168,8 @@ pub enum Reply {
         effort: String,
         permissions: String,
     },
-    AgentDefaults(crate::storage::AgentDefaults),
+    /// A location's saved and effective new-session defaults.
+    AgentDefaults(Box<effective::Defaults>),
     Models(Vec<crate::model::ModelInfo>),
     Remote(remote::Status),
     RepositoryRules {

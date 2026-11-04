@@ -105,6 +105,12 @@ pub(super) fn request_at_boundary_with(
                     let mut line = String::new();
                     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
                     let request = serde_json::from_str(&line)?;
+                    // Background reads (the new-session form's defaults) are
+                    // not actions.
+                    if matches!(request, Request::AgentDefaults { .. }) {
+                        stream.write_all(b"{\"Error\":\"fixture\"}\n")?;
+                        continue;
+                    }
                     stream.write_all(b"\"Ok\"\n")?;
                     return Ok(request);
                 }
@@ -634,12 +640,16 @@ while True:
         line=client.makefile('rb').readline()
         if not line: continue
         request=json.loads(line)
+        # Background reads (the new-session form's defaults) are not actions.
+        background=isinstance(request,dict) and 'AgentDefaults' in request
         if request=='ServiceVersion':
             reply={'ServiceVersion':{'version':sys.argv[2]}}
+        elif background:
+            reply={'Error':'fixture'}
         else:
             reply='Ok'
         client.sendall((json.dumps(reply)+'\n').encode())
-        if request!='ServiceVersion':
+        if request!='ServiceVersion' and not background:
             print(json.dumps(request),flush=True)
             break
 "#;

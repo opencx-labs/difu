@@ -189,9 +189,31 @@ sessions are included; filter them client-side (Active / Archived toggle).
   "activity": {"label": "Running cargo test", "since": 1790000000000},  // or null
   "queue": [{"index": 0, "text": "Also update the docs"}],
   "pending": [PendingView],
+  "permissionMode": PermissionMode, // coding sessions; null otherwise, absent on older computers
   "entries": [EntryView]
 }
 ```
+
+`PermissionMode` — the session's mode as the terminal's mode indicator shows
+it, for a mode chip:
+
+```json
+{
+  "id": "auto",                     // active mode id; null until the provider reports one
+  "label": "Auto",                  // Manual / Regular for "default"; null with id
+  "pending": null,                  // a mode waiting for the next turn or a reload
+  "pendingLabel": null,
+  "preset": "Auto",                 // Codex: the approval preset it runs with (null: custom or inherited)
+  "presetLabel": "Approve for me",
+  "pendingPreset": null,            // Codex: a preset waiting for the next turn
+  "pendingPresetLabel": null
+}
+```
+
+Switch with `/permissions <id>` (`session.command`): its `permissions` result
+lists each mode and preset with `available` and a `reason` when not, and a
+refused switch fails with the computer's message (for example "Bypass mode is
+disabled by settings", or a managed Codex policy).
 
 `EntryView` — one transcript row, already normalized for display:
 
@@ -287,11 +309,11 @@ all other fields with `session` (including `version`).
 | `session.changes` | `id` | `{"files": [DiffFile]}` uncommitted + committed worktree changes |
 | `session.commands` | `id`, `refresh` (bool; lists the provider's skills again) | `{"commands": [Command], "errors": ["..."]}`; see *Slash commands* (slow the first time: seconds) |
 | `session.command` | `id`, `name` (`/compact`, `$lint` or a bare name), `args` (string, optional), `confirm` (bool), `queue` (bool, provider commands) | `CommandOutcome`; see *Slash commands* |
-| `agents.new` | `repository` (path or null for the default), `model`, `effort`, `text` (first message, optional) | `{"id": "..."}` — a `model` picks its own provider; the saved provider, effort and starting mode apply only when they belong to it |
+| `agents.new` | `repository` (path or null for the default), `model`, `effort`, `startingMode`, `codexPreset`, `text` (first message, optional) | `{"id": "..."}` — blank choices are the location's effective defaults (see *New-session defaults*); a `model` picks its own provider |
 | `agents.repositories` | – | `{"repositories": [{"path": "...", "name": "difu", "default": true}]}` |
 | `agents.models` | – | `{"models": [{"id": "gpt-5.6-luna", "name": "GPT-5.6 Luna", "provider": "codex", "efforts": ["low","medium","high"]}]}` (slow: seconds) |
 | `agents.defaults` | – | `AgentDefaults`; see *New-session defaults* |
-| `agents.defaults.set` | any of `provider`, `model`, `effort`, `repository`, `startingMode`, `isolated` | `AgentDefaults` as saved |
+| `agents.defaults.set` | any of `provider`, `model`, `effort`, `repository`, `startingMode`, `codexPreset`, `isolated` | `AgentDefaults` as saved |
 | `server.info` | – | `{"name", "version", "hosts", "port"}` |
 
 **Switching providers.** `agents.models` lists both providers' models, and
@@ -311,32 +333,83 @@ also used by `agents.new` and by its terminal's new-session form for that
 location. `agents.defaults.set` saves them there with the terminal's settings
 transaction (other settings and unknown fields stay untouched).
 
+**Effective defaults.** The computer or server works out what a session
+started without choices gets, the same way for its terminal's new-session
+form, `agents.new` and sessions agents start:
+
+* Saved fields win.
+* Without a saved model (and unless Codex is the saved provider), the newest
+  Claude Opus in that machine's Claude Code catalog: the highest version from
+  the id (else the name), ignoring dates, plan-mode models and 1M-context
+  variants of the same version, with the `opus` alias last; at `xhigh`, or the
+  model's highest effort. A saved effort the model offers wins. Without Claude
+  models there, the provider's configured model.
+* Without a saved starting mode or preset, a server (`"server": true`) starts
+  Claude Code in its native `auto` mode and gives Codex the "Approve for me"
+  preset (`Auto`); a computer keeps each provider's own default. Both providers
+  still check risky actions themselves; bypass permissions and Full Access are
+  never chosen automatically. When a provider refuses an automatic start (Auto
+  disabled by settings, a managed Codex policy), the session starts in its own
+  default and its transcript says why; a chosen or saved mode that is refused
+  fails as before.
+
+`agents.new` fills blank `model`, `effort`, `startingMode` and `codexPreset`
+from them; the effective effort belongs to the effective model, and a
+starting mode the session's provider doesn't offer fails.
+
 `AgentDefaults`:
 
 ```json
 {
-  "provider": "claude",             // codex | claude: the saved provider, or the saved model's
-  "model": "claude/claude-opus-4-7",// null = the provider's configured model
-  "effort": "xhigh",                // null = the model's default
+  "provider": "claude",             // codex | claude: the saved provider, or the saved model's (codex when nothing is saved)
+  "savedProvider": null,            // the saved provider; null = automatic
+  "model": null,                    // saved; null = automatic
+  "effort": null,                   // saved; null = automatic
   "repository": "/Users/ali/code/difu",   // null = none
-  "startingMode": null,             // a startingModes[].id of the provider; null = its default
+  "startingMode": null,             // saved: a startingModes[].id of the provider it was saved for; null = automatic
+  "codexPreset": null,              // saved Codex approval preset: Ask | Auto | Full | ReadOnly; null = automatic
   "isolated": true,                 // saved for the terminal; sessions always get their own worktree
+  "server": true,                   // a difu server (Auto starts)
   "providers": [{"id": "codex", "label": "Codex",
                  "startingModes": [{"id": "default", "label": "Regular", "description": "Native coding mode"},
-                                   {"id": "plan", "label": "Plan", "description": "Native planning mode"}]},
-                {"id": "claude", "label": "Claude Code", "startingModes": [...]}]
+                                   {"id": "plan", "label": "Plan", "description": "Native planning mode"}],
+                 "presets": [{"id": "Ask", "label": "Ask for approval", "description": "…"},
+                             {"id": "Auto", "label": "Approve for me", "description": "…"},
+                             {"id": "Full", "label": "Full Access", "description": "…"},
+                             {"id": "ReadOnly", "label": "Read Only", "description": "…"}],
+                 "startingMode": null,           // effective, for this provider's sessions; null = its default
+                 "startingModeAutomatic": false, // from the server rule rather than saved
+                 "codexPreset": "Auto",          // effective; null = Codex's configured policy
+                 "codexPresetAutomatic": true},
+                {"id": "claude", "label": "Claude Code", "startingModes": [...],
+                 "startingMode": "auto", "startingModeAutomatic": true}],
+  "effective": {                    // what a session without choices gets
+    "provider": "claude",
+    "model": "claude/claude-opus-4-7",   // null = the provider's configured model
+    "effort": "xhigh",                   // null = the model's default
+    "modelAutomatic": true,              // the newest Opus, not saved
+    "effortAutomatic": true
+  }
 }
 ```
 
 Models and their efforts come from `agents.models`, repositories from
-`agents.repositories`. `agents.defaults.set` changes only the keys it is given;
-`null` or `""` sets one back to automatic. A `model` of the other provider (or
-a `provider` alone) switches the provider and drops the saved model, effort and
-starting mode of the old one unless they are given too. It fails without saving
-anything when the model belongs to a different `provider`, the starting mode
-isn't one of the provider's, or `repository` isn't a folder on that machine.
-Computers without these methods answer `Unknown method`; the iOS app then hides
-its defaults screen.
+`agents.repositories`. `agents.defaults` is slow the first time (the computer
+lists its Claude Code models), then quick. `agents.defaults.set` changes only
+the keys it is given; `null` or `""` sets one back to automatic, including
+`provider` (`{"provider": null, "model": null, "effort": null}` returns the
+model to automatic; a starting mode only Claude Code has goes too unless it is
+given). A `model` of the other provider (or a `provider` alone) switches the
+provider and drops the saved model, effort and starting mode of the old one
+unless they are given too. A starting mode is checked against the saved
+provider (or the saved model's), so saving a Claude Code mode with an automatic
+model sends `"provider": "claude"` too, which keeps the model automatic. It
+fails without saving anything when the model belongs to a different
+`provider`, the starting mode isn't one of the provider's, the preset is
+unknown, or `repository` isn't a folder on that machine. Computers without
+these methods answer `Unknown method`; the iOS app then hides its defaults
+screen. Older computers omit `effective` and the other new keys; the iOS app
+then preselects the newest Opus itself and shows no Mode picker.
 
 `DiffFile`: `{"path": "src/a.rs", "oldPath": null, "status": "modified", "additions": 3, "deletions": 1, "patch": "@@ ...", "truncated": false}`;
 `status` is `added | deleted | modified | renamed`. `patch` contains hunks only
@@ -379,7 +452,7 @@ sessions; `rules` and `repo` not in the orchestrator; `diff` only when
 | `/skills` | screen `skills` | *coding*: lists only the provider's entries. |
 | `/status` | screen `status` | Session, model, mode and workspace. |
 | `/rules` | screen `rules` | *coding*: the session repository's rules (`server.rules.*`). |
-| `/permissions [mode]` | screen `permissions` | *coding*: provider modes and Codex approval presets; the argument (an id or label) selects one. |
+| `/permissions [mode]` | screen `permissions` | *coding*: provider modes and Codex approval presets; the argument (an id or label) selects one. The phone's mode chip uses it. |
 | `/usage` | screen `usage` | *coding*: provider usage and rate limits. |
 | `/diff` | screen `changes` | *coding*: `session.changes`. |
 | `/new` | screen `new` | A new session on the same computer or server. |

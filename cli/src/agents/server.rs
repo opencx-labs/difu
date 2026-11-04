@@ -217,6 +217,9 @@ struct Service {
     pods: Arc<dyn super::sandbox::Runner>,
     /// Disk status and cleanups on a server, started on first use.
     disk: std::sync::OnceLock<Arc<crate::cloud::disk::Monitor>>,
+    /// This machine's models, for automatic new-session models; a fixture in
+    /// tests.
+    catalog: Arc<super::effective::Catalog>,
 }
 
 pub fn home(storage: &Storage) -> Result<PathBuf> {
@@ -385,21 +388,35 @@ impl Service {
                 .collect::<String>()
         ))
     }
+    /// This machine's new-session defaults as sessions get them.
+    fn effective(&self) -> Result<super::effective::Defaults> {
+        let config = self.store.storage.load_config()?;
+        Ok(super::effective::Defaults::new(
+            config.agent_defaults,
+            || self.catalog.get(),
+            config.server.enabled,
+        ))
+    }
     fn insert_session(
         &self,
         mut job: Job,
         empty: bool,
-        defaults: Option<&crate::storage::AgentDefaults>,
+        start: Option<&super::effective::Resolved>,
     ) -> Result<String> {
         let id = self.new_id()?;
         if let Job::Coding(launch) = &mut job {
             launch.isolated = true;
+            if let Some(start) = start {
+                launch.model.clone_from(&start.model);
+                launch.effort.clone_from(&start.effort);
+            }
         }
         let mut session = Session::new(id.clone(), job);
-        if let Some(defaults) = defaults {
-            defaults.validate()?;
-            session.provider = defaults.resolved_provider();
-            session.permission_state.pending_mode = defaults.starting_mode.clone();
+        if let Some(start) = start {
+            session.provider = start.provider;
+            session.permission_state.pending_mode = start.starting_mode.clone();
+            session.permission_state.pending_preset = start.preset;
+            session.permission_state.automatic_start = start.automatic_start;
         }
         super::rules::capture(&self.store.storage, &mut session)?;
         if empty {
@@ -1128,7 +1145,7 @@ impl Service {
                 remember_repository,
                 server: None,
             } => {
-                defaults.validate()?;
+                let start = self.effective()?.resolve(&defaults)?;
                 crate::cloud::disk::guard(&self.store.storage)?;
                 let root = match super::workspace::repository(
                     defaults.repository.as_deref().unwrap_or(&cwd),
@@ -1153,16 +1170,29 @@ impl Service {
                     }
                     .into(),
                     prompt: String::new(),
-                    model: defaults.model.clone(),
-                    effort: defaults.effort.clone(),
+                    model: start.model.clone(),
+                    effort: start.effort.clone(),
                 });
                 Ok(Reply::Launched(self.insert_session(
                     job,
                     true,
-                    Some(&defaults),
+                    Some(&start),
                 )?))
             }
-            Request::Launch { job } => {
+            Request::Launch {
+                job,
+                effective_defaults,
+            } => {
+                let start = match (&*job, effective_defaults) {
+                    (Job::Coding(launch), true) => {
+                        Some(self.effective()?.resolve(&crate::storage::AgentDefaults {
+                            model: launch.model.clone(),
+                            effort: launch.effort.clone(),
+                            ..crate::storage::AgentDefaults::default()
+                        })?)
+                    }
+                    _ => None,
+                };
                 let _launch_guard = self
                     .launch_lock
                     .lock()
@@ -1180,7 +1210,7 @@ impl Service {
                         return Ok(Reply::Launched(existing.id.clone()));
                     }
                 }
-                let id = self.insert_session(*job, false, None)?;
+                let id = self.insert_session(*job, false, start.as_ref())?;
                 Ok(Reply::Launched(id))
             }
             Request::Control { id, control } => {
@@ -1991,9 +2021,9 @@ impl Service {
                 &Cancel::default(),
             )?)),
             Request::Defaults { cwd, server: None } => super::engine::defaults(&cwd),
-            Request::AgentDefaults { server: None } => Ok(Reply::AgentDefaults(
-                self.store.storage.load_config()?.agent_defaults,
-            )),
+            Request::AgentDefaults { server: None } => {
+                Ok(Reply::AgentDefaults(Box::new(self.effective()?)))
+            }
             Request::DefaultModel {
                 server: None,
                 model,
@@ -2001,11 +2031,14 @@ impl Service {
             } => {
                 let mut draft = self.store.storage.settings_draft()?;
                 draft.select_default_model(model, effort)?;
-                let config = self.store.storage.save_settings_draft(&mut draft)?;
-                Ok(Reply::AgentDefaults(config.agent_defaults))
+                self.store.storage.save_settings_draft(&mut draft)?;
+                Ok(Reply::AgentDefaults(Box::new(self.effective()?)))
             }
             Request::Models { server: None } => {
-                Ok(Reply::Models(provider::models(&Cancel::default())?))
+                let models = provider::models(&Cancel::default())?;
+                // The picker's list is the newest catalog for automatic models too.
+                self.catalog.remember(&models);
+                Ok(Reply::Models(models))
             }
             Request::Defaults {
                 server: Some(server),
@@ -2291,6 +2324,7 @@ pub fn run(storage: Storage) -> Result<()> {
         federation: Some(federation),
         pods: super::sandbox::podman(),
         disk: std::sync::OnceLock::new(),
+        catalog: Arc::new(super::effective::Catalog::discover()),
     });
     ensure_orchestrator(&service.store)?;
     let _pr_cache =
@@ -2540,6 +2574,7 @@ mod federation_tests {
             federation: federation.map(Arc::new),
             pods: super::sandbox::podman(),
             disk: std::sync::OnceLock::new(),
+            catalog: Arc::new(super::effective::tests::fixture_catalog()),
         });
         Ok((temp, service))
     }
@@ -2906,7 +2941,7 @@ mod federation_tests {
         else {
             anyhow::bail!("server defaults");
         };
-        assert_eq!(remote, crate::cloud::federation::tests::server_defaults());
+        assert_eq!(*remote, crate::cloud::federation::tests::server_defaults());
         // Saving here goes through the settings draft, so the provider follows.
         let Reply::AgentDefaults(saved) = agents.handle(Request::DefaultModel {
             server: None,
@@ -2917,7 +2952,9 @@ mod federation_tests {
             anyhow::bail!("saved defaults");
         };
         let config = agents.store.storage.load_config()?.agent_defaults;
-        assert_eq!(saved, config);
+        assert_eq!(saved.saved, config);
+        assert_eq!(saved.model.as_deref(), Some("claude/opus"));
+        assert!(!saved.automatic_model);
         assert_eq!(
             (
                 config.model.as_deref(),
@@ -3039,6 +3076,7 @@ mod routed_queue_tests {
             federation: None,
             pods: super::sandbox::podman(),
             disk: std::sync::OnceLock::new(),
+            catalog: Arc::new(super::effective::tests::fixture_catalog()),
         };
         let mut route = slack::Route {
             account: "account".into(),
@@ -3118,6 +3156,7 @@ mod routed_queue_tests {
             federation: None,
             pods: super::sandbox::podman(),
             disk: std::sync::OnceLock::new(),
+            catalog: Arc::new(super::effective::tests::fixture_catalog()),
         };
         service.handle(Request::SlackControl {
             id: "worker".into(),
@@ -3271,6 +3310,7 @@ mod clear_tests {
             federation: None,
             pods: super::sandbox::podman(),
             disk: std::sync::OnceLock::new(),
+            catalog: Arc::new(super::effective::tests::fixture_catalog()),
         };
         assert!(crate::github::store::load(&service.store.storage, &pr).is_none());
         let scope = crate::process::fixture::Scope::new(
@@ -3464,6 +3504,7 @@ mod clear_tests {
                 federation: None,
                 pods: super::sandbox::podman(),
                 disk: std::sync::OnceLock::new(),
+                catalog: Arc::new(super::effective::tests::fixture_catalog()),
             });
 
             // Pause cleanup to observe progress before the clear request returns.
@@ -3621,6 +3662,7 @@ mod move_tests {
             federation: federation.map(Arc::new),
             pods: super::sandbox::podman(),
             disk: std::sync::OnceLock::new(),
+            catalog: Arc::new(super::effective::tests::fixture_catalog()),
         })
     }
 
@@ -3937,6 +3979,7 @@ mod session_tool_tests {
             federation: None,
             pods: super::super::sandbox::podman(),
             disk: std::sync::OnceLock::new(),
+            catalog: Arc::new(super::effective::tests::fixture_catalog()),
         }))
     }
     fn tool(service: &Service, name: &str, args: Value) -> Result<Value> {
@@ -4209,6 +4252,7 @@ mod server_delete_tests {
             federation: None,
             pods: pods.clone(),
             disk: std::sync::OnceLock::new(),
+            catalog: Arc::new(super::effective::tests::fixture_catalog()),
         };
         assert!(matches!(
             service.handle(Request::Delete { id: id.into() })?,
@@ -4308,6 +4352,7 @@ mod disk_tests {
             federation: None,
             pods: Podman::replying(&[]),
             disk: std::sync::OnceLock::new(),
+            catalog: Arc::new(super::effective::tests::fixture_catalog()),
         };
         Ok(Fixture {
             _temp: temp,
@@ -4444,6 +4489,255 @@ mod disk_tests {
     }
 }
 
+#[cfg(test)]
+mod defaults_tests {
+    use super::*;
+    use crate::{
+        agents::{
+            effective::tests::{catalog, fixed_catalog},
+            permissions::CodexPreset,
+            provider::Provider,
+        },
+        storage::AgentDefaults,
+    };
+
+    /// A service on a machine with Claude Opus 4.7, with a repository.
+    fn service(server: bool) -> Result<(tempfile::TempDir, PathBuf, Service)> {
+        let temp = tempfile::tempdir()?;
+        let repository = temp.path().join("repo");
+        fs::create_dir(&repository)?;
+        crate::cloud::disk::tests::git(&repository, &["init", "-b", "main"])?;
+        let store = Arc::new(Store::fixture(temp.path().into(), Vec::new()));
+        store
+            .storage
+            .update_config(|config| config.server.enabled = server)?;
+        let service = Service {
+            remote: super::remote::Remote::start(store.storage.clone()),
+            store,
+            workers: Mutex::new(BTreeMap::new()),
+            action_locks: Mutex::new(BTreeMap::new()),
+            launch_lock: Mutex::new(()),
+            federation: None,
+            pods: super::sandbox::podman(),
+            disk: std::sync::OnceLock::new(),
+            catalog: Arc::new(fixed_catalog(catalog())),
+        };
+        Ok((temp, repository, service))
+    }
+
+    /// What a new session starts with, before its (empty) worker does
+    /// anything; no provider starts for an empty session.
+    fn started(service: &Service, reply: Reply) -> Result<Session> {
+        let Reply::Launched(id) = reply else {
+            anyhow::bail!("expected a launch");
+        };
+        let session = service.store.get(&id)?;
+        service.stop_worker(&id)?;
+        Ok(session)
+    }
+
+    fn launch(session: &Session) -> (Option<&str>, Option<&str>) {
+        match &session.job {
+            Job::Coding(launch) => (launch.model.as_deref(), launch.effort.as_deref()),
+            _ => (None, None),
+        }
+    }
+
+    fn new_agent(repository: &std::path::Path, defaults: AgentDefaults) -> Request {
+        Request::NewAgent {
+            defaults: AgentDefaults {
+                repository: Some(repository.into()),
+                ..defaults
+            },
+            cwd: repository.into(),
+            remember_repository: false,
+            server: None,
+        }
+    }
+
+    #[test]
+    fn new_sessions_fill_blank_choices_from_the_effective_defaults() -> Result<()> {
+        let (_temp, repository, service) = service(true)?;
+        let automatic = started(
+            &service,
+            service.handle(new_agent(&repository, AgentDefaults::default()))?,
+        )?;
+        assert_eq!(automatic.provider, Provider::Claude);
+        assert_eq!(
+            launch(&automatic),
+            (Some("claude/claude-opus-4-7"), Some("xhigh"))
+        );
+        let state = &automatic.permission_state;
+        assert_eq!(state.pending_mode.as_deref(), Some("auto"));
+        assert_eq!(state.pending_preset, None);
+        assert!(state.automatic_start, "a refused Auto falls back");
+        // A Codex model gets "Approve for me" there, never Full Access.
+        let codex = started(
+            &service,
+            service.handle(new_agent(
+                &repository,
+                AgentDefaults {
+                    model: Some("gpt-5.6".into()),
+                    ..AgentDefaults::default()
+                },
+            ))?,
+        )?;
+        assert_eq!(codex.provider, Provider::Codex);
+        assert_eq!(launch(&codex), (Some("gpt-5.6"), None));
+        assert_eq!(
+            codex.permission_state.pending_preset,
+            Some(CodexPreset::Auto)
+        );
+        assert_eq!(codex.permission_state.pending_mode, None);
+        assert!(codex.permission_state.automatic_start);
+        // Chosen ones are kept and strict.
+        let chosen = started(
+            &service,
+            service.handle(new_agent(
+                &repository,
+                AgentDefaults {
+                    model: Some("claude/sonnet".into()),
+                    effort: Some("high".into()),
+                    starting_mode: Some("plan".into()),
+                    ..AgentDefaults::default()
+                },
+            ))?,
+        )?;
+        assert_eq!(launch(&chosen), (Some("claude/sonnet"), Some("high")));
+        assert_eq!(
+            chosen.permission_state.pending_mode.as_deref(),
+            Some("plan")
+        );
+        assert!(!chosen.permission_state.automatic_start);
+        // A mode the provider lacks is refused before anything starts.
+        let refused = service.handle(new_agent(
+            &repository,
+            AgentDefaults {
+                model: Some("gpt-5.6".into()),
+                starting_mode: Some("acceptEdits".into()),
+                ..AgentDefaults::default()
+            },
+        ));
+        assert!(refused.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn computers_keep_provider_modes_and_saved_defaults_win() -> Result<()> {
+        let (_temp, repository, service) = service(false)?;
+        let automatic = started(
+            &service,
+            service.handle(new_agent(&repository, AgentDefaults::default()))?,
+        )?;
+        assert_eq!(
+            launch(&automatic),
+            (Some("claude/claude-opus-4-7"), Some("xhigh"))
+        );
+        assert_eq!(automatic.permission_state.pending_mode, None);
+        assert!(!automatic.permission_state.automatic_start);
+        service.store.storage.update_config(|config| {
+            config.agent_defaults.provider = Some(Provider::Codex);
+            config.agent_defaults.starting_mode = Some("plan".into());
+            config.agent_defaults.codex_preset = Some(CodexPreset::ReadOnly);
+        })?;
+        let saved = started(
+            &service,
+            service.handle(new_agent(&repository, AgentDefaults::default()))?,
+        )?;
+        assert_eq!(saved.provider, Provider::Codex);
+        assert_eq!(launch(&saved), (None, None));
+        assert_eq!(saved.permission_state.pending_mode.as_deref(), Some("plan"));
+        assert_eq!(
+            saved.permission_state.pending_preset,
+            Some(CodexPreset::ReadOnly)
+        );
+        assert!(!saved.permission_state.automatic_start);
+        Ok(())
+    }
+
+    #[test]
+    fn sessions_agents_start_use_the_same_defaults() -> Result<()> {
+        let (_temp, repository, service) = service(true)?;
+        let job = |model: Option<&str>| {
+            Box::new(Job::Coding(Launch {
+                repository: repository.clone(),
+                isolated: true,
+                base: "HEAD".into(),
+                prompt: String::new(),
+                model: model.map(String::from),
+                effort: None,
+            }))
+        };
+        let peer = started(
+            &service,
+            service.handle(Request::Launch {
+                job: job(None),
+                effective_defaults: true,
+            })?,
+        )?;
+        assert_eq!(peer.provider, Provider::Claude);
+        assert_eq!(
+            launch(&peer),
+            (Some("claude/claude-opus-4-7"), Some("xhigh"))
+        );
+        assert_eq!(peer.permission_state.pending_mode.as_deref(), Some("auto"));
+        let codex = started(
+            &service,
+            service.handle(Request::Launch {
+                job: job(Some("gpt-5.6")),
+                effective_defaults: true,
+            })?,
+        )?;
+        assert_eq!(
+            codex.permission_state.pending_preset,
+            Some(CodexPreset::Auto)
+        );
+        // Other jobs (guides, voice checks) launch exactly as asked.
+        let plain = started(
+            &service,
+            service.handle(Request::Launch {
+                job: job(None),
+                effective_defaults: false,
+            })?,
+        )?;
+        assert_eq!(plain.provider, Provider::Codex);
+        assert_eq!(launch(&plain), (None, None));
+        assert_eq!(plain.permission_state.pending_mode, None);
+        assert_eq!(plain.permission_state.pending_preset, None);
+        Ok(())
+    }
+
+    #[test]
+    fn location_defaults_report_saved_and_automatic_values() -> Result<()> {
+        let (_temp, _repository, service) = service(true)?;
+        let Reply::AgentDefaults(defaults) =
+            service.handle(Request::AgentDefaults { server: None })?
+        else {
+            anyhow::bail!("defaults");
+        };
+        assert!(defaults.server && defaults.automatic_model);
+        assert_eq!(defaults.model.as_deref(), Some("claude/claude-opus-4-7"));
+        assert_eq!(defaults.claude.mode.as_deref(), Some("auto"));
+        assert_eq!(defaults.codex.preset, Some(CodexPreset::Auto));
+        // The model picker's discovery refreshes the catalog it uses.
+        service
+            .catalog
+            .remember(&[crate::agents::effective::tests::model(
+                "claude/claude-opus-5",
+                "Opus 5",
+                &["high", "max"],
+            )]);
+        let Reply::AgentDefaults(newer) =
+            service.handle(Request::AgentDefaults { server: None })?
+        else {
+            anyhow::bail!("defaults");
+        };
+        assert_eq!(newer.model.as_deref(), Some("claude/claude-opus-5"));
+        assert_eq!(newer.effort.as_deref(), Some("max"));
+        Ok(())
+    }
+}
+
 /// A real service answering on the storage's socket, for clients tested end to
 /// end (the phone API). Stops accepting and removes the socket when dropped.
 #[cfg(test)]
@@ -4455,6 +4749,14 @@ pub(super) struct Served {
 #[cfg(test)]
 impl Served {
     pub(super) fn start(home: PathBuf, sessions: Vec<Session>) -> Result<Self> {
+        Self::start_with(home, sessions, Vec::new())
+    }
+    /// A service whose machine offers `models` for automatic defaults.
+    pub(super) fn start_with(
+        home: PathBuf,
+        sessions: Vec<Session>,
+        models: Vec<crate::model::ModelInfo>,
+    ) -> Result<Self> {
         use std::sync::atomic::{AtomicBool, Ordering};
         let store = Arc::new(Store::fixture(home, sessions));
         let service = Arc::new(Service {
@@ -4466,6 +4768,7 @@ impl Served {
             federation: None,
             pods: super::sandbox::podman(),
             disk: std::sync::OnceLock::new(),
+            catalog: Arc::new(super::effective::tests::fixed_catalog(models)),
         });
         let path = socket(&store.storage)?;
         let listener = UnixListener::bind(&path)?;

@@ -518,7 +518,7 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
         "agents.new" => new_session(inner, params),
         "agents.repositories" => Ok(json!({"repositories": repositories(inner)?})),
         "agents.models" => models(inner),
-        "agents.defaults" => Ok(super::defaults::get(&inner.storage)),
+        "agents.defaults" => super::defaults::get(&inner.storage),
         "agents.defaults.set" => super::defaults::set(&inner.storage, params),
         "reviews.inbox" => reviews::inbox(
             &inner.storage,
@@ -824,7 +824,6 @@ fn new_session(inner: &Inner, params: &Value) -> Result<Value> {
     // Before a repository is cloned for it.
     crate::cloud::disk::guard(&inner.storage)?;
     let config = config(&inner.storage);
-    let saved = config.agent_defaults;
     // A server also takes `owner/name`, adding and cloning it when needed.
     let repository = match optional::<String>(params, "repository")? {
         Some(repository) if config.server.enabled => {
@@ -832,12 +831,7 @@ fn new_session(inner: &Inner, params: &Value) -> Result<Value> {
         }
         repository => repository.map(PathBuf::from),
     };
-    let defaults = phone_defaults(
-        saved,
-        repository,
-        optional::<String>(params, "model")?.filter(|m| !m.is_empty()),
-        optional::<String>(params, "effort")?.filter(|e| !e.is_empty()),
-    );
+    let defaults = phone_choices(params, repository, &config.agent_defaults)?;
     ensure!(
         defaults.repository.is_some(),
         "Choose a repository for the new session"
@@ -866,33 +860,37 @@ fn new_session(inner: &Inner, params: &Value) -> Result<Value> {
     Ok(json!({"id": id}))
 }
 
-/// The saved new-session defaults with the phone's choices. A chosen model
-/// picks its own provider, so the saved provider and the saved effort and
-/// starting mode, which belong to it, apply only when they match.
-fn phone_defaults(
-    saved: AgentDefaults,
+/// The phone's choices for `agents.new`. Blank ones are left to the service,
+/// which fills them from this machine's effective defaults exactly as for the
+/// terminal's new-session form: a chosen model picks its own provider, and
+/// the saved effort and starting mode apply only where they belong.
+fn phone_choices(
+    params: &Value,
     repository: Option<PathBuf>,
-    model: Option<String>,
-    effort: Option<String>,
-) -> AgentDefaults {
-    let repository = repository.or(saved.repository.clone());
-    let Some(model) = model else {
-        return AgentDefaults {
-            repository,
-            effort: effort.or(saved.effort.clone()),
-            ..saved
-        };
+    saved: &AgentDefaults,
+) -> Result<AgentDefaults> {
+    let text = |key: &str| -> Result<Option<String>> {
+        Ok(optional::<String>(params, key)?
+            .map(|text| text.trim().to_owned())
+            .filter(|text| !text.is_empty()))
     };
-    let provider = Provider::for_model(Some(&model));
-    let same = saved.resolved_provider() == provider;
-    AgentDefaults {
-        provider: Some(provider),
-        starting_mode: saved.starting_mode.filter(|_| same),
-        repository,
-        model: Some(model),
-        effort: effort.or(saved.effort.filter(|_| same)),
+    let codex_preset = match text("codexPreset")? {
+        Some(preset) => Some(
+            super::super::permissions::CodexPreset::parse(&preset).with_context(|| {
+                format!("Unknown Codex preset `{preset}`; choose Ask, Auto, Full or ReadOnly")
+            })?,
+        ),
+        None => None,
+    };
+    Ok(AgentDefaults {
+        provider: None,
+        starting_mode: text("startingMode")?,
+        repository: repository.or_else(|| saved.repository.clone()),
+        model: text("model")?,
+        effort: text("effort")?,
         isolated: saved.isolated,
-    }
+        codex_preset,
+    })
 }
 
 /// Repositories difu already knows: the default, review clones, local diff
@@ -1394,7 +1392,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chosen_model_picks_its_provider_for_new_sessions() {
+    fn phone_choices_leave_blanks_to_the_effective_defaults() -> Result<()> {
         let saved = AgentDefaults {
             provider: Some(Provider::Codex),
             starting_mode: Some("plan".into()),
@@ -1402,43 +1400,48 @@ mod tests {
             model: Some("gpt-5.5".into()),
             effort: Some("xhigh".into()),
             isolated: true,
+            codex_preset: None,
         };
-        let claude = phone_defaults(saved.clone(), None, Some("claude/opus".into()), None);
-        assert_eq!(claude.provider, Some(Provider::Claude));
-        assert_eq!(claude.model.as_deref(), Some("claude/opus"));
-        assert_eq!(claude.effort, None, "Codex's saved effort stays with Codex");
-        assert_eq!(claude.starting_mode, None);
-        assert_eq!(claude.repository.as_deref(), Some(Path::new("/saved")));
-        assert!(claude.validate().is_ok());
-        let codex = phone_defaults(
-            saved.clone(),
+        let chosen = phone_choices(
+            &json!({"model": "claude/opus", "effort": "high", "startingMode": "auto",
+                    "codexPreset": "approve for me"}),
             Some("/repo".into()),
-            Some("gpt-5.6".into()),
-            None,
-        );
-        assert_eq!(codex.provider, Some(Provider::Codex));
-        assert_eq!(codex.effort.as_deref(), Some("xhigh"));
-        assert_eq!(codex.starting_mode.as_deref(), Some("plan"));
-        assert_eq!(codex.repository.as_deref(), Some(Path::new("/repo")));
-        let default = phone_defaults(saved, None, None, Some("low".into()));
-        assert_eq!(default.provider, Some(Provider::Codex));
-        assert_eq!(default.model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(default.effort.as_deref(), Some("low"));
-        let unsaved = phone_defaults(
+            &saved,
+        )?;
+        assert_eq!(
+            chosen,
             AgentDefaults {
                 provider: None,
-                model: Some("claude/sonnet".into()),
-                ..AgentDefaults::default()
-            },
-            None,
-            Some("gpt-5.6".into()),
-            None,
+                starting_mode: Some("auto".into()),
+                repository: Some("/repo".into()),
+                model: Some("claude/opus".into()),
+                effort: Some("high".into()),
+                isolated: true,
+                codex_preset: Some(super::super::super::permissions::CodexPreset::Auto),
+            }
         );
-        assert_eq!(unsaved.resolved_provider(), Provider::Codex);
+        // Blank and null choices stay blank for the service; the saved
+        // repository is the default.
+        let blank = phone_choices(
+            &json!({"model": "", "effort": null, "startingMode": " "}),
+            None,
+            &saved,
+        )?;
+        assert_eq!(
+            blank,
+            AgentDefaults {
+                repository: Some("/saved".into()),
+                ..AgentDefaults::default()
+            }
+        );
+        let unknown = phone_choices(&json!({"codexPreset": "yolo"}), None, &saved);
+        let message = unknown.err().context("unknown preset")?.to_string();
+        assert!(message.contains("Unknown Codex preset"), "{message}");
+        Ok(())
     }
 
     #[test]
-    fn new_phone_sessions_ask_for_the_provider_of_their_model() -> Result<()> {
+    fn new_phone_sessions_send_their_choices_to_the_service() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let storage = storage(&dir);
         storage.update_config(|config| {
@@ -1448,16 +1451,18 @@ mod tests {
         let fake = serve(&storage, coding(Provider::Codex), Vec::new())?;
         let result = new_session(
             &connection(&storage).0,
-            &json!({"repository": "/repo", "model": "claude/opus", "effort": null}),
+            &json!({"repository": "/repo", "model": "claude/opus", "effort": null,
+                    "startingMode": "plan"}),
         )?;
         assert_eq!(result, json!({"id": "new"}));
         let actions = fake.actions()?;
         let [Request::NewAgent { defaults, .. }] = actions.as_slice() else {
             anyhow::bail!("one new session request");
         };
-        assert_eq!(defaults.provider, Some(Provider::Claude));
+        assert_eq!(defaults.provider, None, "the model picks it");
         assert_eq!(defaults.model.as_deref(), Some("claude/opus"));
         assert_eq!(defaults.effort, None);
+        assert_eq!(defaults.starting_mode.as_deref(), Some("plan"));
         Ok(())
     }
 

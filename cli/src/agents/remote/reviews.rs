@@ -290,6 +290,7 @@ pub fn generate(storage: &Storage, key: &PrKey) -> Result<Value> {
                 snapshot: Box::new(snapshot),
                 model,
             }),
+            effective_defaults: false,
         },
     )?
     else {

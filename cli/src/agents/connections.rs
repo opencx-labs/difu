@@ -179,9 +179,10 @@ pub fn capabilities(
     })
 }
 
-struct Deadline(std::sync::mpsc::Sender<()>);
+/// Cancels `cancel` after ten seconds unless dropped first.
+pub(crate) struct Deadline(std::sync::mpsc::Sender<()>);
 impl Deadline {
-    fn new(cancel: Cancel) -> Self {
+    pub(crate) fn new(cancel: Cancel) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             if rx.recv_timeout(std::time::Duration::from_secs(10))

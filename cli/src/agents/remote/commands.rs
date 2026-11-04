@@ -344,13 +344,6 @@ pub fn model_arguments(
     Ok((session.model.clone(), Some((*effort).to_owned())))
 }
 
-const PRESETS: [CodexPreset; 4] = [
-    CodexPreset::Ask,
-    CodexPreset::Auto,
-    CodexPreset::Full,
-    CodexPreset::ReadOnly,
-];
-
 /// The mode (or Codex approval preset) `/permissions <choice>` names, by id or
 /// label.
 pub fn permission_action(provider: Provider, choice: &str) -> Result<permissions::Action> {
@@ -366,15 +359,13 @@ pub fn permission_action(provider: Provider, choice: &str) -> Result<permissions
         });
     }
     if provider == Provider::Codex
-        && let Some(preset) = PRESETS.into_iter().find(|p| {
-            format!("{p:?}").eq_ignore_ascii_case(choice) || p.label().eq_ignore_ascii_case(choice)
-        })
+        && let Some(preset) = CodexPreset::parse(choice)
     {
         return Ok(permissions::Action::SetPreset { preset });
     }
     let mut names: Vec<String> = modes.iter().map(|m| m.id.clone()).collect();
     if provider == Provider::Codex {
-        names.extend(PRESETS.iter().map(|p| format!("{p:?}")));
+        names.extend(CodexPreset::ALL.iter().map(|p| p.id().to_owned()));
     }
     bail!(
         "Unknown mode `{choice}` for {}; choose {}",

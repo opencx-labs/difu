@@ -61,7 +61,7 @@ impl Ui {
                 Modal::Resources { .. } => AGENT_RESOURCE_LIST,
                 Modal::Subagents { .. } => AGENT_RESOURCE_PICKER,
                 Modal::AgentDefaults(form) => {
-                    if form.field < 3 {
+                    if form.field < defaults::FIELDS {
                         AGENT_DEFAULTS
                     } else {
                         AGENT_DEFAULTS_BUTTON

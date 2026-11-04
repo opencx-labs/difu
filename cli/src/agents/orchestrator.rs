@@ -179,17 +179,12 @@ pub(super) fn handle(store: &Store, caller: &str, args: &Value) -> Result<Value>
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .into(),
-                model: args
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .map(String::from)
-                    .or(defaults.model),
-                effort: args
-                    .get("effort")
-                    .and_then(Value::as_str)
-                    .map(String::from)
-                    .or(defaults.effort),
+                model: args.get("model").and_then(Value::as_str).map(String::from),
+                effort: args.get("effort").and_then(Value::as_str).map(String::from),
             })),
+            // Blank model and effort, the starting mode and the preset come
+            // from this machine's new-session defaults.
+            effective_defaults: true,
         }
     } else {
         let id = required(args, "id")?;

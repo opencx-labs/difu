@@ -1,8 +1,27 @@
 use super::*;
 use crate::{
+    agents::permissions::{self, CodexPreset},
     shortcuts::{Bindings, ids::*},
     storage::AgentDefaults,
 };
+use provider::Provider;
+
+/// The editable fields: repository, model, reasoning, starting mode and Codex
+/// approvals; the Save button comes after them.
+pub(super) const FIELDS: usize = 5;
+pub(super) const SAVE: usize = FIELDS;
+const MODE: usize = 3;
+const APPROVALS: usize = 4;
+/// Typed in the model field: Codex's configured model rather than the
+/// automatic one.
+const CODEX_MODEL: &str = "codex";
+
+/// Whether `provider` offers the starting mode `mode`.
+fn offers(provider: Provider, mode: &str) -> bool {
+    permissions::mode_choices(provider)
+        .iter()
+        .any(|choice| choice.id == mode)
+}
 
 pub struct Settings {
     draft: crate::settings::SettingsDraft,
@@ -19,10 +38,24 @@ pub struct Settings {
     inherited: Option<String>,
     inherited_cwd: Option<std::path::PathBuf>,
     inherited_rx: Option<mpsc::Receiver<Result<String, String>>>,
+    /// The provider of a blank (automatic) model here: Claude Code, unless
+    /// this Mac has no Claude models.
+    automatic: Provider,
+    /// This Mac is a difu server (Auto starting modes).
+    server: bool,
+    /// This Mac's effective defaults, as last read from the service.
+    effective: Option<super::super::effective::Defaults>,
+    effective_rx: Option<mpsc::Receiver<Result<super::super::effective::Defaults, String>>>,
 }
 impl Settings {
     fn new(defaults: AgentDefaults) -> Self {
         let provider = defaults.resolved_provider();
+        // Codex's configured model is spelled out; blank is automatic.
+        let model = match (&defaults.model, defaults.provider) {
+            (Some(model), _) => model.clone(),
+            (None, Some(Provider::Codex)) => CODEX_MODEL.into(),
+            (None, _) => String::new(),
+        };
         Self {
             draft: crate::settings::SettingsDraft::new(Config {
                 agent_defaults: defaults.clone(),
@@ -36,8 +69,10 @@ impl Settings {
                         .map(|p| p.to_string_lossy().into_owned())
                         .unwrap_or_default(),
                 ),
-                Editor::from(defaults.model.unwrap_or_default()),
+                Editor::from(model.as_str()),
                 Editor::from(defaults.effort.unwrap_or_default()),
+                Editor::from(defaults.starting_mode.unwrap_or_default()),
+                Editor::from(defaults.codex_preset.map(|p| p.id()).unwrap_or_default()),
             ],
             field: 0,
             error: None,
@@ -50,16 +85,50 @@ impl Settings {
             inherited: None,
             inherited_cwd: None,
             inherited_rx: None,
+            automatic: Provider::Claude,
+            server: false,
+            effective: None,
+            effective_rx: None,
         }
     }
+    /// The model field's model; `None` for a blank (automatic) one and for
+    /// Codex's configured model.
+    fn model(&self) -> Option<String> {
+        self.value(1)
+            .filter(|model| !model.eq_ignore_ascii_case(CODEX_MODEL))
+    }
+    /// The provider the model field picks: the model's, Codex for `codex`,
+    /// and the automatic model's when blank.
+    fn model_provider(&self) -> Provider {
+        match self.value(1) {
+            Some(model) => Provider::for_model(Some(&model)),
+            None => self.automatic,
+        }
+    }
+    /// This Mac's effective defaults arrived.
+    fn receive(&mut self, defaults: super::super::effective::Defaults) {
+        let saved = &defaults.saved;
+        // Without Claude models a blank model is Codex's configured one.
+        if saved.model.is_none() && saved.provider != Some(Provider::Codex) {
+            self.automatic = defaults.provider;
+        }
+        self.server = defaults.server;
+        self.effective = Some(defaults);
+        self.changed();
+    }
     pub(super) fn changed(&mut self) {
-        let provider = self
-            .value(1)
-            .map(|model| super::super::provider::Provider::for_model(Some(&model)))
-            .unwrap_or(self.draft.config().agent_defaults.resolved_provider());
+        let provider = self.model_provider();
         if provider != self.provider {
             if let Some(effort) = self.fields.get_mut(2) {
                 *effort = Editor::default();
+            }
+            // Starting modes belong to a provider too.
+            if self
+                .value(MODE)
+                .is_some_and(|mode| !offers(provider, &mode))
+                && let Some(mode) = self.fields.get_mut(MODE)
+            {
+                *mode = Editor::default();
             }
             self.provider = provider;
         }
@@ -116,7 +185,7 @@ impl Settings {
             }
         }
         if self.field == 2
-            && self.value(1).is_none()
+            && self.model().is_none()
             && self.provider == super::super::provider::Provider::Codex
         {
             let cwd = self
@@ -147,6 +216,31 @@ impl Settings {
                 Err(error) => self.error = Some(error),
             }
         }
+        if let Some(result) = self.effective_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            crate::repaint::request();
+            self.effective_rx = None;
+            if let Ok(defaults) = result {
+                self.receive(defaults);
+            }
+        }
+    }
+    /// What new sessions here start with, from the service's answer.
+    fn summary(&self) -> Option<String> {
+        let defaults = self.effective.as_ref()?;
+        let mut parts = vec![defaults.provider.label().to_owned()];
+        parts.push(
+            defaults
+                .model
+                .clone()
+                .unwrap_or_else(|| "its default model".into()),
+        );
+        if let Some(effort) = &defaults.effort {
+            parts.push(effort.clone());
+        }
+        if defaults.automatic_model {
+            parts.push("automatic".into());
+        }
+        Some(format!("New sessions here: {}", parts.join(" · ")))
     }
     fn options(&self, models: &models::State) -> Vec<String> {
         if self.field == 0 {
@@ -158,14 +252,69 @@ impl Settings {
                 })
                 .map(|name| format!("{prefix}{name}/"))
                 .collect()
-        } else if self.field < 3 {
+        } else if self.field < MODE {
+            // A blank model's levels: Codex's inherited model, or the
+            // automatic Opus.
+            let automatic = self
+                .effective
+                .as_ref()
+                .filter(|defaults| defaults.automatic_model && self.value(1).is_none())
+                .and_then(|defaults| defaults.model.clone());
             let model = self
-                .value(1)
-                .or_else(|| (self.field == 2).then(|| self.inherited.clone()).flatten())
+                .model()
+                .or_else(|| {
+                    (self.field == 2)
+                        .then(|| self.inherited.clone().or(automatic))
+                        .flatten()
+                })
                 .unwrap_or_default();
-            models.choices(&model, &self.value(2).unwrap_or_default(), self.field == 1)
+            let typed = self.value(1).unwrap_or_default();
+            let mut choices = models.choices(
+                if self.field == 1 { &typed } else { &model },
+                &self.value(2).unwrap_or_default(),
+                self.field == 1,
+            );
+            if self.field == 1 && CODEX_MODEL.contains(&typed.to_lowercase()) {
+                choices.insert(0, CODEX_MODEL.into());
+            }
+            choices
+        } else if self.field == MODE {
+            let typed = self.value(MODE).unwrap_or_default().to_lowercase();
+            permissions::mode_choices(self.model_provider())
+                .into_iter()
+                .map(|choice| choice.id)
+                .filter(|id| id.to_lowercase().contains(&typed))
+                .collect()
+        } else if self.field == APPROVALS {
+            let typed = self.value(APPROVALS).unwrap_or_default().to_lowercase();
+            CodexPreset::ALL
+                .into_iter()
+                .filter(|preset| {
+                    preset.id().to_lowercase().contains(&typed)
+                        || preset.label().to_lowercase().contains(&typed)
+                })
+                .map(|preset| preset.id().to_owned())
+                .collect()
         } else {
             Vec::new()
+        }
+    }
+    /// How an option reads in the list: modes and presets with their labels.
+    fn option_text(&self, option: &str) -> String {
+        match self.field {
+            1 if option == CODEX_MODEL => "codex · Codex's configured model".into(),
+            MODE => permissions::mode_choices(self.model_provider())
+                .into_iter()
+                .find(|choice| choice.id == option)
+                .map_or_else(
+                    || option.to_owned(),
+                    |choice| format!("{option} · {} · {}", choice.label, choice.description),
+                ),
+            APPROVALS => CodexPreset::parse(option).map_or_else(
+                || option.to_owned(),
+                |preset| format!("{option} · {}", preset.label()),
+            ),
+            _ => option.to_owned(),
         }
     }
     fn value(&self, index: usize) -> Option<String> {
@@ -180,9 +329,26 @@ impl Ui {
     pub(super) fn open_defaults(&mut self) {
         match self.storage.load_config() {
             Ok(config) => {
-                self.modal = Some(Modal::AgentDefaults(Box::new(Settings::new(
-                    config.agent_defaults,
-                ))));
+                let mut form = Settings::new(config.agent_defaults);
+                form.server = config.server.enabled;
+                if let Some(effective) = self.local_effective.clone() {
+                    form.receive(effective);
+                }
+                // What a blank model becomes needs this Mac's model catalog,
+                // which the service keeps.
+                let (tx, rx) = mpsc::channel();
+                let storage = self.storage.clone();
+                thread::spawn(move || {
+                    let result =
+                        match client::request(&storage, Request::AgentDefaults { server: None }) {
+                            Ok(Reply::AgentDefaults(defaults)) => Ok(*defaults),
+                            Ok(_) => Err("Unexpected defaults reply".to_owned()),
+                            Err(error) => Err(format!("{error:#}")),
+                        };
+                    let _ = tx.send(result);
+                });
+                form.effective_rx = Some(rx);
+                self.modal = Some(Modal::AgentDefaults(Box::new(form)));
                 // These are this Mac's defaults, so this Mac's models.
                 self.model_completion.load(&self.storage, None);
             }
@@ -197,13 +363,66 @@ impl Ui {
         };
         let result = (|| -> anyhow::Result<Config> {
             use crate::settings::{SettingId, SettingValue};
-            let model = form.value(1);
+            let saved = form.draft.config().agent_defaults.clone();
+            let model = form.model();
             let effort = form.value(2);
-            if model != form.draft.config().agent_defaults.model {
-                form.draft.select_default_model(model, effort.clone())?;
-            } else if effort != form.draft.config().agent_defaults.effort {
+            let preset = form
+                .value(APPROVALS)
+                .map(|text| {
+                    anyhow::Context::with_context(CodexPreset::parse(&text), || {
+                        format!(
+                            "Unknown Codex approvals `{text}`; choose Ask, Auto, Full or ReadOnly"
+                        )
+                    })
+                })
+                .transpose()?;
+            // A model picks its provider and `codex` picks Codex; a blank
+            // model stays automatic, with Claude Code for a mode only it has.
+            let provider = match (&model, form.value(1)) {
+                (Some(model), _) => Some(Provider::for_model(Some(model))),
+                (None, Some(_)) => Some(Provider::Codex),
+                (None, None) => form
+                    .value(MODE)
+                    .filter(|mode| !offers(Provider::Codex, mode))
+                    .map(|_| Provider::Claude),
+            };
+            let target = provider.unwrap_or_else(|| {
+                AgentDefaults {
+                    provider: None,
+                    model: model.clone(),
+                    ..AgentDefaults::default()
+                }
+                .resolved_provider()
+            });
+            // Another provider's starting mode goes with the switch.
+            let mode = form
+                .value(MODE)
+                .filter(|mode| offers(target, mode) || target == saved.resolved_provider());
+            if model != saved.model || provider != saved.provider {
+                match &model {
+                    Some(_) => form
+                        .draft
+                        .select_default_model(model.clone(), effort.clone())?,
+                    None => {
+                        if let Some(provider) = provider {
+                            form.draft.set(
+                                SettingId::Provider,
+                                SettingValue::Choice(provider.key().into()),
+                            )?;
+                        }
+                        form.draft
+                            .set(SettingId::DefaultModel, SettingValue::Text(None))?;
+                        form.draft
+                            .set(SettingId::DefaultEffort, SettingValue::Text(effort.clone()))?;
+                    }
+                }
+            } else if effort != saved.effort {
                 form.draft
                     .set(SettingId::DefaultEffort, SettingValue::Text(effort))?;
+            }
+            if mode != form.draft.config().agent_defaults.starting_mode {
+                form.draft
+                    .set(SettingId::StartingMode, SettingValue::Text(mode.clone()))?;
             }
             let repository = form.value(0);
             if repository.as_deref()
@@ -218,11 +437,28 @@ impl Ui {
                 form.draft
                     .set(SettingId::DefaultRepository, SettingValue::Text(repository))?;
             }
-            Ok(self.storage.save_settings_draft(&mut form.draft)?)
+            // Checked first for a plain message; the provider may go back to
+            // automatic, which the settings registry cannot express.
+            let mut checked = form.draft.config().agent_defaults.clone();
+            checked.provider = provider;
+            checked.codex_preset = preset;
+            checked.validate()?;
+            let config = self.storage.save_settings_draft(&mut form.draft)?;
+            if config.agent_defaults.provider == provider
+                && config.agent_defaults.codex_preset == preset
+            {
+                return Ok(config);
+            }
+            self.storage.try_patch_config(|config| {
+                config.agent_defaults.provider = provider;
+                config.agent_defaults.codex_preset = preset;
+                config.agent_defaults.validate()
+            })
         })();
         match result {
             Ok(config) => {
                 self.defaults = config.agent_defaults;
+                self.local_effective = None;
                 self.modal = None;
                 self.notice = Some(("Agent defaults saved for new sessions".into(), false));
             }
@@ -249,9 +485,9 @@ impl Ui {
                     + if action == Some(NAVIGATION_NEXT_FOCUS) {
                         1
                     } else {
-                        3
+                        SAVE
                     })
-                    % 4;
+                    % (SAVE + 1);
                 form.changed();
             }
             Some(NAVIGATION_UP | NAVIGATION_DOWN) => {
@@ -276,7 +512,7 @@ impl Ui {
         let Some(Modal::AgentDefaults(form)) = &mut self.modal else {
             return;
         };
-        if form.field == 3 {
+        if form.field == SAVE {
             self.save_defaults();
             return;
         }
@@ -290,7 +526,7 @@ impl Ui {
             form.changed();
             form.filled = true;
         } else {
-            form.field = (form.field + 1) % 4;
+            form.field = (form.field + 1) % (SAVE + 1);
             form.changed();
         }
     }
@@ -323,8 +559,18 @@ impl Ui {
         let mut buttons = Vec::new();
         let labels = [
             "Default local repository",
-            "Default model · blank inherits Codex",
-            "Default reasoning · blank uses provider default",
+            "Default model · blank: newest Claude Opus · codex: Codex's configured model",
+            "Default reasoning · blank: xhigh for the automatic Opus, else the model's",
+            if form.server {
+                "Starting mode · blank: Auto for Claude Code on this server"
+            } else {
+                "Starting mode · blank: the provider's own mode"
+            },
+            if form.server {
+                "Codex approvals · blank: Approve for me on this server"
+            } else {
+                "Codex approvals · blank: Codex's configured policy"
+            },
         ];
         for (i, label) in labels.into_iter().enumerate() {
             let rect = Rect::new(area.x, area.y.saturating_add(i as u16 * 4), area.width, 3)
@@ -334,7 +580,8 @@ impl Ui {
             }
             buttons.push((rect, Action::DefaultField(i)));
         }
-        let toggle = Rect::new(area.x, area.y + 12, area.width, 1).intersection(area);
+        let below = area.y + FIELDS as u16 * 4;
+        let toggle = Rect::new(area.x, below, area.width, 1).intersection(area);
         let rules = Rect::new(area.x, area.y + 3, area.width, 1).intersection(area);
         frame.render_widget(
             Paragraph::new(format!(
@@ -345,24 +592,27 @@ impl Ui {
             rules,
         );
         buttons.push((rules, Action::DefaultRules));
+        let note = match form.summary() {
+            Some(summary) => format!("{summary} · always in their own worktree"),
+            None => "New sessions always use an isolated worktree".into(),
+        };
         frame.render_widget(
-            Paragraph::new("New sessions always use an isolated worktree")
-                .style(Style::default().fg(TEXT)),
+            Paragraph::new(crate::model::clean(&note)).style(Style::default().fg(TEXT)),
             toggle,
         );
-        let save = Rect::new(area.x, area.y + 15, area.width, 1).intersection(area);
+        let save = Rect::new(area.x, below + 1, area.width, 1).intersection(area);
         frame.render_widget(
             Paragraph::new(format!("[ Save defaults · {} ]", hint(DEFAULTS_SAVE)))
-                .style(Style::default().fg(if form.field == 3 { ACCENT } else { TEXT })),
+                .style(Style::default().fg(if form.field == SAVE { ACCENT } else { TEXT })),
             save,
         );
         buttons.push((save, Action::DefaultSave));
         let options = form.options(&self.model_completion);
-        let top = area.y.saturating_add(17);
+        let top = below.saturating_add(3);
         let available = area.bottom().saturating_sub(top).saturating_sub(1);
         let selected = form.selected.min(options.len().saturating_sub(1));
         let first = selected.saturating_sub(usize::from(available).saturating_sub(1));
-        if form.field < 3 {
+        if form.field < SAVE {
             for (index, option) in options
                 .iter()
                 .enumerate()
@@ -380,7 +630,7 @@ impl Ui {
                     Paragraph::new(format!(
                         "{} {}",
                         if index == selected { "›" } else { " " },
-                        crate::model::clean(option)
+                        crate::model::clean(&form.option_text(option))
                     ))
                     .style(crate::ui::option_style(index == selected)),
                     rect,
@@ -425,13 +675,8 @@ impl Ui {
                 Paragraph::new(error.as_str())
                     .style(Style::default().fg(RED))
                     .wrap(Wrap { trim: false }),
-                Rect::new(
-                    area.x,
-                    area.y + 17,
-                    area.width,
-                    area.height.saturating_sub(17),
-                )
-                .intersection(area),
+                Rect::new(area.x, top, area.width, area.bottom().saturating_sub(top))
+                    .intersection(area),
             );
         }
         self.hits.extend(buttons);
@@ -575,7 +820,11 @@ mod tests {
             name: "Other".into(),
             efforts: vec!["low".into()],
         });
-        assert_eq!(form.options(&models).len(), 2); // Empty model query still shows the whole catalog.
+        // An empty model query shows Codex's configured model and the whole catalog.
+        assert_eq!(
+            form.options(&models),
+            ["codex", "inherited-model", "other-model"]
+        );
         Ok(())
     }
 }
@@ -617,19 +866,19 @@ mod shortcut_regressions {
     }
     #[test]
     fn defaults_focus_and_completion_keys_have_real_remap_and_reset_effects() -> Result<()> {
-        for field in 0..4 {
+        for field in 0..=SAVE {
             for (action, code, mods, want) in [
                 (
                     NAVIGATION_NEXT_FOCUS,
                     KeyCode::Tab,
                     KeyModifiers::NONE,
-                    (field + 1) % 4,
+                    (field + 1) % (SAVE + 1),
                 ),
                 (
                     NAVIGATION_PREVIOUS_FOCUS,
                     KeyCode::BackTab,
                     KeyModifiers::SHIFT,
-                    (field + 3) % 4,
+                    (field + SAVE) % (SAVE + 1),
                 ),
             ] {
                 for (phase, custom) in shortcut_tests::BINDING_PHASES {
@@ -647,7 +896,7 @@ mod shortcut_regressions {
                 }
             }
         }
-        for field in 0..3 {
+        for field in 0..FIELDS {
             for (action, code, start, want) in [
                 (NAVIGATION_UP, KeyCode::Up, 1, 0),
                 (NAVIGATION_DOWN, KeyCode::Down, 0, 1),
@@ -687,7 +936,7 @@ mod shortcut_regressions {
     }
     #[test]
     fn defaults_save_uses_control_predicate_and_separate_repository_rules() -> Result<()> {
-        for field in 0..4 {
+        for field in 0..=SAVE {
             for (phase, custom) in shortcut_tests::BINDING_PHASES {
                 for extra in 0..32 {
                     let (mut ui, _dir, _) = shortcut_tests::binding_fixture(DEFAULTS_SAVE, phase)?;
@@ -734,7 +983,7 @@ mod shortcut_regressions {
         // This is the existing CtrlR repository-rules action, never a defaults reset.
         let action = crate::shortcuts::find("defaults.repository_rules")
             .context("truthful repository rules action")?;
-        for field in 0..4 {
+        for field in 0..=SAVE {
             for (phase, custom) in shortcut_tests::BINDING_PHASES {
                 let (mut ui, _dir, _) = shortcut_tests::binding_fixture(action, phase)?;
                 setup(&mut ui, field);
@@ -793,7 +1042,7 @@ mod shortcut_regressions {
     }
     #[test]
     fn defaults_field_and_button_contexts_preserve_copy_globals_and_editing() -> Result<()> {
-        for field in 0..4 {
+        for field in 0..=SAVE {
             shortcut_tests::owned_modal_context(
                 |ui| {
                     setup(ui, field);
@@ -804,19 +1053,19 @@ mod shortcut_regressions {
                         editor.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
                     }
                 },
-                if field < 3 {
+                if field < FIELDS {
                     crate::shortcuts::contexts::AGENT_DEFAULTS
                 } else {
                     crate::shortcuts::contexts::AGENT_DEFAULTS_BUTTON
                 },
-                (field < 3).then_some("d"),
+                (field < FIELDS).then_some("d"),
             )?;
         }
         Ok(())
     }
     #[test]
     fn defaults_activate_fills_or_advances_each_field_and_saves_only_on_button() -> Result<()> {
-        for field in 0..4 {
+        for field in 0..=SAVE {
             for (phase, custom) in shortcut_tests::BINDING_PHASES {
                 let (mut ui, _dir, _) =
                     shortcut_tests::binding_fixture(NAVIGATION_ACTIVATE, phase)?;
@@ -835,7 +1084,7 @@ mod shortcut_regressions {
                     },
                     KeyModifiers::NONE,
                 ));
-                if field == 3 {
+                if field == SAVE {
                     assert!(ui.modal.is_none());
                     assert_eq!(
                         ui.storage.load_config()?.agent_defaults.model.as_deref(),
@@ -926,7 +1175,7 @@ mod shortcut_regressions {
     }
     #[test]
     fn repository_rules_control_predicate_keeps_all_modifiers_and_override_removal() -> Result<()> {
-        for field in 0..4 {
+        for field in 0..=SAVE {
             for (phase, custom) in shortcut_tests::BINDING_PHASES {
                 for extra in 0..32 {
                     let (mut ui, _dir, _) =
@@ -1016,6 +1265,142 @@ mod shortcut_regressions {
 mod dependent_defaults_tests {
     use super::*;
     use anyhow::{Context, Result};
+    fn ui(dir: &tempfile::TempDir) -> Result<Ui> {
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().into(),
+        };
+        let mut ui = Ui::new(storage.clone(), &storage.load_config()?);
+        ui.model_completion.options = vec![crate::model::ModelInfo {
+            id: "gpt-5.6".into(),
+            name: "GPT".into(),
+            efforts: vec!["high".into()],
+        }];
+        Ok(ui)
+    }
+    fn fill(ui: &mut Ui, values: [&str; 5]) -> Result<()> {
+        let Some(Modal::AgentDefaults(form)) = &mut ui.modal else {
+            anyhow::bail!("form")
+        };
+        for (editor, value) in form.fields.iter_mut().zip(values) {
+            *editor = Editor::from(value);
+        }
+        form.changed();
+        Ok(())
+    }
+
+    #[test]
+    fn starting_mode_and_codex_approvals_are_saved_with_an_automatic_model() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = ui(&dir)?;
+        ui.open_defaults();
+        // A Claude-only mode with a blank model keeps the model automatic
+        // (newest Opus) and saves Claude Code as the provider.
+        fill(&mut ui, ["", "", "", "acceptEdits", "approve for me"])?;
+        ui.save_defaults();
+        assert!(ui.modal.is_none(), "saved");
+        let saved = ui.storage.load_config()?.agent_defaults;
+        assert_eq!(saved.provider, Some(Provider::Claude));
+        assert_eq!(saved.model, None);
+        assert_eq!(saved.starting_mode.as_deref(), Some("acceptEdits"));
+        assert_eq!(saved.codex_preset, Some(CodexPreset::Auto));
+        // Reopened, the fields show what was saved.
+        ui.open_defaults();
+        let Some(Modal::AgentDefaults(form)) = &ui.modal else {
+            anyhow::bail!("form")
+        };
+        assert_eq!(form.value(MODE).as_deref(), Some("acceptEdits"));
+        assert_eq!(form.value(APPROVALS).as_deref(), Some("Auto"));
+        // `codex` saves Codex's configured model; its modes only.
+        fill(&mut ui, ["", "codex", "", "plan", ""])?;
+        ui.save_defaults();
+        let saved = ui.storage.load_config()?.agent_defaults;
+        assert_eq!((saved.provider, saved.model), (Some(Provider::Codex), None));
+        assert_eq!(saved.starting_mode.as_deref(), Some("plan"));
+        assert_eq!(saved.codex_preset, None);
+        ui.open_defaults();
+        let Some(Modal::AgentDefaults(form)) = &ui.modal else {
+            anyhow::bail!("form")
+        };
+        assert_eq!(form.value(1).as_deref(), Some("codex"));
+        // Blank again returns the provider to automatic.
+        fill(&mut ui, ["", "", "", "", ""])?;
+        ui.save_defaults();
+        let saved = ui.storage.load_config()?.agent_defaults;
+        assert_eq!(saved, AgentDefaults::default());
+        Ok(())
+    }
+
+    #[test]
+    fn mode_and_approval_lists_follow_the_model_and_refuse_unknown_values() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut ui = ui(&dir)?;
+        ui.open_defaults();
+        fill(&mut ui, ["", "", "", "acceptEdits", ""])?;
+        let Some(Modal::AgentDefaults(form)) = &mut ui.modal else {
+            anyhow::bail!("form")
+        };
+        // Choosing a Codex model drops the Claude-only mode.
+        *form.fields.get_mut(1).context("model")? = Editor::from("gpt-5.6");
+        form.changed();
+        assert_eq!(form.value(MODE), None);
+        form.field = MODE;
+        assert_eq!(form.options(&ui.model_completion), ["default", "plan"]);
+        assert!(
+            form.option_text("plan").starts_with("plan · Plan"),
+            "{}",
+            form.option_text("plan")
+        );
+        form.field = APPROVALS;
+        assert_eq!(
+            form.options(&ui.model_completion),
+            ["Ask", "Auto", "Full", "ReadOnly"]
+        );
+        *form.fields.get_mut(APPROVALS).context("approvals")? = Editor::from("read");
+        assert_eq!(form.options(&ui.model_completion), ["ReadOnly"]);
+        *form.fields.get_mut(APPROVALS).context("approvals")? = Editor::from("yolo");
+        ui.save_defaults();
+        assert!(
+            matches!(&ui.modal, Some(Modal::AgentDefaults(form))
+                if form.error.as_deref().is_some_and(|e| e.contains("Unknown Codex approvals"))),
+            "an unknown preset is refused"
+        );
+        assert_eq!(
+            ui.storage.load_config()?.agent_defaults,
+            AgentDefaults::default(),
+            "nothing saved"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_service_says_what_a_blank_model_becomes() -> Result<()> {
+        let mut form = Settings::new(AgentDefaults::default());
+        assert_eq!(form.summary(), None);
+        form.receive(super::super::super::effective::Defaults::new(
+            AgentDefaults::default(),
+            || Some(super::super::super::effective::tests::catalog()),
+            true,
+        ));
+        assert_eq!(
+            form.summary().as_deref(),
+            Some("New sessions here: Claude Code · claude/claude-opus-4-7 · xhigh · automatic")
+        );
+        assert!(form.server);
+        form.field = MODE;
+        let models = models::State::default();
+        assert!(form.options(&models).contains(&"auto".to_owned()));
+        // Without Claude models a blank model is Codex's configured one.
+        let mut codex = Settings::new(AgentDefaults::default());
+        codex.receive(super::super::super::effective::Defaults::new(
+            AgentDefaults::default(),
+            || None,
+            false,
+        ));
+        assert_eq!(codex.model_provider(), Provider::Codex);
+        Ok(())
+    }
+
     #[test]
     fn legacy_defaults_patch_fields_and_clear_mode_only_on_provider_change() -> Result<()> {
         let dir = tempfile::tempdir()?;

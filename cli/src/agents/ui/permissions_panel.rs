@@ -3232,3 +3232,94 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+    use crate::cloud::federation::tests::{Fake, connected, session};
+    use anyhow::Result;
+    use new_session::tests::{Service, until};
+
+    /// A Claude Code session on the saved server `box`, selected.
+    fn server_session(ui: &mut Ui) {
+        let mut session = session("box:1");
+        session.provider = provider::Provider::Claude;
+        session.permission_state.mode = Some("default".into());
+        let mut summary = session.summary();
+        summary.server = Some("box".into());
+        ui.summaries.push(summary);
+        ui.sessions.insert(session.id.clone(), session);
+        ui.selected = Some("box:1".into());
+        ui.focus = Focus::Composer;
+    }
+
+    fn composer(ui: &Ui) -> String {
+        ui.sessions
+            .get("box:1")
+            .map(|session| {
+                composer_status(session)
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn shift_tab_and_the_panel_switch_a_server_sessions_mode_there() -> Result<()> {
+        let mut remote = session("1");
+        remote.provider = provider::Provider::Claude;
+        remote.permission_state.mode = Some("default".into());
+        let fake = Fake::new(vec![remote]);
+        let (_servers, federation) = connected(vec![("box", fake.clone())])?;
+        let (mut ui, _dir, _) = super::super::shortcut_tests::fixture(None)?;
+        server_session(&mut ui);
+        let service = Service::start(&ui.storage, federation)?;
+        assert!(composer(&ui).starts_with("Manual"), "{}", composer(&ui));
+        // Shift+Tab: the server cycles its session's mode and the indicator
+        // shows what the server answered.
+        ui.key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE));
+        until(&mut ui, "the server's next mode", |ui| {
+            composer(ui).starts_with("Accept edits")
+        })?;
+        // The permissions panel's choice reaches the same server session.
+        ui.open_permissions();
+        until(
+            &mut ui,
+            "the server's permissions",
+            |ui| matches!(&ui.modal, Some(Modal::Permissions(state)) if !state.loading),
+        )?;
+        ui.request_permissions(permissions::Action::SetMode {
+            mode: "auto".into(),
+        });
+        until(&mut ui, "Auto on the server", |ui| {
+            composer(ui).starts_with("Auto")
+        })?;
+        // Reading the session back keeps the server's mode.
+        until(&mut ui, "the session read back", |ui| {
+            ui.sessions.get("box:1").is_some_and(|s| s.version > 0)
+        })?;
+        assert!(composer(&ui).starts_with("Auto"), "{}", composer(&ui));
+        drop(service);
+        let forwarded: Vec<_> = fake
+            .requests()
+            .into_iter()
+            .filter_map(|request| match request {
+                Request::Permissions { id, action } => Some((id, format!("{action:?}"))),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            forwarded.contains(&("1".to_owned(), "CycleMode".to_owned())),
+            "{forwarded:?}"
+        );
+        assert!(
+            forwarded.iter().any(|(id, action)| id == "1"
+                && action.contains("SetMode")
+                && action.contains("auto")),
+            "{forwarded:?}"
+        );
+        Ok(())
+    }
+}

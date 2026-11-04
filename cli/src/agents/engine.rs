@@ -1705,6 +1705,23 @@ fn instructions(session: &Session) -> String {
         base
     }
 }
+/// Without a server's automatic preset, the session keeps Codex's configured
+/// approvals, saying why.
+fn drop_automatic_preset(store: &Store, id: &str, reason: &str) -> Result<()> {
+    store.update(id, |s| {
+        if let Some(preset) = s.permission_state.pending_preset.take() {
+            s.note(
+                "system",
+                format!(
+                    "Codex couldn't use \"{}\", this server's default ({reason}). This session keeps Codex's configured approvals; change them with /permissions.",
+                    preset.label()
+                ),
+            );
+        }
+        s.permission_state.automatic_start = false;
+    })?;
+    store.save(id)
+}
 fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool)> {
     // Capture a legacy turn's durable outcome before reconnect resets live status.
     store.update(id, super::plan::preserve_legacy_outcome)?;
@@ -1783,7 +1800,25 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
     if resuming {
         isolation::settings(&mut params, &session)?;
     }
-    permissions_control::selected_policy(&mut params, &session, true)?;
+    // A preset chosen before the first connection (a new session's, a moved
+    // one's) is checked against Codex's managed requirements, so read them
+    // before the thread starts.
+    let mut current = None;
+    if session.permission_state.pending_preset.is_some()
+        && session.permission_state.requirements.is_null()
+    {
+        permissions_control::capabilities(&mut rpc, store, id, cancel)?;
+        current = Some(store.get(id)?);
+    }
+    let policy = current.as_ref().unwrap_or(&session);
+    if let Err(error) = permissions_control::selected_policy(&mut params, policy, true) {
+        if !policy.permission_state.automatic_start {
+            return Err(error);
+        }
+        // A server's automatic preset never blocks a session.
+        drop_automatic_preset(store, id, &format!("{error:#}"))?;
+        permissions_control::selected_policy(&mut params, &store.get(id)?, true)?;
+    }
     let response = rpc.call(
         if resuming {
             "thread/resume"
@@ -1867,6 +1902,12 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
         s.voice = false;
     })?;
     permissions_control::record_policy(store, id, &response)?;
+    if store.inspect(id, |s| {
+        s.permission_state.automatic_start && s.permission_state.pending_preset.is_some()
+    })? {
+        drop_automatic_preset(store, id, "Codex kept another policy")?;
+    }
+    store.update(id, |s| s.permission_state.automatic_start = false)?;
     permissions_control::capabilities(&mut rpc, store, id, cancel)?;
     let restored = permissions_control::restore_mode(
         &mut rpc,

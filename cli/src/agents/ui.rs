@@ -513,7 +513,10 @@ pub struct Ui {
     cloud: cloud::State,
     model_completion: models::State,
     /// Saved cloud servers' new-session defaults, as last read from each.
-    location_defaults: HashMap<String, crate::storage::AgentDefaults>,
+    location_defaults: HashMap<String, super::effective::Defaults>,
+    /// This Mac's effective new-session defaults, as last read from the
+    /// service.
+    local_effective: Option<super::effective::Defaults>,
     /// The defaults of the launch in flight, reused when the service asks for
     /// a repository first.
     launch_defaults: Option<crate::storage::AgentDefaults>,
@@ -625,6 +628,7 @@ impl Ui {
             cloud: cloud::State::default(),
             model_completion: models::State::default(),
             location_defaults: HashMap::new(),
+            local_effective: None,
             launch_defaults: None,
             toast_rect: Rect::default(),
             media_pending: None,
@@ -1119,7 +1123,7 @@ impl Ui {
                                 false,
                             ));
                         }
-                        self.location_defaults.insert(server, defaults);
+                        self.location_defaults.insert(server, *defaults);
                     }
                     (Task::Launch, Reply::Launched(id)) => {
                         self.task(

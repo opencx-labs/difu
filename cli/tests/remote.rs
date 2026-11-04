@@ -407,6 +407,7 @@ fn phones_answer_approvals_send_images_and_read_changes() -> Result<()> {
     let Reply::Launched(id) = client::request(
         &storage,
         Request::Launch {
+            effective_defaults: false,
             job: Box::new(difu::agents::Job::Coding(difu::agents::Launch {
                 repository: repo.clone(),
                 base: "HEAD".into(),

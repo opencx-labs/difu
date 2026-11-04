@@ -154,7 +154,41 @@ local "do not run tests" rule:
 > whole test suite when it would take a long time; leave full validation to
 > pull-request CI. Repository rules take precedence over this guidance.
 
-Permission prompts are unchanged.
+## Starting modes
+
+A server's sessions keep working while nobody watches, so they start in the
+providers' automatic modes unless the server's defaults save another starting
+mode or preset:
+
+* Claude Code sessions start in its native **Auto** mode (`--permission-mode
+  auto`), where Claude Code decides permission prompts itself with its own
+  checks.
+* Codex sessions get the **Approve for me** preset (`workspace-write`,
+  `on-request`, reviewer `auto_review`): Codex reviews its own approval
+  requests, inside the workspace-write sandbox policy.
+* Bypass permissions and Full Access are never applied automatically; a
+  person can still choose them (and enabling Claude's bypass works as on a
+  Mac).
+
+These come from the server's *effective defaults* (`agents::effective`),
+which also pick the model: saved fields win; without a saved model, the newest
+Claude Opus the server's Claude Code offers at xhigh. Ordinary computers apply
+the same model rule but keep each provider's own starting mode. Every path
+that starts a session asks the service, which fills the blanks: the Mac's
+new-session form (`NewAgent`), the phone (`agents.new`) and sessions agents
+start (`Launch` with `effective_defaults`). The form and the phone show the
+same values first (`Request::AgentDefaults`, `agents.defaults`), each marked
+automatic or saved.
+
+An automatic start never blocks a session: when Claude Code refuses Auto (for
+example `disableAutoMode` in settings, or a model without it) or a managed
+Codex policy forbids the preset (the server reads Codex's requirements before
+the thread starts), the session starts in the provider's own default and its
+transcript says why. A starting mode a person chose or saved is strict, as
+before. Running sessions switch modes from any client: Shift+Tab and
+**/permissions** on a Mac, the mode chip or `/permissions` on a phone.
+
+Permission prompts are otherwise unchanged.
 
 ## Sandboxes
 
@@ -616,11 +650,21 @@ Three service requests exist for clients whose sessions live elsewhere:
   the repository when the row has room. Requests for a namespaced id are forwarded with `rpc`; watches
   with `rpc.watch`.
 * Every new session opens one form: **Location** (This Mac, then each saved
-  server with its connection state or problem), **Repository**, **Model** and
-  **Reasoning**, prefilled from the chosen location's saved defaults (a
-  server's come from `Request::AgentDefaults`, cached with its repositories in
-  `Request::Servers`). Enter starts right away; choosing another location
-  reloads the other lists from it.
+  server with its connection state or problem), **Repository**, **Model**,
+  **Reasoning** and **Mode**, prefilled from the chosen location's effective
+  defaults and marked automatic where nothing is saved (see *Starting modes*).
+  `Request::AgentDefaults` answers `Reply::AgentDefaults(effective::Defaults)`:
+  the saved `AgentDefaults` plus the effective provider, model, effort and
+  each provider's starting mode and Codex preset, with flags for what is
+  automatic. This Mac's come from its own service when the form opens; a
+  server's are cached with its repositories in `Request::Servers`. **Mode**
+  lists the provider's modes and, for Codex, the approval presets; fields left
+  alone are sent blank, so the location fills them (and may fall back from an
+  automatic start). Enter starts right away; choosing another location reloads
+  the other lists from it.
+* Shift+Tab and the permissions panel switch a server session's mode with
+  `Request::Permissions`, forwarded by session id; the composer's mode
+  indicator shows the server's session state.
 * Anything that consults a machine on a session's behalf asks the session's
   location. Requests with a session id are forwarded by id; the others carry
   `server`: `NewAgent`, `RepositoryRules`, `Defaults` (Codex's configured model
@@ -689,6 +733,10 @@ Three service requests exist for clients whose sessions live elsewhere:
   the session (difu's commands plus its provider's skills) and runs them with
   `session.command`; Model & Effort lists both providers' models and switches
   provider between turns.
+* New Session shows the server's effective defaults (`agents.defaults`) with a
+  Mode picker and sends only what the person changed; the session screen's mode
+  chip (`SessionView.permissionMode`) switches modes with `/permissions`,
+  showing why a mode is unavailable or a switch was refused.
 * Per-server settings: disk space (bar, status, breakdown, and the three
   cleanups with confirmations), logins (status, device-code login, Claude
   token), server repositories (add from `server.repos.available`, remove,
@@ -704,4 +752,7 @@ Three service requests exist for clients whose sessions live elsewhere:
 * SSH is key-only after onboarding; the `difu` user has no sudo.
 * Agents run in rootless containers with only the session's worktree and the
   server logins; standard devices cannot reach `rpc`.
+* Sessions start in Claude Code's Auto mode or Codex's "Approve for me" preset,
+  both of which keep the providers' own checks; bypass permissions and Full
+  Access are never applied automatically.
 * Revocation works from any paired client and from `difu remote forget`.

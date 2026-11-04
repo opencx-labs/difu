@@ -79,6 +79,7 @@ fn launch(storage: &Storage, root: &Path, prompt: &str) -> Result<String> {
     let Reply::Launched(id) = client::request(
         storage,
         Request::Launch {
+            effective_defaults: false,
             job: Box::new(Job::Coding(Launch {
                 repository: root.into(),
                 base: "HEAD".into(),
@@ -261,6 +262,7 @@ fn archiving_and_deleting_stop_provider_shells_and_their_servers() -> Result<()>
             let Reply::Launched(id) = client::request(
                 &storage,
                 Request::Launch {
+                    effective_defaults: false,
                     job: Box::new(Job::Coding(Launch {
                         repository: repo.clone(),
                         base: "HEAD".into(),
@@ -1298,6 +1300,7 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
     let Reply::Launched(existing) = client::request(
         &storage,
         Request::Launch {
+            effective_defaults: false,
             job: Box::new(Job::Coding(Launch {
                 repository: repo.clone(),
                 base: "HEAD".into(),
@@ -1386,6 +1389,11 @@ fn new_sessions_accept_input_while_worktrees_are_preparing() -> Result<()> {
                     defaults: difu::storage::AgentDefaults {
                         repository: Some(repo.clone()),
                         model: model.map(String::from),
+                        // Codex without a model, so no automatic model is
+                        // looked up.
+                        provider: model
+                            .is_none()
+                            .then_some(difu::agents::provider::Provider::Codex),
                         ..Default::default()
                     },
                     cwd: root.into(),
@@ -2369,6 +2377,7 @@ fn empty_sessions_create_worktrees_before_the_first_turn_and_keep_provider_conte
         let Reply::Launched(deleting) = client::request(
             &storage,
             Request::Launch {
+                effective_defaults: false,
                 job: Box::new(Job::Coding(Launch {
                     repository: repo.clone(),
                     base: "HEAD".into(),
@@ -2554,6 +2563,7 @@ fn mcp_controls_use_live_workers_without_sending_model_turns() -> Result<()> {
         let Reply::Launched(id) = client::request(
             &storage,
             Request::Launch {
+                effective_defaults: false,
                 job: Box::new(Job::Coding(Launch {
                     repository: repo.clone(),
                     base: "HEAD".into(),
