@@ -53,7 +53,10 @@ pub(super) fn offered(session: &Session) -> bool {
 /// The environment part of a server session's instructions.
 pub(super) fn instructions(session: &Session) -> String {
     match &session.environment {
-        Some(status) => format!("{INSTRUCTIONS}\n\nEnvironment status: {status}"),
+        Some(status) => format!(
+            "{INSTRUCTIONS}\n\nEnvironment status: {}",
+            environments::short(status, 4000)
+        ),
         None => INSTRUCTIONS.to_owned(),
     }
 }
