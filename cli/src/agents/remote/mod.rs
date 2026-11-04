@@ -7,6 +7,7 @@
 //! without trusting any certificate authority. See docs/remote-protocol.md and
 //! docs/cloud-agents.md.
 mod api;
+mod commands;
 mod identity;
 mod listener;
 mod network;

@@ -174,6 +174,9 @@ pub struct Header {
     pub preparing: bool,
     pub can_send: bool,
     pub can_interrupt_and_send: bool,
+    /// No turn, pending request or queued message: provider switches (and
+    /// Claude Code model changes) are accepted now.
+    pub between_turns: bool,
     pub activity: Option<Activity>,
     pub queue: Vec<Queued>,
     pub pending: Vec<PendingView>,
@@ -224,6 +227,7 @@ impl SessionView {
                 && !session.archived
                 && !session.workspace_removed,
             can_interrupt_and_send: session.can_send_waiting(),
+            between_turns: super::super::provider::between_turns(session),
             activity: session.status.active().then(|| {
                 let (label, detail, since) = transcript::activity_text(session);
                 Activity {

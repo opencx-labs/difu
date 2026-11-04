@@ -65,8 +65,10 @@ extension DifuAPI {
         ).entry
     }
 
+    /// `skills` names the Codex skills (`$name`) to send with the message.
     public func send(
-        _ id: String, text: String, queue: Bool = false, attachments: [Attachment] = []
+        _ id: String, text: String, queue: Bool = false, attachments: [Attachment] = [],
+        skills: [String] = []
     ) async throws {
         var params: [String: JSONValue] = [
             "id": .string(id), "text": .string(text), "queue": .bool(queue),
@@ -74,7 +76,30 @@ extension DifuAPI {
         if !attachments.isEmpty {
             params["attachments"] = .array(attachments.map(\.json))
         }
+        if !skills.isEmpty {
+            params["skills"] = .array(skills.map(JSONValue.string))
+        }
         try await perform("session.send", params)
+    }
+
+    /// The session's slash commands: difu's, then its provider's skills and
+    /// commands (`refresh` lists the skills again; slow: seconds).
+    public func commands(_ id: String, refresh: Bool = false) async throws -> SessionCommandList {
+        var params: [String: JSONValue] = ["id": .string(id)]
+        if refresh { params["refresh"] = .bool(true) }
+        return try await request("session.commands", params, as: SessionCommandList.self)
+    }
+
+    /// Runs a slash command by name (`/compact`, `$lint`, or a bare name).
+    /// Destructive commands need `confirm`.
+    public func runCommand(
+        _ id: String, name: String, arguments: String = "", confirm: Bool = false, queue: Bool = false
+    ) async throws -> CommandOutcome {
+        var params: [String: JSONValue] = ["id": .string(id), "name": .string(name)]
+        if !arguments.isEmpty { params["args"] = .string(arguments) }
+        if confirm { params["confirm"] = .bool(true) }
+        if queue { params["queue"] = .bool(true) }
+        return try await request("session.command", params, as: CommandOutcome.self)
     }
 
     public func interrupt(_ id: String) async throws {

@@ -34,6 +34,12 @@ public struct AgentRepository: Identifiable, Hashable, Sendable, Decodable {
 
     public var id: String { path }
 
+    public init(path: String, name: String? = nil, isDefault: Bool = false) {
+        self.path = path
+        self.name = name ?? URL(fileURLWithPath: path).lastPathComponent
+        self.isDefault = isDefault
+    }
+
     public init(from decoder: Decoder) throws {
         let f = try decoder.fields()
         path = f.string("path") ?? ""

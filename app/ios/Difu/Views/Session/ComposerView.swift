@@ -59,18 +59,44 @@ struct QueueSection: View {
 }
 
 /// Multi-line input with photo attachments. While the agent works it offers
-/// Steer (send now) or Queue, and Stop when empty.
+/// Steer (send now) or Queue, and Stop when empty. Typing `/` at the start
+/// lists the session's slash commands.
 struct ComposerView: View {
     @Bindable var composer: ComposerModel
     let view: SessionView
+    let commands: SlashCommandModel
+    let serverName: String
     let send: (_ queue: Bool) -> Void
     let stop: () -> Void
+    let choose: (SessionCommand) -> Void
+    /// Loads the commands; `true` lists the provider's skills again.
+    let loadCommands: (_ refresh: Bool) -> Void
 
     @State private var pickerItems: [PhotosPickerItem] = []
     @FocusState private var focused: Bool
 
+    private var showsCommands: Bool {
+        view.canSend && (commands.skillsOnly || SlashCommands.query(composer.text) != nil)
+    }
+
+    /// The draft runs one of difu's commands rather than messaging the agent.
+    private var isCommandDraft: Bool {
+        guard composer.attachments.isEmpty else { return false }
+        if case .command = SlashCommands.submission(composer.text, commands: commands.commands) { return true }
+        return false
+    }
+
     var body: some View {
         VStack(spacing: 8) {
+            if showsCommands {
+                CommandMenu(
+                    commands: commands, text: composer.text, serverName: serverName,
+                    choose: { command in
+                        choose(command)
+                        focused = true
+                    },
+                    reload: { loadCommands(true) })
+            }
             if !composer.attachments.isEmpty {
                 attachmentStrip
             }
@@ -97,6 +123,9 @@ struct ComposerView: View {
         .padding(.horizontal, 12)
         .padding(.top, 8)
         .padding(.bottom, 6)
+        .onChange(of: showsCommands) { _, shown in
+            if shown { loadCommands(false) }
+        }
         .onChange(of: pickerItems) { _, items in
             guard !items.isEmpty else { return }
             pickerItems = []
@@ -114,6 +143,13 @@ struct ComposerView: View {
         if composer.sending {
             ProgressView()
                 .frame(width: 36, height: 36)
+        } else if isCommandDraft {
+            Button("Run") { send(false) }
+                .buttonStyle(.borderedProminent)
+                .foregroundStyle(Color.onAccent)
+                .controlSize(.small)
+                .padding(.bottom, 4)
+                .accessibilityLabel("Run the command")
         } else if view.active, !view.preparing {
             if composer.hasContent {
                 HStack(spacing: 6) {
@@ -176,6 +212,6 @@ struct ComposerView: View {
     private var placeholder: String {
         if !view.canSend { return "This session can't take messages right now" }
         if view.preparing { return "Message (queued until the agent is ready)" }
-        return view.active ? "Steer or queue a message…" : "Message the agent…"
+        return view.active ? "Steer or queue a message…" : "Message the agent, or / for commands…"
     }
 }

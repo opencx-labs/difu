@@ -4,6 +4,8 @@ import SwiftUI
 /// Starts a session: server (when several are saved), repository, model and
 /// effort, first message.
 struct NewSessionSheet: View {
+    /// The server picked first (a session's `/new` starts on its own server).
+    var initialServerID: String?
     var onCreated: (SessionRef) -> Void
 
     @Environment(AppModel.self) private var app
@@ -71,7 +73,7 @@ struct NewSessionSheet: View {
                 }
             }
             .onAppear {
-                if serverID == nil { serverID = server?.id }
+                if serverID == nil { serverID = app.server(initialServerID)?.id ?? server?.id }
             }
             .task(id: serverID) { await load() }
             .errorAlert($error, title: "Couldn't start the session")
@@ -182,22 +184,26 @@ struct NewSessionSheet: View {
     }
 }
 
-/// Model and effort pickers fed by `agents.models` ("Default" = nil).
+/// Model and effort pickers fed by `agents.models` ("Default" = nil). Every
+/// provider's models are listed, grouped like the terminal's Alt+M picker,
+/// with `provider`'s (the session's) first; efforts follow the chosen model.
 struct ModelPickerSection: View {
     let models: [AgentModel]?
     let error: String?
     @Binding var model: String?
     @Binding var effort: String?
     var provider: String?
+    var footer = "Leave on Default to use the agent's configured model."
 
     var body: some View {
         Section {
             if let models {
                 Picker("Model", selection: $model) {
-                    Text("Default").tag(String?.none)
-                    ForEach(grouped(models), id: \.0) { provider, models in
-                        Section(provider) {
-                            ForEach(models) { Text($0.name).tag(Optional($0.id)) }
+                    Text(provider.map { "Default (\(ModelPicker.providerLabel($0)))" } ?? "Default")
+                        .tag(String?.none)
+                    ForEach(ModelPicker.groups(models, first: provider)) { group in
+                        Section(group.title) {
+                            ForEach(group.models) { Text($0.name).tag(Optional($0.id)) }
                         }
                     }
                 }
@@ -218,32 +224,23 @@ struct ModelPickerSection: View {
         } header: {
             Text("Model")
         } footer: {
-            Text("Leave on Default to use the agent's configured model.")
+            Text(footer)
         }
         .onChange(of: model) {
-            if let effort, let models, !efforts(models).contains(effort) { self.effort = nil }
+            guard let models else { return }
+            effort = ModelPicker.syncedEffort(effort, models: models, model: model, provider: target(models))
         }
     }
 
-    private func grouped(_ models: [AgentModel]) -> [(String, [AgentModel])] {
-        let relevant = provider.map { provider in
-            models.filter { $0.provider == nil || $0.provider == provider }
-        } ?? models
-        var order: [String] = []
-        var groups: [String: [AgentModel]] = [:]
-        for model in relevant {
-            let key = (model.provider ?? "Other").capitalized
-            if groups[key] == nil { order.append(key) }
-            groups[key, default: []].append(model)
-        }
-        return order.map { ($0, groups[$0] ?? []) }
+    /// The provider the chosen model runs on.
+    private func target(_ models: [AgentModel]) -> String? {
+        model.map { ModelPicker.provider(of: $0, in: models) } ?? provider
     }
 
     private func efforts(_ models: [AgentModel]) -> [String] {
-        if let model, let match = models.first(where: { $0.id == model }) {
-            return match.efforts
-        }
-        var seen = Set<String>()
-        return models.flatMap(\.efforts).filter { seen.insert($0).inserted }
+        var list = ModelPicker.efforts(models, model: model, provider: target(models))
+        // Keep a current effort the list doesn't know, so the picker shows it.
+        if let effort, !list.contains(effort) { list.append(effort) }
+        return list
     }
 }

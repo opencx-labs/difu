@@ -68,6 +68,15 @@ and sandbox storage), logins (GitHub and Codex device-code login, Claude Code
 token), repositories (add, remove, **Refresh Mains**), repository rules and
 paired devices.
 
+In a session, type **/** at the start of the message to see its commands:
+difu's (compact, model and effort, status and usage, permissions, rules,
+changes, rename, new session, clear, change repository) and the agent's own
+skills and commands, each from the computer or server running the session.
+Choosing one runs it (asking first for destructive ones), opens its screen, or
+puts it in the message to add arguments. **Model & Effort** lists every
+provider's models; picking another provider's switches the session there once
+it's between turns.
+
 **Forget** revokes the phone on that server first, then removes it from the
 phone. When another device pairs with one of your servers, a banner offers to
 revoke it.
@@ -142,6 +151,8 @@ swift run difu-remote-probe send <session-id> "Run the tests" --queue
 swift run difu-remote-probe inbox --refresh
 swift run difu-remote-probe overview opencx-labs/difu 45
 swift run difu-remote-probe call agents.models          # any method, raw JSON
+swift run difu-remote-probe call session.commands '{"id":"…"}'
+swift run difu-remote-probe call session.command '{"id":"…","name":"/compact"}'
 swift run difu-remote-probe call session.entry '{"id":"…","entry":"item_12"}'
 swift run difu-remote-probe forget --revoke             # device.unpair, then delete the token
 ```

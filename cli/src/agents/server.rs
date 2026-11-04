@@ -4441,3 +4441,57 @@ mod disk_tests {
         Ok(())
     }
 }
+
+/// A real service answering on the storage's socket, for clients tested end to
+/// end (the phone API). Stops accepting and removes the socket when dropped.
+#[cfg(test)]
+pub(super) struct Served {
+    pub store: Arc<Store>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    socket: PathBuf,
+}
+#[cfg(test)]
+impl Served {
+    pub(super) fn start(home: PathBuf, sessions: Vec<Session>) -> Result<Self> {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let store = Arc::new(Store::fixture(home, sessions));
+        let service = Arc::new(Service {
+            remote: super::remote::Remote::start(store.storage.clone()),
+            store: store.clone(),
+            workers: Mutex::new(BTreeMap::new()),
+            action_locks: Mutex::new(BTreeMap::new()),
+            launch_lock: Mutex::new(()),
+            federation: None,
+            pods: super::sandbox::podman(),
+            disk: std::sync::OnceLock::new(),
+        });
+        let path = socket(&store.storage)?;
+        let listener = UnixListener::bind(&path)?;
+        listener.set_nonblocking(true)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        thread::spawn(move || {
+            while !stopped.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let service = service.clone();
+                        thread::spawn(move || serve(&service, stream));
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(5)),
+                }
+            }
+        });
+        Ok(Self {
+            store,
+            stop,
+            socket: path,
+        })
+    }
+}
+#[cfg(test)]
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = fs::remove_file(&self.socket);
+    }
+}

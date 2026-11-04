@@ -679,6 +679,10 @@ Three service requests exist for clients whose sessions live elsewhere:
 * The session screen shows the session's PRs (`SessionSummary.prs`) as chips;
   tapping one opens the PR screen on the same server. Photos are sent with
   `session.send` straight to the server running the session.
+* Typing `/` in the composer lists `session.commands` from the server running
+  the session (difu's commands plus its provider's skills) and runs them with
+  `session.command`; Model & Effort lists both providers' models and switches
+  provider between turns.
 * Per-server settings: disk space (bar, status, breakdown, and the three
   cleanups with confirmations), logins (status, device-code login, Claude
   token), server repositories (add from `server.repos.available`, remove,

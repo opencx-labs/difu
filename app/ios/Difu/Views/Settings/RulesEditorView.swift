@@ -4,6 +4,8 @@ import SwiftUI
 /// Edits a repository's rules on the server (shared by every client).
 struct RulesEditorView: View {
     let server: ServerConnection
+    /// Opens this repository's rules (a session's `/rules`) instead of the default's.
+    var initialRepository: String?
 
     @State private var repositories: [AgentRepository]?
     @State private var repositoriesError: String?
@@ -78,9 +80,14 @@ struct RulesEditorView: View {
 
     private func loadRepositories() async {
         do {
-            let list = try await server.api.repositories()
+            var list = try await server.api.repositories()
+            if let initialRepository, !list.contains(where: { $0.path == initialRepository }) {
+                list.insert(AgentRepository(path: initialRepository), at: 0)
+            }
             repositories = list
-            if repository == nil { repository = (list.first(where: \.isDefault) ?? list.first)?.path }
+            if repository == nil {
+                repository = initialRepository ?? (list.first(where: \.isDefault) ?? list.first)?.path
+            }
         } catch {
             repositoriesError = error.localizedDescription
         }

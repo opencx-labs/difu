@@ -38,6 +38,11 @@ struct SessionListView: View {
                 .sheet(isPresented: $showingNewSession) {
                     NewSessionSheet { ref in path.append(ref) }
                 }
+                .onChange(of: app.requestedSession) { _, ref in
+                    guard let ref else { return }
+                    app.requestedSession = nil
+                    path.append(ref)
+                }
                 .alert("Rename Session", isPresented: renameBinding) {
                     TextField("Title", text: $renameText)
                     Button("Cancel", role: .cancel) {}

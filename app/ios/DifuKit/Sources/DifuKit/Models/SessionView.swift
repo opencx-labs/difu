@@ -15,6 +15,9 @@ public struct SessionView: Identifiable, Equatable, Sendable {
     public var canSend: Bool
     /// Queued messages exist that "Send now" would flush.
     public var canInterruptAndSend: Bool
+    /// No turn, pending request or queued message: provider switches (and
+    /// Claude Code model changes) are accepted now. Nil from older computers.
+    public var betweenTurns: Bool?
     public var activity: Activity?
     public var queue: [QueuedMessage]
     public var pending: [PendingView]
@@ -24,6 +27,12 @@ public struct SessionView: Identifiable, Equatable, Sendable {
 
     public subscript<T>(dynamicMember keyPath: KeyPath<SessionSummary, T>) -> T {
         summary[keyPath: keyPath]
+    }
+
+    /// Whether the session is between turns, estimated from its state when
+    /// the computer doesn't say.
+    public var isBetweenTurns: Bool {
+        betweenTurns ?? (!summary.active && !preparing && pending.isEmpty && queue.isEmpty)
     }
 }
 
@@ -39,6 +48,7 @@ extension SessionView: Decodable {
         preparing = f.bool("preparing") ?? false
         canSend = f.bool("canSend") ?? true
         canInterruptAndSend = f.bool("canInterruptAndSend") ?? false
+        betweenTurns = f.bool("betweenTurns")
         activity = f.value("activity", as: Activity.self)
         queue = f.list("queue")
         pending = f.list("pending")

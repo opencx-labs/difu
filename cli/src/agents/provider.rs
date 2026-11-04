@@ -112,6 +112,18 @@ pub(super) fn handoff(entries: &[Entry], through: usize) -> Option<String> {
     ))
 }
 
+/// No turn is running and nothing waits on the user or in the queue: the
+/// service accepts provider switches (and Claude Code model changes) now.
+pub fn between_turns(session: &Session) -> bool {
+    matches!(
+        session.status,
+        Status::Idle | Status::Interrupted | Status::Failed
+    ) && session.turn_id.is_none()
+        && session.pending.is_empty()
+        && session.queue.is_empty()
+        && !session.switching_workspace
+}
+
 pub fn switch(
     session: &mut Session,
     provider: Provider,
@@ -119,13 +131,7 @@ pub fn switch(
     effort: Option<String>,
 ) -> Result<()> {
     ensure!(
-        matches!(
-            session.status,
-            Status::Idle | Status::Interrupted | Status::Failed
-        ) && session.turn_id.is_none()
-            && session.pending.is_empty()
-            && session.queue.is_empty()
-            && !session.switching_workspace,
+        between_turns(session),
         "Finish the current turn and pending requests before switching providers"
     );
     ensure!(

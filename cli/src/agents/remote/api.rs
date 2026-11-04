@@ -3,11 +3,12 @@
 //! way. `full` devices may also tunnel the service protocol (`rpc`, `rpc.watch`).
 use super::{
     super::{
-        Control, Reply, Request, Session, Summary, client, media,
+        Control, Reply, Request, Session, Skill, Summary, client, media,
         pr_cache::{self, SessionLink, SessionLinks},
+        provider::Provider,
         server, transport,
     },
-    Access, Remote, reviews,
+    Access, Remote, commands, reviews,
     view::{self, EntryView, SessionSummary, SessionView},
 };
 use crate::storage::{AgentDefaults, Config, Storage};
@@ -30,6 +31,8 @@ use std::{
 };
 
 const MODELS_TTL: Duration = Duration::from_secs(10 * 60);
+/// A session's provider skills are listed again after this long (or on refresh).
+const SKILLS_TTL: Duration = Duration::from_secs(2 * 60);
 /// Session lists and watched sessions reread cached pull requests this often.
 const PRS_TTL: Duration = Duration::from_secs(5);
 /// `rpc.watch` streams one connection may hold open.
@@ -62,6 +65,16 @@ struct Inner {
     listing: AtomicBool,
     models: Mutex<Option<(Instant, Value)>>,
     prs: Mutex<Option<(Instant, SessionLinks)>>,
+    skills: Mutex<BTreeMap<String, Skills>>,
+}
+
+/// A session's provider skills and discovery errors, as last listed.
+#[derive(Clone)]
+struct Skills {
+    at: Instant,
+    provider: Provider,
+    skills: Vec<Skill>,
+    errors: Vec<String>,
 }
 
 /// One `rpc.watch`: a service subscription forwarded as events.
@@ -107,6 +120,7 @@ impl Connection {
             listing: AtomicBool::new(false),
             models: Mutex::new(None),
             prs: Mutex::new(None),
+            skills: Mutex::new(BTreeMap::new()),
         }))
     }
 
@@ -234,6 +248,42 @@ impl Inner {
         *cached = Some((Instant::now(), prs.clone()));
         prs
     }
+    /// The session provider's skills and commands, listed again after a while,
+    /// when its provider changed, or when `force`d.
+    fn skills(&self, session: &Session, force: bool) -> Result<Skills> {
+        if !force
+            && let Some(cached) = self
+                .skills
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Skills lock failed"))?
+                .get(&session.id)
+                .filter(|c| c.at.elapsed() < SKILLS_TTL && c.provider == session.provider)
+        {
+            return Ok(cached.clone());
+        }
+        let Reply::Skills { skills, errors } = self.request(Request::Skills {
+            id: session.id.clone(),
+            force,
+        })?
+        else {
+            anyhow::bail!("Unexpected skills reply");
+        };
+        let listed = Skills {
+            at: Instant::now(),
+            provider: session.provider,
+            skills,
+            errors,
+        };
+        self.skills
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Skills lock failed"))?
+            .insert(session.id.clone(), listed.clone());
+        Ok(listed)
+    }
+    /// Whether this service runs in server mode (`difu serve`).
+    fn server_mode(&self) -> bool {
+        config(&self.storage).server.enabled
+    }
     /// A watched session's cached pull requests.
     fn session_prs(&self, session: &Session) -> Vec<SessionLink> {
         pr_cache::cached(&self.storage, &[session.summary()])
@@ -350,6 +400,16 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
             let mut text: String = param(params, "text")?;
             let queue = optional::<bool>(params, "queue")?.unwrap_or(false);
             let uploads: Vec<Upload> = optional(params, "attachments")?.unwrap_or_default();
+            let names: Vec<String> = optional(params, "skills")?.unwrap_or_default();
+            let skills = if names.is_empty() {
+                Vec::new()
+            } else {
+                let listed = inner.skills(&inner.session(&id)?, false)?;
+                names
+                    .iter()
+                    .map(|name| commands::find_skill(&listed.skills, name, true).cloned())
+                    .collect::<Result<Vec<_>>>()?
+            };
             let mut attachments = Vec::new();
             for (index, upload) in uploads.iter().enumerate() {
                 let bytes = STANDARD
@@ -371,11 +431,17 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
                 Control::Message {
                     text,
                     queue,
-                    skills: Vec::new(),
+                    skills,
                     attachments,
                 },
             )
         }
+        "session.commands" => session_commands(
+            inner,
+            &id()?,
+            optional::<bool>(params, "refresh")?.unwrap_or(false),
+        ),
+        "session.command" => run_command(inner, params),
         "session.interrupt" => inner.control(id()?, Control::Interrupt),
         "session.sendNow" => inner.control(id()?, Control::InterruptAndSend),
         "session.resume" => inner.control(id()?, Control::Resume),
@@ -575,6 +641,145 @@ fn rpc_watch(inner: &Arc<Inner>, id: Value, params: &Value) {
     }
 }
 
+/// difu's phone commands for the session, then its provider's skills and
+/// commands. Skill discovery problems are reported beside the list.
+fn session_commands(inner: &Inner, id: &str, refresh: bool) -> Result<Value> {
+    let session = inner.session(id)?;
+    let mut list = commands::difu(&session, inner.server_mode());
+    let mut errors = Vec::new();
+    if matches!(session.job, super::super::Job::Coding(_)) {
+        match inner.skills(&session, refresh) {
+            Ok(listed) => {
+                list.extend(commands::provider(session.provider, &listed.skills));
+                errors = listed.errors;
+            }
+            Err(error) => errors.push(format!("{error:#}")),
+        }
+    }
+    Ok(json!({"commands": list, "errors": errors}))
+}
+
+/// Runs a slash command: difu's own on the computer (destructive ones only with
+/// `confirm`), or a provider skill or command sent as a message.
+fn run_command(inner: &Inner, params: &Value) -> Result<Value> {
+    let id: String = param(params, "id")?;
+    let requested: String = param(params, "name")?;
+    let args = optional::<String>(params, "args")?.unwrap_or_default();
+    let args = args.trim();
+    let confirm = optional::<bool>(params, "confirm")?.unwrap_or(false);
+    let queue = optional::<bool>(params, "queue")?.unwrap_or(false);
+    let attached = requested.trim().starts_with('$');
+    let name = requested.trim().trim_start_matches(['/', '$']);
+    ensure!(!name.is_empty(), "Choose a command");
+    let session = inner.session(&id)?;
+    let done = |message: &str| Ok(json!({"message": message}));
+    if !attached && let Some(builtin) = commands::builtin(name) {
+        ensure!(
+            commands::available(builtin, &session),
+            "/{name} isn't available in this session"
+        );
+        ensure!(
+            args.is_empty() || builtin.arguments != commands::Arguments::None,
+            "/{name} does not accept arguments. Run /{name} on its own."
+        );
+        return match name {
+            "compact" => {
+                inner.control(id, Control::Compact)?;
+                done("Compacting the conversation")
+            }
+            "clear" => {
+                ensure!(
+                    confirm,
+                    "/clear discards the conversation, PRs and artifacts and starts a fresh worktree from main; confirm to continue"
+                );
+                inner.request(Request::Clear { id })?;
+                done("Started over")
+            }
+            "repo" => {
+                ensure!(!args.is_empty(), "Usage: /repo <path>");
+                ensure!(
+                    confirm,
+                    "/repo discards the current workspace's work; confirm to continue"
+                );
+                let repository = if inner.server_mode() {
+                    crate::cloud::repos::resolve(&inner.storage, args)?
+                } else {
+                    PathBuf::from(args)
+                };
+                inner.request(Request::Repository { id, repository })?;
+                done("Changed the repository")
+            }
+            "rename" if !args.is_empty() => {
+                inner.request(Request::Rename {
+                    id,
+                    title: args.to_owned(),
+                })?;
+                done("Renamed the session")
+            }
+            "model" | "effort" if !args.is_empty() => {
+                let (model, effort) = commands::model_arguments(name, args, &session)?;
+                inner.control(id, Control::Model { model, effort })?;
+                done("Changed the model")
+            }
+            "permissions" => {
+                let action = if args.is_empty() {
+                    super::super::permissions::Action::Refresh
+                } else {
+                    commands::permission_action(session.provider, args)?
+                };
+                let Reply::Permissions { snapshot } =
+                    inner.request(Request::Permissions { id, action })?
+                else {
+                    anyhow::bail!("Unexpected permissions reply");
+                };
+                Ok(json!({
+                    "screen": "permissions",
+                    "permissions": commands::permissions_view(&snapshot),
+                }))
+            }
+            "usage" => {
+                let Reply::Usage(usage) = inner.request(Request::Usage { id })? else {
+                    anyhow::bail!("Unexpected usage reply");
+                };
+                Ok(
+                    json!({"screen": "usage", "usage": commands::usage_view(session.provider, &usage)}),
+                )
+            }
+            "status" => Ok(json!({"screen": "status", "status": commands::status_view(&session)})),
+            "rules" => Ok(json!({
+                "screen": "rules",
+                "repository": session.job.root().display().to_string(),
+            })),
+            _ => Ok(json!({"screen": builtin.screen.unwrap_or(name)})),
+        };
+    }
+    ensure!(
+        matches!(session.job, super::super::Job::Coding(_)),
+        "Unknown command `/{name}`"
+    );
+    let listed = inner.skills(&session, false)?;
+    let skill = commands::find_skill(&listed.skills, name, attached)?;
+    let text = commands::skill_text(skill, args);
+    let message = format!(
+        "Sent {}",
+        text.split_whitespace().next().unwrap_or_default()
+    );
+    inner.control(
+        id,
+        Control::Message {
+            text,
+            queue,
+            skills: if skill.slash {
+                Vec::new()
+            } else {
+                vec![skill.clone()]
+            },
+            attachments: Vec::new(),
+        },
+    )?;
+    done(&message)
+}
+
 fn new_session(inner: &Inner, params: &Value) -> Result<Value> {
     // Before a repository is cloned for it.
     crate::cloud::disk::guard(&inner.storage)?;
@@ -587,18 +792,12 @@ fn new_session(inner: &Inner, params: &Value) -> Result<Value> {
         }
         repository => repository.map(PathBuf::from),
     };
-    let defaults = AgentDefaults {
-        provider: saved.provider,
-        starting_mode: saved.starting_mode,
-        repository: repository.or(saved.repository),
-        model: optional::<String>(params, "model")?
-            .filter(|m| !m.is_empty())
-            .or(saved.model),
-        effort: optional::<String>(params, "effort")?
-            .filter(|e| !e.is_empty())
-            .or(saved.effort),
-        isolated: saved.isolated,
-    };
+    let defaults = phone_defaults(
+        saved,
+        repository,
+        optional::<String>(params, "model")?.filter(|m| !m.is_empty()),
+        optional::<String>(params, "effort")?.filter(|e| !e.is_empty()),
+    );
     ensure!(
         defaults.repository.is_some(),
         "Choose a repository for the new session"
@@ -625,6 +824,35 @@ fn new_session(inner: &Inner, params: &Value) -> Result<Value> {
         )?;
     }
     Ok(json!({"id": id}))
+}
+
+/// The saved new-session defaults with the phone's choices. A chosen model
+/// picks its own provider, so the saved provider and the saved effort and
+/// starting mode, which belong to it, apply only when they match.
+fn phone_defaults(
+    saved: AgentDefaults,
+    repository: Option<PathBuf>,
+    model: Option<String>,
+    effort: Option<String>,
+) -> AgentDefaults {
+    let repository = repository.or(saved.repository.clone());
+    let Some(model) = model else {
+        return AgentDefaults {
+            repository,
+            effort: effort.or(saved.effort.clone()),
+            ..saved
+        };
+    };
+    let provider = Provider::for_model(Some(&model));
+    let same = saved.resolved_provider() == provider;
+    AgentDefaults {
+        provider: Some(provider),
+        starting_mode: saved.starting_mode.filter(|_| same),
+        repository,
+        model: Some(model),
+        effort: effort.or(saved.effort.filter(|_| same)),
+        isolated: saved.isolated,
+    }
 }
 
 /// Repositories difu already knows: the default, review clones, local diff
@@ -875,6 +1103,7 @@ pub fn patch_files(patch: &str) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn at<'a>(value: &'a Value, pointer: &str) -> &'a Value {
         value.pointer(pointer).unwrap_or(&Value::Null)
@@ -975,6 +1204,498 @@ mod tests {
         assert!(
             storage.load_config()?.server.repositories.is_empty(),
             "nothing listed or cloned"
+        );
+        Ok(())
+    }
+
+    fn connection(storage: &Storage) -> Connection {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(64);
+        Connection::new(
+            super::super::Remote::start(storage.clone()),
+            "device".into(),
+            super::super::Access::Standard,
+            0,
+            sender,
+        )
+    }
+
+    fn storage(dir: &tempfile::TempDir) -> Storage {
+        Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        }
+    }
+
+    /// A stand-in agent service on the storage's socket: answers every request
+    /// with `reply` and records it.
+    struct Fake {
+        requests: Arc<Mutex<Vec<Request>>>,
+        stop: Arc<AtomicBool>,
+        socket: PathBuf,
+    }
+    impl Fake {
+        fn start(
+            storage: &Storage,
+            reply: impl Fn(&Request) -> Reply + Send + Sync + 'static,
+        ) -> Result<Self> {
+            let socket = server::socket(storage)?;
+            let listener = std::os::unix::net::UnixListener::bind(&socket)?;
+            listener.set_nonblocking(true)?;
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let (recorded, stopped, reply) = (requests.clone(), stop.clone(), Arc::new(reply));
+            thread::spawn(move || {
+                while !stopped.load(Ordering::Relaxed) {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    };
+                    let answered = (|| -> Result<()> {
+                        stream.set_nonblocking(false)?;
+                        let line = client::read_line(&mut BufReader::new(stream.try_clone()?))?;
+                        let request: Request = serde_json::from_str(&line)?;
+                        let answer = reply(&request);
+                        recorded
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("requests"))?
+                            .push(request);
+                        transport::write_reply(&mut stream, &answer)
+                    })();
+                    if let Err(error) = answered {
+                        eprintln!("fake service: {error:#}");
+                    }
+                }
+            });
+            Ok(Self {
+                requests,
+                stop,
+                socket,
+            })
+        }
+        /// Requests other than session reads, in order.
+        fn actions(&self) -> Result<Vec<Request>> {
+            Ok(self
+                .requests
+                .lock()
+                .map_err(|_| anyhow::anyhow!("requests"))?
+                .iter()
+                .filter(|r| !matches!(r, Request::Read { .. }))
+                .cloned()
+                .collect())
+        }
+    }
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            let _ = std::fs::remove_file(&self.socket);
+        }
+    }
+
+    fn skill(name: &str, slash: bool) -> Skill {
+        Skill {
+            name: name.into(),
+            path: if slash {
+                PathBuf::new()
+            } else {
+                PathBuf::from(format!("{name}/SKILL.md"))
+            },
+            description: format!("About {name}"),
+            enabled: true,
+            slash,
+        }
+    }
+
+    fn coding(provider: Provider) -> Session {
+        let mut session = Session::new(
+            "one".into(),
+            super::super::super::Job::Coding(super::super::super::Launch {
+                repository: "/repo".into(),
+                isolated: true,
+                base: "origin/main".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.provider = provider;
+        session.status = super::super::super::Status::Idle;
+        session.workspace = Some("/worktree".into());
+        session.thread_id = Some("thread".into());
+        session
+    }
+
+    /// A fake service holding `session` with `skills`.
+    fn serve(storage: &Storage, session: Session, skills: Vec<Skill>) -> Result<Fake> {
+        Fake::start(storage, move |request| match request {
+            Request::Read { .. } => Reply::Session(Box::new(session.clone())),
+            Request::Skills { .. } => Reply::Skills {
+                skills: skills.clone(),
+                errors: Vec::new(),
+            },
+            Request::Usage { .. } => Reply::Usage(json!({"rate_limits": {
+                "five_hour": {"utilization": 30, "resets_at": "2027-01-15T08:00:00Z"}
+            }})),
+            Request::Permissions { action, .. } => Reply::Permissions {
+                snapshot: super::super::super::permissions::Snapshot {
+                    provider: Provider::Claude,
+                    active_mode: match action {
+                        super::super::super::permissions::Action::SetMode { mode } => {
+                            Some(mode.clone())
+                        }
+                        _ => Some("default".into()),
+                    },
+                    modes: super::super::super::permissions::mode_choices(Provider::Claude),
+                    ..Default::default()
+                },
+            },
+            Request::NewAgent { .. } => Reply::Launched("new".into()),
+            _ => Reply::Ok,
+        })
+    }
+
+    #[test]
+    fn a_chosen_model_picks_its_provider_for_new_sessions() {
+        let saved = AgentDefaults {
+            provider: Some(Provider::Codex),
+            starting_mode: Some("plan".into()),
+            repository: Some("/saved".into()),
+            model: Some("gpt-5.5".into()),
+            effort: Some("xhigh".into()),
+            isolated: true,
+        };
+        let claude = phone_defaults(saved.clone(), None, Some("claude/opus".into()), None);
+        assert_eq!(claude.provider, Some(Provider::Claude));
+        assert_eq!(claude.model.as_deref(), Some("claude/opus"));
+        assert_eq!(claude.effort, None, "Codex's saved effort stays with Codex");
+        assert_eq!(claude.starting_mode, None);
+        assert_eq!(claude.repository.as_deref(), Some(Path::new("/saved")));
+        assert!(claude.validate().is_ok());
+        let codex = phone_defaults(
+            saved.clone(),
+            Some("/repo".into()),
+            Some("gpt-5.6".into()),
+            None,
+        );
+        assert_eq!(codex.provider, Some(Provider::Codex));
+        assert_eq!(codex.effort.as_deref(), Some("xhigh"));
+        assert_eq!(codex.starting_mode.as_deref(), Some("plan"));
+        assert_eq!(codex.repository.as_deref(), Some(Path::new("/repo")));
+        let default = phone_defaults(saved, None, None, Some("low".into()));
+        assert_eq!(default.provider, Some(Provider::Codex));
+        assert_eq!(default.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(default.effort.as_deref(), Some("low"));
+        let unsaved = phone_defaults(
+            AgentDefaults {
+                provider: None,
+                model: Some("claude/sonnet".into()),
+                ..AgentDefaults::default()
+            },
+            None,
+            Some("gpt-5.6".into()),
+            None,
+        );
+        assert_eq!(unsaved.resolved_provider(), Provider::Codex);
+    }
+
+    #[test]
+    fn new_phone_sessions_ask_for_the_provider_of_their_model() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = storage(&dir);
+        storage.update_config(|config| {
+            config.agent_defaults.provider = Some(Provider::Codex);
+            config.agent_defaults.effort = Some("xhigh".into());
+        })?;
+        let fake = serve(&storage, coding(Provider::Codex), Vec::new())?;
+        let result = new_session(
+            &connection(&storage).0,
+            &json!({"repository": "/repo", "model": "claude/opus", "effort": null}),
+        )?;
+        assert_eq!(result, json!({"id": "new"}));
+        let actions = fake.actions()?;
+        let [Request::NewAgent { defaults, .. }] = actions.as_slice() else {
+            anyhow::bail!("one new session request");
+        };
+        assert_eq!(defaults.provider, Some(Provider::Claude));
+        assert_eq!(defaults.model.as_deref(), Some("claude/opus"));
+        assert_eq!(defaults.effort, None);
+        Ok(())
+    }
+
+    #[test]
+    fn the_phone_switches_an_idle_session_to_another_provider() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut busy = coding(Provider::Codex);
+        busy.id = "busy".into();
+        busy.status = super::super::super::Status::Running;
+        busy.turn_id = Some("turn".into());
+        let served = server::Served::start(dir.path().into(), vec![coding(Provider::Codex), busy])?;
+        let storage = served.store.storage.clone();
+        let connection = connection(&storage);
+        let view = |id: &str| -> Result<bool> {
+            Ok(SessionView::new(&served.store.get(id)?, &BTreeSet::new())
+                .header
+                .between_turns)
+        };
+        assert!(view("one")?);
+        dispatch(
+            &connection.0,
+            "session.model",
+            &json!({"id": "one", "model": "claude/opus", "effort": "high"}),
+        )?;
+        let switched = served.store.get("one")?;
+        assert_eq!(switched.provider, Provider::Claude);
+        assert_eq!(switched.model.as_deref(), Some("claude/opus"));
+        assert_eq!(switched.effort.as_deref(), Some("high"));
+        assert_eq!(switched.thread_id, None, "a fresh Claude Code conversation");
+        assert!(
+            switched
+                .entries
+                .last()
+                .is_some_and(|e| e.text.starts_with("Selected Claude Code"))
+        );
+        assert!(!view("busy")?);
+        let error = dispatch(
+            &connection.0,
+            "session.model",
+            &json!({"id": "busy", "model": "claude/opus", "effort": null}),
+        )
+        .err()
+        .context("refused while working")?;
+        assert!(
+            error
+                .to_string()
+                .contains("Finish the current turn and pending requests"),
+            "{error}"
+        );
+        assert_eq!(served.store.get("busy")?.provider, Provider::Codex);
+        Ok(())
+    }
+
+    #[test]
+    fn session_commands_list_difu_commands_then_cached_provider_skills() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = storage(&dir);
+        let fake = serve(
+            &storage,
+            coding(Provider::Codex),
+            vec![skill("lint", false), skill("review", true)],
+        )?;
+        let connection = connection(&storage);
+        let listed = dispatch(&connection.0, "session.commands", &json!({"id": "one"}))?;
+        let triggers: Vec<_> = at(&listed, "/commands")
+            .as_array()
+            .context("commands")?
+            .iter()
+            .filter_map(|c| at(c, "/trigger").as_str())
+            .collect();
+        assert_eq!(triggers.first(), Some(&"/compact"));
+        assert_eq!(
+            triggers.get(triggers.len().saturating_sub(2)..),
+            Some(&["$lint", "/review"][..])
+        );
+        assert_eq!(*at(&listed, "/errors"), json!([]));
+        assert_eq!(
+            *at(&listed, "/commands/0"),
+            json!({"name": "compact", "trigger": "/compact",
+                   "description": "Compact the current conversation", "hint": null,
+                   "kind": "action", "screen": null, "confirm": false,
+                   "arguments": "none", "source": "difu"})
+        );
+        let lint = at(&listed, "/commands")
+            .as_array()
+            .and_then(|c| c.iter().find(|c| *at(c, "/trigger") == "$lint"))
+            .context("lint")?;
+        assert_eq!(*at(lint, "/kind"), "prompt");
+        assert_eq!(*at(lint, "/source"), "codex");
+        dispatch(&connection.0, "session.commands", &json!({"id": "one"}))?;
+        dispatch(
+            &connection.0,
+            "session.commands",
+            &json!({"id": "one", "refresh": true}),
+        )?;
+        let listings: Vec<_> = fake
+            .actions()?
+            .into_iter()
+            .filter_map(|r| match r {
+                Request::Skills { force, .. } => Some(force),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            listings,
+            [false, true],
+            "the second listing came from the cache"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn destructive_commands_run_only_when_confirmed() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = storage(&dir);
+        let fake = serve(&storage, coding(Provider::Codex), Vec::new())?;
+        let connection = connection(&storage);
+        let run = |params: Value| dispatch(&connection.0, "session.command", &params);
+        let refused = run(json!({"id": "one", "name": "clear"}))
+            .err()
+            .context("unconfirmed")?;
+        assert!(refused.to_string().contains("confirm"), "{refused}");
+        let usage = run(json!({"id": "one", "name": "/repo", "confirm": true}))
+            .err()
+            .context("no path")?;
+        assert!(usage.to_string().contains("Usage: /repo <path>"));
+        assert!(fake.actions()?.is_empty(), "nothing ran");
+        run(json!({"id": "one", "name": "clear", "confirm": true}))?;
+        run(json!({"id": "one", "name": "repo", "args": " /other ", "confirm": true}))?;
+        let actions = fake.actions()?;
+        assert!(matches!(
+            actions.as_slice(),
+            [Request::Clear { id }, Request::Repository { repository, .. }]
+                if id == "one" && repository == Path::new("/other")
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn difu_commands_run_controls_or_name_their_screen() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = storage(&dir);
+        let fake = serve(&storage, coding(Provider::Claude), Vec::new())?;
+        let connection = connection(&storage);
+        let run = |params: Value| dispatch(&connection.0, "session.command", &params);
+        assert_eq!(
+            run(json!({"id": "one", "name": "/compact"}))?,
+            json!({"message": "Compacting the conversation"})
+        );
+        let extra = run(json!({"id": "one", "name": "compact", "args": "now"}))
+            .err()
+            .context("no arguments")?;
+        assert!(extra.to_string().contains("does not accept arguments"));
+        assert_eq!(
+            run(json!({"id": "one", "name": "model"}))?,
+            json!({"screen": "model"})
+        );
+        assert_eq!(
+            run(json!({"id": "one", "name": "effort"}))?,
+            json!({"screen": "model"})
+        );
+        assert_eq!(
+            run(json!({"id": "one", "name": "new"}))?,
+            json!({"screen": "new"})
+        );
+        assert_eq!(
+            run(json!({"id": "one", "name": "skills"}))?,
+            json!({"screen": "skills"})
+        );
+        assert_eq!(
+            run(json!({"id": "one", "name": "rename"}))?,
+            json!({"screen": "rename"})
+        );
+        let hidden = run(json!({"id": "one", "name": "diff"}))
+            .err()
+            .context("no changes yet")?;
+        assert!(hidden.to_string().contains("isn't available"));
+        assert_eq!(
+            run(json!({"id": "one", "name": "rules"}))?,
+            json!({"screen": "rules", "repository": "/repo"})
+        );
+        let status = run(json!({"id": "one", "name": "status"}))?;
+        assert_eq!(*at(&status, "/screen"), "status");
+        assert_eq!(*at(&status, "/status/providerLabel"), "Claude Code");
+        let usage = run(json!({"id": "one", "name": "usage"}))?;
+        assert_eq!(
+            *at(&usage, "/usage/limits"),
+            json!([{"section": null, "title": "Current session (5 hours)", "percent": 30.0,
+                    "remaining": false, "resetsAt": 1_800_000_000_000_i64}])
+        );
+        let permissions = run(json!({"id": "one", "name": "permissions", "args": "Plan"}))?;
+        assert_eq!(*at(&permissions, "/permissions/activeMode"), "plan");
+        run(json!({"id": "one", "name": "rename", "args": "Fix login"}))?;
+        run(json!({"id": "one", "name": "model", "args": "gpt-5.6 low"}))?;
+        let actions = fake.actions()?;
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [
+                    Request::Control { control: Control::Compact, .. },
+                    Request::Usage { .. },
+                    Request::Permissions {
+                        action: super::super::super::permissions::Action::SetMode { mode },
+                        ..
+                    },
+                    Request::Rename { title, .. },
+                    Request::Control { control: Control::Model { model: Some(model), effort: Some(effort) }, .. },
+                ] if mode == "plan" && title == "Fix login" && model == "gpt-5.6" && effort == "low"
+            ),
+            "{actions:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_skills_are_sent_as_messages_like_the_terminal_sends_them() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = storage(&dir);
+        let fake = serve(
+            &storage,
+            coding(Provider::Codex),
+            vec![skill("lint", false), skill("review", true)],
+        )?;
+        let connection = connection(&storage);
+        assert_eq!(
+            dispatch(
+                &connection.0,
+                "session.command",
+                &json!({"id": "one", "name": "/review", "args": "45"}),
+            )?,
+            json!({"message": "Sent /review"})
+        );
+        dispatch(
+            &connection.0,
+            "session.command",
+            &json!({"id": "one", "name": "$lint", "queue": true}),
+        )?;
+        dispatch(
+            &connection.0,
+            "session.send",
+            &json!({"id": "one", "text": "$lint the docs", "skills": ["lint"]}),
+        )?;
+        let unknown = dispatch(
+            &connection.0,
+            "session.send",
+            &json!({"id": "one", "text": "$gone", "skills": ["gone"]}),
+        )
+        .err()
+        .context("unknown skill")?;
+        assert!(unknown.to_string().contains("Unknown command `$gone`"));
+        let messages: Vec<_> = fake
+            .actions()?
+            .into_iter()
+            .filter_map(|r| match r {
+                Request::Control {
+                    control:
+                        Control::Message {
+                            text,
+                            queue,
+                            skills,
+                            ..
+                        },
+                    ..
+                } => Some((
+                    text,
+                    queue,
+                    skills.into_iter().map(|s| s.name).collect::<Vec<_>>(),
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            messages,
+            [
+                ("/review 45".to_owned(), false, vec![]),
+                ("$lint".to_owned(), true, vec!["lint".to_owned()]),
+                ("$lint the docs".to_owned(), false, vec!["lint".to_owned()]),
+            ]
         );
         Ok(())
     }

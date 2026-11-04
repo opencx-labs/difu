@@ -184,6 +184,7 @@ sessions are included; filter them client-side (Active / Archived toggle).
   "preparing": false,               // worktree/agent still starting; messages are queued
   "canSend": true,                  // composer enabled
   "canInterruptAndSend": false,     // there are queued messages that "Send now" would flush
+  "betweenTurns": true,             // no turn, pending request or queued message; may be absent (older computers)
   "activity": {"label": "Running cargo test", "since": 1790000000000},  // or null
   "queue": [{"index": 0, "text": "Also update the docs"}],
   "pending": [PendingView],
@@ -260,7 +261,7 @@ all other fields with `session` (including `version`).
 | `session.watch` | `id` | `{}`; then a `session` event, followed by `session.delta` events. Several sessions may be watched at once. |
 | `session.unwatch` | `id` | `{}` |
 | `session.entry` | `id`, `entry` (entry id) | `{"entry": EntryView}` untruncated (up to ~4 MB) |
-| `session.send` | `id`, `text`, `queue` (bool, default false), `attachments` (optional `[{"name": "photo.jpg", "data": "<base64>"}]`, PNG/JPEG/WebP/GIF, each under 32 MB) | `{}` |
+| `session.send` | `id`, `text`, `queue` (bool, default false), `attachments` (optional `[{"name": "photo.jpg", "data": "<base64>"}]`, PNG/JPEG/WebP/GIF, each under 32 MB), `skills` (optional names of Codex skills the text uses as `$name`; sent with the message as the terminal does) | `{}` |
 | `session.interrupt` | `id` | `{}` |
 | `session.sendNow` | `id` | `{}` — interrupt and send queued messages now |
 | `session.resume` | `id` | `{}` — "Continue session" |
@@ -268,20 +269,117 @@ all other fields with `session` (including `version`).
 | `session.unqueue` | `id`, `index` | `{}` — remove a queued message |
 | `session.answer` | `id`, `request`, `question`, `answer` (string, or `null` to skip) | `{}` |
 | `session.decide` | `id`, `request`, `choice` (a `choices[].id`) | `{}` |
-| `session.model` | `id`, `model`, `effort` (either may be null) | `{}` |
+| `session.model` | `id`, `model`, `effort` (either may be null) | `{}` — a model of the other provider switches the session to it (see below) |
 | `session.rename` | `id`, `title` | `{}` |
 | `session.archive` | `id`, `archived` | `{}` |
 | `session.delete` | `id` | `{}` — removes chat and worktree (confirm first) |
 | `session.clear` | `id` | `{}` — fresh conversation and worktree (confirm first) |
 | `session.changes` | `id` | `{"files": [DiffFile]}` uncommitted + committed worktree changes |
-| `agents.new` | `repository` (path or null for the default), `model`, `effort`, `text` (first message, optional) | `{"id": "..."}` |
+| `session.commands` | `id`, `refresh` (bool; lists the provider's skills again) | `{"commands": [Command], "errors": ["..."]}`; see *Slash commands* (slow the first time: seconds) |
+| `session.command` | `id`, `name` (`/compact`, `$lint` or a bare name), `args` (string, optional), `confirm` (bool), `queue` (bool, provider commands) | `CommandOutcome`; see *Slash commands* |
+| `agents.new` | `repository` (path or null for the default), `model`, `effort`, `text` (first message, optional) | `{"id": "..."}` — a `model` picks its own provider; the saved provider, effort and starting mode apply only when they belong to it |
 | `agents.repositories` | – | `{"repositories": [{"path": "...", "name": "difu", "default": true}]}` |
 | `agents.models` | – | `{"models": [{"id": "gpt-5.6-luna", "name": "GPT-5.6 Luna", "provider": "codex", "efforts": ["low","medium","high"]}]}` (slow: seconds) |
 | `server.info` | – | `{"name", "version", "hosts", "port"}` |
 
+**Switching providers.** `agents.models` lists both providers' models, and
+`session.model` accepts any of them: a model of the other provider switches the
+session there (the chat and workspace stay; the conversation is handed over
+with the next message). The computer allows that only for coding sessions
+between turns (`betweenTurns`), and changes a Claude Code session's model or
+effort only between turns too; otherwise the call fails with "Finish the current
+turn and pending requests before switching models or providers". A provider is
+derived from a model the same way everywhere: `claude/…`, `claude-…`, `sonnet`,
+`opus` and `haiku` are Claude Code, everything else Codex.
+
 `DiffFile`: `{"path": "src/a.rs", "oldPath": null, "status": "modified", "additions": 3, "deletions": 1, "patch": "@@ ...", "truncated": false}`;
 `status` is `added | deleted | modified | renamed`. `patch` contains hunks only
 (starting at the first `@@`), lines prefixed with `+`, `-`, or space.
+
+### Slash commands
+
+`session.commands` lists what typing `/` in the composer offers for a session,
+from the computer or server running it: difu's session commands that work on a
+phone, then the session provider's skills and commands (Codex skills, Claude
+Code commands and skills). Provider skills are cached per connection for two
+minutes; `refresh` lists them again. Problems listing them come back in
+`errors` while difu's commands are still listed.
+
+`Command`:
+
+```json
+{
+  "name": "model",                  // without the trigger
+  "trigger": "/model",              // what to show and insert: "/name", or "$name" for a Codex skill
+  "description": "Choose a model",
+  "hint": "[model] [effort]",       // argument hint, or null
+  "kind": "screen",                 // action | prompt | screen
+  "screen": "model",                // for screen commands: model | rename | rules | changes | usage | status | permissions | new | skills
+  "confirm": false,                 // destructive: session.command needs "confirm": true
+  "arguments": "optional",          // none | optional | required
+  "source": "difu"                  // difu, or the provider (codex | claude) for its skills and commands
+}
+```
+
+difu's commands, in the terminal's order (those marked *coding* only in coding
+sessions; `rules` and `repo` not in the orchestrator; `diff` only when
+`canReadChanges`):
+
+| Command | Kind | Behaviour |
+| --- | --- | --- |
+| `/compact` | action | Compacts the conversation. |
+| `/model [model] [effort]` | screen `model` | Opens the model picker; with arguments switches like the terminal (a model of the session's provider keeps the effort). |
+| `/effort [level]` | screen `model` | Same picker; with an argument sets the effort. |
+| `/skills` | screen `skills` | *coding*: lists only the provider's entries. |
+| `/status` | screen `status` | Session, model, mode and workspace. |
+| `/rules` | screen `rules` | *coding*: the session repository's rules (`server.rules.*`). |
+| `/permissions [mode]` | screen `permissions` | *coding*: provider modes and Codex approval presets; the argument (an id or label) selects one. |
+| `/usage` | screen `usage` | *coding*: provider usage and rate limits. |
+| `/diff` | screen `changes` | *coding*: `session.changes`. |
+| `/new` | screen `new` | A new session on the same computer or server. |
+| `/rename [title]` | screen `rename` | With a title renames the session. |
+| `/clear` | action, confirm | Fresh conversation and worktree from main. |
+| `/repo <path>` | action, confirm | *coding*: changes repository, discarding the workspace's work. On a server `owner/name` works too. |
+
+Provider entries are `prompt`s with `arguments: "optional"`: insert the trigger
+in the composer and send it as a message. Claude Code runs `/name args` from the
+text; Codex skills are named `$name` in the text and sent in `session.send`'s
+`skills`. A Claude Code command named like one of difu's is not listed (difu's
+runs, as in the terminal). Text starting with a difu command's `/name` should be
+run with `session.command`, not sent.
+
+`session.command` runs a command by name. difu's run on the computer; screen
+commands without arguments only name their screen, except `status`, `usage` and
+`permissions`, which also return the screen's data. A provider skill or command
+is sent as a message (`queue` as in `session.send`). Destructive commands fail
+without `confirm: true`, commands that take no arguments fail with some.
+
+`CommandOutcome` — every field optional:
+
+```json
+{
+  "message": "Compacting the conversation",   // what an action did
+  "screen": "usage",                         // the screen to open
+  "repository": "/Users/ali/code/difu",       // rules: the session's repository
+  "status": {"title": "Fix login", "provider": "claude", "providerLabel": "Claude Code",
+             "model": null, "effort": "high", "state": "Ready", "repository": "/Users/ali/code/difu",
+             "workspace": "/…/worktrees/…", "branch": "difu/agent-…", "providerSession": "…",
+             "mode": "Plan", "preset": null},          // preset: Codex approval preset label
+  "usage": {"provider": "codex", "title": "OpenAI Codex · Usage",
+            "limits": [{"section": "Codex", "title": "Weekly limit", "percent": 96.0,
+                        "remaining": true, "resetsAt": 1800000000000}],   // percent left (remaining) or used
+            "details": [{"section": null, "label": "Account", "value": "pro"}]},
+  "permissions": {"provider": "codex", "activeMode": "default", "pendingMode": null,
+                  "activePreset": "Auto", "pendingPreset": null, "reloadPending": false,
+                  "modes": [{"id": "plan", "label": "Plan", "description": "…", "available": true, "reason": null}],
+                  "presets": [{"id": "Auto", "label": "Approve for me", "description": "…", "available": true, "reason": null}],
+                  "message": null}
+}
+```
+
+Computers without these methods answer `Unknown method`; clients then offer the
+commands existing methods run (`session.compact`, `session.clear`,
+`session.rename`, the model picker, changes and new session).
 
 ## Reviews
 
