@@ -12,7 +12,7 @@ struct DevicesView: View {
 
     var body: some View {
         Loadable(value: devices, error: error, loadingText: "Loading devices…", retry: load) { devices in
-            List {
+            ThemedList {
                 Section {
                     ForEach(devices) { device in
                         DeviceRow(device: device)
@@ -86,7 +86,7 @@ private struct DeviceRow: View {
                 HStack(spacing: 6) {
                     Text(device.name).lineLimit(1)
                     if device.current {
-                        Pill(text: "This phone", color: .accentColor)
+                        Pill(text: "This phone", color: .accent)
                     }
                 }
                 Text(details)

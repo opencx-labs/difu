@@ -46,6 +46,8 @@ final class AppModel {
     private(set) var pairedDevices: [PairedDeviceNotice] = []
     /// The server the Reviews tab uses (nil: the first one).
     var reviewsServerID: String?
+    /// A session to open in the agents list, e.g. one started with `/new`.
+    var requestedSession: SessionRef?
 
     let lock: AppLock
 

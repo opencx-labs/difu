@@ -47,7 +47,7 @@ struct ToolRow: View {
         .background(Color.codeBackground.opacity(0.6), in: RoundedRectangle(cornerRadius: 10))
         .overlay {
             RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(entry.state == .failed ? Color.red.opacity(0.45) : Color.primary.opacity(0.06))
+                .strokeBorder(entry.state == .failed ? Color.failure.opacity(0.45) : Color.primary.opacity(0.06))
         }
         .contextMenu {
             if let detail = entry.detail { Button("Copy Command", systemImage: "terminal") { UIPasteboard.general.string = detail } }
@@ -64,7 +64,7 @@ struct ToolRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 Text(title)
                     .font(.subheadline.weight(.medium))
-                    .foregroundStyle(entry.state == .failed ? Color.red : .primary)
+                    .foregroundStyle(entry.state == .failed ? Color.failure : .primary)
                     .lineLimit(expanded ? 4 : 1)
                     .multilineTextAlignment(.leading)
                 if !expanded, let summary = fileSummary {
@@ -94,7 +94,7 @@ struct ToolRow: View {
                     }
                 }
             case .failed:
-                Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
+                Image(systemName: "xmark.circle.fill").foregroundStyle(.failure)
                 durationText
             case .interrupted:
                 Image(systemName: "stop.circle").foregroundStyle(.secondary)
@@ -133,8 +133,8 @@ struct ToolRow: View {
 
     private var tint: Color {
         switch entry.state {
-        case .running: .accentColor
-        case .failed: .red
+        case .running: .accent
+        case .failed: .failure
         default: .secondary
         }
     }

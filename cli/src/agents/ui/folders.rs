@@ -4,7 +4,7 @@ use crate::agents::folders::{self, Folder};
 
 pub(super) enum Row {
     Folder(Card),
-    Session(Summary),
+    Session(Box<Summary>),
 }
 pub(super) struct Card {
     pub id: String,
@@ -122,12 +122,15 @@ impl Ui {
     pub(super) fn rows(&self) -> Vec<Row> {
         let sessions = self.filtered();
         if self.orchestrator_list || self.folder_view.is_some() || self.session_folders.is_empty() {
-            return sessions.into_iter().map(Row::Session).collect();
+            return sessions
+                .into_iter()
+                .map(|session| Row::Session(Box::new(session)))
+                .collect();
         }
         let mut rows = Vec::new();
         let mut rest = sessions.into_iter().peekable();
         if let Some(root) = rest.next_if(|s| s.id == super::super::orchestrator::ID) {
-            rows.push(Row::Session(root));
+            rows.push(Row::Session(Box::new(root)));
         }
         for folder in &self.session_folders {
             let sessions: Vec<Summary> = folder
@@ -149,7 +152,7 @@ impl Ui {
                 sessions,
             }));
         }
-        rows.extend(rest.map(Row::Session));
+        rows.extend(rest.map(|session| Row::Session(Box::new(session))));
         rows
     }
     pub(super) fn selectable_rows(&self) -> Vec<Row> {

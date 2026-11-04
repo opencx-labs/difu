@@ -50,10 +50,10 @@ struct UserBubble: View {
                 .textSelection(.enabled)
                 .padding(.horizontal, 12)
                 .padding(.vertical, 8)
-                .background(Color.accentColor.opacity(0.18), in: RoundedRectangle(cornerRadius: 16))
+                .background(Color.accent.opacity(0.18), in: RoundedRectangle(cornerRadius: 16))
                 .overlay {
                     if entry.delivery == .unsent {
-                        RoundedRectangle(cornerRadius: 16).strokeBorder(Color.red.opacity(0.6))
+                        RoundedRectangle(cornerRadius: 16).strokeBorder(Color.failure.opacity(0.6))
                     }
                 }
             if let delivery = entry.delivery {
@@ -75,7 +75,7 @@ struct UserBubble: View {
             .foregroundStyle(.secondary)
         case .unsent:
             Label("Not sent", systemImage: "exclamationmark.circle.fill")
-                .foregroundStyle(.red)
+                .foregroundStyle(.failure)
         case .awaiting:
             Label("Waiting to send", systemImage: "clock")
                 .foregroundStyle(.secondary)
@@ -156,7 +156,7 @@ struct PlanRow: View {
         case .completed:
             Image(systemName: "checkmark.circle.fill").foregroundStyle(Color.success)
         case .inProgress:
-            Image(systemName: "circle.dotted.circle").foregroundStyle(Color.accentColor)
+            Image(systemName: "circle.dotted.circle").foregroundStyle(Color.accent)
                 .symbolEffect(.pulse, isActive: active)
         case .pending:
             Image(systemName: "circle").foregroundStyle(.secondary)
@@ -174,10 +174,10 @@ struct ErrorRow: View {
             Image(systemName: "exclamationmark.triangle.fill")
         }
         .font(.callout)
-        .foregroundStyle(.red)
+        .foregroundStyle(.failure)
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.red.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+        .background(Color.failure.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
     }
 }
 

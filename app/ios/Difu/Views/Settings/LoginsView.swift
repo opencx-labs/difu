@@ -23,7 +23,7 @@ struct LoginsView: View {
 
     var body: some View {
         Loadable(value: logins, error: error, loadingText: "Loading logins…", retry: load) { logins in
-            List {
+            ThemedList {
                 if let active {
                     Section {
                         DeviceLoginCard(active: active) { self.active = nil }
@@ -231,7 +231,7 @@ private struct ClaudeTokenSheet: View {
 
     var body: some View {
         NavigationStack {
-            Form {
+            ThemedForm {
                 Section {
                     SecureField("sk-ant-…", text: $token)
                         .font(.monoBody)

@@ -34,6 +34,9 @@ public struct PendingQuestion: Identifiable, Hashable, Sendable, Decodable {
     public var multiSelect: Bool
     public var secret: Bool
     public var answered: Bool
+    /// `session.answer` takes a `note` for this question; false from older
+    /// computers, which would drop it.
+    public var acceptsNote: Bool
 
     /// Permission questions must be answered with an option label exactly.
     public var isPermission: Bool { id == "difu-decision" }
@@ -47,6 +50,7 @@ public struct PendingQuestion: Identifiable, Hashable, Sendable, Decodable {
         multiSelect = f.bool("multiSelect") ?? false
         secret = f.bool("secret") ?? false
         answered = f.bool("answered") ?? false
+        acceptsNote = (f.bool("acceptsNote") ?? false) && id != "difu-decision"
     }
 }
 

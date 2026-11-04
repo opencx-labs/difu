@@ -396,6 +396,9 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
             && (session.orchestrator && tool == Some(super::orchestrator::TOOL)
                 || session.peer_tools && tool == Some(super::peers::TOOL)
                 || session.folder_tools && tool == Some(super::folders::TOOL)
+                || session.command_tools
+                    && !session.orchestrator
+                    && tool.is_some_and(|tool| super::session_tools::TOOLS.contains(&tool))
                 || !session.orchestrator && tool == Some(super::moving::TOOL))
         {
             session.orchestrator_requests.push(Pending {
@@ -1673,6 +1676,11 @@ fn instructions(session: &Session) -> String {
     } else {
         base
     };
+    let base = if session.command_tools {
+        format!("{base}\n\n{}", super::session_tools::INSTRUCTIONS)
+    } else {
+        base
+    };
     let base = if session.server_mode {
         base
     } else {
@@ -1697,6 +1705,23 @@ fn instructions(session: &Session) -> String {
         base
     }
 }
+/// Without a server's automatic preset, the session keeps Codex's configured
+/// approvals, saying why.
+fn drop_automatic_preset(store: &Store, id: &str, reason: &str) -> Result<()> {
+    store.update(id, |s| {
+        if let Some(preset) = s.permission_state.pending_preset.take() {
+            s.note(
+                "system",
+                format!(
+                    "Codex couldn't use \"{}\", this server's default ({reason}). This session keeps Codex's configured approvals; change them with /permissions.",
+                    preset.label()
+                ),
+            );
+        }
+        s.permission_state.automatic_start = false;
+    })?;
+    store.save(id)
+}
 fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool)> {
     // Capture a legacy turn's durable outcome before reconnect resets live status.
     store.update(id, super::plan::preserve_legacy_outcome)?;
@@ -1709,6 +1734,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
             s.question_tools = true;
             s.peer_tools = true;
             s.folder_tools = true;
+            s.command_tools = true;
             s.voice_tools = !s.orchestrator;
         })?;
     }
@@ -1774,7 +1800,25 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
     if resuming {
         isolation::settings(&mut params, &session)?;
     }
-    permissions_control::selected_policy(&mut params, &session, true)?;
+    // A preset chosen before the first connection (a new session's, a moved
+    // one's) is checked against Codex's managed requirements, so read them
+    // before the thread starts.
+    let mut current = None;
+    if session.permission_state.pending_preset.is_some()
+        && session.permission_state.requirements.is_null()
+    {
+        permissions_control::capabilities(&mut rpc, store, id, cancel)?;
+        current = Some(store.get(id)?);
+    }
+    let policy = current.as_ref().unwrap_or(&session);
+    if let Err(error) = permissions_control::selected_policy(&mut params, policy, true) {
+        if !policy.permission_state.automatic_start {
+            return Err(error);
+        }
+        // A server's automatic preset never blocks a session.
+        drop_automatic_preset(store, id, &format!("{error:#}"))?;
+        permissions_control::selected_policy(&mut params, &store.get(id)?, true)?;
+    }
     let response = rpc.call(
         if resuming {
             "thread/resume"
@@ -1805,6 +1849,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
                 s.question_tools = true;
                 s.peer_tools = true;
                 s.folder_tools = true;
+                s.command_tools = true;
                 s.voice_tools = !s.orchestrator;
             })?;
             let fresh = store.get(id)?;
@@ -1857,6 +1902,12 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
         s.voice = false;
     })?;
     permissions_control::record_policy(store, id, &response)?;
+    if store.inspect(id, |s| {
+        s.permission_state.automatic_start && s.permission_state.pending_preset.is_some()
+    })? {
+        drop_automatic_preset(store, id, "Codex kept another policy")?;
+    }
+    store.update(id, |s| s.permission_state.automatic_start = false)?;
     permissions_control::capabilities(&mut rpc, store, id, cancel)?;
     let restored = permissions_control::restore_mode(
         &mut rpc,
@@ -1881,7 +1932,10 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
     Ok((rpc, resuming))
 }
 fn send_queued(rpc: &mut Connection, store: &Store, id: &str, cancel: &Cancel) -> Result<()> {
-    if !store.inspect(id, |s| s.status == Status::Idle && !s.queue.is_empty())? {
+    // Scheduled session actions (a model change, ...) apply before the queue.
+    if !store.inspect(id, |s| {
+        s.status == Status::Idle && !s.queue.is_empty() && !s.scheduled.holds_queue()
+    })? {
         return Ok(());
     }
     let mut next = None;
@@ -2048,6 +2102,14 @@ pub fn run(
                         super::folders::handle_tool(store, id, &args)
                     } else if tool == Some(super::moving::TOOL) {
                         super::moving::schedule(store, id, &args)
+                    } else if let Some(tool) =
+                        tool.filter(|tool| super::session_tools::TOOLS.contains(tool))
+                    {
+                        // Usage comes over this worker's own connection: the
+                        // service would wait for this worker to answer it.
+                        super::session_tools::handle(store, id, tool, &args, |session| {
+                            usage_with(&mut rpc, session, cancel, |v| event(store, id, v))
+                        })
                     } else {
                         super::orchestrator::handle(store, id, &args)
                     }
@@ -2316,6 +2378,25 @@ mod tests {
         apply_event(&mut session, &call);
         assert!(session.orchestrator_requests.is_empty());
         assert_eq!(session.pending.len(), 1);
+    }
+    #[test]
+    fn session_tool_calls_need_a_thread_that_was_given_them() {
+        let mut session =
+            super::super::session_tools::tests::session("one", std::path::Path::new("."));
+        let call = json!({"id":8,"method":"item/tool/call","params":{
+            "tool":super::super::session_tools::SET_MODEL,"threadId":"thread","turnId":"turn",
+            "arguments":{"effort":"low"}}});
+        // An older thread never received the tools or their guidance.
+        assert!(!instructions(&session).contains(super::super::session_tools::INSTRUCTIONS));
+        apply_event(&mut session, &call);
+        assert!(session.orchestrator_requests.is_empty());
+        assert_eq!(session.pending.len(), 1);
+        session.pending.clear();
+        session.command_tools = true;
+        assert!(instructions(&session).contains(super::super::session_tools::INSTRUCTIONS));
+        apply_event(&mut session, &call);
+        assert_eq!(session.orchestrator_requests.len(), 1);
+        assert!(session.pending.is_empty());
     }
     #[test]
     fn completing_an_agent_turn_leaves_user_shell_commands_running() {

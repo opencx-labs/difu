@@ -66,7 +66,7 @@ pub enum RemoteCommand {
         #[arg(long)]
         disable: bool,
     },
-    /// Addresses advertised to clients and the listening port.
+    /// Addresses advertised to clients, the listening port and the name clients show.
     Config {
         /// Public IP, DNS or Tailscale name; repeat for several.
         #[arg(long = "host")]
@@ -75,6 +75,9 @@ pub enum RemoteCommand {
         clear_hosts: bool,
         #[arg(long)]
         port: Option<u16>,
+        /// Name clients show for this server instead of its host name; "" resets it.
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 

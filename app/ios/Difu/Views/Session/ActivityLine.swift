@@ -12,7 +12,7 @@ struct ActivityLine: View {
                 TimelineView(.periodic(from: .now, by: 1)) { context in
                     Text(heading(now: context.date))
                         .font(.subheadline.monospaced())
-                        .foregroundStyle(Color.accentColor)
+                        .foregroundStyle(Color.accent)
                         .lineLimit(2)
                 }
                 .phaseAnimator([0.55, 1.0]) { content, opacity in
@@ -33,7 +33,7 @@ struct ActivityLine: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .tint(.red)
+            .tint(.failure)
         }
         .padding(.vertical, 2)
     }

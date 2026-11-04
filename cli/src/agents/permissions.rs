@@ -14,6 +14,23 @@ pub enum CodexPreset {
     ReadOnly,
 }
 impl CodexPreset {
+    pub const ALL: [Self; 4] = [Self::Ask, Self::Auto, Self::Full, Self::ReadOnly];
+    /// The preset an id (`Auto`) or label (`Approve for me`) names, ignoring case.
+    pub fn parse(text: &str) -> Option<Self> {
+        let text = text.trim();
+        Self::ALL.into_iter().find(|preset| {
+            preset.id().eq_ignore_ascii_case(text) || preset.label().eq_ignore_ascii_case(text)
+        })
+    }
+    /// The serialized name: `Ask`, `Auto`, `Full` or `ReadOnly`.
+    pub fn id(&self) -> &'static str {
+        match self {
+            Self::Ask => "Ask",
+            Self::Auto => "Auto",
+            Self::Full => "Full",
+            Self::ReadOnly => "ReadOnly",
+        }
+    }
     pub fn label(&self) -> &'static str {
         match self {
             Self::Ask => "Ask for approval",
@@ -149,6 +166,10 @@ pub struct State {
     pub claude_settings: Value,
     pub reload_pending: bool,
     pub bypass_enabled: bool,
+    /// The pending starting mode or preset came from a server's automatic
+    /// defaults: a provider refusing it starts in its own default with a note
+    /// instead of failing. Cleared once the provider has started.
+    pub automatic_start: bool,
     pub denials: Vec<Denial>,
     pub capabilities: Value,
     pub requirements: Value,
@@ -380,26 +401,21 @@ pub fn snapshot(session: &Session) -> Snapshot {
                     mode.reason = Some("Provider has not reported support for this mode".into());
                 }
             }
-            result.presets = [
-                CodexPreset::Ask,
-                CodexPreset::Auto,
-                CodexPreset::Full,
-                CodexPreset::ReadOnly,
-            ]
-            .into_iter()
-            .map(|p| {
-                let mut c = choice(
-                    &format!("{p:?}"),
-                    p.label(),
-                    "Native Codex approval and sandbox policy",
-                );
-                if let Err(e) = validate_preset(session, p) {
-                    c.available = false;
-                    c.reason = Some(e.to_string());
-                }
-                c
-            })
-            .collect();
+            result.presets = CodexPreset::ALL
+                .into_iter()
+                .map(|p| {
+                    let mut c = choice(
+                        p.id(),
+                        p.label(),
+                        "Native Codex approval and sandbox policy",
+                    );
+                    if let Err(e) = validate_preset(session, p) {
+                        c.available = false;
+                        c.reason = Some(e.to_string());
+                    }
+                    c
+                })
+                .collect();
         }
         Provider::Claude => {
             result.active_mode = state.mode.clone().or_else(|| {

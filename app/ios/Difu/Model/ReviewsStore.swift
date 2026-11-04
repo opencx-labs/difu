@@ -56,6 +56,9 @@ final class PrModel {
     var guide: Guide?
     var guideError: String?
     var startingGuide = false
+    /// Images in the description and activity, fetched through the PR's
+    /// computer or server (which has the GitHub login).
+    let images: PrImageStore
 
     @ObservationIgnored private let api: DifuAPI
 
@@ -63,11 +66,13 @@ final class PrModel {
         self.repo = repo
         self.number = number
         self.api = api
+        images = PrImageStore(api: api, repo: repo, number: number)
     }
 
     func loadOverview() async {
         do {
             overview = try await api.overview(repo: repo, number: number)
+            images.head = overview?.head
             overviewError = nil
         } catch {
             overviewError = error.localizedDescription

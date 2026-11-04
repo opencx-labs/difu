@@ -304,6 +304,7 @@ fn live_voice_negotiates_through_the_session_service() -> anyhow::Result<()> {
                     model: None,
                     effort: None,
                 })),
+                effective_defaults: false,
             },
         )?
         else {

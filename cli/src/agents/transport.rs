@@ -185,6 +185,30 @@ pub fn write_reply(output: &mut impl Write, reply: &Reply) -> Result<()> {
     serde_json::to_writer(&mut writer, reply).context("Encode session service reply")?;
     writer.finish().context("Send session service reply")
 }
+/// Whether `error` only says the client went away before its reply, as a
+/// closed watch or a client that gave up does: normal for the service, so it
+/// is not logged.
+pub fn disconnected(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        let kind = cause
+            .downcast_ref::<io::Error>()
+            .map(io::Error::kind)
+            // serde_json hides the io::Error it wraps from `source`.
+            .or_else(|| {
+                cause
+                    .downcast_ref::<serde_json::Error>()
+                    .and_then(serde_json::Error::io_error_kind)
+            });
+        matches!(
+            kind,
+            Some(
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+            )
+        )
+    })
+}
 struct FramedReader<'a, R> {
     input: &'a mut R,
     buffer: io::Cursor<Vec<u8>>,
@@ -234,6 +258,24 @@ pub fn read_reply(input: &mut impl BufRead) -> Result<Reply> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn replies_to_clients_that_left_count_as_disconnects() -> Result<()> {
+        let (mut service, client) = std::os::unix::net::UnixStream::pair()?;
+        drop(client);
+        // A small reply fails in the final write, a framed one inside serde_json.
+        for reply in [Reply::Ok, Reply::Changes("x".repeat(CHUNK * 3))] {
+            let error = write_reply(&mut service, &reply)
+                .err()
+                .context("Writing to a closed client must fail")?;
+            assert!(disconnected(&error), "{error:#}");
+        }
+        assert!(!disconnected(&anyhow::anyhow!("Session not found")));
+        assert!(!disconnected(
+            &anyhow::Error::new(io::Error::from(io::ErrorKind::PermissionDenied))
+                .context("Send session service reply")
+        ));
+        Ok(())
+    }
     #[test]
     fn large_history_crosses_old_message_limit_using_bounded_frames() -> Result<()> {
         let text = "é".repeat(34 * 1024 * 1024);

@@ -14,7 +14,7 @@ struct PendingCard: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Image(systemName: icon)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.warning)
                 Text(pending.title ?? defaultTitle)
                     .font(.headline)
                 Spacer(minLength: 0)
@@ -36,13 +36,13 @@ struct PendingCard: View {
             }
             content
             if let error {
-                Text(error).font(.caption).foregroundStyle(.red)
+                Text(error).font(.caption).foregroundStyle(.failure)
             }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.orange.opacity(0.35)))
+        .background(Color.warning.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.warning.opacity(0.35)))
         .disabled(busy)
     }
 
@@ -68,10 +68,11 @@ struct PendingCard: View {
 
     @ViewBuilder private func questionForms(_ questions: [PendingQuestion]) -> some View {
         ForEach(questions) { question in
-            QuestionForm(question: question) { answer in
+            QuestionForm(question: question) { answer, note in
                 await run {
                     try await server.api.answer(
-                        sessionID, request: pending.request, question: question.id, answer: answer)
+                        sessionID, request: pending.request, question: question.id, answer: answer,
+                        note: note)
                 }
             }
             if question.id != questions.last?.id { Divider() }
@@ -131,13 +132,17 @@ struct PendingCard: View {
     }
 }
 
-/// Answers one question: option buttons, multi-select, free text, skip.
+/// Answers one question: option buttons, multi-select, free text, an
+/// optional note sent with the answer (when the computer accepts one), skip.
 struct QuestionForm: View {
     let question: PendingQuestion
-    let submit: (String?) async -> Void
+    /// The answer (nil skips) and the note.
+    let submit: (_ answer: String?, _ note: String?) async -> Void
 
     @State private var selected: [String] = []
     @State private var other = ""
+    @State private var note = ""
+    @State private var noting = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -148,6 +153,10 @@ struct QuestionForm: View {
             }
             MarkdownText(source: question.question, font: .callout)
 
+            if question.acceptsNote {
+                noteField
+            }
+
             if question.multiSelect {
                 multiSelect
             } else {
@@ -155,18 +164,46 @@ struct QuestionForm: View {
             }
 
             if !question.isPermission {
-                Button("Skip") { Task { await submit(nil) } }
+                Button("Skip") { Task { await submit(nil, nil) } }
                     .font(.caption)
                     .buttonStyle(.borderless)
             }
         }
     }
 
+    /// Above the options, since tapping an option answers right away.
+    @ViewBuilder private var noteField: some View {
+        if noting || !note.isEmpty {
+            VStack(alignment: .leading, spacing: 4) {
+                TextField("Note for the agent", text: $note, axis: .vertical)
+                    .lineLimit(1...4)
+                    .textFieldStyle(.roundedBorder)
+                Text(question.multiSelect ? "Sent with your submitted answer." : "Sent with the option or answer you choose.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        } else {
+            Button {
+                noting = true
+            } label: {
+                Label("Add a note", systemImage: "note.text.badge.plus")
+            }
+            .font(.caption)
+            .buttonStyle(.borderless)
+        }
+    }
+
+    /// The note to send, if any.
+    private var sentNote: String? {
+        let text = note.trimmingCharacters(in: .whitespacesAndNewlines)
+        return question.acceptsNote && !text.isEmpty ? text : nil
+    }
+
     private var singleSelect: some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(Array(question.options.enumerated()), id: \.offset) { _, option in
                 Button {
-                    Task { await submit(option.label) }
+                    Task { await submit(option.label, sentNote) }
                 } label: {
                     optionLabel(option)
                 }
@@ -176,7 +213,7 @@ struct QuestionForm: View {
                 otherField(submitLabel: "Send") {
                     let text = other.trimmingCharacters(in: .whitespacesAndNewlines)
                     guard !text.isEmpty else { return }
-                    Task { await submit(text) }
+                    Task { await submit(text, sentNote) }
                 }
             }
         }
@@ -191,7 +228,7 @@ struct QuestionForm: View {
                 } label: {
                     HStack(alignment: .firstTextBaseline) {
                         Image(systemName: isOn ? "checkmark.square.fill" : "square")
-                            .foregroundStyle(isOn ? Color.accentColor : .secondary)
+                            .foregroundStyle(isOn ? Color.accent : .secondary)
                         optionLabel(option)
                     }
                     .contentShape(Rectangle())
@@ -204,7 +241,7 @@ struct QuestionForm: View {
                 var answers = question.options.map(\.label).filter(selected.contains)
                 let text = other.trimmingCharacters(in: .whitespacesAndNewlines)
                 if !text.isEmpty { answers.append(text) }
-                Task { await submit(answers.joined(separator: ", ")) }
+                Task { await submit(answers.joined(separator: ", "), sentNote) }
             }
             .buttonStyle(.borderedProminent)
             .foregroundStyle(Color.onAccent)
@@ -253,7 +290,7 @@ struct ChoiceButtonStyle: ButtonStyle {
     let destructive: Bool
 
     func makeBody(configuration: Configuration) -> some View {
-        let tint: Color = destructive ? .red : .accentColor
+        let tint: Color = destructive ? .failure : .accent
         configuration.label
             .font(.callout.weight(.medium))
             .foregroundStyle(prominent ? (destructive ? Color.white : Color.onAccent) : tint)

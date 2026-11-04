@@ -93,6 +93,14 @@ require_debian() {
   command -v systemctl >/dev/null || fail "systemd is missing; difu runs as a systemd service."
 }
 
+# Whether a user belongs to a group, without piping into an early-exiting
+# grep (see password_logins_off).
+in_group() {
+  local groups
+  groups=" $(id -nG "$1") "
+  [[ $groups == *" $2 "* ]]
+}
+
 # Adds the key once, keeping the file's other keys intact.
 authorize() {
   local user=$1 home=$2 group file
@@ -123,7 +131,7 @@ step_keys() {
   quiet usermod --password '*' difu
   local group
   for group in sudo admin wheel; do
-    if id -nG difu | tr ' ' '\n' | grep -qx "$group"; then
+    if in_group difu "$group"; then
       quiet gpasswd -d difu "$group"
     fi
   done
@@ -155,9 +163,18 @@ EOF
   elif systemctl is-active --quiet sshd; then
     quiet systemctl reload sshd
   fi
-  if ! sshd -T 2>/dev/null | grep -qx 'passwordauthentication no'; then
+  if ! password_logins_off; then
     say "Warning: another SSH setting keeps password logins on; check /etc/ssh/sshd_config."
   fi
+}
+
+# Whether sshd's effective settings refuse passwords. Its output is read in
+# full first: with pipefail, `sshd -T | grep -q` fails when grep stops at the
+# match and sshd dies of SIGPIPE writing the rest.
+password_logins_off() {
+  local settings
+  settings=$(sshd -T 2>/dev/null) || return 1
+  grep -qx 'passwordauthentication no' <<<"$settings"
 }
 
 step_packages() {
@@ -214,7 +231,7 @@ step_tailscale() {
     say "Open the login link below to add this server to your tailnet."
     tailscale up
   fi
-  say "Tailscale address: $(tailscale ip -4 | head -n 1)"
+  say "Tailscale address: $(tailscale ip -4 | sed -n 1p)"
 }
 
 # Runs over Tailscale once this computer reached the server there.
@@ -273,8 +290,8 @@ step_tools() {
   elif ! try as_claude "$home/.local/bin/claude" update; then
     say "Warning: Claude Code could not update itself (details in $LOG); keeping the installed version."
   fi
-  say "Codex: $(as_difu "$home/.local/bin/codex" --version 2>/dev/null | head -n 1 || true)"
-  say "Claude Code: $(as_claude "$home/.local/bin/claude" --version 2>/dev/null | head -n 1 || true)"
+  say "Codex: $(as_difu "$home/.local/bin/codex" --version 2>/dev/null | sed -n 1p || true)"
+  say "Claude Code: $(as_claude "$home/.local/bin/claude" --version 2>/dev/null | sed -n 1p || true)"
   share_claude_config "$home"
 }
 

@@ -2,7 +2,7 @@ import DifuKit
 import SwiftUI
 
 /// One saved computer or server: connection, disk, logins, repositories,
-/// rules, paired devices, and Forget.
+/// new-session defaults, rules, paired devices, and Forget.
 struct ServerSettingsView: View {
     let server: ServerConnection
 
@@ -12,10 +12,13 @@ struct ServerSettingsView: View {
     @State private var forgetting = false
     @State private var disk: ServerDisk?
     @State private var diskError: String?
+    @State private var defaults: AgentDefaults?
+    /// False for older computers without `agents.defaults`.
+    @State private var hasDefaults = true
 
     var body: some View {
         let credential = server.credential
-        Form {
+        ThemedForm {
             Section("Connection") {
                 LabeledContent("Name", value: server.name)
                 LabeledContent("Kind", value: server.isServer ? "Cloud server" : "Computer")
@@ -76,6 +79,21 @@ struct ServerSettingsView: View {
             }
 
             Section {
+                if hasDefaults {
+                    NavigationLink {
+                        NewSessionDefaultsView(server: server)
+                    } label: {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Label("New Session Defaults", systemImage: "slider.horizontal.3")
+                            if let defaults {
+                                Text(defaults.summary)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                }
                 NavigationLink {
                     RulesEditorView(server: server)
                 } label: {
@@ -125,6 +143,7 @@ struct ServerSettingsView: View {
         .navigationTitle(server.name)
         .navigationBarTitleDisplayMode(.inline)
         .task(id: server.isConnected) { await loadDisk() }
+        .task(id: server.isConnected) { await loadDefaults() }
         .confirmationDialog(
             "Forget \(server.name)?", isPresented: $confirmingForget, titleVisibility: .visible
         ) {
@@ -144,6 +163,19 @@ struct ServerSettingsView: View {
             return
         } catch {
             diskError = ServerDiskView.message(for: error, on: server)
+        }
+    }
+
+    /// Reloads on appear (fresh after editing them) and on reconnect.
+    private func loadDefaults() async {
+        guard server.isConnected else { return }
+        do {
+            defaults = try await server.api.agentDefaults()
+            hasDefaults = true
+        } catch let error as RemoteError where error.isUnknownMethod {
+            hasDefaults = false
+        } catch {
+            // The screen itself shows what went wrong.
         }
     }
 

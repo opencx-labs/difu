@@ -53,14 +53,16 @@ pub fn remote(storage: &Storage, command: RemoteCommand) -> Result<()> {
             hosts,
             clear_hosts,
             port,
+            name,
         } => {
-            let command = if hosts.is_empty() && !clear_hosts && port.is_none() {
+            let command = if hosts.is_empty() && !clear_hosts && port.is_none() && name.is_none() {
                 Command::Status
             } else {
                 Command::Configure {
                     hosts,
                     clear_hosts,
                     port,
+                    name,
                 }
             };
             show_config(&send(storage, command)?);
@@ -101,19 +103,51 @@ fn pair(storage: &Storage, json: bool) -> Result<()> {
                 .unwrap_or_else(|| "Remote control is not listening".into())
         );
     };
+    let now = chrono::Utc::now().timestamp_millis();
     if json {
-        println!("{}", serde_json::json!({"link": link, "expires": expires}));
+        // `expiresIn` (seconds) spares a client the server's clock and time zone.
+        let remaining = (expires - now).max(0) / 1000;
+        println!(
+            "{}",
+            serde_json::json!({"link": link, "expires": expires, "expiresIn": remaining})
+        );
         return Ok(());
     }
-    print!("{}", qr_text(&link, io::stdout().is_terminal())?);
+    print_pairing(&link, expires, now)
+}
+
+/// The QR code and link, and when the code expires: relative, then in this
+/// computer's time (`difu server pair` prints it on the client, whose time
+/// zone the server does not know).
+pub(super) fn print_pairing(link: &str, expires: i64, now: i64) -> Result<()> {
+    print!("{}", qr_text(link, io::stdout().is_terminal())?);
     println!();
     println!("Scan this code in the difu app, or paste the link:");
     println!("{link}");
-    println!(
-        "It works once and expires at {}.",
-        local_time(expires, "%H:%M")
-    );
+    match expires_in(expires, now) {
+        Some(relative) => println!(
+            "It works once and expires {relative} (at {}).",
+            local_time(expires, "%H:%M")
+        ),
+        None => println!("This code has expired; ask for a new one."),
+    }
     Ok(())
+}
+
+/// "in 10 minutes", or `None` once it has expired.
+fn expires_in(expires: i64, now: i64) -> Option<String> {
+    let seconds = (expires - now) / 1000;
+    match seconds {
+        ..=0 => None,
+        1..60 => Some("in less than a minute".into()),
+        _ => {
+            let minutes = (seconds + 30) / 60;
+            Some(format!(
+                "in {minutes} minute{}",
+                if minutes == 1 { "" } else { "s" }
+            ))
+        }
+    }
 }
 
 fn devices(status: &Status) {
@@ -261,6 +295,7 @@ fn prompt_secret(prompt: &str) -> Result<String> {
 }
 
 fn show_config(status: &Status) {
+    println!("Name: {}", status.name);
     println!(
         "Port: {}{}",
         status.port,
@@ -356,6 +391,31 @@ mod tests {
         let colored = qr_text("difu://pair?v=1", true)?;
         assert!(colored.starts_with("\x1b[97;40m") && colored.ends_with("\x1b[0m\n"));
         Ok(())
+    }
+
+    #[test]
+    fn pairing_codes_show_a_relative_expiry() {
+        let now = 1_790_000_000_000;
+        let minute = 60_000;
+        assert_eq!(
+            expires_in(now + 10 * minute, now).as_deref(),
+            Some("in 10 minutes")
+        );
+        // A code shown a moment after it was made still reads 10 minutes.
+        assert_eq!(
+            expires_in(now + 10 * minute - 1_500, now).as_deref(),
+            Some("in 10 minutes")
+        );
+        assert_eq!(
+            expires_in(now + minute + 10_000, now).as_deref(),
+            Some("in 1 minute")
+        );
+        assert_eq!(
+            expires_in(now + 59_000, now).as_deref(),
+            Some("in less than a minute")
+        );
+        assert_eq!(expires_in(now, now), None);
+        assert_eq!(expires_in(now - minute, now), None);
     }
 
     #[test]

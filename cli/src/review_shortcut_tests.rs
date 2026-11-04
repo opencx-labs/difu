@@ -1521,7 +1521,7 @@ while True:
             serde_json::from_str(&rx.recv_timeout(Duration::from_secs(3))??)?;
         finish_workers(app)?;
         match request {
-            crate::agents::Request::Launch { job } => Ok(*job),
+            crate::agents::Request::Launch { job, .. } => Ok(*job),
             _ => anyhow::bail!("wrong service request"),
         }
     })();

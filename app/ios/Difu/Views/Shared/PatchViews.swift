@@ -6,9 +6,9 @@ extension PatchLineKind {
         switch self {
         case .addition: .addition
         case .deletion: .deletion
-        case .hunk: .accentColor
+        case .hunk: .accent
         case .meta: .secondary
-        case .context: .primary
+        case .context: .codeText
         }
     }
 
@@ -16,7 +16,7 @@ extension PatchLineKind {
         switch self {
         case .addition: Color.addition.opacity(0.13)
         case .deletion: Color.deletion.opacity(0.13)
-        case .hunk: Color.accentColor.opacity(0.08)
+        case .hunk: Color.accent.opacity(0.08)
         case .meta, .context: .clear
         }
     }
@@ -111,6 +111,7 @@ struct FilePatchView: View {
                 }
             }
         }
+        .themedBackground(.plain)
         .navigationTitle((file.path as NSString).lastPathComponent)
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -166,9 +167,9 @@ struct DiffFileRow: View {
     private var color: Color {
         switch file.status {
         case .added: Color.success
-        case .deleted: .red
-        case .renamed: .blue
-        case .modified: .orange
+        case .deleted: .failure
+        case .renamed: .info
+        case .modified: .warning
         }
     }
 }
@@ -180,8 +181,9 @@ struct DiffFileList: View {
     var body: some View {
         if files.isEmpty {
             ContentUnavailableView("No changes", systemImage: "checkmark.circle", description: Text("Nothing has changed yet."))
+                .themedBackground()
         } else {
-            List {
+            ThemedList {
                 Section {
                     ForEach(files) { file in
                         NavigationLink {

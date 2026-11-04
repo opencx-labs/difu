@@ -475,7 +475,7 @@ impl Ui {
     /// once read, or this Mac's.
     fn location_defaults(&self, server: Option<&str>) -> Option<&crate::storage::AgentDefaults> {
         match server {
-            Some(server) => self.location_defaults.get(server),
+            Some(server) => self.location_defaults.get(server).map(|d| &d.saved),
             None => Some(&self.defaults),
         }
     }

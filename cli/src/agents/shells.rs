@@ -112,13 +112,56 @@ struct Terminal {
     /// Declared after `child`: removes the sandbox container `podman run`
     /// leaves behind when the shell is killed.
     container: Option<super::sandbox::Container>,
-    parser: vt100::Parser,
+    parser: vt100::Parser<Replies>,
     exit_code: Option<u32>,
     reader_done: bool,
     revision: u64,
     published: u64,
     finished_at: Option<i64>,
     error: Option<String>,
+}
+
+/// Answers to the queries a terminal emulator must answer. Prompts such as
+/// `gh`'s (also behind `ssh -t`) ask for the cursor position before reading
+/// keys and wait for the report, reading and dropping everything typed until
+/// it comes; without one they seem to ignore the pane and agent input alike.
+#[derive(Default)]
+struct Replies(Vec<u8>);
+impl Replies {
+    /// Bounded like the input queue: a program flooding queries without
+    /// reading its input cannot grow this.
+    const LIMIT: usize = 4096;
+}
+impl vt100::Callbacks for Replies {
+    fn unhandled_csi(
+        &mut self,
+        screen: &mut vt100::Screen,
+        marker: Option<u8>,
+        _: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        let first = params
+            .first()
+            .and_then(|param| param.first())
+            .copied()
+            .unwrap_or(0);
+        let (row, col) = screen.cursor_position();
+        let (row, col) = (u32::from(row) + 1, u32::from(col) + 1);
+        let reply = match (marker, c, first) {
+            // Device status: OK.
+            (None, 'n', 5) => "\x1b[0n".to_owned(),
+            // Cursor position report, plain and DEC private.
+            (None, 'n', 6) => format!("\x1b[{row};{col}R"),
+            (Some(b'?'), 'n', 6) => format!("\x1b[?{row};{col}R"),
+            // Primary device attributes: a VT100 with advanced video.
+            (None, 'c', 0) => "\x1b[?1;2c".to_owned(),
+            _ => return,
+        };
+        if self.0.len() + reply.len() <= Self::LIMIT {
+            self.0.extend_from_slice(reply.as_bytes());
+        }
+    }
 }
 
 fn size(rows: u16, cols: u16) -> PtySize {
@@ -329,6 +372,25 @@ impl Manager {
             .collect::<Result<Vec<_>>>()
             .map(|items| items.into_iter().flatten().collect())
     }
+    /// Shells per session, as `list` would return them.
+    pub(super) fn counts(&self) -> Result<BTreeMap<String, usize>> {
+        let mut counts = BTreeMap::new();
+        for record in self
+            .terminals
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Shell list lock failed"))?
+            .values()
+        {
+            let session = record
+                .terminal
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Shell lock failed"))?
+                .session
+                .clone();
+            *counts.entry(session).or_insert(0) += 1;
+        }
+        Ok(counts)
+    }
     pub(super) fn handle(&self, store: &Store, id: &str, action: Action) -> Result<Value> {
         let _lifecycle = self
             .lifecycle
@@ -386,7 +448,7 @@ impl Manager {
                     !terminal.human_focused(),
                     "The human controls this shell while its pane is focused. You can read output now; write again after they leave the terminal. This input was not queued."
                 );
-                terminal.write(&text, enter)?;
+                terminal.write(&typed(&text), enter)?;
                 Ok(json!({"written":true}))
             }
             Action::Close { shell } => {
@@ -504,10 +566,11 @@ impl Manager {
                 humans: BTreeMap::new(),
                 child,
                 container,
-                parser: vt100::Parser::new(
+                parser: vt100::Parser::new_with_callbacks(
                     dimension(dimensions.rows),
                     dimension(dimensions.cols),
                     SCROLLBACK,
+                    Replies::default(),
                 ),
                 exit_code: None,
                 reader_done: false,
@@ -638,6 +701,13 @@ impl Manager {
     }
 }
 
+/// Agent text as a terminal sends it: a newline is the Enter key (`\r`), which
+/// programs in raw mode (`ssh -t`, prompts, password reads) expect; the line
+/// discipline turns it back into `\n` for ordinary line input.
+fn typed(text: &str) -> String {
+    text.replace("\r\n", "\r").replace('\n', "\r")
+}
+
 fn publish(store: &Store, terminal: &mut Terminal) -> Result<()> {
     let Some(command) = terminal.command.clone() else {
         return Ok(());
@@ -715,6 +785,13 @@ fn read_output(terminal: Arc<Mutex<Terminal>>, mut reader: Box<dyn Read + Send>)
                         .process(buffer.get(..count).unwrap_or_default());
                 }
                 terminal.revision += 1;
+                let replies = std::mem::take(&mut terminal.parser.callbacks_mut().0);
+                if !replies.is_empty() && terminal.exit_code.is_none() {
+                    // After input still queued: it was typed before the query.
+                    terminal.pending_input.extend(replies);
+                    // The service loop retries what the PTY cannot take yet.
+                    let _ = terminal.flush_input();
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1086,6 +1163,69 @@ mod tests {
         )?;
         until(&store, || {
             Ok(output(&store, &shell)?.contains("value=recovered"))
+        })?;
+        tool_call(&store, "one", &json!({"action":"close","shell":shell}))?;
+        Ok(())
+    }
+    #[test]
+    fn raw_mode_programs_get_cursor_reports_and_input_from_the_pane_and_agents() -> Result<()> {
+        let (_temp, store) = fixture()?;
+        // Like a `gh` prompt behind `ssh -t`: raw mode, ask the terminal for
+        // the cursor position and wait for the answer, then read keys byte by
+        // byte (as hex, so the output shows exactly what arrived).
+        let script = r#"stty raw -echo
+printf '\033[2J\033[Habc\033[6n'
+report=''
+while :; do
+  byte=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+  report="$report$byte"
+  [ "$byte" = 52 ] && break
+done
+printf '\r\nreport=%s\r\nready\r\n' "$report"
+input=$(dd bs=1 count=9 2>/dev/null | od -An -tx1 | tr -d ' \n')
+printf 'input=%s\r\n' "$input"
+sleep 30
+"#;
+        let shell = id(store.shells.handle(
+            &store,
+            "one",
+            Action::Run {
+                command: script.into(),
+            },
+        )?)?;
+        until(&store, || Ok(output(&store, &shell)?.contains("ready")))?;
+        // ESC [ 1 ; 4 R: row 1, column 4, after "abc".
+        assert!(
+            output(&store, &shell)?.contains("report=1b5b313b3452"),
+            "{}",
+            output(&store, &shell)?
+        );
+        let human = |sequence, focused, text: &str| {
+            store.shells.handle(
+                &store,
+                "one",
+                Action::Human {
+                    shell: shell.clone(),
+                    client: "pane".into(),
+                    sequence,
+                    focused,
+                    text: text.into(),
+                },
+            )
+        };
+        // The pane sends Enter as a terminal does (`\r`).
+        human(1, true, "y\r")?;
+        human(2, false, "")?;
+        for (text, enter) in [("no", false), ("ok", true), ("a\n", false)] {
+            tool_call(
+                &store,
+                "one",
+                &json!({"action":"write","shell":shell,"text":text,"enter":enter}),
+            )?;
+        }
+        // y \r, n o, o k \r, and the agent's newline arrives as Enter too.
+        until(&store, || {
+            Ok(output(&store, &shell)?.contains("input=790d6e6f6f6b0d610d"))
         })?;
         tool_call(&store, "one", &json!({"action":"close","shell":shell}))?;
         Ok(())

@@ -39,9 +39,12 @@ struct Loadable<Value, Content: View>: View {
                         .buttonStyle(.bordered)
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .themedBackground()
         } else {
             ProgressView(loadingText)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .themedBackground()
         }
     }
 }

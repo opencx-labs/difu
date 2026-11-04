@@ -91,6 +91,7 @@ fn launch(storage: &Storage, root: &Path, model: &str, prompt: &str) -> Result<S
     match client::request(
         storage,
         Request::Launch {
+            effective_defaults: false,
             job: Box::new(Job::Coding(Launch {
                 repository: root.into(),
                 base: "HEAD".into(),
@@ -122,6 +123,25 @@ fn frames(root: &Path, file: &str) -> Result<Vec<Value>> {
         .lines()
         .map(|line| Ok(serde_json::from_str(line)?))
         .collect()
+}
+/// Claude Code starts for sessions, without model discovery (which looks for
+/// the newest Opus when no model is saved).
+fn session_starts(root: &Path) -> Result<Vec<Value>> {
+    if !root.join("claude-starts.jsonl").exists() {
+        return Ok(Vec::new());
+    }
+    Ok(frames(root, "claude-starts.jsonl")?
+        .into_iter()
+        .filter(|start| {
+            !start
+                .get("args")
+                .and_then(Value::as_array)
+                .is_some_and(|args| {
+                    args.iter()
+                        .any(|arg| arg.as_str() == Some("--no-session-persistence"))
+                })
+        })
+        .collect())
 }
 fn setup(root: &Path) -> Result<(Storage, support::Service, std::path::PathBuf)> {
     let repo = root.join("repo");
@@ -2616,6 +2636,146 @@ fn new_defaults_choose_explicit_provider_and_acknowledge_mode_before_first_turn(
     Ok(())
 }
 
+/// A server-mode service, as `difu serve` runs it (sandboxes stay off).
+fn server(root: &Path) -> Result<(Storage, support::Service, std::path::PathBuf)> {
+    let (storage, service, repo) = setup(root)?;
+    storage.update_config(|config| config.server.enabled = true)?;
+    Ok((storage, service, repo))
+}
+fn new_session(
+    storage: &Storage,
+    repo: &Path,
+    provider: difu::agents::provider::Provider,
+) -> Result<String> {
+    let Reply::Launched(id) = client::request(
+        storage,
+        Request::NewAgent {
+            defaults: difu::storage::AgentDefaults {
+                provider: Some(provider),
+                repository: Some(repo.into()),
+                ..Default::default()
+            },
+            cwd: repo.into(),
+            remember_repository: false,
+            server: None,
+        },
+    )?
+    else {
+        anyhow::bail!("Expected new session")
+    };
+    Ok(id)
+}
+
+#[test]
+fn servers_start_claude_in_auto_and_codex_approving_for_itself() -> Result<()> {
+    use difu::agents::provider::Provider;
+    let temp = tempfile::tempdir()?;
+    let (storage, _service, repo) = server(temp.path())?;
+    let id = new_session(&storage, &repo, Provider::Claude)?;
+    let ready = wait(&storage, &id, |s| s.status == Status::Idle)?;
+    assert_eq!(ready.permission_state.pending_mode.as_deref(), Some("auto"));
+    assert!(ready.permission_state.automatic_start);
+    message(&storage, &id, "first server turn")?;
+    let completed = wait(&storage, &id, |s| s.completed_turn.is_some())?;
+    assert_eq!(completed.permission_state.mode.as_deref(), Some("auto"));
+    assert!(!completed.permission_state.automatic_start);
+    let starts = session_starts(temp.path())?;
+    let args = starts
+        .first()
+        .and_then(|f| f.get("args"))
+        .and_then(Value::as_array)
+        .context("native args")?;
+    assert!(args.windows(2).any(|pair| matches!(pair, [flag, value]
+        if flag.as_str() == Some("--permission-mode") && value.as_str() == Some("auto"))));
+    // Auto is Claude's own checked mode, never bypass.
+    assert!(
+        !args
+            .iter()
+            .any(|v| v.as_str() == Some("--allow-dangerously-skip-permissions"))
+    );
+
+    let id = new_session(&storage, &repo, Provider::Codex)?;
+    let ready = wait(&storage, &id, |s| s.status == Status::Idle)?;
+    assert_eq!(
+        ready.permission_state.pending_preset,
+        Some(CodexPreset::Auto)
+    );
+    message(&storage, &id, "first codex server turn")?;
+    let completed = wait(&storage, &id, |s| s.completed_turn.is_some())?;
+    assert_eq!(completed.permission_state.preset, Some(CodexPreset::Auto));
+    assert!(completed.permission_state.pending_preset.is_none());
+    let wire = frames(temp.path(), "protocol.jsonl")?;
+    let method = |name: &str| {
+        wire.iter()
+            .position(|v| v.get("method").and_then(Value::as_str) == Some(name))
+    };
+    let start = method("thread/start").context("thread start")?;
+    // Managed requirements are read before the preset is sent.
+    assert!(method("configRequirements/read").is_some_and(|read| read < start));
+    let started = wire.get(start).context("thread start frame")?;
+    assert_eq!(
+        started.pointer("/params/approvalsReviewer"),
+        Some(&json!("auto_review"))
+    );
+    assert_eq!(
+        started.pointer("/params/sandbox"),
+        Some(&json!("workspace-write"))
+    );
+    Ok(())
+}
+
+#[test]
+fn refused_automatic_starts_fall_back_to_the_providers_own_with_a_note() -> Result<()> {
+    use difu::agents::provider::Provider;
+    // Claude: the repository disables Auto mode.
+    let temp = tempfile::tempdir()?;
+    let (storage, _service, repo) = server(temp.path())?;
+    fs::create_dir(repo.join(".claude"))?;
+    fs::write(
+        repo.join(".claude/settings.json"),
+        r#"{"permissions":{"disableAutoMode":"disable"}}"#,
+    )?;
+    git(&repo, &["add", ".claude/settings.json"])?;
+    git(&repo, &["commit", "-m", "no auto mode"])?;
+    git(&repo, &["update-ref", "refs/remotes/origin/main", "HEAD"])?;
+    let id = new_session(&storage, &repo, Provider::Claude)?;
+    wait(&storage, &id, |s| s.status == Status::Idle)?;
+    message(&storage, &id, "still works")?;
+    let completed = wait(&storage, &id, |s| s.completed_turn.is_some())?;
+    assert_eq!(completed.permission_state.mode.as_deref(), Some("default"));
+    assert!(completed.permission_state.pending_mode.is_none());
+    assert!(
+        completed
+            .entries
+            .iter()
+            .any(|entry| entry.kind == "system"
+                && entry.text.contains("couldn't start in Auto mode"))
+    );
+    // Codex: managed requirements allow only the user as reviewer.
+    let temp = tempfile::tempdir()?;
+    fs::write(temp.path().join("restrict-permissions"), "")?;
+    let (storage, _service, repo) = server(temp.path())?;
+    let id = new_session(&storage, &repo, Provider::Codex)?;
+    wait(&storage, &id, |s| s.status == Status::Idle)?;
+    message(&storage, &id, "still works for codex")?;
+    let completed = wait(&storage, &id, |s| s.completed_turn.is_some())?;
+    assert!(completed.permission_state.pending_preset.is_none());
+    assert_ne!(completed.permission_state.preset, Some(CodexPreset::Auto));
+    assert!(
+        completed
+            .entries
+            .iter()
+            .any(|entry| entry.kind == "system" && entry.text.contains("Approve for me"))
+    );
+    let wire = frames(temp.path(), "protocol.jsonl")?;
+    assert!(
+        wire.iter()
+            .filter(|v| v.get("method").and_then(Value::as_str) == Some("thread/start"))
+            .all(|v| v.pointer("/params/approvalsReviewer").is_none())
+    );
+    Ok(())
+}
+
 #[test]
 fn rejected_starting_mode_stays_pending_and_sends_no_first_turn() -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -2700,7 +2860,7 @@ fn claude_starting_modes_use_native_arguments_and_repository_restrictions() -> R
         let completed = wait(&storage, &id, |s| s.completed_turn.is_some())
             .with_context(|| format!("Starting mode {mode}"))?;
         assert_eq!(completed.permission_state.mode.as_deref(), Some(mode));
-        let starts = frames(temp.path(), "claude-starts.jsonl")?;
+        let starts = session_starts(temp.path())?;
         let args = starts
             .first()
             .and_then(|f| f.get("args"))
@@ -2746,6 +2906,6 @@ fn claude_starting_modes_use_native_arguments_and_repository_restrictions() -> R
         failed.permission_state.pending_mode.as_deref(),
         Some("bypassPermissions")
     );
-    assert!(!temp.path().join("claude-starts.jsonl").exists());
+    assert!(session_starts(temp.path())?.is_empty());
     Ok(())
 }

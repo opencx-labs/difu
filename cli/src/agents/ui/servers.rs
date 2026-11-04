@@ -16,6 +16,15 @@ pub(super) fn server_name(id: &str) -> Option<&str> {
     federation::split(id).map(|(server, _)| server)
 }
 
+/// A sidebar row rebuilt from a session. `Session::summary` cannot know the
+/// server, so take it from the id; otherwise every live update of a server
+/// session drops its cloud mark until the next list arrives.
+pub(super) fn summary(session: &Session) -> Summary {
+    let mut summary = session.summary();
+    summary.server = server_name(&session.id).map(str::to_owned);
+    summary
+}
+
 impl Ui {
     /// The saved server running the selected session; `None` is this Mac.
     pub(super) fn selected_server(&self) -> Option<String> {
@@ -29,6 +38,25 @@ impl Ui {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rows_rebuilt_from_server_sessions_keep_their_server() -> Result<()> {
+        let mut cloud = Session::new(
+            "aws:1790000000000-ab12cd34".into(),
+            Job::Coding(crate::agents::Launch {
+                repository: "/srv/repo".into(),
+                isolated: true,
+                base: "origin/main".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        assert_eq!(summary(&cloud).server.as_deref(), Some("aws"));
+        cloud.id = "1790000000000-ab12cd34".into();
+        assert_eq!(summary(&cloud).server, None);
+        Ok(())
+    }
     use anyhow::{Context, Result};
 
     fn screen(ui: &mut Ui) -> Result<String> {

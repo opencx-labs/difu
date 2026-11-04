@@ -7,9 +7,12 @@
 //! without trusting any certificate authority. See docs/remote-protocol.md and
 //! docs/cloud-agents.md.
 mod api;
+mod commands;
+mod defaults;
 mod identity;
 mod listener;
 mod network;
+mod resources;
 mod reviews;
 mod server_api;
 mod view;
@@ -47,11 +50,14 @@ pub enum Command {
     Password {
         verifier: Option<Verifier>,
     },
-    /// Add advertised hosts (after clearing them, if asked) and change the port.
+    /// Add advertised hosts (after clearing them, if asked), change the port
+    /// and set the display name (an empty name returns to the host name).
     Configure {
         hosts: Vec<String>,
         clear_hosts: bool,
         port: Option<u16>,
+        #[serde(default)]
+        name: Option<String>,
     },
 }
 
@@ -82,7 +88,8 @@ pub struct Status {
     pub pairing_expires: Option<i64>,
     pub devices: Vec<DeviceStatus>,
     pub error: Option<String>,
-    /// Hosts from `difu remote config`, advertised ahead of discovered ones.
+    /// Hosts from `difu remote config`, advertised ahead of discovered ones
+    /// (instead of them on a server).
     #[serde(default)]
     pub configured_hosts: Vec<String>,
     /// A server password is set, so password pairing is on.
@@ -112,6 +119,9 @@ struct Settings {
     devices: Vec<Device>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     hosts: Vec<String>,
+    /// Shown to clients instead of the host name (`difu remote config --name`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
     /// The server password's verifier; never the password itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     password: Option<Verifier>,
@@ -252,7 +262,8 @@ impl Remote {
                 hosts,
                 clear_hosts,
                 port,
-            } => self.configure(hosts, clear_hosts, port)?,
+                name,
+            } => self.configure(hosts, clear_hosts, port, name)?,
         }
         self.status()
     }
@@ -285,11 +296,13 @@ impl Remote {
         hosts: Vec<String>,
         clear_hosts: bool,
         port: Option<u16>,
+        name: Option<String>,
     ) -> Result<()> {
         let hosts = hosts
             .iter()
             .map(|host| advertised_host(host))
             .collect::<Result<Vec<_>>>()?;
+        let name = name.as_deref().map(display_name).transpose()?;
         ensure!(port != Some(0), "Choose a port between 1 and 65535");
         let moved = {
             let state = self.lock()?;
@@ -320,6 +333,9 @@ impl Remote {
             }
             if let Some(port) = port {
                 state.settings.port = port;
+            }
+            if let Some(name) = name {
+                state.settings.name = name;
             }
             let previous = match replacement {
                 Some((server, port)) => {
@@ -366,7 +382,7 @@ impl Remote {
         } else {
             Vec::new()
         };
-        let name = network::name();
+        let name = state.settings.name.clone().unwrap_or_else(network::name);
         let pairing = match (&state.pairing, &identity, listening) {
             (Some(pairing), Some(identity), true) => Some(pairing_uri(
                 &name,
@@ -409,7 +425,15 @@ impl Remote {
         })
     }
 
-    /// Configured hosts first, then the addresses discovered on this machine.
+    /// The name clients show: the configured one, else the computer's name.
+    fn name(&self) -> String {
+        self.lock()
+            .ok()
+            .and_then(|s| s.settings.name.clone())
+            .unwrap_or_else(network::name)
+    }
+
+    /// The hosts in pairing links, `welcome` and `server.info`; see [`advertise`].
     fn hosts(&self) -> Vec<String> {
         let configured = self
             .lock()
@@ -423,13 +447,7 @@ impl Remote {
             Some(bind) => vec![bind.clone()],
             None => network::hosts(),
         };
-        let mut hosts = configured.to_vec();
-        for host in discovered {
-            if !hosts.contains(&host) {
-                hosts.push(host);
-            }
-        }
-        hosts
+        advertise(configured, discovered, self.server_mode())
     }
 
     /// `difu serve` turned server mode on in this installation's settings.
@@ -614,6 +632,35 @@ fn home(storage: &Storage) -> PathBuf {
     super::server::home(storage)
         .map(|home| home.join("remote"))
         .unwrap_or_else(|_| storage.cache.join("remote"))
+}
+
+/// Configured hosts first, then the addresses discovered on this machine. A
+/// server with configured hosts (`difu remote config --host`) advertises only
+/// those: what it discovers are private cloud addresses (`ip-172-31-….local`,
+/// `172.31.….`) that clients would save and try in vain. A computer keeps its
+/// discovered addresses, which are how phones on its network reach it.
+fn advertise(configured: &[String], discovered: Vec<String>, server: bool) -> Vec<String> {
+    let mut hosts = configured.to_vec();
+    if server && !configured.is_empty() {
+        return hosts;
+    }
+    for host in discovered {
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
+}
+
+/// A display name for clients, or `None` (an empty name) to show the
+/// computer's name again.
+fn display_name(name: &str) -> Result<Option<String>> {
+    let name = name.trim();
+    ensure!(
+        name.chars().count() <= 64 && !name.chars().any(char::is_control),
+        "Use a name of at most 64 characters without control characters"
+    );
+    Ok((!name.is_empty()).then(|| name.to_owned()))
 }
 
 /// A host name or IP address for pairing links; the port is separate.
@@ -803,6 +850,62 @@ mod tests {
     }
 
     #[test]
+    fn servers_advertise_only_configured_hosts_and_computers_add_discovered_ones() {
+        let discovered = || vec!["ip-172-31-33-39.local".into(), "172.31.33.39".into()];
+        let configured = ["63.185.13.36".to_owned()];
+        assert_eq!(advertise(&configured, discovered(), true), ["63.185.13.36"]);
+        // Nothing configured yet: discovered addresses are all a server has.
+        assert_eq!(
+            advertise(&[], discovered(), true),
+            ["ip-172-31-33-39.local", "172.31.33.39"]
+        );
+        // A computer on a LAN keeps them after its configured hosts.
+        assert_eq!(
+            advertise(
+                &["mac.tail1.ts.net".into(), "172.31.33.39".into()],
+                discovered(),
+                false
+            ),
+            ["mac.tail1.ts.net", "172.31.33.39", "ip-172-31-33-39.local"]
+        );
+    }
+
+    #[test]
+    fn the_display_name_reaches_links_and_is_saved() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let remote = remote(&temp);
+        let configure = |name: &str| {
+            remote.command(Command::Configure {
+                hosts: Vec::new(),
+                clear_hosts: false,
+                port: None,
+                name: Some(name.into()),
+            })
+        };
+        assert_eq!(configure(" aws ")?.name, "aws");
+        assert_eq!(remote.name(), "aws");
+        let link = remote.command(Command::Open)?.pairing.context("link")?;
+        let pairs: std::collections::BTreeMap<_, _> =
+            url::Url::parse(&link)?.query_pairs().into_owned().collect();
+        assert_eq!(pairs.get("n").map(String::as_str), Some("aws"));
+        assert_eq!(load(&remote.home)?.name.as_deref(), Some("aws"));
+        // Other settings changes keep it.
+        remote.command(Command::Configure {
+            hosts: vec!["203.0.113.4".into()],
+            clear_hosts: false,
+            port: None,
+            name: None,
+        })?;
+        assert_eq!(load(&remote.home)?.name.as_deref(), Some("aws"));
+        assert!(configure("bad\nname").is_err());
+        assert!(configure(&"x".repeat(65)).is_err());
+        assert_eq!(configure("")?.name, network::name());
+        assert_eq!(load(&remote.home)?.name, None);
+        remote.shut_down()?;
+        Ok(())
+    }
+
+    #[test]
     fn changing_the_port_moves_the_listener() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let remote = remote(&temp);
@@ -814,6 +917,7 @@ mod tests {
             hosts: Vec::new(),
             clear_hosts: false,
             port: Some(free),
+            name: None,
         })?;
         assert!(status.listening);
         assert_eq!(status.port, free);

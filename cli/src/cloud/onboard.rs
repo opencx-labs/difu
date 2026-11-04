@@ -61,6 +61,13 @@ const TAILSCALE_ADDRESS: &str =
 const GITHUB_STATUS: &str = "gh auth status";
 const GITHUB_LOGIN: &str =
     "gh auth login --hostname github.com --git-protocol https --web && gh auth setup-git";
+/// Commits made by agents need an author. Unless one is set, use the GitHub
+/// account the server logged in with and its private noreply address.
+const GIT_IDENTITY: &str = "git config --global user.email >/dev/null || { \
+    login=$(gh api user --jq .login) && id=$(gh api user --jq .id) \
+    && name=$(gh api user --jq '.name // .login') \
+    && git config --global user.name \"$name\" \
+    && git config --global user.email \"$id+$login@users.noreply.github.com\"; }";
 const CODEX_STATUS: &str = "\"$HOME/.local/bin/codex\" login status";
 const CODEX_LOGIN: &str = "\"$HOME/.local/bin/codex\" login --device-auth";
 const CLAUDE_STATUS: &str = "grep -q '^CLAUDE_CODE_OAUTH_TOKEN=' \"$HOME/.config/difu/server.env\"";
@@ -240,6 +247,7 @@ pub fn add(storage: &Storage, options: Options) -> Result<()> {
         "~/.local/bin/codex login --device-auth",
     )?;
     claude_login(&difu, &root, &name)?;
+    git_identity(&difu);
 
     progress.next("Choosing the server password");
     note("Other computers and phones join with the server's address and this password.");
@@ -268,13 +276,12 @@ pub fn add(storage: &Storage, options: Options) -> Result<()> {
     pair_this_computer(storage, &difu, &name, hosts, &key, &retry)?;
 
     progress.next("Pairing a phone");
-    if confirm("Show a QR code for the difu iPhone app now?", true)? {
-        let status = difu.interactive(Some("difu remote pair"))?;
-        if !status.success() {
-            warn(&format!(
-                "No QR code was shown. Later: `difu server pair {name}`."
-            ));
-        }
+    if confirm("Show a QR code for the difu iPhone app now?", true)?
+        && let Err(error) = show_pairing(&difu)
+    {
+        warn(&format!(
+            "No QR code was shown ({error:#}). Later: `difu server pair {name}`."
+        ));
     }
     println!(
         "\n{name} is ready: pick it when you start a new session in difu.\n\
@@ -344,7 +351,7 @@ fn pair_this_computer(
     key: &Path,
     retry: &str,
 ) -> Result<()> {
-    let output = difu.output(&remote_config(&hosts), None)?;
+    let output = difu.output(&remote_config(name, &hosts), None)?;
     ensure!(
         output.status.success(),
         "Could not save the server's address on the server ({}). Run `{retry}` again",
@@ -357,7 +364,7 @@ fn pair_this_computer(
          `difu server ssh {name}` and `systemctl status difu-agent`, then run `{retry}` again",
         stderr(&output)
     );
-    let link = pairing_link(&String::from_utf8_lossy(&output.stdout))?;
+    let (link, _) = pairing_answer(&String::from_utf8_lossy(&output.stdout))?;
     let device = computer_name();
     let paired = client::pair_with_link(&link, &device, true).with_context(|| {
         format!(
@@ -409,13 +416,12 @@ pub fn pair(storage: &Storage, name: &str) -> Result<()> {
     let access = access(storage, name)?;
     let remote = Remote::saved(&access);
     let login = Login::Key(access.key.clone());
-    let status = Ssh::new(&remote, "difu", &login).interactive(Some("difu remote pair"))?;
-    ensure!(
-        status.success(),
-        "Could not show a pairing code for {name}. Check the service with \
-         `difu server ssh {name}`, then `systemctl status difu-agent`"
-    );
-    Ok(())
+    show_pairing(&Ssh::new(&remote, "difu", &login)).with_context(|| {
+        format!(
+            "Could not show a pairing code for {name}. Check the service with \
+             `difu server ssh {name}`, then `systemctl status difu-agent`"
+        )
+    })
 }
 
 /// Brings a saved server up to this computer's difu: the binary, Codex and
@@ -459,8 +465,35 @@ pub fn upgrade(storage: &Storage, name: &str) -> Result<()> {
         "The upgrade stopped (see above). Fix the problem, then run \
          `difu server upgrade {name}` again"
     );
+    // Servers set up before display names show their host name; name them as
+    // saved here. The service restarts above, so give it a moment to listen.
+    let difu = Ssh::new(&remote, "difu", &login);
+    let command = format!("difu remote config --name {}", shell_quote(name));
+    let named = (0..10).any(|attempt| {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        difu.output(&command, None)
+            .is_ok_and(|output| output.status.success())
+    });
+    if !named {
+        println!("Could not name the server {name}; run `difu remote config --name {name}` on it");
+    }
+    git_identity(&difu);
     println!("{name} now runs difu {VERSION}");
     Ok(())
+}
+
+/// Sets the `difu` user's Git author from its GitHub login when none is set;
+/// failures only print a hint, since agents can still commit with an override.
+fn git_identity(difu: &Ssh) {
+    match difu.output(GIT_IDENTITY, None) {
+        Ok(output) if output.status.success() => {}
+        _ => println!(
+            "Could not set a Git author for agents; log in to GitHub on the server, then run \
+             `git config --global user.name` and `user.email` as difu"
+        ),
+    }
 }
 
 /// Where one server answers SSH, and its own known_hosts file.
@@ -888,12 +921,13 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-fn remote_config(hosts: &[String]) -> String {
-    hosts
-        .iter()
-        .fold("difu remote config".to_owned(), |command, host| {
-            format!("{command} --host {}", shell_quote(host))
-        })
+/// Advertises `hosts` and names the server as this computer saves it, so
+/// phones and other clients show that name rather than the host name.
+fn remote_config(name: &str, hosts: &[String]) -> String {
+    hosts.iter().fold(
+        format!("difu remote config --name {}", shell_quote(name)),
+        |command, host| format!("{command} --host {}", shell_quote(host)),
+    )
 }
 
 /// `difu server add` again with what this run settled, for failure messages.
@@ -1156,8 +1190,10 @@ fn parse_tailscale(stdout: &str) -> Result<(String, Option<String>)> {
     Ok((ip.to_owned(), dns))
 }
 
-/// `{"link":"difu://pair?...","expires":...}` from `difu remote pair --json`.
-fn pairing_link(stdout: &str) -> Result<String> {
+/// `{"link":"difu://pair?...","expires":...,"expiresIn":...}` from
+/// `difu remote pair --json`: the link, and when it expires by this
+/// computer's clock (from `expiresIn`, which older servers leave out).
+fn pairing_answer(stdout: &str) -> Result<(String, Option<i64>)> {
     let line = stdout
         .lines()
         .rev()
@@ -1170,7 +1206,27 @@ fn pairing_link(stdout: &str) -> Result<String> {
         .and_then(serde_json::Value::as_str)
         .filter(|link| link.starts_with("difu://"))
         .context("`difu remote pair --json` printed no pairing link")?;
-    Ok(link.to_owned())
+    let expires = match value.get("expiresIn").and_then(serde_json::Value::as_i64) {
+        Some(seconds) => Some(
+            chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_add(seconds.saturating_mul(1000)),
+        ),
+        None => value.get("expires").and_then(serde_json::Value::as_i64),
+    };
+    Ok((link.to_owned(), expires))
+}
+
+/// A phone pairing code for the server, printed here so its expiry is in this
+/// computer's time; the server's own `difu remote pair` uses the server's
+/// clock and time zone (often UTC).
+fn show_pairing(difu: &Ssh) -> Result<()> {
+    let output = difu.output("difu remote pair --json", None)?;
+    ensure!(output.status.success(), "{}", stderr(&output));
+    let (link, expires) = pairing_answer(&String::from_utf8_lossy(&output.stdout))?;
+    let now = chrono::Utc::now().timestamp_millis();
+    // Codes last 10 minutes when an older server says nothing.
+    super::serve::print_pairing(&link, expires.unwrap_or(now + 10 * 60_000), now)
 }
 
 fn replace_root_password(root: &Ssh, name: &str) -> Result<()> {
@@ -1933,6 +1989,53 @@ mod tests {
     }
 
     #[test]
+    fn setup_checks_survive_producers_that_die_of_sigpipe() -> Result<()> {
+        // Like a real `sshd -T`, the stand-ins keep writing after the line
+        // the check looks for, far more than a pipe buffers.
+        let sshd = |answer: &str| {
+            format!(
+                "sshd() {{ printf 'port 22\\npasswordauthentication {answer}\\n'; seq 1 200000; }}\n"
+            )
+        };
+        let run = |script: String| run_bash(&format!("set -Eeuo pipefail\n{script}"), &["-s"]);
+        // The old check: grep -q exits at the match, sshd dies of SIGPIPE and
+        // pipefail fails the pipeline, so the warning showed on every server.
+        let naive = run(format!(
+            "{}sshd -T 2>/dev/null | grep -qx 'passwordauthentication no'\n",
+            sshd("no")
+        ))?;
+        assert!(!naive.status.success(), "the SIGPIPE was not reproduced");
+        let check = bootstrap_function("password_logins_off")?;
+        for (stand_in, off) in [
+            (sshd("no"), true),
+            (sshd("yes"), false),
+            ("sshd() { return 1; }\n".to_owned(), false),
+        ] {
+            let output = run(format!("{stand_in}{check}password_logins_off\n"))?;
+            assert_eq!(output.status.success(), off, "{stand_in}");
+        }
+        let groups = bootstrap_function("in_group")?;
+        let id = "id() { printf 'difu sudo'; seq -f ' group%g' 1 200000 | tr -d '\\n'; printf '\\n'; }\n";
+        for (group, member) in [
+            ("sudo", true),
+            ("difu", true),
+            ("sud", false),
+            ("wheel", false),
+        ] {
+            let output = run(format!("{id}{groups}in_group difu {group}\n"))?;
+            assert_eq!(output.status.success(), member, "{group}");
+        }
+        // No other check pipes into a reader that stops early.
+        for line in BOOTSTRAP.lines().map(str::trim) {
+            assert!(
+                line.starts_with('#') || !(line.contains("| grep -q") || line.contains("| head")),
+                "{line}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn claude_code_in_the_setup_shares_the_config_only_once_it_moved() -> Result<()> {
         let body = bootstrap_function("as_claude")?;
         let home = tempfile::tempdir()?;
@@ -2172,12 +2275,20 @@ mod tests {
             ("100.101.102.103".into(), None)
         );
         assert!(parse_tailscale("\n").is_err());
+        // An older server: only the expiry by its own clock.
         assert_eq!(
-            pairing_link("note\n{\"link\":\"difu://pair?c=1\",\"expires\":1790000000000}\n")?,
-            "difu://pair?c=1"
+            pairing_answer("note\n{\"link\":\"difu://pair?c=1\",\"expires\":1790000000000}\n")?,
+            ("difu://pair?c=1".to_owned(), Some(1_790_000_000_000))
         );
-        assert!(pairing_link("{\"link\":\"https://example.com\"}").is_err());
-        assert!(pairing_link("nothing").is_err());
+        // `expiresIn` counts from now on this computer, whatever the server's clock.
+        let before = chrono::Utc::now().timestamp_millis();
+        let (_, expires) =
+            pairing_answer("{\"link\":\"difu://pair?c=1\",\"expires\":1,\"expiresIn\":600}")?;
+        let expires = expires.context("expiry")?;
+        assert!(expires >= before + 600_000, "{expires}");
+        assert!(expires <= chrono::Utc::now().timestamp_millis() + 600_000);
+        assert!(pairing_answer("{\"link\":\"https://example.com\"}").is_err());
+        assert!(pairing_answer("nothing").is_err());
         Ok(())
     }
 
@@ -2185,8 +2296,8 @@ mod tests {
     fn commands_quote_what_they_pass_on() {
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(
-            remote_config(&["203.0.113.7".into(), "box.ts.net".into()]),
-            "difu remote config --host '203.0.113.7' --host 'box.ts.net'"
+            remote_config("aws", &["203.0.113.7".into(), "box.ts.net".into()]),
+            "difu remote config --name 'aws' --host '203.0.113.7' --host 'box.ts.net'"
         );
         let mut custom = options();
         assert_eq!(

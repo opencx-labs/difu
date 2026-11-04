@@ -153,7 +153,10 @@ fn accept(
                     .name("difu-remote-peer".into())
                     .spawn(move || {
                         let remote = admission.remote.clone();
-                        if let Err(error) = serve(&remote, &identity, stream, admission) {
+                        // Phones and computers drop off mid-reply all the time.
+                        if let Err(error) = serve(&remote, &identity, stream, admission)
+                            && !crate::agents::transport::disconnected(&error)
+                        {
                             eprintln!("Remote control client {address}: {error:#}");
                         }
                     });
@@ -563,7 +566,7 @@ fn authenticate(
         "token": authenticated.enrolled.as_ref().map(|e| e.token.clone()),
         "access": authenticated.access,
         "server": {
-            "name": super::network::name(),
+            "name": remote.name(),
             "version": env!("CARGO_PKG_VERSION"),
             "hosts": remote.hosts(),
             "port": socket.get_ref().sock.local_addr()?.port(),

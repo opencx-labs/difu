@@ -194,6 +194,7 @@ final class ServerConnection: Identifiable {
         case .session(let view): sessions.receive(view)
         case .sessionDelta(let delta): sessions.apply(delta)
         case .sessionClosed(let id, let message): sessions.closed(id, message: message)
+        case .folders(let folders): sessions.receive(folders: folders)
         case .devicePaired, .unknown: onEvent?(self, event)
         }
     }

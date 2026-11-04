@@ -12,7 +12,7 @@ struct WelcomeView: View {
                     VStack(spacing: 14) {
                         Image(systemName: "chevron.right.square.fill")
                             .font(.system(size: 64))
-                            .foregroundStyle(Color.accentColor)
+                            .foregroundStyle(Color.accent)
                             .symbolRenderingMode(.hierarchical)
                         Text("difu")
                             .font(.system(size: 40, weight: .bold, design: .monospaced))
@@ -26,10 +26,10 @@ struct WelcomeView: View {
                     if let notice = app.notice {
                         Label(notice, systemImage: "exclamationmark.triangle.fill")
                             .font(.callout)
-                            .foregroundStyle(.orange)
+                            .foregroundStyle(.warning)
                             .padding(12)
                             .frame(maxWidth: .infinity, alignment: .leading)
-                            .background(Color.orange.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
+                            .background(Color.warning.opacity(0.1), in: RoundedRectangle(cornerRadius: 12))
                     }
 
                     PairingInstructions()
@@ -48,6 +48,7 @@ struct WelcomeView: View {
                 .padding(.bottom, 32)
             }
             .scrollBounceBehavior(.basedOnSize)
+            .themedBackground(.plain)
         }
     }
 }
@@ -66,7 +67,7 @@ struct PairingInstructions: View {
     private func row(_ icon: String, _ title: String, _ text: LocalizedStringKey) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 12) {
             Image(systemName: icon)
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(Color.accent)
                 .frame(width: 24)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.body.weight(.semibold))
@@ -181,10 +182,10 @@ struct PairingStatus: View {
                 Image(systemName: "xmark.octagon.fill")
             }
             .font(.callout)
-            .foregroundStyle(.red)
+            .foregroundStyle(.failure)
             .padding(12)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.red.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+            .background(Color.failure.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
         case .idle:
             EmptyView()
         }
@@ -205,7 +206,7 @@ struct PasswordJoinSheet: View {
 
     var body: some View {
         NavigationStack {
-            Form {
+            ThemedForm {
                 Section {
                     TextField("203.0.113.5 or my-server.example.com", text: $address)
                         .font(.monoBody)
@@ -294,7 +295,7 @@ struct PasteLinkSheet: View {
 
     var body: some View {
         NavigationStack {
-            Form {
+            ThemedForm {
                 Section {
                     TextField("difu://pair?…", text: $text, axis: .vertical)
                         .font(.monoCaption)
@@ -306,7 +307,7 @@ struct PasteLinkSheet: View {
                     }
                 } footer: {
                     if let error {
-                        Text(error).foregroundStyle(.red)
+                        Text(error).foregroundStyle(.failure)
                     } else {
                         Text("Copy the link shown under the QR code in /remote-control.")
                     }
@@ -356,6 +357,7 @@ struct AddServerSheet: View {
                 .padding(.horizontal, 24)
                 .padding(.top, 16)
             }
+            .themedBackground(.plain)
             .navigationTitle("Add Server")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {

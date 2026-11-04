@@ -2,8 +2,14 @@
 //! shapes are normalized here, reusing the terminal's labels, so the app only
 //! renders. Tool output is shortened; `session.entry` returns a full row.
 use super::super::{
-    Entry, Job, Pending, Session, Summary, orchestrator,
+    Entry, Job, Pending, Session, Summary,
+    artifacts::Artifact,
+    folders::{self, Folder},
+    orchestrator,
+    permissions::{self, CodexPreset},
     pr_cache::{SessionLink, SessionLinks},
+    provider::Provider,
+    subagents::{self, Subagent},
     ui::transcript,
 };
 use serde::Serialize;
@@ -18,6 +24,8 @@ const TOOL_TEXT: usize = 6_000;
 const MESSAGE_TEXT: usize = 200_000;
 const DIFF_TEXT: usize = 20_000;
 pub const FULL_TEXT: usize = 4_000_000;
+/// A queued message as the queue shows it; `session.editQueued` compares it.
+pub const QUEUED_TEXT: usize = 2_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,6 +51,17 @@ pub struct SessionSummary {
     pub can_read_changes: bool,
     /// Attached and discovered pull requests, current open ones first.
     pub prs: Vec<PrView>,
+    /// Presented HTML artifacts (`session.artifact`).
+    pub artifacts: usize,
+    /// Open shells (`session.shells`).
+    pub shells: usize,
+    /// Sub-agents, and how many are still working (`session.subagent`).
+    pub subagents: usize,
+    pub running_subagents: usize,
+    /// The sidebar folder holding the session (`folders.list`).
+    pub folder: Option<String>,
+    /// The `<server>:<session>` this session moved to; it takes no messages.
+    pub moved_to: Option<String>,
 }
 
 /// A session's pull request, as the terminal's badges show it.
@@ -111,7 +130,20 @@ impl SessionSummary {
             queued: summary.queued,
             can_read_changes: summary.can_read_changes,
             prs: prs.iter().map(PrView::new).collect(),
+            artifacts: summary.artifacts,
+            shells: summary.shells,
+            subagents: summary.subagents,
+            running_subagents: summary.running_subagents,
+            folder: None,
+            moved_to: summary.moved_to.clone(),
         }
+    }
+}
+
+/// Files each listed session under the sidebar folder holding it.
+pub fn file_folders(sessions: &mut [SessionSummary], folders: &[Folder]) {
+    for session in sessions {
+        session.folder = folders::home(folders, &session.id).map(|folder| folder.id.clone());
     }
 }
 
@@ -159,6 +191,74 @@ pub struct Activity {
 pub struct Queued {
     pub index: usize,
     pub text: String,
+    /// `text` was shortened; edit the message on the computer.
+    pub truncated: bool,
+}
+
+/// A presented HTML artifact; `session.artifact` takes `path` and `workspace`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ArtifactView {
+    pub title: String,
+    /// Relative to `workspace` (or the session's workspace when null).
+    pub path: String,
+    pub workspace: Option<String>,
+    pub name: String,
+}
+
+impl ArtifactView {
+    pub fn new(artifact: &Artifact) -> Self {
+        Self {
+            title: artifact.title.clone(),
+            path: artifact.path.display().to_string(),
+            workspace: artifact
+                .workspace
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            name: artifact
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| artifact.path.display().to_string()),
+        }
+    }
+}
+
+/// A provider sub-agent, without its transcript (`session.subagent`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentView {
+    pub id: String,
+    pub name: String,
+    pub task: String,
+    /// The terminal's row title: name and the task's first line.
+    pub title: String,
+    /// Starting | Running | Completed | Interrupted | Failed | Closed | Unknown
+    pub state: subagents::State,
+    pub state_label: &'static str,
+    pub active: bool,
+    pub provider: super::super::provider::Provider,
+    pub provider_label: &'static str,
+    pub background: bool,
+    /// Messages recorded so far (Codex loads them when opened).
+    pub entries: usize,
+}
+
+impl SubagentView {
+    pub fn new(agent: &Subagent) -> Self {
+        Self {
+            id: agent.id.clone(),
+            name: clip(&agent.name, 200, false).0,
+            task: clip(&agent.task, 2_000, false).0,
+            title: clip(&agent.title(), 300, false).0,
+            state: agent.state,
+            state_label: agent.state.label(),
+            active: agent.state.active(),
+            provider: agent.provider,
+            provider_label: agent.provider.label(),
+            background: agent.background,
+            entries: agent.entries.len(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -174,9 +274,70 @@ pub struct Header {
     pub preparing: bool,
     pub can_send: bool,
     pub can_interrupt_and_send: bool,
+    /// No turn, pending request or queued message: provider switches (and
+    /// Claude Code model changes) are accepted now.
+    pub between_turns: bool,
     pub activity: Option<Activity>,
     pub queue: Vec<Queued>,
     pub pending: Vec<PendingView>,
+    /// The mode chip: the session's permission mode (and Codex approval
+    /// preset); `None` outside coding sessions.
+    pub permission_mode: Option<PermissionMode>,
+    pub artifacts: Vec<ArtifactView>,
+    pub subagents: Vec<SubagentView>,
+}
+
+/// A coding session's permission mode as the terminal's mode indicator shows
+/// it: ids with their labels, and what waits for the next turn.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionMode {
+    pub id: Option<String>,
+    pub label: Option<String>,
+    pub pending: Option<String>,
+    pub pending_label: Option<String>,
+    pub preset: Option<CodexPreset>,
+    pub preset_label: Option<&'static str>,
+    pub pending_preset: Option<CodexPreset>,
+    pub pending_preset_label: Option<&'static str>,
+}
+
+impl PermissionMode {
+    pub fn new(session: &Session) -> Option<Self> {
+        if !matches!(session.job, Job::Coding(_)) {
+            return None;
+        }
+        let state = &session.permission_state;
+        let provider = session.provider;
+        let id = state.mode.clone().or_else(|| {
+            (provider == Provider::Claude)
+                .then(|| session.permissions.get("permissionMode"))
+                .flatten()
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+        let label = |id: &String| {
+            permissions::mode_choices(provider)
+                .into_iter()
+                .find(|choice| &choice.id == id)
+                .map_or_else(|| id.clone(), |choice| choice.label)
+        };
+        let codex = provider == Provider::Codex;
+        let preset = codex
+            .then(|| permissions::detected_preset(&session.permissions))
+            .flatten();
+        let pending_preset = state.pending_preset.filter(|_| codex);
+        Some(Self {
+            label: id.as_ref().map(label),
+            id,
+            pending_label: state.pending_mode.as_ref().map(label),
+            pending: state.pending_mode.clone(),
+            preset_label: preset.map(|preset| preset.label()),
+            preset,
+            pending_preset_label: pending_preset.map(|preset| preset.label()),
+            pending_preset,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -224,6 +385,7 @@ impl SessionView {
                 && !session.archived
                 && !session.workspace_removed,
             can_interrupt_and_send: session.can_send_waiting(),
+            between_turns: super::super::provider::between_turns(session),
             activity: session.status.active().then(|| {
                 let (label, detail, since) = transcript::activity_text(session);
                 Activity {
@@ -236,9 +398,13 @@ impl SessionView {
                 .queue
                 .iter()
                 .enumerate()
-                .map(|(index, prompt)| Queued {
-                    index,
-                    text: clip(prompt.text(), 2_000, false).0,
+                .map(|(index, prompt)| {
+                    let (text, truncated) = clip(prompt.text(), QUEUED_TEXT, false);
+                    Queued {
+                        index,
+                        text,
+                        truncated,
+                    }
                 })
                 .collect(),
             pending: session
@@ -246,6 +412,9 @@ impl SessionView {
                 .iter()
                 .map(|p| PendingView::new(session, p))
                 .collect(),
+            permission_mode: PermissionMode::new(session),
+            artifacts: session.artifacts.iter().map(ArtifactView::new).collect(),
+            subagents: session.subagents.iter().map(SubagentView::new).collect(),
         };
         let active = session.status.active();
         let mut next = HashMap::new();
@@ -602,6 +771,8 @@ pub struct QuestionView {
     pub multi_select: bool,
     pub secret: bool,
     pub answered: bool,
+    /// `session.answer` takes a `note` for this question.
+    pub accepts_note: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -755,6 +926,7 @@ impl PendingView {
                         .collect(),
                     multi_select: q.get("multiSelect").and_then(Value::as_bool) == Some(true),
                     secret: q.get("isSecret").and_then(Value::as_bool) == Some(true),
+                    accepts_note: super::super::questions::accepts_note(pending, q),
                 }
             })
             .collect();
@@ -861,6 +1033,58 @@ mod tests {
         );
         session.status = Status::Idle;
         session
+    }
+
+    #[test]
+    fn the_mode_chip_shows_the_mode_preset_and_what_waits() -> Result<(), anyhow::Error> {
+        let mut claude = session();
+        claude.provider = Provider::Claude;
+        claude.permission_state.pending_mode = Some("auto".into());
+        let starting = serde_json::to_value(SessionView::new(&claude, &BTreeSet::new()))?;
+        assert_eq!(
+            starting.get("permissionMode"),
+            Some(
+                &json!({"id": null, "label": null, "pending": "auto", "pendingLabel": "Auto",
+                         "preset": null, "presetLabel": null,
+                         "pendingPreset": null, "pendingPresetLabel": null})
+            )
+        );
+        claude.permission_state.pending_mode = None;
+        claude.permission_state.mode = Some("default".into());
+        let manual = PermissionMode::new(&claude).context("chip")?;
+        assert_eq!(manual.label.as_deref(), Some("Manual"));
+        // Codex: its mode with the approval preset it runs with.
+        let mut codex = session();
+        codex.permission_state.mode = Some("default".into());
+        codex.permissions = json!({"sandbox": {"type": "workspaceWrite"},
+            "approvalPolicy": "on-request", "approvalsReviewer": "auto_review"});
+        codex.permission_state.pending_preset = Some(CodexPreset::ReadOnly);
+        let chip = PermissionMode::new(&codex).context("chip")?;
+        assert_eq!(
+            (chip.label.as_deref(), chip.preset, chip.preset_label),
+            (
+                Some("Regular"),
+                Some(CodexPreset::Auto),
+                Some("Approve for me")
+            )
+        );
+        assert_eq!(chip.pending_preset_label, Some("Read Only"));
+        let value = serde_json::to_value(&chip)?;
+        assert_eq!(value.get("preset"), Some(&json!("Auto")));
+        // Reviews and guides have no mode.
+        let mut guide = session();
+        guide.job = Job::Conflict {
+            root: "/tmp/repo".into(),
+            key: crate::model::PrKey {
+                owner: "acme".into(),
+                repo: "api".into(),
+                number: 1,
+            },
+            head: "abc".into(),
+            model: Default::default(),
+        };
+        assert_eq!(PermissionMode::new(&guide), None);
+        Ok(())
     }
 
     #[test]
@@ -988,6 +1212,51 @@ mod tests {
                 .get(1)
                 .is_some_and(|q| !q.answered && q.options.is_empty())
         );
+    }
+
+    #[test]
+    fn questions_say_whether_answers_take_a_note() -> anyhow::Result<()> {
+        let mut session = session();
+        session.pending.push(Pending {
+            id: json!("ask"),
+            method: "item/tool/requestUserInput".into(),
+            params: json!({"questions": [
+                {"id": "scope", "question": "Scope?", "options": [{"label": "Small"}]},
+                {"id": "token", "question": "Token?", "isSecret": true}
+            ]}),
+            responded: false,
+        });
+        let mut form = Pending {
+            id: json!("form"),
+            method: "mcpServer/elicitation/request".into(),
+            params: json!({"serverName": "Claude Code", "message": "Allow?",
+                           "requestedSchema": {"type": "object", "properties": {"n": {"type": "integer"}}}}),
+            responded: false,
+        };
+        super::super::super::elicitation::normalize(&mut form);
+        session.pending.push(form);
+        let view = SessionView::new(&session, &BTreeSet::new());
+        let notes: Vec<Vec<(String, bool)>> = view
+            .header
+            .pending
+            .iter()
+            .map(|p| {
+                p.questions
+                    .iter()
+                    .map(|q| (q.id.clone(), q.accepts_note))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                vec![("scope".into(), true), ("token".into(), false)],
+                vec![("difu-decision".into(), false), ("field:n".into(), false)],
+            ]
+        );
+        let json = serde_json::to_value(view.header.pending.first())?;
+        assert_eq!(json.pointer("/questions/0/acceptsNote"), Some(&json!(true)));
+        Ok(())
     }
 
     #[test]

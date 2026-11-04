@@ -65,8 +65,10 @@ extension DifuAPI {
         ).entry
     }
 
+    /// `skills` names the Codex skills (`$name`) to send with the message.
     public func send(
-        _ id: String, text: String, queue: Bool = false, attachments: [Attachment] = []
+        _ id: String, text: String, queue: Bool = false, attachments: [Attachment] = [],
+        skills: [String] = []
     ) async throws {
         var params: [String: JSONValue] = [
             "id": .string(id), "text": .string(text), "queue": .bool(queue),
@@ -74,7 +76,30 @@ extension DifuAPI {
         if !attachments.isEmpty {
             params["attachments"] = .array(attachments.map(\.json))
         }
+        if !skills.isEmpty {
+            params["skills"] = .array(skills.map(JSONValue.string))
+        }
         try await perform("session.send", params)
+    }
+
+    /// The session's slash commands: difu's, then its provider's skills and
+    /// commands (`refresh` lists the skills again; slow: seconds).
+    public func commands(_ id: String, refresh: Bool = false) async throws -> SessionCommandList {
+        var params: [String: JSONValue] = ["id": .string(id)]
+        if refresh { params["refresh"] = .bool(true) }
+        return try await request("session.commands", params, as: SessionCommandList.self)
+    }
+
+    /// Runs a slash command by name (`/compact`, `$lint`, or a bare name).
+    /// Destructive commands need `confirm`.
+    public func runCommand(
+        _ id: String, name: String, arguments: String = "", confirm: Bool = false, queue: Bool = false
+    ) async throws -> CommandOutcome {
+        var params: [String: JSONValue] = ["id": .string(id), "name": .string(name)]
+        if !arguments.isEmpty { params["args"] = .string(arguments) }
+        if confirm { params["confirm"] = .bool(true) }
+        if queue { params["queue"] = .bool(true) }
+        return try await request("session.command", params, as: CommandOutcome.self)
     }
 
     public func interrupt(_ id: String) async throws {
@@ -99,16 +124,20 @@ extension DifuAPI {
         try await perform("session.unqueue", ["id": .string(id), "index": JSONValue(index)])
     }
 
-    /// Answers one question; `answer == nil` skips it.
+    /// Answers one question; `answer == nil` skips it. A `note` goes with the
+    /// answer like a note added in the terminal (only for questions that
+    /// accept one: `PendingQuestion.acceptsNote`).
     public func answer(
-        _ id: String, request: JSONValue, question: String, answer: String?
+        _ id: String, request: JSONValue, question: String, answer: String?, note: String? = nil
     ) async throws {
-        try await perform(
-            "session.answer",
-            [
-                "id": .string(id), "request": request, "question": .string(question),
-                "answer": JSONValue(answer),
-            ])
+        var params: [String: JSONValue] = [
+            "id": .string(id), "request": request, "question": .string(question),
+            "answer": JSONValue(answer),
+        ]
+        if let note = note?.trimmingCharacters(in: .whitespacesAndNewlines), !note.isEmpty {
+            params["note"] = .string(note)
+        }
+        try await perform("session.answer", params)
     }
 
     public func decide(_ id: String, request: JSONValue, choice: String) async throws {
@@ -145,14 +174,19 @@ extension DifuAPI {
     /// Starts a session and returns its id. `repository` is a path from
     /// `repositories()`, an `owner/name` on a server (added and cloned first if
     /// it isn't listed), or nil for the default. `base` picks the branch to
-    /// start from (servers only).
+    /// start from (servers only). `startingMode` and `codexPreset` are sent
+    /// only when chosen; without them (and with a blank model or effort) the
+    /// location's effective defaults apply. Older computers ignore them.
     public func newSession(
-        repository: String?, base: String? = nil, model: String?, effort: String?, text: String?
+        repository: String?, base: String? = nil, model: String?, effort: String?,
+        startingMode: String? = nil, codexPreset: String? = nil, text: String?
     ) async throws -> String {
         var params: [String: JSONValue] = [
             "repository": JSONValue(repository), "model": JSONValue(model),
             "effort": JSONValue(effort),
         ]
+        if let startingMode { params["startingMode"] = .string(startingMode) }
+        if let codexPreset { params["codexPreset"] = .string(codexPreset) }
         if let text, !text.isEmpty { params["text"] = .string(text) }
         if let base = base?.trimmingCharacters(in: .whitespacesAndNewlines), !base.isEmpty {
             params["base"] = .string(base)
@@ -167,6 +201,18 @@ extension DifuAPI {
     /// Slow: the server asks each provider.
     public func models() async throws -> [AgentModel] {
         try await request("agents.models", as: ModelsResult.self).models
+    }
+
+    /// The new-session defaults saved on the computer or server. Older
+    /// computers answer `Unknown method` (`RemoteError.isUnknownMethod`).
+    public func agentDefaults() async throws -> AgentDefaults {
+        try await request("agents.defaults", as: AgentDefaults.self)
+    }
+
+    /// Saves new-session defaults there and returns them as saved.
+    @discardableResult
+    public func setAgentDefaults(_ change: AgentDefaultsChange) async throws -> AgentDefaults {
+        try await request("agents.defaults.set", change.params, as: AgentDefaults.self)
     }
 
     public func serverInfo() async throws -> ServerInfo {
@@ -204,6 +250,15 @@ extension DifuAPI {
 
     public func generateGuide(repo: String, number: Int) async throws -> Guide {
         try await request("pr.generateGuide", pr(repo, number), as: Guide.self)
+    }
+
+    /// An image from the PR's description or activity, downloaded by the
+    /// computer or server. `url` is the source as written; repository paths
+    /// need `head`.
+    public func prImage(repo: String, number: Int, head: String?, url: String) async throws -> PrImage {
+        var params = pr(repo, number, head: head.flatMap { $0.isEmpty ? nil : $0 })
+        params["url"] = .string(url)
+        return try await request("pr.image", params, as: PrImage.self)
     }
 
     public func comment(repo: String, number: Int, head: String, body: String) async throws -> String {

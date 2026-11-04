@@ -317,6 +317,12 @@ pub fn guard(storage: &Storage) -> Result<()> {
     let Ok(path) = crate::agents::server::home(storage) else {
         return Ok(());
     };
+    // Tests enforce the guard only for a pretended disk, so a full disk on the
+    // machine running them cannot fail unrelated tests.
+    #[cfg(test)]
+    if tests::pretended(&path).is_none() {
+        return Ok(());
+    }
     match space(&path) {
         Ok(space) => {
             ensure!(space.status() != Status::Critical, "{}", refusal(&space));

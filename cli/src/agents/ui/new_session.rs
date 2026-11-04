@@ -1,10 +1,15 @@
 //! The new-session form. Every new coding session starts here: where it runs
-//! (this Mac or a saved cloud server) first, then its repository, model and
-//! reasoning, each prefilled from that location's saved defaults. Enter starts
-//! at once, so the defaults stay one keystroke away; choosing another location
-//! reloads the other lists from it.
+//! (this Mac or a saved cloud server) first, then its repository, model,
+//! reasoning and mode, each prefilled from that location's effective defaults
+//! (saved ones, else the newest Claude Opus at xhigh, and Auto on a server).
+//! Enter starts at once, so the defaults stay one keystroke away; choosing
+//! another location reloads the other lists from it.
 use super::*;
 use crate::{
+    agents::{
+        effective::Defaults,
+        permissions::{self, CodexPreset},
+    },
     cloud::federation::ServerStatus,
     model::ModelInfo,
     shortcuts::{Bindings, contexts::AGENT_MODEL, ids::*},
@@ -20,12 +25,16 @@ pub(super) const LOCATION: usize = 0;
 pub(super) const REPOSITORY: usize = 1;
 pub(super) const MODEL: usize = 2;
 pub(super) const EFFORT: usize = 3;
-const LABELS: [&str; 4] = ["Location", "Repository", "Model", "Reasoning"];
+pub(super) const MODE: usize = 4;
+const LABELS: [&str; 5] = ["Location", "Repository", "Model", "Reasoning", "Mode"];
+/// Mode rows for a Codex approval preset carry this before the preset's id.
+const PRESET: &str = "preset:";
 /// Local repositories offered at most.
 const CANDIDATES: usize = 40;
 
 type Fetched = std::result::Result<Vec<ServerStatus>, String>;
 type Inherited = std::result::Result<String, String>;
+type Effective = std::result::Result<Defaults, String>;
 
 /// A row of the focused field's list.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,7 +42,8 @@ pub(super) struct Choice {
     pub label: String,
     pub detail: String,
     /// What choosing the row sets. `None` is the location's default: This Mac,
-    /// this directory's repository, or the provider's model or reasoning.
+    /// this directory's repository, or the location's model, reasoning or
+    /// mode.
     pub value: Option<String>,
     pub enabled: bool,
 }
@@ -70,8 +80,11 @@ pub struct Form {
     servers: Vec<ServerStatus>,
     /// Where the session runs; `None` is this Mac.
     pub(super) location: Option<String>,
-    /// This Mac's saved defaults.
-    local: AgentDefaults,
+    /// This Mac's effective defaults (its saved ones until the service
+    /// answers).
+    local: Defaults,
+    /// This Mac's effective defaults, being read from the service.
+    local_loading: Option<mpsc::Receiver<Effective>>,
     /// Repositories on this Mac difu already knows.
     candidates: Vec<PathBuf>,
     cwd: Option<PathBuf>,
@@ -81,9 +94,15 @@ pub struct Form {
     pub(super) repository: Option<String>,
     pub(super) model: Option<String>,
     pub(super) effort: Option<String>,
+    /// The chosen starting mode; `None` is the location's for the provider.
+    pub(super) mode: Option<String>,
+    /// The chosen Codex approval preset; `None` is the location's.
+    pub(super) preset: Option<CodexPreset>,
+    /// The Mode row chosen last, for the list's cursor.
+    mode_row: Option<String>,
     /// Fields edited since the location was chosen keep their value when the
     /// location's defaults arrive.
-    touched: [bool; 4],
+    touched: [bool; 5],
     loading: Option<mpsc::Receiver<Fetched>>,
     fetched: Option<Instant>,
     inherited: Option<Inheritance>,
@@ -132,9 +151,17 @@ fn server_detail(status: &ServerStatus) -> String {
     )
 }
 
+/// A mode's label: `default` is Manual for Claude Code and Regular for Codex.
+fn mode_label(provider: Provider, id: &str) -> String {
+    permissions::mode_choices(provider)
+        .into_iter()
+        .find(|choice| choice.id == id)
+        .map_or_else(|| id.to_owned(), |choice| choice.label)
+}
+
 impl Form {
     pub(super) fn new(
-        local: AgentDefaults,
+        local: Defaults,
         candidates: Vec<PathBuf>,
         cwd: Option<PathBuf>,
         servers: Vec<ServerStatus>,
@@ -143,6 +170,7 @@ impl Form {
             servers,
             location: None,
             local,
+            local_loading: None,
             candidates,
             cwd,
             field: LOCATION,
@@ -150,7 +178,10 @@ impl Form {
             repository: None,
             model: None,
             effort: None,
-            touched: [false; 4],
+            mode: None,
+            preset: None,
+            mode_row: None,
+            touched: [false; 5],
             loading: None,
             fetched: None,
             inherited: None,
@@ -165,8 +196,8 @@ impl Form {
         let server = self.location.as_ref()?;
         self.servers.iter().find(|status| &status.name == server)
     }
-    /// The defaults saved where the session would run.
-    fn defaults(&self) -> AgentDefaults {
+    /// The effective defaults where the session would run.
+    pub(super) fn defaults(&self) -> Defaults {
         match &self.location {
             None => self.local.clone(),
             Some(_) => self
@@ -175,21 +206,24 @@ impl Form {
                 .unwrap_or_default(),
         }
     }
-    /// The provider a model runs on here; a blank model keeps the location's.
+    /// The provider a model runs on here; a blank model is the location's.
     fn provider(&self, model: Option<&str>) -> Provider {
         match model {
             Some(model) => Provider::for_model(Some(model)),
-            None => self.defaults().provider.unwrap_or_default(),
+            None => self.defaults().provider,
         }
     }
     /// The location's default repository; a server without a saved one offers
     /// its first ready repository.
     fn default_repository(&self) -> Option<String> {
         if self.location.is_none() {
-            return self.local.repository.as_deref().map(path_text);
+            return self.local.saved.repository.as_deref().map(path_text);
         }
         let status = self.status()?;
-        let saved = status.defaults.as_ref().and_then(|d| d.repository.as_ref());
+        let saved = status
+            .defaults
+            .as_ref()
+            .and_then(|d| d.saved.repository.as_ref());
         status
             .repositories
             .iter()
@@ -211,13 +245,27 @@ impl Form {
         if !self.touched[EFFORT] {
             self.effort = defaults.effort;
         }
+        if !self.touched[MODE] {
+            self.mode = None;
+            self.preset = None;
+            self.mode_row = None;
+        }
+    }
+    /// This Mac's effective defaults arrived.
+    fn receive_local(&mut self, result: Effective) {
+        if let Ok(defaults) = result {
+            self.local = defaults;
+            if self.location.is_none() {
+                self.prefill();
+            }
+        }
     }
     fn relocate(&mut self, location: Option<String>) {
         if self.location == location {
             return;
         }
         self.location = location;
-        self.touched = [false; 4];
+        self.touched = [false; 5];
         self.inherited = None;
         self.prefill();
     }
@@ -243,7 +291,8 @@ impl Form {
             LOCATION => self.location.as_ref(),
             REPOSITORY => self.repository.as_ref(),
             MODEL => self.model.as_ref(),
-            _ => self.effort.as_ref(),
+            EFFORT => self.effort.as_ref(),
+            _ => self.mode_row.as_ref(),
         }
     }
     fn choose(&mut self, field: usize, value: Option<String>) {
@@ -255,17 +304,35 @@ impl Form {
                 self.touched[REPOSITORY] = true;
             }
             MODEL => {
-                // Reasoning levels belong to a provider.
+                // Reasoning levels and modes belong to a provider.
                 if self.provider(value.as_deref()) != self.provider(self.model.as_deref()) {
                     self.effort = None;
                     self.touched[EFFORT] = true;
+                    self.mode = None;
+                    self.preset = None;
+                    self.mode_row = None;
+                    self.touched[MODE] = false;
                 }
                 self.model = value;
                 self.touched[MODEL] = true;
             }
-            _ => {
+            EFFORT => {
                 self.effort = value;
                 self.touched[EFFORT] = true;
+            }
+            _ => {
+                match value.as_deref() {
+                    None => {
+                        self.mode = None;
+                        self.preset = None;
+                    }
+                    Some(row) => match row.strip_prefix(PRESET) {
+                        Some(preset) => self.preset = CodexPreset::parse(preset),
+                        None => self.mode = Some(row.to_owned()),
+                    },
+                }
+                self.mode_row = value;
+                self.touched[MODE] = true;
             }
         }
     }
@@ -276,7 +343,7 @@ impl Form {
     /// Custom values are typed paths on this Mac, and models or levels the
     /// catalog does not list; server repositories come only from the server.
     fn accepts_custom(&self, field: usize) -> bool {
-        field != LOCATION && (field != REPOSITORY || self.location.is_none())
+        !matches!(field, LOCATION | MODE) && (field != REPOSITORY || self.location.is_none())
     }
     /// The focused field's rows matching the filter.
     pub(super) fn choices(&self, field: usize, catalog: Option<&[ModelInfo]>) -> Vec<Choice> {
@@ -284,7 +351,8 @@ impl Form {
             LOCATION => self.location_choices(),
             REPOSITORY => self.repository_choices(),
             MODEL => self.model_choices(catalog),
-            _ => self.effort_choices(catalog),
+            EFFORT => self.effort_choices(catalog),
+            _ => self.mode_choices(),
         };
         let typed = self.query.text().trim().to_owned();
         let query = typed.to_lowercase();
@@ -321,7 +389,7 @@ impl Form {
     fn location_choices(&self) -> Vec<Choice> {
         let mut choices = vec![Choice::new(
             "This Mac",
-            match &self.local.repository {
+            match &self.local.saved.repository {
                 Some(path) => format!("default repository {}", path.display()),
                 None => "this directory's repository".into(),
             },
@@ -340,7 +408,10 @@ impl Form {
             let Some(status) = self.status() else {
                 return Vec::new();
             };
-            let saved = status.defaults.as_ref().and_then(|d| d.repository.as_ref());
+            let saved = status
+                .defaults
+                .as_ref()
+                .and_then(|d| d.saved.repository.as_ref());
             return status
                 .repositories
                 .iter()
@@ -359,7 +430,7 @@ impl Form {
                 .collect();
         }
         let mut choices = Vec::new();
-        if self.local.repository.is_none() {
+        if self.local.saved.repository.is_none() {
             choices.push(Choice::new(
                 "This directory",
                 self.cwd.as_deref().map(path_text).unwrap_or_default(),
@@ -369,7 +440,7 @@ impl Form {
         choices.extend(self.candidates.iter().map(|path| {
             Choice::new(
                 path_text(path),
-                if self.local.repository.as_ref() == Some(path) {
+                if self.local.saved.repository.as_ref() == Some(path) {
                     "default"
                 } else {
                     ""
@@ -383,9 +454,13 @@ impl Form {
         let defaults = self.defaults();
         let mut choices = vec![Choice::new(
             "Default",
-            match self.provider(None) {
-                Provider::Codex => "Codex's configured model",
-                Provider::Claude => "Claude Code's default model",
+            match (&defaults.model, defaults.provider) {
+                (Some(model), _) if defaults.automatic_model => {
+                    format!("{model} · newest Claude Opus")
+                }
+                (Some(model), _) => model.clone(),
+                (None, Provider::Codex) => "Codex's configured model".into(),
+                (None, Provider::Claude) => "Claude Code's default model".into(),
             },
             None,
         )];
@@ -393,7 +468,11 @@ impl Form {
             let name = crate::model::clean(&model.name);
             let mut detail = crate::model::clean(&model.id);
             if defaults.model.as_ref() == Some(&model.id) {
-                detail.push_str(" · default");
+                detail.push_str(if defaults.automatic_model {
+                    " · automatic default"
+                } else {
+                    " · default"
+                });
             }
             choices.push(Choice::new(
                 if name.is_empty() {
@@ -420,10 +499,23 @@ impl Form {
             .and_then(|(catalog, model)| catalog.iter().find(|m| m.id == model))
             .map(|model| model.efforts.clone())
             .unwrap_or_default();
-        let mut choices = vec![Choice::new("Default", "the model's default", None)];
+        // The location's level belongs to its model.
+        let here = self.model == defaults.model;
+        let mut choices = vec![Choice::new(
+            "Default",
+            match &defaults.effort {
+                Some(effort) if here => format!("{effort} for this model here"),
+                _ => "the model's default".into(),
+            },
+            None,
+        )];
         for effort in efforts {
-            let detail = if defaults.effort.as_ref() == Some(&effort) {
-                "default"
+            let detail = if here && defaults.effort.as_ref() == Some(&effort) {
+                if defaults.automatic_effort {
+                    "automatic default"
+                } else {
+                    "default"
+                }
             } else {
                 ""
             };
@@ -437,6 +529,69 @@ impl Form {
             choices.push(Choice::new(effort.clone(), "default", Some(effort.clone())));
         }
         choices
+    }
+    /// The provider's modes, and Codex's approval presets as in the
+    /// permissions panel; `Default` is how the location starts sessions.
+    fn mode_choices(&self) -> Vec<Choice> {
+        let provider = self.provider(self.model.as_deref());
+        let mut choices = vec![Choice::new(
+            "Default",
+            self.start_text(provider, None, None),
+            None,
+        )];
+        choices.extend(
+            permissions::mode_choices(provider)
+                .into_iter()
+                .map(|mode| Choice::new(mode.label, mode.description, Some(mode.id))),
+        );
+        if provider == Provider::Codex {
+            choices.extend(CodexPreset::ALL.into_iter().map(|preset| {
+                Choice::new(
+                    preset.label(),
+                    "Codex approvals",
+                    Some(format!("{PRESET}{}", preset.id())),
+                )
+            }));
+        }
+        choices
+    }
+    /// How a session of `provider` starts with `mode` and `preset` (`None`:
+    /// the location's), e.g. `Auto · automatic on this server`.
+    fn start_text(
+        &self,
+        provider: Provider,
+        mode: Option<&str>,
+        preset: Option<CodexPreset>,
+    ) -> String {
+        let defaults = self.defaults();
+        let start = defaults.start(provider);
+        let mut parts = vec![mode.or(start.mode.as_deref()).map_or_else(
+            || mode_label(provider, "default"),
+            |id| mode_label(provider, id),
+        )];
+        if provider == Provider::Codex {
+            parts.push(
+                preset
+                    .or(start.preset)
+                    .map_or("Codex's configured approvals", |preset| preset.label())
+                    .into(),
+            );
+        }
+        let automatic = (mode.is_none() && start.automatic_mode)
+            || (provider == Provider::Codex && preset.is_none() && start.automatic_preset);
+        let saved = (mode.is_none() && start.mode.is_some() && !start.automatic_mode)
+            || (provider == Provider::Codex
+                && preset.is_none()
+                && start.preset.is_some()
+                && !start.automatic_preset);
+        if automatic && defaults.server {
+            parts.push("automatic on this server".into());
+        } else if automatic {
+            parts.push("automatic".into());
+        } else if saved {
+            parts.push("default".into());
+        }
+        parts.join(" · ")
     }
     fn inherited_model(&self) -> Option<String> {
         self.inherited
@@ -552,30 +707,53 @@ impl Form {
                 (Some(_), None) => "No repository yet".into(),
                 (None, Some(path)) => path.clone(),
             },
-            MODEL => match &self.model {
-                None => "Default".into(),
-                Some(id) => catalog
-                    .and_then(|catalog| catalog.iter().find(|m| &m.id == id))
-                    .filter(|model| !model.name.is_empty())
-                    .map(|model| format!("{} · {id}", model.name))
-                    .unwrap_or_else(|| id.clone()),
-            },
-            _ => self.effort.clone().unwrap_or_else(|| "Default".into()),
+            MODEL => {
+                let defaults = self.defaults();
+                let mut text = match &self.model {
+                    None => "Default".into(),
+                    Some(id) => catalog
+                        .and_then(|catalog| catalog.iter().find(|m| &m.id == id))
+                        .filter(|model| !model.name.is_empty())
+                        .map(|model| format!("{} · {id}", model.name))
+                        .unwrap_or_else(|| id.clone()),
+                };
+                if !self.touched[MODEL] && defaults.automatic_model && self.model == defaults.model
+                {
+                    text.push_str(" · automatic");
+                }
+                text
+            }
+            EFFORT => {
+                let defaults = self.defaults();
+                let mut text = self.effort.clone().unwrap_or_else(|| "Default".into());
+                if !self.touched[EFFORT]
+                    && defaults.automatic_effort
+                    && self.effort == defaults.effort
+                {
+                    text.push_str(" · automatic");
+                }
+                text
+            }
+            _ => self.start_text(
+                self.provider(self.model.as_deref()),
+                self.mode.as_deref(),
+                self.preset,
+            ),
         }
     }
-    /// The launch request, or why the session cannot start yet.
+    /// The launch request, or why the session cannot start yet. Blank
+    /// choices are the location's: its service fills them in.
     fn request(&self) -> std::result::Result<Request, String> {
-        let mut defaults = self.defaults();
-        let provider = defaults.resolved_provider();
-        defaults.model = self.model.clone();
-        defaults.effort = self.effort.clone();
-        if let Some(model) = &self.model {
-            let chosen = Provider::for_model(Some(model));
-            if chosen != provider {
-                defaults.starting_mode = None;
-            }
-            defaults.provider = Some(chosen);
-        }
+        let provider = self.provider(self.model.as_deref());
+        let mut defaults = AgentDefaults {
+            provider: self.model.as_ref().map(|_| provider),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            starting_mode: self.mode.clone(),
+            codex_preset: self.preset.filter(|_| provider == Provider::Codex),
+            repository: None,
+            isolated: self.defaults().saved.isolated,
+        };
         let Some(server) = &self.location else {
             defaults.repository = self.repository.as_deref().map(PathBuf::from);
             let cwd = std::env::current_dir()
@@ -639,14 +817,22 @@ impl Form {
 }
 
 impl Ui {
-    /// Opens the new-session form on this Mac with its saved defaults.
+    /// Opens the new-session form on this Mac with its effective defaults:
+    /// the ones last read from the service while they match what is saved,
+    /// else the saved ones until the service answers.
     pub(super) fn open_new_session(&mut self) {
         let config = self.storage.load_config().ok();
-        let local = config
+        let saved = config
             .as_ref()
             .map(|config| config.agent_defaults.clone())
             .unwrap_or_else(|| self.defaults.clone());
-        let candidates = self.local_repositories(config.as_ref(), &local);
+        let server = config.as_ref().is_some_and(|config| config.server.enabled);
+        let candidates = self.local_repositories(config.as_ref(), &saved);
+        let local = self
+            .local_effective
+            .clone()
+            .filter(|effective| effective.saved == saved)
+            .unwrap_or_else(|| Defaults::new(saved, || None, server));
         let servers = crate::cloud::servers::load(&self.storage)
             .unwrap_or_default()
             .into_iter()
@@ -658,7 +844,21 @@ impl Ui {
                 ..ServerStatus::default()
             })
             .collect();
-        let form = Form::new(local, candidates, std::env::current_dir().ok(), servers);
+        let mut form = Form::new(local, candidates, std::env::current_dir().ok(), servers);
+        // The automatic model needs this Mac's model catalog, which the
+        // service keeps.
+        let (tx, rx) = mpsc::channel();
+        let storage = self.storage.clone();
+        thread::spawn(move || {
+            let result = match client::request(&storage, Request::AgentDefaults { server: None }) {
+                Ok(Reply::AgentDefaults(defaults)) => Ok(*defaults),
+                Ok(Reply::Error(error)) => Err(error),
+                Ok(_) => Err("Unexpected defaults reply".into()),
+                Err(error) => Err(format!("{error:#}")),
+            };
+            let _ = tx.send(result);
+        });
+        form.local_loading = Some(rx);
         self.modal = Some(Modal::NewSession(Box::new(form)));
         self.model_completion.retry();
         self.tick_new_session();
@@ -669,7 +869,7 @@ impl Ui {
         let mut recent: Vec<_> = self
             .summaries
             .iter()
-            .filter(|summary| summary.server.is_none())
+            .filter(|summary| !super::servers::is_server_session(&summary.id))
             .filter_map(|summary| summary.repository.clone().map(|r| (summary.updated, r)))
             .collect();
         recent.sort_by_key(|(updated, _)| std::cmp::Reverse(*updated));
@@ -697,6 +897,18 @@ impl Ui {
         let Some(Modal::NewSession(form)) = &mut self.modal else {
             return;
         };
+        if let Some(result) = form
+            .local_loading
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            form.local_loading = None;
+            crate::repaint::request();
+            if let Ok(defaults) = &result {
+                self.local_effective = Some(defaults.clone());
+            }
+            form.receive_local(result);
+        }
         if let Some(result) = form.loading.as_ref().and_then(|rx| rx.try_recv().ok()) {
             form.loading = None;
             crate::repaint::request();
@@ -867,7 +1079,9 @@ impl Ui {
             );
             hits.push((rect, Action::NewSessionField(index)));
         }
-        let start = Rect::new(area.x, area.y.saturating_add(7), area.width, 1).intersection(area);
+        let rows = LABELS.len() as u16;
+        let start =
+            Rect::new(area.x, area.y.saturating_add(3 + rows), area.width, 1).intersection(area);
         let place = form.location.as_deref().unwrap_or("This Mac");
         frame.render_widget(
             Paragraph::new(if form.starting {
@@ -879,7 +1093,8 @@ impl Ui {
             start,
         );
         hits.push((start, Action::NewSessionStart));
-        let filter = Rect::new(area.x, area.y.saturating_add(9), area.width, 3).intersection(area);
+        let filter =
+            Rect::new(area.x, area.y.saturating_add(5 + rows), area.width, 3).intersection(area);
         let label = LABELS
             .get(form.field)
             .copied()
@@ -896,7 +1111,7 @@ impl Ui {
             &form.query,
             true,
         );
-        let top = area.y.saturating_add(12);
+        let top = area.y.saturating_add(8 + rows);
         let footer = area.bottom().saturating_sub(1);
         let status_row = footer.saturating_sub(1);
         let visible = usize::from(status_row.saturating_sub(top));
@@ -1139,8 +1354,9 @@ pub(super) mod tests {
 
     /// The form with these servers, fresh enough that it never polls.
     fn open(ui: &mut Ui, servers: Vec<ServerStatus>) {
-        let local = ui.defaults.clone();
-        let candidates = ui.local_repositories(None, &local);
+        let saved = ui.defaults.clone();
+        let candidates = ui.local_repositories(None, &saved);
+        let local = Defaults::new(saved, || None, false);
         let mut form = Form::new(local, candidates, Some("/Users/me/code".into()), servers);
         form.fetched = Some(Instant::now());
         ui.modal = Some(Modal::NewSession(Box::new(form)));
@@ -1438,6 +1654,135 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn the_mode_field_starts_from_the_location_and_sends_only_choices() -> Result<()> {
+        let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
+        open(&mut ui, vec![status("hetzner", None)]);
+        press(&mut ui, KeyCode::Down);
+        // The server's Codex model starts with "Approve for me" there.
+        let text = screen(&mut ui)?;
+        assert!(
+            text.contains("Regular · Approve for me · automatic on this server"),
+            "{text}"
+        );
+        for _ in 0..4 {
+            press(&mut ui, KeyCode::Tab);
+        }
+        assert_eq!(form(&ui)?.field, MODE);
+        assert_eq!(
+            labels(&ui)?,
+            [
+                "Default",
+                "Regular",
+                "Plan",
+                "Ask for approval",
+                "Approve for me",
+                "Full Access",
+                "Read Only"
+            ]
+        );
+        // Untouched, the server decides (and may fall back): nothing is sent.
+        let request =
+            shortcut_tests::request_at_boundary_with(&mut ui, |ui| press(ui, KeyCode::Enter))?;
+        let Request::NewAgent { defaults, .. } = request else {
+            anyhow::bail!("a new agent request");
+        };
+        assert_eq!(
+            (defaults.starting_mode, defaults.codex_preset),
+            (None, None)
+        );
+
+        let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
+        open(&mut ui, vec![status("hetzner", None)]);
+        press(&mut ui, KeyCode::Down);
+        for _ in 0..4 {
+            press(&mut ui, KeyCode::Tab);
+        }
+        press(&mut ui, KeyCode::Down);
+        press(&mut ui, KeyCode::Down);
+        assert_eq!(form(&ui)?.mode.as_deref(), Some("plan"));
+        for _ in 0..4 {
+            press(&mut ui, KeyCode::Down);
+        }
+        assert_eq!(form(&ui)?.preset, Some(CodexPreset::ReadOnly));
+        assert!(screen(&mut ui)?.contains("Plan · Read Only"));
+        let request =
+            shortcut_tests::request_at_boundary_with(&mut ui, |ui| press(ui, KeyCode::Enter))?;
+        let Request::NewAgent { defaults, .. } = request else {
+            anyhow::bail!("a new agent request");
+        };
+        assert_eq!(defaults.starting_mode.as_deref(), Some("plan"));
+        assert_eq!(defaults.codex_preset, Some(CodexPreset::ReadOnly));
+
+        // A Claude Code model brings its own modes, Auto on this server.
+        let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
+        open(&mut ui, vec![status("hetzner", None)]);
+        press(&mut ui, KeyCode::Down);
+        for _ in 0..4 {
+            press(&mut ui, KeyCode::Tab);
+        }
+        press(&mut ui, KeyCode::Down);
+        press(&mut ui, KeyCode::BackTab);
+        press(&mut ui, KeyCode::BackTab);
+        ui.paste("claude/opus");
+        assert_eq!(form(&ui)?.model.as_deref(), Some("claude/opus"));
+        assert_eq!(form(&ui)?.mode, None, "Codex's mode does not carry over");
+        press(&mut ui, KeyCode::Tab);
+        press(&mut ui, KeyCode::Tab);
+        assert_eq!(
+            labels(&ui)?,
+            [
+                "Default",
+                "Manual",
+                "Accept edits",
+                "Plan",
+                "Bypass permissions",
+                "Auto",
+                "Don't ask"
+            ]
+        );
+        assert!(screen(&mut ui)?.contains("Auto · automatic on this server"));
+        Ok(())
+    }
+
+    #[test]
+    fn this_macs_effective_defaults_fill_untouched_fields() -> Result<()> {
+        let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
+        open(&mut ui, Vec::new());
+        assert_eq!(form(&ui)?.model, None, "nothing saved, catalog unknown");
+        let effective = Defaults::new(
+            AgentDefaults::default(),
+            || Some(crate::agents::effective::tests::catalog()),
+            false,
+        );
+        let Some(Modal::NewSession(form)) = &mut ui.modal else {
+            anyhow::bail!("form");
+        };
+        form.receive_local(Ok(effective.clone()));
+        assert_eq!(form.model.as_deref(), Some("claude/claude-opus-4-7"));
+        assert_eq!(form.effort.as_deref(), Some("xhigh"));
+        let text = screen(&mut ui)?;
+        assert!(
+            text.contains("claude/claude-opus-4-7 · automatic"),
+            "{text}"
+        );
+        assert!(text.contains("xhigh · automatic"), "{text}");
+        // A computer keeps Claude Code's own starting mode.
+        assert!(text.contains("Manual"), "{text}");
+        // A model typed before they arrive stays.
+        let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
+        open(&mut ui, Vec::new());
+        press(&mut ui, KeyCode::Tab);
+        press(&mut ui, KeyCode::Tab);
+        ui.paste("gpt-5.6");
+        let Some(Modal::NewSession(form)) = &mut ui.modal else {
+            anyhow::bail!("form");
+        };
+        form.receive_local(Ok(effective));
+        assert_eq!(form.model.as_deref(), Some("gpt-5.6"));
+        Ok(())
+    }
+
+    #[test]
     fn a_typed_path_on_this_mac_becomes_the_repository() -> Result<()> {
         let (mut ui, dir, _) = shortcut_tests::fixture(None)?;
         open(&mut ui, Vec::new());
@@ -1497,6 +1842,7 @@ pub(super) mod tests {
         assert_eq!(form(&ui)?.effort.as_deref(), Some("max"));
         // This Mac's catalog comes back from memory, without discovery.
         press(&mut ui, KeyCode::Tab);
+        press(&mut ui, KeyCode::Tab);
         press(&mut ui, KeyCode::Up);
         press(&mut ui, KeyCode::Tab);
         press(&mut ui, KeyCode::Tab);
@@ -1537,13 +1883,19 @@ pub(super) mod tests {
         ui.model_completion.set(Some("hetzner"), inherited);
         let service = Service::start(&ui.storage, federation)?;
         let mut blank = status("hetzner", None);
-        blank.defaults = Some(AgentDefaults {
-            model: None,
-            effort: None,
-            ..server_defaults()
-        });
+        blank.defaults = Some(Defaults::new(
+            AgentDefaults {
+                model: None,
+                effort: None,
+                provider: Some(Provider::Codex),
+                ..server_defaults().saved
+            },
+            || None,
+            true,
+        ));
         open(&mut ui, vec![blank]);
         press(&mut ui, KeyCode::Down);
+        press(&mut ui, KeyCode::BackTab);
         press(&mut ui, KeyCode::BackTab);
         until(&mut ui, "the inherited levels", |ui| {
             labels(ui).is_ok_and(|labels| labels.contains(&"minimal".to_owned()))
@@ -1576,8 +1928,21 @@ pub(super) mod tests {
         );
         press(&mut ui, KeyCode::Down);
         assert_eq!(form(&ui)?.model.as_deref(), Some("server-model"));
+        // Besides server state, only this Mac's effective defaults are read.
         let requests = service.requests()?;
-        assert!(requests.iter().all(|r| matches!(r, Request::Servers)));
+        assert!(
+            requests.iter().all(|r| matches!(
+                r,
+                Request::Servers | Request::AgentDefaults { server: None }
+            )),
+            "{requests:?}"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| matches!(r, Request::AgentDefaults { server: None })),
+            "{requests:?}"
+        );
         Ok(())
     }
 

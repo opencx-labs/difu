@@ -85,7 +85,7 @@ struct ConnectionBanner: View {
                         .font(.caption.weight(.semibold))
                         .buttonStyle(.borderless)
                 }
-                .bannerStyle(color: .orange)
+                .bannerStyle(color: .warning)
             } else if showConnecting, !connecting.isEmpty {
                 HStack(spacing: 8) {
                     ProgressView().controlSize(.mini)
@@ -154,7 +154,7 @@ struct DevicePairedBanner: View {
                     .foregroundStyle(.secondary)
                     .accessibilityLabel("Dismiss")
                 }
-                .bannerStyle(color: .blue)
+                .bannerStyle(color: .info)
             }
         }
         .animation(.easeInOut(duration: 0.25), value: app.pairedDevices)

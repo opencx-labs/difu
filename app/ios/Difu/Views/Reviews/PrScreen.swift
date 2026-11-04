@@ -45,6 +45,7 @@ struct PrScreen: View {
                 ProgressView()
             }
         }
+        .themedBackground()
         .navigationTitle("\(route.repo.split(separator: "/").last.map(String.init) ?? route.repo) #\(route.number)")
         .navigationBarTitleDisplayMode(.inline)
         .onAppear {
@@ -63,7 +64,7 @@ struct PrOverviewTab: View {
     var body: some View {
         Loadable(value: model.overview, error: model.overviewError, loadingText: "Loading pull request…",
                  retry: model.loadOverview) { pr in
-            List {
+            ThemedList {
                 Section {
                     VStack(alignment: .leading, spacing: 8) {
                         Text(pr.title).font(.title3.weight(.semibold))
@@ -141,6 +142,7 @@ struct PrOverviewTab: View {
             }
             .listStyle(.insetGrouped)
             .refreshable { await model.loadOverview() }
+            .environment(\.prImages, model.images)
         }
         .task {
             if model.overview == nil { await model.loadOverview() }
@@ -159,8 +161,8 @@ struct PrStateBadge: View {
 
     private var style: (String, String, Color) {
         switch state.lowercased() {
-        case "merged": ("Merged", "arrow.triangle.merge", .purple)
-        case "closed": ("Closed", "xmark.circle", .red)
+        case "merged": ("Merged", "arrow.triangle.merge", .violet)
+        case "closed": ("Closed", "xmark.circle", .failure)
         default: draft ? ("Draft", "pencil.circle", .secondary) : ("Open", "arrow.triangle.pull", Color.success)
         }
     }
@@ -188,12 +190,12 @@ private struct MergeabilityRow: View {
 
     private var describe: (String, String, Color) {
         switch (mergeable ?? "").uppercased() {
-        case "CONFLICTING": return ("Has conflicts", "exclamationmark.triangle.fill", .red)
+        case "CONFLICTING": return ("Has conflicts", "exclamationmark.triangle.fill", .failure)
         case "MERGEABLE":
             switch (mergeState ?? "").uppercased() {
-            case "BLOCKED": return ("Blocked by branch protection", "lock.fill", .orange)
-            case "BEHIND": return ("Behind the base branch", "arrow.down.circle", .orange)
-            case "UNSTABLE": return ("Mergeable, some checks failing", "exclamationmark.circle", .orange)
+            case "BLOCKED": return ("Blocked by branch protection", "lock.fill", .warning)
+            case "BEHIND": return ("Behind the base branch", "arrow.down.circle", .warning)
+            case "UNSTABLE": return ("Mergeable, some checks failing", "exclamationmark.circle", .warning)
             case "DRAFT": return ("Draft — mark ready to merge", "pencil.circle", .secondary)
             default: return ("Ready to merge", "checkmark.circle.fill", Color.success)
             }
@@ -218,10 +220,10 @@ private struct ReviewerRow: View {
     private var style: (String, Color, String) {
         let state = reviewer.state.lowercased()
         if state.contains("approved") { return ("checkmark.circle.fill", Color.success, "Approved") }
-        if state.contains("changes") { return ("exclamationmark.circle.fill", .red, "Changes requested") }
+        if state.contains("changes") { return ("exclamationmark.circle.fill", .failure, "Changes requested") }
         if state.contains("comment") { return ("text.bubble", .secondary, "Commented") }
         if state.contains("dismiss") { return ("minus.circle", .secondary, "Dismissed") }
-        return ("clock", .orange, "Pending")
+        return ("clock", .warning, "Pending")
     }
 }
 
@@ -249,8 +251,8 @@ private struct CheckRow: View {
     private var style: (String, Color) {
         switch check.state {
         case .pass: ("checkmark.circle.fill", Color.success)
-        case .fail: ("xmark.circle.fill", .red)
-        case .pending, .expected: ("clock.fill", .orange)
+        case .fail: ("xmark.circle.fill", .failure)
+        case .pending, .expected: ("clock.fill", .warning)
         case .skipping: ("forward.circle", .secondary)
         case .cancelled: ("slash.circle", .secondary)
         case .unknown: ("questionmark.circle", .secondary)

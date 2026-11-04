@@ -280,7 +280,11 @@ public final class RemoteConnection: @unchecked Sendable {
 
     /// How long to wait for a reply by default: disk cleanups can run for minutes.
     public static func timeout(for method: String) -> TimeInterval {
-        method == "server.disk.clean" ? 15 * 60 : 120
+        switch method {
+        // A move may clone its repository on the server first.
+        case "server.disk.clean", "session.move": 15 * 60
+        default: 120
+        }
     }
 
     /// Sends a request and returns the raw response frame (`{"id":..,"result":..}`).

@@ -318,7 +318,7 @@ impl Ui {
             || !self
                 .summaries
                 .iter()
-                .any(|summary| summary.server.is_some())
+                .any(|summary| super::servers::is_server_session(&summary.id))
         {
             return;
         }

@@ -6,13 +6,18 @@ struct ServerRoute: Hashable {
     let id: String
 }
 
+/// Appearance screens in the Settings navigation stack.
+enum AppearanceRoute: Hashable {
+    case theme
+}
+
 struct SettingsView: View {
     @Environment(AppModel.self) private var app
     @State private var addingServer = false
 
     var body: some View {
         NavigationStack {
-            Form {
+            ThemedForm {
                 Section {
                     ForEach(app.servers) { server in
                         NavigationLink(value: ServerRoute(id: server.id)) {
@@ -28,6 +33,12 @@ struct SettingsView: View {
                     Text("Servers")
                 } footer: {
                     Text("difu connects to every saved computer and server while the app is open.")
+                }
+
+                Section("Appearance") {
+                    NavigationLink(value: AppearanceRoute.theme) {
+                        LabeledContent("Theme", value: ThemeStore.shared.theme?.name ?? "Default")
+                    }
                 }
 
                 LockSection()
@@ -46,8 +57,10 @@ struct SettingsView: View {
                     ContentUnavailableView(
                         "Server removed", systemImage: "server.rack",
                         description: Text("This server is no longer saved on this phone."))
+                        .themedBackground()
                 }
             }
+            .navigationDestination(for: AppearanceRoute.self) { _ in ThemeSettingsView() }
             .sheet(isPresented: $addingServer) { AddServerSheet() }
         }
     }
@@ -88,7 +101,7 @@ struct ServerRow: View {
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: server.isServer ? "server.rack" : "laptopcomputer")
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(Color.accent)
                 .frame(width: 26)
             VStack(alignment: .leading, spacing: 2) {
                 Text(server.name)
@@ -111,7 +124,7 @@ struct ConnectionStatusLabel: View {
                 .labelStyle(StatusLabelStyle())
         case .connecting(let failures, _):
             Label(failures == 0 ? "Connecting…" : "Unreachable", systemImage: "circle.fill")
-                .foregroundStyle(failures == 0 ? Color.secondary : Color.orange)
+                .foregroundStyle(failures == 0 ? Color.secondary : Color.warning)
                 .labelStyle(StatusLabelStyle())
         case .idle:
             Label("Disconnected", systemImage: "circle")

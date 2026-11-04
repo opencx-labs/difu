@@ -200,6 +200,19 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(pending.choices.first?.label, "stop")
     }
 
+    func testQuestionsAcceptNotesOnlyWhenTheComputerSaysSo() throws {
+        let pending = try decode(
+            PendingView.self,
+            """
+            {"request": "ask", "kind": "questions", "questions": [
+              {"id": "scope", "question": "Scope?", "options": [{"label": "Small"}], "acceptsNote": true},
+              {"id": "old", "question": "From an older computer"},
+              {"id": "difu-decision", "question": "Allow?", "acceptsNote": true}
+            ]}
+            """)
+        XCTAssertEqual(pending.questions.map(\.acceptsNote), [true, false, false])
+    }
+
     func testDiffFile() throws {
         let file = try decode(
             DiffFile.self,
@@ -342,6 +355,23 @@ final class ModelDecodingTests: XCTestCase {
         XCTAssertEqual(calls[2].0, "agents.new")
         XCTAssertEqual(calls[2].1["repository"], .null)
         XCTAssertNil(calls[2].1["text"], "an empty first message is omitted")
+    }
+
+    func testAnswersSendANoteOnlyWhenThereIsOne() async throws {
+        let recorder = Recorder()
+        let api = DifuAPI { method, params in
+            await recorder.record(method, params)
+            return Data(#"{"id": 1, "result": {}}"#.utf8)
+        }
+        try await api.answer("s1", request: "ask", question: "scope", answer: "Small", note: "  only the API ")
+        try await api.answer("s1", request: "ask", question: "scope", answer: "Large", note: " \n")
+        try await api.answer("s1", request: "ask", question: "scope", answer: nil)
+        let calls = await recorder.calls
+        XCTAssertEqual(calls[0].1["note"], .string("only the API"))
+        XCTAssertEqual(calls[0].1["answer"], .string("Small"))
+        XCTAssertNil(calls[1].1["note"])
+        XCTAssertNil(calls[2].1["note"])
+        XCTAssertEqual(calls[2].1["answer"], .null)
     }
 }
 

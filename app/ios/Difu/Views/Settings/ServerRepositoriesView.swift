@@ -16,7 +16,7 @@ struct ServerRepositoriesView: View {
 
     var body: some View {
         Loadable(value: result, error: error, loadingText: "Loading repositories…", retry: load) { result in
-            List {
+            ThemedList {
                 Section {
                     ForEach(result.repositories) { repository in
                         RepositoryRow(repository: repository)
@@ -158,7 +158,7 @@ private struct RepositoryRow: View {
             if let error = repository.error {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(.failure)
                     .lineLimit(3)
             } else if !repository.cloned {
                 HStack(spacing: 6) {
@@ -198,7 +198,7 @@ private struct AddRepositorySheet: View {
 
     var body: some View {
         NavigationStack {
-            List {
+            ThemedList {
                 Section {
                     HStack {
                         TextField("owner/name", text: $name)
@@ -271,7 +271,7 @@ private struct AddRepositorySheet: View {
                 ProgressView()
             } else if isAdded(repository.name) {
                 Image(systemName: "checkmark")
-                    .foregroundStyle(Color.accentColor)
+                    .foregroundStyle(Color.accent)
             }
         }
     }

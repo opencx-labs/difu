@@ -219,10 +219,14 @@ changes persist in that shell. **Esc** hides the pane while the process keeps
 running; reopen it from **Shells**. Shared shells use normal local-terminal access
 for both providers and remain running when the difu UI closes. They stop when the
 session is archived/deleted, its worktree is discarded, or the service exits.
+Like a terminal app, a shared shell answers cursor-position and device queries, so
+prompts that wait for those answers, such as `gh auth login` (also over `ssh -t`),
+take input from the pane and from agents.
 
 Agents can list, open, read, write to and close these shells through `difu_shell`.
 While a human focuses a shell, agent writes are rejected without queueing; reads
-remain available. Agent input is enabled again when the human leaves the pane. Existing
+remain available. Agent input is enabled again when the human leaves the pane. A newline
+in agent text is sent as Enter (`\r`), as a terminal sends it. Existing
 Codex conversations can use the same actions through the compatibility command:
 
 ```sh
@@ -285,6 +289,26 @@ orchestrator, answer another session's questions, or approve its permissions.
 Like the other difu tools, it is available in new Codex threads and in Claude
 sessions.
 
+Agents can run the slash commands on their own session as tools.
+**difu_status**, **difu_usage**, **difu_skills** and **difu_rules** read the
+session's status (model, effort, provider, permission mode, repository, branch,
+worktree, queued and pending counts, attached PRs), provider usage and rate
+limits, available skills and the repository rules. **difu_rename** renames the
+session, and **difu_rules** with `rules` replaces the repository rules (running
+sessions keep the copy they started with). **difu_set_model** changes the model
+and/or reasoning effort, switching between Codex and Claude Code if needed, after
+checking the catalog where the session runs; **difu_compact** compacts the
+conversation. Neither can happen mid-turn, so difu applies them when the current
+turn ends and reports the result in the chat. Messages queued in the meantime wait
+for them, and an interrupted or failed turn cancels them. **difu_clear** and
+**difu_change_repository** discard the conversation or the worktree, uncommitted
+files included. Agents are told to use them only when you explicitly ask in that
+conversation, and they also run after the turn. On purpose, no tool changes
+permission modes, presets or approvals, so an agent can never loosen its own
+permissions. UI-only commands (`/cpu`, `/settings`, `/theme`, …) have no tool. A
+server session's tools run on its server. They are available in new Codex threads
+and in Claude sessions.
+
 Press **n** (or `/new`) to open an empty session immediately while its isolated Git
 worktree is created in the background. The composer stays enabled and shows the
 preparation state. Each new worktree fetches `origin/main` and branches from that
@@ -294,7 +318,21 @@ order once the worktree and provider are ready. New sessions automatically copy
 missing repository guidance before starting the provider. Failed or interrupted setup retains queued messages as unsent;
 restarting difu never automatically replays them.
 
-Repository, model, and reasoning defaults live in **/actions → Default
+Every new session opens the new-session form: **Location** (this Mac or a
+saved server), **Repository**, **Model**, **Reasoning** and **Mode**, each
+prefilled from that location's defaults and marked *automatic* when nothing is
+saved. Without a saved model, new sessions use the newest Claude Opus that
+location's Claude Code offers, at xhigh reasoning (or the highest it supports);
+without Claude Code there, the provider's configured model. **Mode** lists the
+provider's modes, and for Codex its approval presets as **/permissions** does.
+A cloud server starts Claude Code in **Auto** and gives Codex **Approve for
+me** unless another mode is saved; this Mac keeps each provider's own default.
+Both still review risky actions themselves; bypass permissions and Full Access
+are never chosen automatically. Fields you leave alone are filled in by the
+location's service, so the terminal, the iPhone app and agents starting
+sessions get the same result.
+
+Repository, model, reasoning and mode defaults live in **/actions → Default
 repository, model, reasoning and worktree**. Without a saved repository, difu
 uses the current Git repository; outside one, it asks you to choose and remembers
 that choice. No model turn runs until your first message. Both Codex and Claude
@@ -467,6 +505,11 @@ Sidebar cards flip their changes too: status, timers, request counts and PRs;
 the selection highlight flips across a card a flap at a time, and a card that
 moves flips from the text that was in its place. Switching between the Agents
 and Reviews tabs flips the whole screen in.
+Every animation eases in and out instead of moving at a constant rate: flips,
+reveals, sweeps, the question panel growing and shrinking, and the inbox
+collapsing start slowly, speed up through the middle, and settle gently, still
+finishing in the same time. A reply that is already flipping in keeps its speed
+when more text streams in.
 **/tweaks** (also in the command palette) changes these four
 values, saved in the difu config; 0 turns an animation off (a reply speed of 0
 turns off the flip for all agent content), and a longest animation of 0 removes
@@ -521,7 +564,9 @@ Review completed plan** reopens it. This also works for the Difu orchestrator. F
 **/permissions** opens provider-native modes and permission settings without a
 model prompt. The composer shows the current mode, approval preset and pending
 changes. **Shift+Tab** in the composer cycles Codex Default/Plan or Claude's
-native mode sequence; it preserves the draft and attachments. Claude bypass
+native mode sequence; it preserves the draft and attachments. Both work the
+same for a server session: the server switches its own agent and the indicator
+shows the server's answer. Claude bypass
 enters the shortcut cycle only after explicitly enabling it in this panel.
 Changing Codex mode updates the native thread setting immediately and preserves
 its approval preset, without sending a message or restarting the conversation.
@@ -676,10 +721,14 @@ legacy repository-guidance permission is unanswered, messages remain queued unti
 answered. With no waiting messages, Esc interrupts an active agent; when idle,
 it returns to the session list.
 
-The new-agent defaults dialog completes local directories, Codex model names, and
-the selected model’s supported reasoning levels. Type to filter, use **Up/Down**
-to select, and press **Enter** to fill a field. **Tab** changes fields and
-**Ctrl+Enter** saves. A blank model inherits Codex’s model for reasoning options.
+The new-agent defaults dialog completes local directories, model names, the
+selected model’s supported reasoning levels, starting modes and Codex
+approvals. Type to filter, use **Up/Down** to select, and press **Enter** to
+fill a field. **Tab** changes fields and **Ctrl+Enter** saves. A blank model is
+automatic (the newest Claude Opus, which the dialog names once this Mac's
+service has looked); `codex` saves Codex’s configured model instead. A blank
+starting mode or Codex approvals field uses the provider's own (Auto and
+Approve for me on a server).
 
 #### Messages, attachments, and session names
 
@@ -851,6 +900,10 @@ show an explanation and a browser link. Previews are limited to 10 MiB and
 8192 pixels per dimension; the disk cache retains up to 256 MiB. GitHub image
 requests can reuse your `gh` authentication; credentials are never forwarded
 to other image hosts.
+
+The iPhone app shows the same images: the computer or server it is connected to
+downloads them with these rules and cache (`pr.image`), so the phone needs no
+GitHub login.
 
 ### States, pinned repositories, and filters
 
@@ -1310,7 +1363,11 @@ Server sessions appear in the sidebar with the server's name. Another Mac joins
 with `difu server join <address>` and the server password; the iPhone app adds a
 server by QR code or by address and server password. On the server, every
 session's agent and shells run in their own rootless Podman container, and agents
-may run the tests relevant to their change. `difu server list|remove|ssh|pair|upgrade`
+may run the tests relevant to their change. Server sessions start in Claude
+Code's **Auto** mode or with Codex's **Approve for me** preset unless a starting
+mode is saved there; if the agent refuses it (for example, Auto disabled by a
+repository's settings), the session starts in the agent's own default and says
+so. `difu server list|remove|ssh|pair|upgrade`
 manage saved servers; on the server, `difu repos` and `difu remote` manage
 repositories, pairing, devices and the password.
 

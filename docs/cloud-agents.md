@@ -48,7 +48,7 @@ Client side (your Mac):
 | `difu server list` | Saved servers, whether they are reachable, and each one's free disk space. |
 | `difu server remove <name>` | Revoke this computer on the server (when reachable) and forget it locally. |
 | `difu server ssh <name>` | Open a shell on the server as the `difu` user. |
-| `difu server pair <name>` | Show a phone pairing QR for that server in this terminal. |
+| `difu server pair <name>` | Show a phone pairing QR for that server in this terminal, with when it expires in this computer's time. |
 | `difu server upgrade <name>` | Install this computer's difu version on the server, update Codex and Claude Code, rebuild the sandbox image when sandboxing is on, refresh `difu-agent.service` and restart it. Safe to repeat. |
 | `difu session move <session> <server>` | Move a session on this computer to a saved server; prints the new `<server>:<id>`. See *Moving a session to a server*. |
 
@@ -57,11 +57,11 @@ Server side (run on the server, usually over SSH):
 | Command | What it does |
 | --- | --- |
 | `difu serve [--port P]` | Run the agent service in the foreground with server mode and remote control on. Default port **3438**. |
-| `difu remote pair [--json]` | Print a pairing QR and `difu://pair` link from the running service. |
+| `difu remote pair [--json]` | Print a pairing QR and `difu://pair` link from the running service, and when the code expires ("in 10 minutes", then the time). `--json` prints `{"link", "expires", "expiresIn"}` (milliseconds since the epoch; seconds left). |
 | `difu remote devices` | List paired devices with access level and last seen. |
 | `difu remote forget <device>` | Revoke a device. |
 | `difu remote password [--generate] [--disable]` | Set the server password (prompt or stdin), generate a strong one, or turn password pairing off. |
-| `difu remote config [--host H]... [--clear-hosts] [--port P]` | Addresses to advertise to clients (public IP, DNS or Tailscale name) and a fixed port. |
+| `difu remote config [--host H]... [--clear-hosts] [--port P] [--name N]` | Addresses to advertise to clients (public IP, DNS or Tailscale name), a fixed port, and the name clients show for the server (`--name ""` returns to the host name). Once a server has advertised hosts, pairing links, `welcome` and `server.info` list only those, not the private addresses it discovers. |
 | `difu repos [list]` / `difu repos add [owner/name]` / `difu repos remove owner/name` / `difu repos refresh [owner/name]` | Server repositories. `add` without a name opens a picker built from `gh repo list`. |
 | `difu sandbox build` / `difu sandbox status` | Build (or pull) the configured sandbox image / show runtime, image and running sandboxes. |
 | `difu disk [status [--refresh]]` / `difu disk clean <archived-worktrees\|build-outputs\|sandbox>` | Free disk space and what uses it / run a cleanup. See *Disk space*. |
@@ -93,8 +93,10 @@ Server side (run on the server, usually over SSH):
 7. Choose the **server password** (or generate one) — the single password new
    clients use with the server's address.
 8. Pick server repositories from the server's `gh repo list`; clone them.
-9. Advertise the address used to connect (`difu remote config --host <ip>`), pair
-   this Mac as a **full** device, save the server, and print a phone pairing QR.
+9. Advertise the address used to connect and name the server as this Mac saves
+   it (`difu remote config --name <name> --host <ip>`), so phones show that
+   name rather than the host name; pair this Mac as a **full** device, save the
+   server, and print a phone pairing QR.
 
 ## Upgrades (`difu server upgrade`)
 
@@ -152,7 +154,41 @@ local "do not run tests" rule:
 > whole test suite when it would take a long time; leave full validation to
 > pull-request CI. Repository rules take precedence over this guidance.
 
-Permission prompts are unchanged.
+## Starting modes
+
+A server's sessions keep working while nobody watches, so they start in the
+providers' automatic modes unless the server's defaults save another starting
+mode or preset:
+
+* Claude Code sessions start in its native **Auto** mode (`--permission-mode
+  auto`), where Claude Code decides permission prompts itself with its own
+  checks.
+* Codex sessions get the **Approve for me** preset (`workspace-write`,
+  `on-request`, reviewer `auto_review`): Codex reviews its own approval
+  requests, inside the workspace-write sandbox policy.
+* Bypass permissions and Full Access are never applied automatically; a
+  person can still choose them (and enabling Claude's bypass works as on a
+  Mac).
+
+These come from the server's *effective defaults* (`agents::effective`),
+which also pick the model: saved fields win; without a saved model, the newest
+Claude Opus the server's Claude Code offers at xhigh. Ordinary computers apply
+the same model rule but keep each provider's own starting mode. Every path
+that starts a session asks the service, which fills the blanks: the Mac's
+new-session form (`NewAgent`), the phone (`agents.new`) and sessions agents
+start (`Launch` with `effective_defaults`). The form and the phone show the
+same values first (`Request::AgentDefaults`, `agents.defaults`), each marked
+automatic or saved.
+
+An automatic start never blocks a session: when Claude Code refuses Auto (for
+example `disableAutoMode` in settings, or a model without it) or a managed
+Codex policy forbids the preset (the server reads Codex's requirements before
+the thread starts), the session starts in the provider's own default and its
+transcript says why. A starting mode a person chose or saved is strict, as
+before. Running sessions switch modes from any client: Shift+Tab and
+**/permissions** on a Mac, the mode chip or `/permissions` on a phone.
+
+Permission prompts are otherwise unchanged.
 
 ## Sandboxes
 
@@ -194,7 +230,10 @@ Permission prompts are unchanged.
   same Containerfile and tagged with that name; any other image comes from a
   registry, so `difu sandbox build` pulls it instead (and says so).
   `difu sandbox status` reports the configured image and whether it is
-  present.
+  present; when Podman cannot answer, it shows Podman's error instead.
+* Every Podman call runs from the user's home directory and, when
+  `XDG_RUNTIME_DIR` is unset, with the user's `/run/user/<uid>`, so the
+  commands also work through `sudo -u difu` from another user's directory.
 * Sessions are always worktrees, exactly as on a local difu. Worktrees share the
   base clone's object store and refs, so a sandbox could rewrite another session's
   branch refs (not its files); this is accepted, as it is locally.
@@ -527,7 +566,8 @@ slots.
 ```
 
 `mode` is `"server"` for `difu serve`, `"computer"` otherwise. Clients key saved
-servers by `server.id`.
+servers by `server.id`. `server.name` (like the link's `n` and `server.info`'s
+`name`) is the name set with `difu remote config --name`, else the host name.
 
 ### Methods for every paired device
 
@@ -610,11 +650,21 @@ Three service requests exist for clients whose sessions live elsewhere:
   the repository when the row has room. Requests for a namespaced id are forwarded with `rpc`; watches
   with `rpc.watch`.
 * Every new session opens one form: **Location** (This Mac, then each saved
-  server with its connection state or problem), **Repository**, **Model** and
-  **Reasoning**, prefilled from the chosen location's saved defaults (a
-  server's come from `Request::AgentDefaults`, cached with its repositories in
-  `Request::Servers`). Enter starts right away; choosing another location
-  reloads the other lists from it.
+  server with its connection state or problem), **Repository**, **Model**,
+  **Reasoning** and **Mode**, prefilled from the chosen location's effective
+  defaults and marked automatic where nothing is saved (see *Starting modes*).
+  `Request::AgentDefaults` answers `Reply::AgentDefaults(effective::Defaults)`:
+  the saved `AgentDefaults` plus the effective provider, model, effort and
+  each provider's starting mode and Codex preset, with flags for what is
+  automatic. This Mac's come from its own service when the form opens; a
+  server's are cached with its repositories in `Request::Servers`. **Mode**
+  lists the provider's modes and, for Codex, the approval presets; fields left
+  alone are sent blank, so the location fills them (and may fall back from an
+  automatic start). Enter starts right away; choosing another location reloads
+  the other lists from it.
+* Shift+Tab and the permissions panel switch a server session's mode with
+  `Request::Permissions`, forwarded by session id; the composer's mode
+  indicator shows the server's session state.
 * Anything that consults a machine on a session's behalf asks the session's
   location. Requests with a session id are forwarded by id; the others carry
   `server`: `NewAgent`, `RepositoryRules`, `Defaults` (Codex's configured model
@@ -679,6 +729,14 @@ Three service requests exist for clients whose sessions live elsewhere:
 * The session screen shows the session's PRs (`SessionSummary.prs`) as chips;
   tapping one opens the PR screen on the same server. Photos are sent with
   `session.send` straight to the server running the session.
+* Typing `/` in the composer lists `session.commands` from the server running
+  the session (difu's commands plus its provider's skills) and runs them with
+  `session.command`; Model & Effort lists both providers' models and switches
+  provider between turns.
+* New Session shows the server's effective defaults (`agents.defaults`) with a
+  Mode picker and sends only what the person changed; the session screen's mode
+  chip (`SessionView.permissionMode`) switches modes with `/permissions`,
+  showing why a mode is unavailable or a switch was refused.
 * Per-server settings: disk space (bar, status, breakdown, and the three
   cleanups with confirmations), logins (status, device-code login, Claude
   token), server repositories (add from `server.repos.available`, remove,
@@ -694,4 +752,7 @@ Three service requests exist for clients whose sessions live elsewhere:
 * SSH is key-only after onboarding; the `difu` user has no sudo.
 * Agents run in rootless containers with only the session's worktree and the
   server logins; standard devices cannot reach `rpc`.
+* Sessions start in Claude Code's Auto mode or Codex's "Approve for me" preset,
+  both of which keep the providers' own checks; bypass permissions and Full
+  Access are never applied automatically.
 * Revocation works from any paired client and from `difu remote forget`.

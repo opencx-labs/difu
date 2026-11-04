@@ -133,9 +133,19 @@ enum LockShield {
         if visible {
             show(lock)
         } else {
-            window?.isHidden = true
-            window = nil
+            hide()
         }
+    }
+
+    /// Hides the shield and hands key status back to the app's window, so
+    /// text fields in it and its sheets get the keyboard again.
+    private static func hide() {
+        guard let shield = window else { return }
+        shield.isHidden = true
+        window = nil
+        shield.windowScene?.windows
+            .first { $0 !== shield && !$0.isHidden && $0.windowLevel == .normal }?
+            .makeKey()
     }
 
     private static func show(_ lock: AppLock) {
@@ -148,7 +158,7 @@ enum LockShield {
             #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
         let shield = UIWindow(windowScene: scene)
         shield.windowLevel = .alert + 1
-        let host = UIHostingController(rootView: LockScreen().environment(lock))
+        let host = UIHostingController(rootView: LockScreen().environment(lock).themed())
         host.view.backgroundColor = .systemBackground
         shield.rootViewController = host
         shield.isHidden = false
@@ -165,7 +175,7 @@ struct LockScreen: View {
             Spacer()
             Image(systemName: "chevron.right.square.fill")
                 .font(.system(size: 64))
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(Color.accent)
                 .symbolRenderingMode(.hierarchical)
             Text("difu")
                 .font(.system(size: 34, weight: .bold, design: .monospaced))
@@ -187,6 +197,6 @@ struct LockScreen: View {
         }
         .padding(.bottom, 48)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(.systemBackground))
+        .background(Color.screenBackground)
     }
 }

@@ -342,7 +342,14 @@ pub fn review_job(
     progress: impl Fn(String),
 ) -> Result<Session> {
     ensure_running(storage)?;
-    let Reply::Launched(id) = request(storage, Request::Launch { job: Box::new(job) })? else {
+    let Reply::Launched(id) = request(
+        storage,
+        Request::Launch {
+            job: Box::new(job),
+            effective_defaults: false,
+        },
+    )?
+    else {
         anyhow::bail!("Missing background job identifier");
     };
     let mut cancelled = false;

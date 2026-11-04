@@ -12,7 +12,7 @@ use super::{
 };
 use crate::{
     agents::{Control, Reply, Request, Summary, media},
-    storage::{AgentDefaults, Storage},
+    storage::Storage,
 };
 use anyhow::{Context, Result};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -129,9 +129,9 @@ pub struct ServerStatus {
     pub problem: Option<String>,
     #[serde(default)]
     pub repositories: Vec<Repository>,
-    /// The server's saved new-session defaults, once read.
+    /// The server's saved and effective new-session defaults, once read.
     #[serde(default)]
-    pub defaults: Option<AgentDefaults>,
+    pub defaults: Option<crate::agents::effective::Defaults>,
     #[serde(default)]
     pub port: u16,
     /// The server's coding sessions, once listed; `None` while they cannot be
@@ -525,7 +525,7 @@ struct Link {
     sessions_at: Option<Instant>,
     repositories: Vec<Repository>,
     repositories_at: Option<Instant>,
-    defaults: Option<AgentDefaults>,
+    defaults: Option<crate::agents::effective::Defaults>,
     disk: Option<disk::Report>,
     disk_problem: Option<String>,
     disk_at: Option<Instant>,
@@ -812,7 +812,7 @@ impl Federation {
                 }
                 // Without them the new-session form starts from blank choices.
                 if let Some(Ok(Reply::AgentDefaults(defaults))) = defaults {
-                    link.defaults = Some(defaults);
+                    link.defaults = Some(*defaults);
                 }
             }
         }
@@ -1145,6 +1145,7 @@ impl Federation {
 pub(crate) mod tests {
     use super::*;
     use crate::agents::{Job, Launch, Session, Status};
+    use crate::{agents::effective::Defaults, storage::AgentDefaults};
     use servers::tests::{server, storage};
 
     /// Session id, version and the sender feeding that `rpc.watch`.
@@ -1245,7 +1246,7 @@ pub(crate) mod tests {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("lock"))?
                 .push(request.clone());
-            let sessions = self.sessions.lock().map_err(|_| anyhow::anyhow!("lock"))?;
+            let mut sessions = self.sessions.lock().map_err(|_| anyhow::anyhow!("lock"))?;
             Ok(match request {
                 Request::List => Reply::Sessions(sessions.iter().map(Session::summary).collect()),
                 Request::Read { id, .. } => match sessions.iter().find(|s| &s.id == id) {
@@ -1257,13 +1258,17 @@ pub(crate) mod tests {
                     root: repository.clone(),
                     rules: "server rules".into(),
                 },
-                Request::AgentDefaults { .. } => Reply::AgentDefaults(server_defaults()),
+                Request::AgentDefaults { .. } => Reply::AgentDefaults(Box::new(server_defaults())),
                 Request::DefaultModel { model, effort, .. } => {
-                    Reply::AgentDefaults(AgentDefaults {
-                        model: model.clone(),
-                        effort: effort.clone(),
-                        ..server_defaults()
-                    })
+                    Reply::AgentDefaults(Box::new(Defaults::new(
+                        AgentDefaults {
+                            model: model.clone(),
+                            effort: effort.clone(),
+                            ..server_defaults().saved
+                        },
+                        || None,
+                        true,
+                    )))
                 }
                 Request::Models { .. } => Reply::Models(server_models()),
                 Request::Defaults { cwd, .. } => Reply::Defaults {
@@ -1291,6 +1296,34 @@ pub(crate) mod tests {
                 }),
                 Request::SessionPrs { .. } => Reply::SessionPrs(lookup()),
                 Request::PrChanges { .. } => Reply::Changes(PATCH.into()),
+                // The server switches its own session's mode: Shift+Tab goes
+                // from Manual to Accept edits, a chosen mode is taken as is.
+                Request::Permissions { id, action } => {
+                    let session = sessions.iter_mut().find(|s| &s.id == id);
+                    let current = session
+                        .as_ref()
+                        .and_then(|s| s.permission_state.mode.clone())
+                        .unwrap_or_else(|| "default".into());
+                    let mode = match action {
+                        crate::agents::permissions::Action::SetMode { mode } => mode.clone(),
+                        crate::agents::permissions::Action::CycleMode => "acceptEdits".into(),
+                        _ => current,
+                    };
+                    if let Some(session) = session {
+                        session.permission_state.mode = Some(mode.clone());
+                        session.version += 1;
+                    }
+                    Reply::Permissions {
+                        snapshot: crate::agents::permissions::Snapshot {
+                            provider: crate::agents::provider::Provider::Claude,
+                            active_mode: Some(mode),
+                            modes: crate::agents::permissions::mode_choices(
+                                crate::agents::provider::Provider::Claude,
+                            ),
+                            ..Default::default()
+                        },
+                    }
+                }
                 _ => Reply::Ok,
             })
         }
@@ -1305,13 +1338,19 @@ pub(crate) mod tests {
     }
 
     /// What every fake server has saved for new sessions.
-    pub(crate) fn server_defaults() -> AgentDefaults {
-        AgentDefaults {
-            model: Some("server-model".into()),
-            effort: Some("high".into()),
-            repository: Some("/srv/difu/repos/acme/api".into()),
-            ..AgentDefaults::default()
-        }
+    /// What every fake server saved, as it reports its defaults: a server
+    /// (Claude Code starts in Auto, Codex with "Approve for me").
+    pub(crate) fn server_defaults() -> Defaults {
+        Defaults::new(
+            AgentDefaults {
+                model: Some("server-model".into()),
+                effort: Some("high".into()),
+                repository: Some("/srv/difu/repos/acme/api".into()),
+                ..AgentDefaults::default()
+            },
+            || None,
+            true,
+        )
     }
 
     /// The models every fake server's logins offer.
@@ -1642,6 +1681,23 @@ pub(crate) mod tests {
             Request::Permissions {
                 id: id(),
                 action: crate::agents::permissions::Action::Refresh,
+            },
+            // Mode switches (Shift+Tab, the permissions panel, presets).
+            Request::Permissions {
+                id: id(),
+                action: crate::agents::permissions::Action::CycleMode,
+            },
+            Request::Permissions {
+                id: id(),
+                action: crate::agents::permissions::Action::SetMode {
+                    mode: "auto".into(),
+                },
+            },
+            Request::Permissions {
+                id: id(),
+                action: crate::agents::permissions::Action::SetPreset {
+                    preset: crate::agents::permissions::CodexPreset::Auto,
+                },
             },
             Request::Usage { id: id() },
             Request::WorkspacePaths { id: id() },

@@ -195,7 +195,7 @@ impl Ui {
             let summaries = self
                 .summaries
                 .iter()
-                .filter(|summary| summary.server.is_none())
+                .filter(|summary| !servers::is_server_session(&summary.id))
                 .cloned()
                 .collect::<Vec<_>>();
             let mut cache = self.prs.cache.clone();
@@ -344,7 +344,7 @@ impl Ui {
             let sender = self.prs.sender.clone();
             // Discovery runs git and gh in the session's worktree, which for a
             // server session is on the server.
-            if summary.server.is_some() {
+            if servers::is_server_session(&summary.id) {
                 thread::spawn(move || {
                     let reply = client::request(
                         &storage,

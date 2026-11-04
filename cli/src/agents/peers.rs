@@ -97,7 +97,6 @@ fn create(store: &Store, caller: &str, args: &Value) -> Result<Value> {
         None => store.inspect(caller, |s| s.job.root().to_path_buf())?,
     };
     let repository = super::workspace::repository(&repository, &crate::process::Cancel::default())?;
-    let defaults = store.storage.load_config()?.agent_defaults;
     let text = |key: &str| args.get(key).and_then(Value::as_str).map(String::from);
     let reply = client::request(
         &store.storage,
@@ -107,9 +106,12 @@ fn create(store: &Store, caller: &str, args: &Value) -> Result<Value> {
                 isolated: true,
                 base: "HEAD".into(),
                 prompt,
-                model: text("model").or(defaults.model),
-                effort: text("effort").or(defaults.effort),
+                model: text("model"),
+                effort: text("effort"),
             })),
+            // Blank model and effort, the starting mode and the preset come
+            // from this machine's new-session defaults, as for the user's.
+            effective_defaults: true,
         },
     )?;
     match reply {
