@@ -61,6 +61,13 @@ const TAILSCALE_ADDRESS: &str =
 const GITHUB_STATUS: &str = "gh auth status";
 const GITHUB_LOGIN: &str =
     "gh auth login --hostname github.com --git-protocol https --web && gh auth setup-git";
+/// Commits made by agents need an author. Unless one is set, use the GitHub
+/// account the server logged in with and its private noreply address.
+const GIT_IDENTITY: &str = "git config --global user.email >/dev/null || { \
+    login=$(gh api user --jq .login) && id=$(gh api user --jq .id) \
+    && name=$(gh api user --jq '.name // .login') \
+    && git config --global user.name \"$name\" \
+    && git config --global user.email \"$id+$login@users.noreply.github.com\"; }";
 const CODEX_STATUS: &str = "\"$HOME/.local/bin/codex\" login status";
 const CODEX_LOGIN: &str = "\"$HOME/.local/bin/codex\" login --device-auth";
 const CLAUDE_STATUS: &str = "grep -q '^CLAUDE_CODE_OAUTH_TOKEN=' \"$HOME/.config/difu/server.env\"";
@@ -240,6 +247,7 @@ pub fn add(storage: &Storage, options: Options) -> Result<()> {
         "~/.local/bin/codex login --device-auth",
     )?;
     claude_login(&difu, &root, &name)?;
+    git_identity(&difu);
 
     progress.next("Choosing the server password");
     note("Other computers and phones join with the server's address and this password.");
@@ -471,8 +479,21 @@ pub fn upgrade(storage: &Storage, name: &str) -> Result<()> {
     if !named {
         println!("Could not name the server {name}; run `difu remote config --name {name}` on it");
     }
+    git_identity(&difu);
     println!("{name} now runs difu {VERSION}");
     Ok(())
+}
+
+/// Sets the `difu` user's Git author from its GitHub login when none is set;
+/// failures only print a hint, since agents can still commit with an override.
+fn git_identity(difu: &Ssh) {
+    match difu.output(GIT_IDENTITY, None) {
+        Ok(output) if output.status.success() => {}
+        _ => println!(
+            "Could not set a Git author for agents; log in to GitHub on the server, then run \
+             `git config --global user.name` and `user.email` as difu"
+        ),
+    }
 }
 
 /// Where one server answers SSH, and its own known_hosts file.

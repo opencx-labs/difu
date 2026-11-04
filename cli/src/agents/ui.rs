@@ -3974,7 +3974,7 @@ impl Ui {
                     .unwrap_or_default()
                     .to_string_lossy(),
                 if session.worktree { " 🌳" } else { "" },
-                if session.server.is_some() {
+                if servers::is_server_session(&session.id) {
                     format!(" {}", servers::CLOUD)
                 } else {
                     String::new()

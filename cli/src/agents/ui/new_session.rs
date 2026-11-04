@@ -669,7 +669,7 @@ impl Ui {
         let mut recent: Vec<_> = self
             .summaries
             .iter()
-            .filter(|summary| summary.server.is_none())
+            .filter(|summary| !super::servers::is_server_session(&summary.id))
             .filter_map(|summary| summary.repository.clone().map(|r| (summary.updated, r)))
             .collect();
         recent.sort_by_key(|(updated, _)| std::cmp::Reverse(*updated));
