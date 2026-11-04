@@ -285,6 +285,26 @@ orchestrator, answer another session's questions, or approve its permissions.
 Like the other difu tools, it is available in new Codex threads and in Claude
 sessions.
 
+Agents can run the slash commands on their own session as tools.
+**difu_status**, **difu_usage**, **difu_skills** and **difu_rules** read the
+session's status (model, effort, provider, permission mode, repository, branch,
+worktree, queued and pending counts, attached PRs), provider usage and rate
+limits, available skills and the repository rules. **difu_rename** renames the
+session, and **difu_rules** with `rules` replaces the repository rules (running
+sessions keep the copy they started with). **difu_set_model** changes the model
+and/or reasoning effort, switching between Codex and Claude Code if needed, after
+checking the catalog where the session runs; **difu_compact** compacts the
+conversation. Neither can happen mid-turn, so difu applies them when the current
+turn ends and reports the result in the chat. Messages queued in the meantime wait
+for them, and an interrupted or failed turn cancels them. **difu_clear** and
+**difu_change_repository** discard the conversation or the worktree, uncommitted
+files included. Agents are told to use them only when you explicitly ask in that
+conversation, and they also run after the turn. On purpose, no tool changes
+permission modes, presets or approvals, so an agent can never loosen its own
+permissions. UI-only commands (`/cpu`, `/settings`, `/theme`, …) have no tool. A
+server session's tools run on its server. They are available in new Codex threads
+and in Claude sessions.
+
 Press **n** (or `/new`) to open an empty session immediately while its isolated Git
 worktree is created in the background. The composer stays enabled and shows the
 preparation state. Each new worktree fetches `origin/main` and branches from that

@@ -396,6 +396,9 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
             && (session.orchestrator && tool == Some(super::orchestrator::TOOL)
                 || session.peer_tools && tool == Some(super::peers::TOOL)
                 || session.folder_tools && tool == Some(super::folders::TOOL)
+                || session.command_tools
+                    && !session.orchestrator
+                    && tool.is_some_and(|tool| super::session_tools::TOOLS.contains(&tool))
                 || !session.orchestrator && tool == Some(super::moving::TOOL))
         {
             session.orchestrator_requests.push(Pending {
@@ -1673,6 +1676,11 @@ fn instructions(session: &Session) -> String {
     } else {
         base
     };
+    let base = if session.command_tools {
+        format!("{base}\n\n{}", super::session_tools::INSTRUCTIONS)
+    } else {
+        base
+    };
     let base = if session.server_mode {
         base
     } else {
@@ -1709,6 +1717,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
             s.question_tools = true;
             s.peer_tools = true;
             s.folder_tools = true;
+            s.command_tools = true;
             s.voice_tools = !s.orchestrator;
         })?;
     }
@@ -1805,6 +1814,7 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
                 s.question_tools = true;
                 s.peer_tools = true;
                 s.folder_tools = true;
+                s.command_tools = true;
                 s.voice_tools = !s.orchestrator;
             })?;
             let fresh = store.get(id)?;
@@ -1881,7 +1891,10 @@ fn connect(store: &Store, id: &str, cancel: &Cancel) -> Result<(Connection, bool
     Ok((rpc, resuming))
 }
 fn send_queued(rpc: &mut Connection, store: &Store, id: &str, cancel: &Cancel) -> Result<()> {
-    if !store.inspect(id, |s| s.status == Status::Idle && !s.queue.is_empty())? {
+    // Scheduled session actions (a model change, ...) apply before the queue.
+    if !store.inspect(id, |s| {
+        s.status == Status::Idle && !s.queue.is_empty() && !s.scheduled.holds_queue()
+    })? {
         return Ok(());
     }
     let mut next = None;
@@ -2048,6 +2061,14 @@ pub fn run(
                         super::folders::handle_tool(store, id, &args)
                     } else if tool == Some(super::moving::TOOL) {
                         super::moving::schedule(store, id, &args)
+                    } else if let Some(tool) =
+                        tool.filter(|tool| super::session_tools::TOOLS.contains(tool))
+                    {
+                        // Usage comes over this worker's own connection: the
+                        // service would wait for this worker to answer it.
+                        super::session_tools::handle(store, id, tool, &args, |session| {
+                            usage_with(&mut rpc, session, cancel, |v| event(store, id, v))
+                        })
                     } else {
                         super::orchestrator::handle(store, id, &args)
                     }
@@ -2316,6 +2337,25 @@ mod tests {
         apply_event(&mut session, &call);
         assert!(session.orchestrator_requests.is_empty());
         assert_eq!(session.pending.len(), 1);
+    }
+    #[test]
+    fn session_tool_calls_need_a_thread_that_was_given_them() {
+        let mut session =
+            super::super::session_tools::tests::session("one", std::path::Path::new("."));
+        let call = json!({"id":8,"method":"item/tool/call","params":{
+            "tool":super::super::session_tools::SET_MODEL,"threadId":"thread","turnId":"turn",
+            "arguments":{"effort":"low"}}});
+        // An older thread never received the tools or their guidance.
+        assert!(!instructions(&session).contains(super::super::session_tools::INSTRUCTIONS));
+        apply_event(&mut session, &call);
+        assert!(session.orchestrator_requests.is_empty());
+        assert_eq!(session.pending.len(), 1);
+        session.pending.clear();
+        session.command_tools = true;
+        assert!(instructions(&session).contains(super::super::session_tools::INSTRUCTIONS));
+        apply_event(&mut session, &call);
+        assert_eq!(session.orchestrator_requests.len(), 1);
+        assert!(session.pending.is_empty());
     }
     #[test]
     fn completing_an_agent_turn_leaves_user_shell_commands_running() {

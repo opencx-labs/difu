@@ -73,6 +73,15 @@ impl Store {
         }
         Ok(())
     }
+    /// Gives session `id` a manual name (`Request::Rename`, `difu_rename`).
+    pub(super) fn rename(&self, id: &str, title: &str) -> Result<()> {
+        ensure!(!title.trim().is_empty(), "Session name cannot be empty");
+        self.update(id, |s| {
+            s.title = title.trim().chars().take(200).collect();
+            s.title_manual = true;
+        })?;
+        self.save(id)
+    }
     /// Serialize durable manager-record changes with saves, without touching chat history.
     pub(super) fn durable<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
         let _guard = self
@@ -771,6 +780,155 @@ impl Service {
         }
         Ok(moves)
     }
+    /// Applies what difu's session tools scheduled (`session_tools::Action`)
+    /// once the turn has ended, in order, reporting each outcome in the chat.
+    /// A turn that failed or was interrupted cancels them.
+    fn scheduled_actions(self: &Arc<Self>) -> Result<Vec<thread::JoinHandle<()>>> {
+        let due: Vec<(String, Status)> = self
+            .store
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session lock failed"))?
+            .values()
+            .filter(|s| {
+                s.turn_id.is_none()
+                    && !s.status.active()
+                    && !s.scheduled.applying
+                    && !s.scheduled.actions.is_empty()
+            })
+            .map(|s| (s.id.clone(), s.status))
+            .collect();
+        let mut handles = Vec::new();
+        for (id, status) in due {
+            let finished = matches!(status, Status::Idle | Status::Completed);
+            let mut actions = Vec::new();
+            self.store.update(&id, |s| {
+                actions = std::mem::take(&mut s.scheduled.actions);
+                s.scheduled.applying = finished;
+                if !finished {
+                    for action in &actions {
+                        s.note("system", action.cancelled());
+                    }
+                }
+            })?;
+            if !finished {
+                self.store.save(&id)?;
+                continue;
+            }
+            let service = self.clone();
+            handles.push(
+                thread::Builder::new()
+                    .name("difu-scheduled-actions".into())
+                    .spawn(move || service.apply_scheduled(&id, actions))?,
+            );
+        }
+        Ok(handles)
+    }
+    fn apply_scheduled(&self, id: &str, actions: Vec<super::session_tools::Action>) {
+        /// Releases held queued messages even if an action panics.
+        struct Applying<'a>(&'a Store, &'a str);
+        impl Drop for Applying<'_> {
+            fn drop(&mut self) {
+                let _ = self.0.update(self.1, |s| s.scheduled.applying = false);
+            }
+        }
+        let live = || {
+            self.workers.lock().is_ok_and(|workers| {
+                workers
+                    .get(id)
+                    .is_some_and(|worker| !worker.handle.is_finished())
+            })
+        };
+        let was_live = live();
+        let applying = Applying(&self.store, id);
+        for action in actions {
+            let result = self.apply_action(id, &action);
+            let _ = self.store.update(id, |s| match result {
+                Ok(Some(note)) => s.note("system", note),
+                Ok(None) => {}
+                Err(error) => s.note("error", action.failed(&error)),
+            });
+            let _ = self.store.save(id);
+        }
+        drop(applying);
+        // Messages queued during the turn waited for these actions.
+        if !self
+            .store
+            .inspect(id, |s| s.status == Status::Idle && !s.queue.is_empty())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        // RefreshShells is a read-only no-op for both providers that makes the
+        // worker (restarted when a provider switch stopped it) send the queue.
+        if (was_live || live())
+            && let Err(error) = self.start(id, Some(Control::RefreshShells))
+        {
+            let _ = self.store.update(id, |s| {
+                s.note(
+                    "error",
+                    format!("Could not send the queued messages: {error:#}"),
+                )
+            });
+        }
+    }
+    /// Applies one scheduled action through the same request a terminal app
+    /// sends; returns a chat note when the request does not write its own.
+    fn apply_action(
+        &self,
+        id: &str,
+        action: &super::session_tools::Action,
+    ) -> Result<Option<String>> {
+        use super::session_tools::Action;
+        let request = match action {
+            Action::Model { model, effort } => {
+                // Switching providers requires an empty queue; queued messages
+                // wait aside and keep their order.
+                let mut queue = Vec::new();
+                self.store
+                    .update(id, |s| queue = std::mem::take(&mut s.queue))?;
+                let result = self.handle(Request::Control {
+                    id: id.into(),
+                    control: Control::Model {
+                        model: model.clone(),
+                        effort: effort.clone(),
+                    },
+                });
+                self.store.update(id, |s| {
+                    queue.append(&mut s.queue);
+                    s.queue = queue;
+                })?;
+                if let Reply::Error(error) = result? {
+                    anyhow::bail!("{error}");
+                }
+                let session = self.store.get(id)?;
+                return Ok(Some(format!(
+                    "Now using {} {} with {} reasoning effort.",
+                    session.provider.label(),
+                    session.model.as_deref().unwrap_or("(default model)"),
+                    session.effort.as_deref().unwrap_or("default")
+                )));
+            }
+            Action::Compact => Request::Control {
+                id: id.into(),
+                control: Control::Compact,
+            },
+            Action::Clear => Request::Clear { id: id.into() },
+            Action::Repository(repository) => Request::Repository {
+                id: id.into(),
+                // A server also takes owner/name, adding and cloning it first.
+                repository: if self.store.storage.load_config()?.server.enabled {
+                    crate::cloud::repos::resolve(&self.store.storage, repository)?
+                } else {
+                    PathBuf::from(repository)
+                },
+            },
+        };
+        if let Reply::Error(error) = self.handle(request)? {
+            anyhow::bail!("{error}");
+        }
+        Ok(None)
+    }
     fn handle(&self, request: Request) -> Result<Reply> {
         let request = match &self.federation {
             Some(federation) => match federation.route(request) {
@@ -1075,7 +1233,7 @@ impl Service {
                     skills,
                     attachments,
                 } = &control
-                    && session.turn_id.is_some()
+                    && (session.turn_id.is_some() || session.scheduled.holds_queue())
                 {
                     ensure!(!text.trim().is_empty(), "Message cannot be empty");
                     self.store.update(&id, |s| {
@@ -1622,12 +1780,7 @@ impl Service {
                 result
             }
             Request::Rename { id, title } => {
-                ensure!(!title.trim().is_empty(), "Session name cannot be empty");
-                self.store.update(&id, |s| {
-                    s.title = title.trim().chars().take(200).collect();
-                    s.title_manual = true;
-                })?;
-                self.store.save(&id)?;
+                self.store.rename(&id, &title)?;
                 Ok(Reply::Ok)
             }
             Request::Archive { id, archived } => {
@@ -1968,6 +2121,9 @@ fn clear_conversation(s: &mut Session) {
     s.question_tools = false;
     s.peer_tools = false;
     s.folder_tools = false;
+    s.command_tools = false;
+    // Nothing is left to compact or change; the queue already became unsent.
+    s.scheduled.actions.clear();
     s.native_setup = true;
     s.guide = None;
     if let Job::Coding(launch) = &mut s.job {
@@ -2179,6 +2335,9 @@ pub fn run(storage: Storage) -> Result<()> {
         flushed = Instant::now();
         if let Err(error) = service.scheduled_moves() {
             eprintln!("Scheduled moves: {error:#}");
+        }
+        if let Err(error) = service.scheduled_actions() {
+            eprintln!("Scheduled session actions: {error:#}");
         }
         for session in service.store.list()? {
             if saved.get(&session.id) != Some(&session.version) {
@@ -3748,6 +3907,198 @@ mod move_tests {
         assert!(session.entries.last().is_some_and(|e| e.kind == "error"
             && e.text.starts_with("Could not move this session to box")
             && e.text.contains("queued messages")));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod session_tool_tests {
+    use super::super::session_tools::{self, Action, tests::repo};
+    use super::*;
+    use serde_json::json;
+
+    /// A service holding session `one`, mid-turn on Codex in repository `repo`.
+    fn service(temp: &std::path::Path) -> Result<Arc<Service>> {
+        let root = repo(&temp.join("repo"))?;
+        let home = temp.join("agents");
+        fs::create_dir_all(&home)?;
+        let store = Arc::new(Store::fixture(
+            home,
+            vec![session_tools::tests::session("one", &root)],
+        ));
+        Ok(Arc::new(Service {
+            remote: super::super::remote::Remote::start(store.storage.clone()),
+            store,
+            workers: Mutex::new(BTreeMap::new()),
+            action_locks: Mutex::new(BTreeMap::new()),
+            launch_lock: Mutex::new(()),
+            federation: None,
+            pods: super::super::sandbox::podman(),
+            disk: std::sync::OnceLock::new(),
+        }))
+    }
+    fn tool(service: &Service, name: &str, args: Value) -> Result<Value> {
+        session_tools::handle(&service.store, "one", name, &args, |_| Ok(Value::Null))
+    }
+    fn end_turn(service: &Service, status: Status) -> Result<()> {
+        service.store.update("one", |s| {
+            s.status = status;
+            s.turn_id = None;
+        })
+    }
+    fn run(service: &Arc<Service>) -> Result<()> {
+        for handle in service.scheduled_actions()? {
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("scheduled actions panicked"))?;
+        }
+        Ok(())
+    }
+    fn texts(session: &Session) -> Vec<String> {
+        session.entries.iter().map(|e| e.text.to_string()).collect()
+    }
+
+    #[test]
+    fn model_changes_wait_for_the_turn_and_unfinished_turns_cancel_them() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let service = service(temp.path())?;
+        tool(
+            &service,
+            session_tools::SET_MODEL,
+            json!({"effort":"xhigh"}),
+        )?;
+        run(&service)?;
+        let running = service.store.get("one")?;
+        assert_eq!(running.scheduled.actions.len(), 1);
+        assert_eq!(running.effort.as_deref(), Some("high"));
+
+        end_turn(&service, Status::Interrupted)?;
+        run(&service)?;
+        let cancelled = service.store.get("one")?;
+        assert!(!cancelled.scheduled.holds_queue());
+        assert_eq!(cancelled.effort.as_deref(), Some("high"));
+        assert!(texts(&cancelled).iter().any(|text| text
+            == "Did not use Codex gpt-fixture with xhigh reasoning effort: the turn did not finish (it was interrupted or failed)."));
+
+        service.store.update("one", |s| {
+            s.status = Status::Running;
+            s.turn_id = Some("turn-2".into());
+        })?;
+        tool(
+            &service,
+            session_tools::SET_MODEL,
+            json!({"effort":"xhigh"}),
+        )?;
+        end_turn(&service, Status::Idle)?;
+        run(&service)?;
+        let applied = service.store.get("one")?;
+        assert!(!applied.scheduled.holds_queue());
+        assert_eq!(applied.model.as_deref(), Some("gpt-fixture"));
+        assert_eq!(applied.effort.as_deref(), Some("xhigh"));
+        assert!(applied.entries.last().is_some_and(|e| e.kind == "system"
+            && e.text == "Now using Codex gpt-fixture with xhigh reasoning effort."));
+        Ok(())
+    }
+
+    #[test]
+    fn a_provider_switch_applies_after_the_turn_and_keeps_the_queue() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let service = service(temp.path())?;
+        tool(
+            &service,
+            session_tools::SET_MODEL,
+            json!({"model":"claude/opus","effort":"max"}),
+        )?;
+        service
+            .store
+            .update("one", |s| s.queue.push("first".into()))?;
+        end_turn(&service, Status::Idle)?;
+        // Taken for applying: messages sent now queue behind the change.
+        service
+            .store
+            .update("one", |s| s.scheduled.applying = true)?;
+        service.handle(Request::Control {
+            id: "one".into(),
+            control: Control::Message {
+                text: "second".into(),
+                queue: true,
+                skills: Vec::new(),
+                attachments: Vec::new(),
+            },
+        })?;
+        assert_eq!(service.store.get("one")?.queue.len(), 2);
+        service
+            .store
+            .update("one", |s| s.scheduled.applying = false)?;
+        run(&service)?;
+        let switched = service.store.get("one")?;
+        assert_eq!(switched.provider, provider::Provider::Claude);
+        assert_eq!(switched.model.as_deref(), Some("claude/opus"));
+        assert_eq!(switched.effort.as_deref(), Some("max"));
+        assert_eq!(
+            switched
+                .queue
+                .iter()
+                .map(|prompt| prompt.text().to_owned())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(!switched.scheduled.holds_queue());
+        let texts = texts(&switched);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.starts_with("Selected Claude Code"))
+        );
+        assert!(texts.last().is_some_and(
+            |text| text == "Now using Claude Code claude/opus with max reasoning effort."
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn a_scheduled_repository_change_runs_after_the_turn_and_failures_are_reported() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let service = service(temp.path())?;
+        let other = repo(&temp.path().join("other"))?;
+        tool(
+            &service,
+            session_tools::CHANGE_REPOSITORY,
+            json!({"repository":other.display().to_string()}),
+        )?;
+        service
+            .store
+            .update("one", |s| s.queue.push("later".into()))?;
+        run(&service)?;
+        assert_ne!(service.store.get("one")?.job.root(), other.as_path());
+        end_turn(&service, Status::Idle)?;
+        run(&service)?;
+        let changed = service.store.get("one")?;
+        assert_eq!(changed.job.root(), other.as_path());
+        assert!(changed.queue.is_empty());
+        assert!(
+            changed
+                .entries
+                .iter()
+                .any(|e| e.kind == "unsent" && e.text == "later")
+        );
+        assert!(
+            texts(&changed)
+                .iter()
+                .any(|text| text.starts_with("Repository changed to"))
+        );
+
+        // A failure is reported in the chat instead of being lost.
+        service.store.update("one", |s| {
+            s.thread_id = None;
+            s.scheduled.actions.push(Action::Compact);
+        })?;
+        run(&service)?;
+        let failed = service.store.get("one")?;
+        assert!(failed.entries.last().is_some_and(|e| e.kind == "error"
+            && e.text
+                == "Could not compact the conversation: Send the first message to start this session"));
+        assert!(!failed.scheduled.holds_queue());
         Ok(())
     }
 }

@@ -43,6 +43,7 @@ pub(super) fn tools(session: &Session) -> Vec<Value> {
             super::peers::tool(),
             super::folders::tool(),
         ];
+        tools.extend(super::session_tools::tools());
         if session.provider == super::provider::Provider::Codex {
             tools.push(super::voice_control::tool());
         }

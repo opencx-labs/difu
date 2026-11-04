@@ -87,6 +87,8 @@ pub struct NativeSession {
     pub peer_tools: bool,
     #[serde(default)]
     pub folder_tools: bool,
+    #[serde(default)]
+    pub command_tools: bool,
 }
 
 /// What a new native thread receives with its first message: the chat from
@@ -152,6 +154,7 @@ pub fn switch(
             question_tools: session.question_tools,
             peer_tools: session.peer_tools,
             folder_tools: session.folder_tools,
+            command_tools: session.command_tools,
         },
     );
     let target = session
@@ -172,6 +175,7 @@ pub fn switch(
     session.question_tools = target.question_tools;
     session.peer_tools = target.peer_tools;
     session.folder_tools = target.folder_tools;
+    session.command_tools = target.command_tools;
     session.usage = Value::Null;
     session.token_usage = Value::Null;
     session.completed_turn = None;
@@ -219,6 +223,7 @@ mod tests {
         let mut session = session();
         session.question_tools = true;
         session.pr_tools = true;
+        session.command_tools = true;
         session.permission_state.mode = Some("plan".into());
         session.permission_state.pending_preset =
             Some(super::super::permissions::CodexPreset::Auto);
@@ -238,6 +243,7 @@ mod tests {
         assert!(session.thread_id.is_none());
         assert!(!session.question_tools);
         assert!(!session.pr_tools);
+        assert!(!session.command_tools);
         assert!(session.permission_state.mode.is_none());
         assert!(session.permission_state.permission_events.is_empty());
         switch(
@@ -249,6 +255,7 @@ mod tests {
         assert_eq!(session.thread_id.as_deref(), Some("codex-thread"));
         assert!(session.question_tools);
         assert!(session.pr_tools);
+        assert!(session.command_tools);
         assert_eq!(session.permission_state.mode.as_deref(), Some("plan"));
         assert_eq!(session.permission_state.permission_events.len(), 1);
         assert_eq!(

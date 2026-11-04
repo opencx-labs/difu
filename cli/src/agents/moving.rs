@@ -408,6 +408,12 @@ pub(super) fn schedule(store: &Store, id: &str, args: &Value) -> Result<Value> {
     if let Some(moved) = &session.moved_to {
         bail!("This session already moved to {moved}");
     }
+    if let Some(action) = session.scheduled.actions.first() {
+        bail!(
+            "This session will {} when the turn ends; move it afterwards",
+            action.describe()
+        );
+    }
     let saved = crate::cloud::servers::load(&store.storage)?;
     if !saved.iter().any(|saved| saved.name == server) {
         let names = saved

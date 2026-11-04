@@ -95,6 +95,36 @@ pub(super) fn usage(store: &Store, id: &str, session: &Session, cancel: &Cancel)
         mcp(store, id, frame)
     })
 }
+/// Account usage for difu_usage, called while the session's own worker waits
+/// on the tool: a separate Claude Code process that neither resumes nor
+/// blocks the live conversation. Shaped like Codex's usage.
+fn account_usage(session: &Session, cancel: &Cancel) -> Result<Value> {
+    let mut connection = Connection::open(
+        Options {
+            cwd: session.workspace.as_deref().unwrap_or(session.job.root()),
+            model: None,
+            effort: None,
+            resume: None,
+            instructions: "",
+            mode: Mode::Commands,
+            permission_mode: None,
+            allow_bypass: false,
+            settings: None,
+            sandbox: None,
+        },
+        cancel,
+    )?;
+    let unexpected = |_: &Value| anyhow::bail!("Unexpected request while reading usage");
+    connection.call(json!({"subtype":"initialize"}), cancel, unexpected)?;
+    let mut limits = connection.call(json!({"subtype":"get_usage"}), cancel, unexpected)?;
+    // Its session totals describe this throwaway process, not the session.
+    if let Some(limits) = limits.as_object_mut() {
+        limits.remove("session");
+    }
+    Ok(
+        json!({"model":session.model,"reasoningEffort":session.effort,"context":session.token_usage,"limits":limits}),
+    )
+}
 fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
     let request = frame
         .get("request")
@@ -152,6 +182,12 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                 super::moving::TOOL => {
                     super::moving::schedule(store, id, args).map(|value| value.to_string())
                 }
+                name if super::session_tools::TOOLS.contains(&name) => {
+                    super::session_tools::handle(store, id, name, args, |session| {
+                        account_usage(session, &Cancel::default())
+                    })
+                    .map(|value| value.to_string())
+                }
                 super::artifacts::TOOL => super::artifacts::register(&mut session, args)
                     .map(|()| "Artifact registered in difu".to_owned()),
                 super::management::TOOL => (|| {
@@ -194,6 +230,7 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                     super::moving::TOOL,
                 ]
                 .contains(&name)
+                && !super::session_tools::TOOLS.contains(&name)
             {
                 store.update(id, |s| {
                     s.artifacts = session.artifacts;
@@ -742,7 +779,11 @@ pub(super) fn instructions(session: &Session) -> String {
         super::pr_attachments::INSTRUCTIONS,
         super::folders::INSTRUCTIONS
     );
-    let instructions = format!("{instructions}\n\n{}", super::shells::instructions(session));
+    let instructions = format!(
+        "{instructions}\n\n{}\n\n{}",
+        super::session_tools::INSTRUCTIONS,
+        super::shells::instructions(session)
+    );
     let instructions = if session.server_mode {
         instructions
     } else {
@@ -880,6 +921,7 @@ fn connect_once(
         s.question_tools = true;
         s.peer_tools = true;
         s.folder_tools = true;
+        s.command_tools = true;
     })?;
     Ok(rpc)
 }
@@ -952,7 +994,10 @@ fn send_queued(
     rpc: &mut Connection,
     decoder: &mut events::Decoder,
 ) -> Result<()> {
-    if !store.inspect(id, |s| s.status == Status::Idle && !s.queue.is_empty())? {
+    // Scheduled session actions (a model change, ...) apply before the queue.
+    if !store.inspect(id, |s| {
+        s.status == Status::Idle && !s.queue.is_empty() && !s.scheduled.holds_queue()
+    })? {
         return Ok(());
     }
     let mut next = None;
@@ -1209,6 +1254,67 @@ mod tests {
             refused.pointer("/mcp_response/result/isError"),
             Some(&json!(true))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn the_difu_mcp_server_lists_and_runs_the_session_tools() -> Result<()> {
+        use super::super::session_tools;
+        let temp = tempfile::tempdir()?;
+        let mut session = session_tools::tests::session("one", temp.path());
+        session.provider = Provider::Claude;
+        session.model = Some("claude/opus".into());
+        session.effort = Some("high".into());
+        let store = Store::fixture(temp.path().into(), vec![session.clone()]);
+        let frame = |message: Value| json!({"request":{"subtype":"mcp_message","server_name":"difu","message":message}});
+        let listed = mcp(
+            &store,
+            "one",
+            &frame(json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})),
+        )?;
+        let names = listed
+            .pointer("/mcp_response/result/tools")
+            .and_then(Value::as_array)
+            .context("tools")?
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        for name in session_tools::TOOLS {
+            assert!(names.contains(&name), "{name}");
+        }
+        let call = |id: u64, name: &str, arguments: Value| {
+            mcp(
+                &store,
+                "one",
+                &frame(json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                    "params":{"name":name,"arguments":arguments}})),
+            )
+        };
+        let renamed = call(2, session_tools::RENAME, json!({"title":"Parser fix"}))?;
+        assert_eq!(
+            renamed.pointer("/mcp_response/result/isError"),
+            Some(&json!(false))
+        );
+        assert_eq!(store.get("one")?.title, "Parser fix");
+        let scheduled = call(3, session_tools::SET_MODEL, json!({"model":"sonnet"}))?;
+        assert_eq!(
+            scheduled.pointer("/mcp_response/result/isError"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            store.get("one")?.scheduled.actions,
+            [session_tools::Action::Model {
+                model: Some("claude/sonnet".into()),
+                effort: Some("high".into())
+            }]
+        );
+        let refused = call(4, session_tools::CLEAR, json!({"id":"another"}))?;
+        assert_eq!(
+            refused.pointer("/mcp_response/result/isError"),
+            Some(&json!(true))
+        );
+        // Claude sessions always receive the tools and their guidance.
+        assert!(instructions(&session).contains(session_tools::INSTRUCTIONS));
         Ok(())
     }
 }

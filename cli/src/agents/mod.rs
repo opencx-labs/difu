@@ -25,6 +25,7 @@ pub mod remote;
 mod rules;
 pub mod sandbox;
 pub mod server;
+mod session_tools;
 mod shared;
 pub mod shells;
 pub mod slack;
@@ -411,6 +412,9 @@ pub struct Session {
     /// The provider thread was given difu_folders.
     #[serde(default)]
     pub folder_tools: bool,
+    /// The provider thread was given difu's session tools (`session_tools`).
+    #[serde(default)]
+    pub command_tools: bool,
     #[serde(default)]
     pub voice_tools: bool,
     #[serde(skip)]
@@ -443,6 +447,9 @@ pub struct Session {
     /// turn ends. Never persisted, so a restart never replays a move.
     #[serde(skip)]
     pub move_scheduled: Option<String>,
+    /// What difu's session tools asked to do once the turn ends.
+    #[serde(skip)]
+    pub scheduled: session_tools::Schedule,
 }
 impl Session {
     pub fn new(id: String, job: Job) -> Self {
@@ -518,6 +525,7 @@ impl Session {
             question_tools: false,
             peer_tools: false,
             folder_tools: false,
+            command_tools: false,
             voice_tools: false,
             voice_requests: Vec::new(),
             artifact_requests: Vec::new(),
@@ -535,6 +543,7 @@ impl Session {
             voice: false,
             moved_to: None,
             move_scheduled: None,
+            scheduled: Default::default(),
         }
     }
     /// Freeze completed output and pending-request origins before another UI or
