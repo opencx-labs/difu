@@ -961,7 +961,7 @@ impl Ui {
                             if let Some(current) = self.sessions.get(&summary.id)
                                 && current.version > summary.version
                             {
-                                *summary = current.summary();
+                                *summary = servers::summary(current);
                             }
                         }
                         self.sidebar.observe(&sessions);
@@ -1079,7 +1079,7 @@ impl Ui {
                             self.modal = None;
                         }
                         if let Some(summary) = self.summaries.iter_mut().find(|s| s.id == id) {
-                            *summary = session.summary();
+                            *summary = servers::summary(&session);
                         }
                         self.sessions.insert(id.clone(), *session);
                         self.question_received(&id);
@@ -1383,7 +1383,7 @@ impl Ui {
             self.panels = panels::Panels::new(self.panels.right);
         }
         self.summaries.retain(|s| s.id != id);
-        self.summaries.push(session.summary());
+        self.summaries.push(servers::summary(&session));
         self.sessions.insert(id, session);
         self.modal = None;
         self.refreshed = None;
