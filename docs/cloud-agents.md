@@ -194,7 +194,10 @@ Permission prompts are unchanged.
   same Containerfile and tagged with that name; any other image comes from a
   registry, so `difu sandbox build` pulls it instead (and says so).
   `difu sandbox status` reports the configured image and whether it is
-  present.
+  present; when Podman cannot answer, it shows Podman's error instead.
+* Every Podman call runs from the user's home directory and, when
+  `XDG_RUNTIME_DIR` is unset, with the user's `/run/user/<uid>`, so the
+  commands also work through `sudo -u difu` from another user's directory.
 * Sessions are always worktrees, exactly as on a local difu. Worktrees share the
   base clone's object store and refs, so a sandbox could rewrite another session's
   branch refs (not its files); this is accepted, as it is locally.

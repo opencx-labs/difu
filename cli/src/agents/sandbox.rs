@@ -79,6 +79,8 @@ const LOGINS: [&str; 3] = [".codex", ".claude", ".config/gh"];
 const READ_ONLY: [&str; 3] = [".gitconfig", ".local/bin", ".local/share/claude"];
 /// Bounds every short Podman call, so a wedged Podman cannot hang a worker.
 const TIMEOUT: Duration = Duration::from_secs(60);
+/// systemd's per-user runtime directories (`/run/user/<uid>`).
+const RUNTIME_ROOT: &str = "/run/user";
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// What a sandboxed process is; part of its container name and labels.
@@ -173,7 +175,7 @@ impl Sandbox {
     ) -> Result<(Command, Container)> {
         let program = Program::from_command(command);
         let (invocation, container) = self.prepare(runner, role, &program, false)?;
-        let mut wrapped = Command::new(PODMAN);
+        let mut wrapped = Environment::current().command();
         wrapped.args(&invocation.args).envs(invocation.env);
         if let Some(cwd) = &program.cwd {
             wrapped.current_dir(cwd);
@@ -188,10 +190,14 @@ impl Sandbox {
             self.prepare(Arc::new(Podman), Role::Shell, &program, true)?;
         let mut wrapped = CommandBuilder::new(PODMAN);
         wrapped.args(&invocation.args);
+        let environment = Environment::current();
+        if let Some(directory) = &environment.runtime_dir {
+            wrapped.env(RUNTIME_VARIABLE, directory);
+        }
         for (key, value) in &invocation.env {
             wrapped.env(key, value);
         }
-        if let Some(cwd) = &program.cwd {
+        if let Some(cwd) = program.cwd.as_ref().or(environment.cwd.as_ref()) {
             wrapped.cwd(cwd);
         }
         Ok((wrapped, container))
@@ -351,7 +357,7 @@ impl Sandbox {
         // Podman would try to pull a missing local image and fail obscurely.
         if local_image(&self.image) {
             ensure!(
-                runner.podman(&os(["image", "exists", &self.image]))?.code == 0,
+                image_present(runner, &self.image)?,
                 "The sandbox image {} is missing. Run `difu sandbox build` on the server",
                 self.image
             );
@@ -758,10 +764,84 @@ pub(crate) trait Runner: Send + Sync {
 struct Podman;
 impl Runner for Podman {
     fn podman(&self, args: &[OsString]) -> Result<process::Output> {
-        bounded(Command::new(PODMAN).args(args), TIMEOUT)
+        bounded(Environment::current().command().args(args), TIMEOUT)
     }
     fn available(&self) -> bool {
         installed(PODMAN)
+    }
+}
+
+const RUNTIME_VARIABLE: &str = "XDG_RUNTIME_DIR";
+
+/// Where Podman runs and how it finds the user's runtime directory, however
+/// difu was started. Rootless Podman re-executes itself in a user namespace
+/// and fails ("cannot chdir") in a directory its user cannot enter, as after
+/// `sudo -u difu` from another user's home, so Podman runs from the user's
+/// home. Logins through `sudo` or `su` have no `XDG_RUNTIME_DIR`, without which
+/// Podman looks for the user's images and containers in the wrong place, so
+/// the user's systemd runtime directory is used when it exists.
+#[derive(Debug, PartialEq, Eq)]
+struct Environment {
+    cwd: Option<PathBuf>,
+    runtime_dir: Option<PathBuf>,
+}
+impl Environment {
+    fn current() -> Self {
+        let uid = nix::unistd::getuid();
+        let home = nix::unistd::User::from_uid(uid)
+            .ok()
+            .flatten()
+            .map(|user| user.dir)
+            .or_else(dirs::home_dir);
+        Self::new(
+            home.as_deref(),
+            std::env::var_os(RUNTIME_VARIABLE).as_deref(),
+            &Path::new(RUNTIME_ROOT).join(uid.to_string()),
+        )
+    }
+    fn new(home: Option<&Path>, runtime_dir: Option<&OsStr>, user_runtime_dir: &Path) -> Self {
+        Self {
+            cwd: home.filter(|home| home.is_dir()).map(Path::to_owned),
+            runtime_dir: runtime_dir
+                .is_none_or(OsStr::is_empty)
+                .then(|| user_runtime_dir.to_owned())
+                .filter(|directory| directory.is_dir()),
+        }
+    }
+    /// A `podman` command; callers with a directory of their own set it after.
+    fn command(&self) -> Command {
+        let mut command = Command::new(PODMAN);
+        if let Some(cwd) = &self.cwd {
+            command.current_dir(cwd);
+        }
+        if let Some(directory) = &self.runtime_dir {
+            command.env(RUNTIME_VARIABLE, directory);
+        }
+        command
+    }
+}
+
+/// `podman image exists`: 0 present, 1 missing, anything else Podman failing
+/// (reported as such, never as a missing image).
+fn image_present(runner: &dyn Runner, image: &str) -> Result<bool> {
+    let output = runner.podman(&os(["image", "exists", image]))?;
+    match output.code {
+        0 => Ok(true),
+        1 => Ok(false),
+        _ => bail!(
+            "Podman could not check the sandbox image {image}: {}",
+            failure(&output)
+        ),
+    }
+}
+
+/// Podman's error message, or its exit code when it printed none.
+fn failure(output: &process::Output) -> String {
+    let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    if message.is_empty() {
+        format!("podman exited with {}", output.code)
+    } else {
+        message
     }
 }
 
@@ -825,7 +905,8 @@ fn build(storage: &Storage) -> Result<()> {
             let directory = tempfile::tempdir()?;
             let file = directory.path().join("Containerfile");
             fs::write(&file, CONTAINERFILE)?;
-            let status = Command::new(PODMAN)
+            let status = Environment::current()
+                .command()
                 .args(build_args(tag, &file, directory.path()))
                 .status()
                 .context("Cannot run podman build")?;
@@ -837,7 +918,8 @@ fn build(storage: &Storage) -> Result<()> {
                 "server.sandbox.image is {image}, a registry image rather than a localhost/ one: \
                  pulling it instead of building difu's Containerfile"
             );
-            let status = Command::new(PODMAN)
+            let status = Environment::current()
+                .command()
                 .args(os(["pull", image]))
                 .status()
                 .context("Cannot run podman pull")?;
@@ -857,27 +939,41 @@ fn build_args(tag: &str, file: &Path, context: &Path) -> Vec<OsString> {
 
 fn status(storage: &Storage) -> Result<()> {
     let settings = storage.load_config()?.server;
-    println!("Sandboxing: {}", mode(&settings));
-    println!("Limits per session: {}", limits(&settings.sandbox));
-    if !installed(PODMAN) {
-        println!("Podman: not installed");
-        return Ok(());
-    }
     let podman = Podman;
-    let version = podman.podman(&os(["--version"]))?;
+    let runner: Option<&dyn Runner> = installed(PODMAN).then_some(&podman);
+    report(&settings, runner, &mut std::io::stdout().lock())
+}
+
+/// `difu sandbox status`; `runner` is `None` without Podman.
+fn report(
+    settings: &ServerSettings,
+    runner: Option<&dyn Runner>,
+    out: &mut impl std::io::Write,
+) -> Result<()> {
+    writeln!(out, "Sandboxing: {}", mode(settings))?;
+    writeln!(out, "Limits per session: {}", limits(&settings.sandbox))?;
+    let Some(runner) = runner else {
+        writeln!(out, "Podman: not installed")?;
+        return Ok(());
+    };
+    let version = runner.podman(&os(["--version"]))?;
     ensure!(
         version.code == 0,
         "Podman is installed but does not run: {}",
-        String::from_utf8_lossy(&version.stderr).trim()
+        failure(&version)
     );
-    println!(
+    writeln!(
+        out,
         "Podman: {}",
         String::from_utf8_lossy(&version.stdout).trim()
-    );
+    )?;
     let image = settings.sandbox.image();
-    let present = podman.podman(&os(["image", "exists", image]))?.code == 0;
-    println!("Image: {}", image_status(image, present));
-    let listed = podman.podman(&os([
+    writeln!(
+        out,
+        "Image: {}",
+        image_status(image, image_present(runner, image)?)
+    )?;
+    let listed = runner.podman(&os([
         "pod",
         "ps",
         "--filter",
@@ -888,13 +984,13 @@ fn status(storage: &Storage) -> Result<()> {
     ensure!(
         listed.code == 0,
         "Cannot list sandboxes: {}",
-        String::from_utf8_lossy(&listed.stderr).trim()
+        failure(&listed)
     );
     let pods = pods(&String::from_utf8_lossy(&listed.stdout));
     let running = pods.iter().filter(|pod| pod.running).count();
-    println!("Sandboxes: {} ({running} running)", pods.len());
+    writeln!(out, "Sandboxes: {} ({running} running)", pods.len())?;
     for pod in pods {
-        println!("  {}  {}  {}", pod.name, pod.status, pod.containers);
+        writeln!(out, "  {}  {}  {}", pod.name, pod.status, pod.containers)?;
     }
     Ok(())
 }
@@ -1708,6 +1804,86 @@ mod tests {
             "{remote}"
         );
         assert!(remote.contains("pulls it on first use"), "{remote}");
+    }
+
+    #[test]
+    fn podman_runs_from_home_with_the_users_runtime_directory() -> Result<()> {
+        let home = tempfile::tempdir()?;
+        let runtime = tempfile::tempdir()?;
+        let user = runtime.path().join("1001");
+        fs::create_dir(&user)?;
+        // `sudo -u difu` from another user's directory, without a login session.
+        let environment = Environment::new(Some(home.path()), None, &user);
+        assert_eq!(
+            environment,
+            Environment {
+                cwd: Some(home.path().to_owned()),
+                runtime_dir: Some(user.clone()),
+            }
+        );
+        let command = environment.command();
+        assert_eq!(command.get_current_dir(), Some(home.path()));
+        assert!(
+            command
+                .get_envs()
+                .any(|(key, value)| key == RUNTIME_VARIABLE && value == Some(user.as_os_str()))
+        );
+        assert_eq!(
+            Environment::new(Some(home.path()), Some(OsStr::new("")), &user).runtime_dir,
+            Some(user.clone())
+        );
+        // A login session's own directory stays; Podman reads it as usual.
+        let session = Environment::new(None, Some(OsStr::new("/run/user/7")), &user);
+        assert_eq!(session.cwd, None);
+        assert_eq!(session.runtime_dir, None);
+        assert!(
+            session
+                .command()
+                .get_envs()
+                .all(|(key, _)| key != RUNTIME_VARIABLE)
+        );
+        // No systemd user instance: nothing to point Podman at.
+        let missing = runtime.path().join("1002");
+        assert_eq!(
+            Environment::new(Some(&missing), None, &missing),
+            Environment {
+                cwd: None,
+                runtime_dir: None,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn status_reports_podman_failures_instead_of_a_missing_image() -> Result<()> {
+        let settings = server(true, true);
+        let status = |fake: &Fake| -> (Result<()>, String) {
+            let mut out = Vec::new();
+            let result = report(&settings, Some(fake), &mut out);
+            (result, String::from_utf8_lossy(&out).into_owned())
+        };
+        let refused = "Error: cannot chdir to /home/ubuntu: Permission denied";
+        let fake = Fake::replying([(0, ""), (125, refused)]);
+        let (result, out) = status(&fake);
+        let error = result.err().context("A Podman failure must be an error")?;
+        assert!(format!("{error:#}").contains(refused), "{error:#}");
+        assert!(!out.contains("missing"), "{out}");
+        let fake = Fake::replying([(0, ""), (1, ""), (0, "")]);
+        let (result, out) = status(&fake);
+        result?;
+        assert!(out.contains("missing; run `difu sandbox build`"), "{out}");
+        assert!(out.contains("Sandboxes: 0 (0 running)"), "{out}");
+        let mut out = Vec::new();
+        report(&settings, None, &mut out)?;
+        assert!(String::from_utf8_lossy(&out).contains("Podman: not installed"));
+        // Starting a session says the same instead of "run difu sandbox build".
+        let fake = Fake::replying([(125, refused)]);
+        let error = sandbox()
+            .ensure_pod(fake.as_ref())
+            .err()
+            .context("Expected a Podman error")?;
+        assert!(format!("{error:#}").contains(refused), "{error:#}");
+        Ok(())
     }
 
     const TEST_IMAGE: &str = "quay.io/libpod/alpine:latest";
