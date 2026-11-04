@@ -2316,7 +2316,9 @@ pub fn run(storage: Storage) -> Result<()> {
             Ok((stream, _)) => {
                 let service = service.clone();
                 thread::spawn(move || {
-                    if let Err(error) = serve(&service, stream) {
+                    if let Err(error) = serve(&service, stream)
+                        && !super::transport::disconnected(&error)
+                    {
                         eprintln!("Agent client: {error:#}");
                     }
                 });

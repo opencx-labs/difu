@@ -153,7 +153,10 @@ fn accept(
                     .name("difu-remote-peer".into())
                     .spawn(move || {
                         let remote = admission.remote.clone();
-                        if let Err(error) = serve(&remote, &identity, stream, admission) {
+                        // Phones and computers drop off mid-reply all the time.
+                        if let Err(error) = serve(&remote, &identity, stream, admission)
+                            && !crate::agents::transport::disconnected(&error)
+                        {
                             eprintln!("Remote control client {address}: {error:#}");
                         }
                     });
