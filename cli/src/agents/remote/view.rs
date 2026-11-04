@@ -2,10 +2,14 @@
 //! shapes are normalized here, reusing the terminal's labels, so the app only
 //! renders. Tool output is shortened; `session.entry` returns a full row.
 use super::super::{
-    Entry, Job, Pending, Session, Summary, orchestrator,
+    Entry, Job, Pending, Session, Summary,
+    artifacts::Artifact,
+    folders::{self, Folder},
+    orchestrator,
     permissions::{self, CodexPreset},
     pr_cache::{SessionLink, SessionLinks},
     provider::Provider,
+    subagents::{self, Subagent},
     ui::transcript,
 };
 use serde::Serialize;
@@ -20,6 +24,8 @@ const TOOL_TEXT: usize = 6_000;
 const MESSAGE_TEXT: usize = 200_000;
 const DIFF_TEXT: usize = 20_000;
 pub const FULL_TEXT: usize = 4_000_000;
+/// A queued message as the queue shows it; `session.editQueued` compares it.
+pub const QUEUED_TEXT: usize = 2_000;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -45,6 +51,17 @@ pub struct SessionSummary {
     pub can_read_changes: bool,
     /// Attached and discovered pull requests, current open ones first.
     pub prs: Vec<PrView>,
+    /// Presented HTML artifacts (`session.artifact`).
+    pub artifacts: usize,
+    /// Open shells (`session.shells`).
+    pub shells: usize,
+    /// Sub-agents, and how many are still working (`session.subagent`).
+    pub subagents: usize,
+    pub running_subagents: usize,
+    /// The sidebar folder holding the session (`folders.list`).
+    pub folder: Option<String>,
+    /// The `<server>:<session>` this session moved to; it takes no messages.
+    pub moved_to: Option<String>,
 }
 
 /// A session's pull request, as the terminal's badges show it.
@@ -113,7 +130,20 @@ impl SessionSummary {
             queued: summary.queued,
             can_read_changes: summary.can_read_changes,
             prs: prs.iter().map(PrView::new).collect(),
+            artifacts: summary.artifacts,
+            shells: summary.shells,
+            subagents: summary.subagents,
+            running_subagents: summary.running_subagents,
+            folder: None,
+            moved_to: summary.moved_to.clone(),
         }
+    }
+}
+
+/// Files each listed session under the sidebar folder holding it.
+pub fn file_folders(sessions: &mut [SessionSummary], folders: &[Folder]) {
+    for session in sessions {
+        session.folder = folders::home(folders, &session.id).map(|folder| folder.id.clone());
     }
 }
 
@@ -161,6 +191,74 @@ pub struct Activity {
 pub struct Queued {
     pub index: usize,
     pub text: String,
+    /// `text` was shortened; edit the message on the computer.
+    pub truncated: bool,
+}
+
+/// A presented HTML artifact; `session.artifact` takes `path` and `workspace`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ArtifactView {
+    pub title: String,
+    /// Relative to `workspace` (or the session's workspace when null).
+    pub path: String,
+    pub workspace: Option<String>,
+    pub name: String,
+}
+
+impl ArtifactView {
+    pub fn new(artifact: &Artifact) -> Self {
+        Self {
+            title: artifact.title.clone(),
+            path: artifact.path.display().to_string(),
+            workspace: artifact
+                .workspace
+                .as_ref()
+                .map(|path| path.display().to_string()),
+            name: artifact
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| artifact.path.display().to_string()),
+        }
+    }
+}
+
+/// A provider sub-agent, without its transcript (`session.subagent`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubagentView {
+    pub id: String,
+    pub name: String,
+    pub task: String,
+    /// The terminal's row title: name and the task's first line.
+    pub title: String,
+    /// Starting | Running | Completed | Interrupted | Failed | Closed | Unknown
+    pub state: subagents::State,
+    pub state_label: &'static str,
+    pub active: bool,
+    pub provider: super::super::provider::Provider,
+    pub provider_label: &'static str,
+    pub background: bool,
+    /// Messages recorded so far (Codex loads them when opened).
+    pub entries: usize,
+}
+
+impl SubagentView {
+    pub fn new(agent: &Subagent) -> Self {
+        Self {
+            id: agent.id.clone(),
+            name: clip(&agent.name, 200, false).0,
+            task: clip(&agent.task, 2_000, false).0,
+            title: clip(&agent.title(), 300, false).0,
+            state: agent.state,
+            state_label: agent.state.label(),
+            active: agent.state.active(),
+            provider: agent.provider,
+            provider_label: agent.provider.label(),
+            background: agent.background,
+            entries: agent.entries.len(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -185,6 +283,8 @@ pub struct Header {
     /// The mode chip: the session's permission mode (and Codex approval
     /// preset); `None` outside coding sessions.
     pub permission_mode: Option<PermissionMode>,
+    pub artifacts: Vec<ArtifactView>,
+    pub subagents: Vec<SubagentView>,
 }
 
 /// A coding session's permission mode as the terminal's mode indicator shows
@@ -298,9 +398,13 @@ impl SessionView {
                 .queue
                 .iter()
                 .enumerate()
-                .map(|(index, prompt)| Queued {
-                    index,
-                    text: clip(prompt.text(), 2_000, false).0,
+                .map(|(index, prompt)| {
+                    let (text, truncated) = clip(prompt.text(), QUEUED_TEXT, false);
+                    Queued {
+                        index,
+                        text,
+                        truncated,
+                    }
                 })
                 .collect(),
             pending: session
@@ -309,6 +413,8 @@ impl SessionView {
                 .map(|p| PendingView::new(session, p))
                 .collect(),
             permission_mode: PermissionMode::new(session),
+            artifacts: session.artifacts.iter().map(ArtifactView::new).collect(),
+            subagents: session.subagents.iter().map(SubagentView::new).collect(),
         };
         let active = session.status.active();
         let mut next = HashMap::new();

@@ -8,7 +8,7 @@ use super::{
         provider::Provider,
         server, transport,
     },
-    Access, Remote, commands, reviews,
+    Access, Remote, commands, resources, reviews,
     view::{self, EntryView, SessionSummary, SessionView},
 };
 use crate::storage::{AgentDefaults, Config, Storage};
@@ -66,6 +66,10 @@ struct Inner {
     models: Mutex<Option<(Instant, Value)>>,
     prs: Mutex<Option<(Instant, SessionLinks)>>,
     skills: Mutex<BTreeMap<String, Skills>>,
+    /// Open shells per session, from the last session list.
+    shell_counts: Mutex<Option<(Instant, BTreeMap<String, usize>)>>,
+    /// This connection's shell input, as one terminal client.
+    shell_input: resources::ShellInput,
 }
 
 /// A session's provider skills and discovery errors, as last listed.
@@ -108,7 +112,6 @@ impl Connection {
         Self(Arc::new(Inner {
             storage: remote.storage.clone(),
             remote,
-            device,
             access,
             port,
             sender,
@@ -121,6 +124,9 @@ impl Connection {
             models: Mutex::new(None),
             prs: Mutex::new(None),
             skills: Mutex::new(BTreeMap::new()),
+            shell_counts: Mutex::new(None),
+            shell_input: resources::ShellInput::new(&device),
+            device,
         }))
     }
 
@@ -228,13 +234,38 @@ impl Inner {
         };
         // Phones connect to cloud servers directly; relayed copies would repeat them.
         list.retain(|summary| summary.server.is_none());
+        self.remember_shells(&list);
         let config = config(&self.storage);
-        Ok(view::summaries(
+        let mut sessions = view::summaries(
             &list,
             &config.pinned_sessions,
             &config.session_order,
             &self.prs(&list),
-        ))
+        );
+        view::file_folders(&mut sessions, &config.session_folders);
+        Ok(sessions)
+    }
+    fn remember_shells(&self, list: &[Summary]) {
+        let counts = list.iter().map(|s| (s.id.clone(), s.shells)).collect();
+        *self.shell_counts.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((Instant::now(), counts));
+    }
+    /// A session's open shells as the list counts them (a session read
+    /// leaves out its shells), listed again every few seconds.
+    fn shell_count(&self, id: &str) -> usize {
+        let fresh = |counts: &Option<(Instant, BTreeMap<String, usize>)>| {
+            counts
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < PRS_TTL)
+                .map(|(_, counts)| counts.get(id).copied().unwrap_or(0))
+        };
+        if let Some(count) = fresh(&self.shell_counts.lock().unwrap_or_else(|e| e.into_inner())) {
+            return count;
+        }
+        if let Ok(Reply::Sessions(list)) = self.request(Request::List) {
+            self.remember_shells(&list);
+        }
+        fresh(&self.shell_counts.lock().unwrap_or_else(|e| e.into_inner())).unwrap_or(0)
     }
     /// Cached pull requests of the listed sessions, reread every few seconds.
     fn prs(&self, list: &[Summary]) -> SessionLinks {
@@ -292,12 +323,12 @@ impl Inner {
     }
 }
 
-fn param<T: DeserializeOwned>(params: &Value, key: &str) -> Result<T> {
+pub(super) fn param<T: DeserializeOwned>(params: &Value, key: &str) -> Result<T> {
     serde_json::from_value(params.get(key).cloned().unwrap_or(Value::Null))
         .with_context(|| format!("Invalid or missing parameter `{key}`"))
 }
 
-fn optional<T: DeserializeOwned>(params: &Value, key: &str) -> Result<Option<T>> {
+pub(super) fn optional<T: DeserializeOwned>(params: &Value, key: &str) -> Result<Option<T>> {
     match params.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(value) => serde_json::from_value(value.clone())
@@ -344,17 +375,22 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
             }
             Ok(json!({}))
         }
-        "sessions.list" => Ok(json!({"sessions": inner.summaries()?})),
+        "sessions.list" => Ok(json!({
+            "sessions": inner.summaries()?,
+            "folders": resources::folders(&inner.storage),
+        })),
         "sessions.subscribe" => {
             let sessions = inner.summaries()?;
+            let folders = resources::folders(&inner.storage);
             if !inner.listing.swap(true, Ordering::Relaxed) {
                 let inner = inner.clone();
                 let first = sessions.clone();
+                let filed = folders.clone();
                 thread::Builder::new()
                     .name("difu-remote-list".into())
-                    .spawn(move || list_sessions(&inner, first))?;
+                    .spawn(move || list_sessions(&inner, first, filed))?;
             }
-            Ok(json!({"sessions": sessions}))
+            Ok(json!({"sessions": sessions, "folders": folders}))
         }
         "session.watch" => {
             let id = id()?;
@@ -534,7 +570,9 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
         "pr.comment" | "pr.review" | "pr.merge" | "pr.close" | "pr.ready" => {
             reviews::act(method, params)
         }
-        _ => match super::server_api::dispatch(&inner.storage, method, params) {
+        _ => match resources::dispatch(&inner.storage, &inner.shell_input, method, params)
+            .or_else(|| super::server_api::dispatch(&inner.storage, method, params))
+        {
             Some(result) => result,
             None => anyhow::bail!("Unknown method `{method}`; update difu on your computer"),
         },
@@ -981,9 +1019,21 @@ fn models(inner: &Inner) -> Result<Value> {
     Ok(value)
 }
 
-fn list_sessions(inner: &Inner, mut sent: Vec<SessionSummary>) {
+fn list_sessions(
+    inner: &Inner,
+    mut sent: Vec<SessionSummary>,
+    mut filed: Vec<crate::agents::folders::Folder>,
+) {
     while !inner.closed.load(Ordering::Relaxed) {
         thread::sleep(Duration::from_secs(1));
+        // Folders first: a session filed into a new folder finds it listed.
+        let folders = resources::folders(&inner.storage);
+        if folders != filed {
+            if !inner.event("folders", &folders) {
+                return;
+            }
+            filed = folders;
+        }
         match inner.summaries() {
             Ok(list) if list != sent => {
                 if !inner.event("sessions", &list) {
@@ -1017,7 +1067,11 @@ fn watch(inner: &Inner, id: &str, stop: &AtomicBool) {
         let mut session: Option<Session> = None;
         let mut sent: Option<SessionView> = None;
         let mut cache = view::Cache::default();
-        let mut pinned = config(&inner.storage).pinned_sessions;
+        let saved = config(&inner.storage);
+        let mut pinned = saved.pinned_sessions;
+        let mut folder = crate::agents::folders::home(&saved.session_folders, id)
+            .map(|folder| folder.id.clone());
+        let mut shells = inner.shell_count(id);
         let mut pinned_at = Instant::now();
         let mut prs = None;
         while !stop.load(Ordering::Relaxed) && !inner.closed.load(Ordering::Relaxed) {
@@ -1035,13 +1089,19 @@ fn watch(inner: &Inner, id: &str, stop: &AtomicBool) {
                 _ => anyhow::bail!("Unexpected session update"),
             }
             if pinned_at.elapsed() >= PRS_TTL {
-                pinned = config(&inner.storage).pinned_sessions;
+                let saved = config(&inner.storage);
+                pinned = saved.pinned_sessions;
+                folder = crate::agents::folders::home(&saved.session_folders, id)
+                    .map(|folder| folder.id.clone());
+                shells = inner.shell_count(id);
                 pinned_at = Instant::now();
                 prs = None;
             }
             let Some(session) = &session else { continue };
             let prs = prs.get_or_insert_with(|| inner.session_prs(session));
-            let next = SessionView::cached(session, &pinned, prs, &mut cache);
+            let mut next = SessionView::cached(session, &pinned, prs, &mut cache);
+            next.header.summary.folder.clone_from(&folder);
+            next.header.summary.shells = shells;
             let delivered = match &sent {
                 None => inner.event("session", &next),
                 Some(previous) if *previous != next => {
@@ -1840,6 +1900,107 @@ mod tests {
                 "{provider:?}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn lists_and_views_carry_artifacts_shells_sub_agents_and_folders() -> Result<()> {
+        use super::super::super::{artifacts::Artifact, folders::Folder, subagents};
+        let dir = tempfile::tempdir()?;
+        let workspace = dir.path().canonicalize()?.join("worktree");
+        std::fs::create_dir_all(&workspace)?;
+        let mut session = coding(Provider::Claude);
+        session.workspace = Some(workspace.clone());
+        session.workspace_ready = true;
+        session.artifacts.push(Artifact {
+            path: "out/report.html".into(),
+            title: "Report".into(),
+            workspace: Some(workspace.clone()),
+        });
+        for (native, state) in [
+            ("a", subagents::State::Running),
+            ("b", subagents::State::Completed),
+        ] {
+            let mut agent = subagents::Subagent::new(Provider::Claude, native);
+            agent.name = format!("Agent {native}");
+            agent.state = state;
+            session.subagents.push(agent);
+        }
+        session.queue = vec![
+            super::super::super::Prompt::Text("short".into()),
+            super::super::super::Prompt::Text("x".repeat(view::QUEUED_TEXT + 1)),
+        ];
+        let served = server::Served::start(dir.path().join("home"), vec![session])?;
+        let storage = served.store.storage.clone();
+        storage.update_config(|config| {
+            config.session_folders = vec![Folder {
+                id: "auth".into(),
+                name: "Auth".into(),
+                sessions: vec!["one".into()],
+            }]
+        })?;
+        let Reply::Shell(opened) = client::request(
+            &storage,
+            Request::Shell {
+                id: "one".into(),
+                action: super::super::super::shells::Action::Open,
+            },
+        )?
+        else {
+            anyhow::bail!("expected a shell");
+        };
+        let connection = connection(&storage);
+        let listed = dispatch(&connection.0, "sessions.list", &json!({}))?;
+        let row = at(&listed, "/sessions/0");
+        assert_eq!(at(row, "/artifacts"), &json!(1));
+        assert_eq!(at(row, "/shells"), &json!(1));
+        assert_eq!(at(row, "/subagents"), &json!(2));
+        assert_eq!(at(row, "/runningSubagents"), &json!(1));
+        assert_eq!(at(row, "/folder"), &json!("auth"));
+        assert_eq!(at(row, "/movedTo"), &Value::Null);
+        assert_eq!(
+            at(&listed, "/folders"),
+            &json!([{"id": "auth", "name": "Auth", "sessions": ["one"]}])
+        );
+        assert_eq!(connection.0.shell_count("one"), 1);
+
+        let view = serde_json::to_value(SessionView::new(
+            &served.store.get("one")?,
+            &BTreeSet::new(),
+        ))?;
+        assert_eq!(
+            at(&view, "/artifacts"),
+            &json!([{
+                "title": "Report",
+                "path": "out/report.html",
+                "workspace": workspace.display().to_string(),
+                "name": "report.html",
+            }])
+        );
+        assert_eq!(at(&view, "/subagents/0/id"), &json!("claude:a"));
+        assert_eq!(at(&view, "/subagents/0/stateLabel"), &json!("Running"));
+        assert_eq!(at(&view, "/subagents/0/active"), &json!(true));
+        assert_eq!(at(&view, "/subagents/1/state"), &json!("Completed"));
+        assert_eq!(
+            at(&view, "/subagents/1/providerLabel"),
+            &json!("Claude Code")
+        );
+        assert_eq!(at(&view, "/queue/0/truncated"), &json!(false));
+        assert_eq!(at(&view, "/queue/1/truncated"), &json!(true));
+
+        client::request(
+            &storage,
+            Request::Shell {
+                id: "one".into(),
+                action: super::super::super::shells::Action::Close {
+                    shell: opened
+                        .get("shell")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .into(),
+                },
+            },
+        )?;
         Ok(())
     }
 

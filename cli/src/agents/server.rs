@@ -179,12 +179,17 @@ impl Store {
         Ok(true)
     }
     pub(super) fn list(&self) -> Result<Vec<Summary>> {
+        let shells = self.shells.counts()?;
         let mut list: Vec<_> = self
             .sessions
             .lock()
             .map_err(|_| anyhow::anyhow!("Session store lock failed"))?
             .values()
-            .map(Session::summary)
+            .map(|session| {
+                let mut summary = session.summary();
+                summary.shells += shells.get(&session.id).copied().unwrap_or(0);
+                summary
+            })
             .collect();
         list.sort_by(|a, b| {
             b.status

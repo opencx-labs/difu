@@ -109,6 +109,7 @@ Server → client push events (no `id`):
 {"event": "session", "data": SessionView}
 {"event": "session.delta", "data": SessionDelta}
 {"event": "session.closed", "data": {"id": "...", "message": "Session not found"}}
+{"event": "folders", "data": [Folder, ...]}
 ```
 
 Unknown fields must be ignored; optional fields may be absent or `null`.
@@ -141,7 +142,13 @@ Timestamps are Unix **milliseconds** unless stated otherwise.
   "pending": 1,                     // unanswered questions + approvals
   "queued": 0,
   "canReadChanges": true,
-  "prs": [SessionPr]                // attached and discovered pull requests; may be absent (older computers)
+  "prs": [SessionPr],               // attached and discovered pull requests; may be absent (older computers)
+  "artifacts": 1,                   // presented HTML artifacts      ┐
+  "shells": 2,                      // open shells                   │ the terminal's resource
+  "subagents": 3,                   // sub-agents                    │ controls; absent (0) on
+  "runningSubagents": 1,            // of which still working        ┘ older computers
+  "folder": "auth",                 // the sidebar folder holding it (Folder.id), or null
+  "movedTo": null                   // "<server>:<session>" after a move; it takes no more messages
 }
 ```
 
@@ -173,6 +180,11 @@ The `sessions` array is already in display order (orchestrator, pinned, the
 user's custom order, newest first) and excludes guide-generation jobs. Archived
 sessions are included; filter them client-side (Active / Archived toggle).
 
+`shells` counts what the terminal's **Shells** control lists: shared shells,
+running `!` commands and Codex's background shells. A finished `!` command
+leaves the list (its output stays in the transcript); a shared shell stays
+until it is closed, even after it exits.
+
 `SessionView` — everything in `SessionSummary` plus:
 
 ```json
@@ -187,9 +199,12 @@ sessions are included; filter them client-side (Active / Archived toggle).
   "canInterruptAndSend": false,     // there are queued messages that "Send now" would flush
   "betweenTurns": true,             // no turn, pending request or queued message; may be absent (older computers)
   "activity": {"label": "Running cargo test", "since": 1790000000000},  // or null
-  "queue": [{"index": 0, "text": "Also update the docs"}],
+  "queue": [{"index": 0, "text": "Also update the docs", "truncated": false}],   // truncated: shortened, can't be edited here
   "pending": [PendingView],
   "permissionMode": PermissionMode, // coding sessions; null otherwise, absent on older computers
+  "artifacts": [{"title": "Report", "path": "out/report.html",          // instead of the summary's count
+                 "workspace": "/…/worktrees/…", "name": "report.html"}],
+  "subagents": [SubagentView],                                            // instead of the summary's count
   "entries": [EntryView]
 }
 ```
@@ -214,6 +229,16 @@ Switch with `/permissions <id>` (`session.command`): its `permissions` result
 lists each mode and preset with `available` and a `reason` when not, and a
 refused switch fails with the computer's message (for example "Bypass mode is
 disabled by settings", or a managed Codex policy).
+`SubagentView` — a provider sub-agent, without its transcript:
+
+```json
+{"id": "claude:toolu_01", "name": "Explore", "task": "Find the login handler…",
+ "title": "Explore · Find the login handler",   // the terminal's row title
+ "state": "Running",              // Starting | Running | Completed | Interrupted | Failed | Closed | Unknown
+ "stateLabel": "Running", "active": true,
+ "provider": "claude", "providerLabel": "Claude Code",
+ "background": false, "entries": 12}             // messages recorded so far
+```
 
 `EntryView` — one transcript row, already normalized for display:
 
@@ -288,8 +313,8 @@ all other fields with `session` (including `version`).
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `sessions.subscribe` | – | `{"sessions": [SessionSummary]}`; then `sessions` events on every change |
-| `sessions.list` | – | `{"sessions": [SessionSummary]}` |
+| `sessions.subscribe` | – | `{"sessions": [SessionSummary], "folders": [Folder]}`; then `sessions` and `folders` events on every change |
+| `sessions.list` | – | `{"sessions": [SessionSummary], "folders": [Folder]}` |
 | `session.watch` | `id` | `{}`; then a `session` event, followed by `session.delta` events. Several sessions may be watched at once. |
 | `session.unwatch` | `id` | `{}` |
 | `session.entry` | `id`, `entry` (entry id) | `{"entry": EntryView}` untruncated (up to ~4 MB) |
@@ -307,6 +332,11 @@ all other fields with `session` (including `version`).
 | `session.delete` | `id` | `{}` — removes chat and worktree (confirm first) |
 | `session.clear` | `id` | `{}` — fresh conversation and worktree (confirm first) |
 | `session.changes` | `id` | `{"files": [DiffFile]}` uncommitted + committed worktree changes |
+| `session.editQueued` | `id`, `index`, `expected` (the queued `text` as shown), `text` | `{}` — replaces a queued message; fails if it changed or was sent meanwhile, or was `truncated` |
+| `session.pin` | `id`, `pinned` (bool) | `{}` — pins the session at the top of the list, as in the terminal |
+| `session.attachPr` | `id`, `url` (a GitHub pull request URL) | `{}` — attaches it like `difu_attach_pr` (verified on GitHub first) |
+| `session.move` | `id`, `server` (an `agents.servers` name) | `{"id": "<server>:<session>"}` — moves a session on this computer to a saved server, like the terminal; can take minutes |
+| `agents.servers` | – | `{"servers": [{"name": "box", "connected": true, "version": "0.38.0", "problem": null}]}` — the saved cloud servers sessions can move to; empty on servers |
 | `session.commands` | `id`, `refresh` (bool; lists the provider's skills again) | `{"commands": [Command], "errors": ["..."]}`; see *Slash commands* (slow the first time: seconds) |
 | `session.command` | `id`, `name` (`/compact`, `$lint` or a bare name), `args` (string, optional), `confirm` (bool), `queue` (bool, provider commands) | `CommandOutcome`; see *Slash commands* |
 | `agents.new` | `repository` (path or null for the default), `model`, `effort`, `startingMode`, `codexPreset`, `text` (first message, optional) | `{"id": "..."}` — blank choices are the location's effective defaults (see *New-session defaults*); a `model` picks its own provider |
@@ -499,6 +529,88 @@ without `confirm: true`, commands that take no arguments fail with some.
 Computers without these methods answer `Unknown method`; clients then offer the
 commands existing methods run (`session.compact`, `session.clear`,
 `session.rename`, the model picker, changes and new session).
+
+### Session resources
+
+What the terminal shows under a session's chat, read and driven through the
+computer or server running the session.
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `session.artifact` | `id`, `path`, `workspace` (an `artifacts[]` entry's) | `{"name": "report.html", "mime": "text/html", "size": 15, "data": "<base64>"}` |
+| `session.shells` | `id` | `{"shells": [ShellView]}` |
+| `session.shell` | `id`, `shell`, `revision` (optional: the last read's) | `{"shell": ShellView, "output": "…", "truncated": false, "error": null}`, or `{"shell": ShellView, "unchanged": true}` when `revision` still matches |
+| `session.shell.open` | `id`, `command` (optional) | `{"id": "<shell>"}` — a shared shell in the worktree, or `command` run like a `!` message |
+| `session.shell.write` | `id`, `shell`, `text`, `enter` (bool) | `{}` |
+| `session.shell.close` | `id`, `shell` | `{}` — terminates it, like **x** in the Shells list |
+| `session.subagent` | `id`, `agent` (a `subagents[].id`), `refresh` (bool) | `{"subagent": SubagentView, "entries": [EntryView], "earlier": 0, "error": null}` |
+
+**Artifacts.** Only artifacts the session presented (`difu_present_artifact`)
+can be read, with the rules a terminal uses for a server session's artifact:
+an HTML file inside its workspace (symlinks may not leave it), at most 32 MB.
+Anything else fails ("That artifact is no longer presented in this session",
+"… artifacts open from a server up to 32 MB"). The file is read on every
+call, so reading again is **Refresh**. Show it in a web view without file
+access; artifacts are meant to be self-contained.
+
+`ShellView`:
+
+```json
+{"id": "difu-shell-1790…-0", "title": "Interactive shell",
+ "kind": "shell",                 // shell (shared) | command (a `!` command) | background (Codex's; read-only)
+ "running": true, "exitCode": null, "cwd": "/…/worktrees/…",
+ "revision": 42,                  // changes with every output; null for background shells
+ "humanFocused": false,           // someone types in it right now (terminal pane or a phone)
+ "canWrite": true, "canClose": true}
+```
+
+**Shells.** `session.shell` returns the shell's text, scrollback and screen,
+without colours, at the size difu gave it: the phone never resizes a shell
+the terminal may be showing. `output` is its last 64 KB (`truncated` says
+earlier output was left out). With the `revision` of the last read, unchanged
+output isn't sent again, so poll quickly only while output moves. A finished
+`!` command and Codex's background shells are read from their transcript row.
+A closed shell fails with "This shell has closed".
+
+`session.shell.write` types like a person at the terminal's pane: a newline
+is Enter (`\r`), `enter` adds one, and control keys go as they are (Ctrl+C is
+`\u0003`, arrows `\u001b[A`…). Input is at most 16 KB at a time and goes in
+order. While a phone types, the shell counts as focused for two seconds, so
+agent writes wait, exactly as while the terminal's pane is focused. Writing to
+an exited shell fails with "Shell has exited". Opening a shell needs an
+unarchived coding session with its worktree ready.
+
+**Sub-agents.** Entries are display rows like a session's (`EntryView`), the
+latest 300 (`earlier` counts the rest). Codex keeps a sub-agent's history in
+its own thread: it is read when first opened and with `refresh: true` (poll
+every few seconds while the sub-agent is `active`); if reading fails, the last
+copy comes back with `error`. Claude Code's sub-agents arrive with the session.
+
+### Folders
+
+The terminal's sidebar folders, saved in the computer's or server's config
+(`session_folders`), so changes show in its terminal within a second and vice
+versa. Every folder method returns `{"folders": [Folder]}` as saved.
+
+`Folder`: `{"id": "auth", "name": "Auth", "sessions": ["<session id>", …]}`,
+in the terminal's order. A session is in at most one folder; the orchestrator
+never is. `sessions` may name sessions the phone doesn't list (another
+server's, filed in the terminal).
+
+| Method | Params | Result |
+| --- | --- | --- |
+| `folders.list` | – | `{"folders": [Folder]}` |
+| `folders.create` | `name`, `ids` (optional sessions to file there) | `{"id": "auth", "folders": [...]}` |
+| `folders.rename` | `folder` (id or name), `name` | `{"folders": [...]}` |
+| `folders.delete` | `folder` | `{"folders": [...]}` — its sessions return to the main list; nothing is deleted |
+| `folders.move` | `ids` (or `id`), `folder` (null: back to the main list) | `{"folders": [...]}` — at most 100 sessions |
+| `folders.reorder` | `folder`, `position` (0 is first) | `{"folders": [...]}` |
+
+Names are trimmed, unique (ignoring case) and at most 60 characters; difu
+keeps at most 64 folders. Moving an orchestrator or an unknown session fails.
+
+Computers without these methods answer `Unknown method`, send no `folders`
+and no resource fields; clients then hide those controls.
 
 ## Reviews
 

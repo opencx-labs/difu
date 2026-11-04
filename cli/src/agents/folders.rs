@@ -40,7 +40,7 @@ pub(super) fn handle_tool(store: &Store, caller: &str, args: &Value) -> Result<V
 
 pub const MAX_FOLDERS: usize = 64;
 const MAX_NAME: usize = 60;
-const MAX_MOVE: usize = 100;
+pub(super) const MAX_MOVE: usize = 100;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Folder {
@@ -187,7 +187,7 @@ pub fn shift(folders: &mut [Folder], id: &str, down: bool) {
 }
 
 /// Drops ids of sessions that no longer exist.
-fn prune(folders: &mut [Folder], known: &HashSet<String>) {
+pub(super) fn prune(folders: &mut [Folder], known: &HashSet<String>) {
     for folder in folders {
         folder.sessions.retain(|id| known.contains(id));
     }

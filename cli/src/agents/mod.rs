@@ -697,6 +697,16 @@ impl Session {
                 && !self.workspace_removed
                 && matches!(self.job, Job::Coding(_)),
             server: None,
+            artifacts: self.artifacts.len(),
+            subagents: self.subagents.len(),
+            running_subagents: self
+                .subagents
+                .iter()
+                .filter(|agent| agent.state.active())
+                .count(),
+            // Codex's background shells; the service adds its shared shells.
+            shells: self.shells.len(),
+            moved_to: self.moved_to.clone(),
         }
     }
 }
@@ -735,6 +745,21 @@ pub struct Summary {
     /// Server sessions have `<server>:<session>` ids and server-side paths.
     #[serde(default)]
     pub server: Option<String>,
+    /// Presented HTML artifacts.
+    #[serde(default)]
+    pub artifacts: usize,
+    /// Provider sub-agents, and how many of them are still working.
+    #[serde(default)]
+    pub subagents: usize,
+    #[serde(default)]
+    pub running_subagents: usize,
+    /// Open shells: shared shells, running `!` commands and Codex's
+    /// background shells, as the Shells control lists them.
+    #[serde(default)]
+    pub shells: usize,
+    /// The `<server>:<session>` this session moved to.
+    #[serde(default)]
+    pub moved_to: Option<String>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Skill {

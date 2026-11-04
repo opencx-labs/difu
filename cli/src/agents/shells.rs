@@ -372,6 +372,25 @@ impl Manager {
             .collect::<Result<Vec<_>>>()
             .map(|items| items.into_iter().flatten().collect())
     }
+    /// Shells per session, as `list` would return them.
+    pub(super) fn counts(&self) -> Result<BTreeMap<String, usize>> {
+        let mut counts = BTreeMap::new();
+        for record in self
+            .terminals
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Shell list lock failed"))?
+            .values()
+        {
+            let session = record
+                .terminal
+                .lock()
+                .map_err(|_| anyhow::anyhow!("Shell lock failed"))?
+                .session
+                .clone();
+            *counts.entry(session).or_insert(0) += 1;
+        }
+        Ok(counts)
+    }
     pub(super) fn handle(&self, store: &Store, id: &str, action: Action) -> Result<Value> {
         let _lifecycle = self
             .lifecycle
