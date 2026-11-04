@@ -457,6 +457,20 @@ pub fn upgrade(storage: &Storage, name: &str) -> Result<()> {
         "The upgrade stopped (see above). Fix the problem, then run \
          `difu server upgrade {name}` again"
     );
+    // Servers set up before display names show their host name; name them as
+    // saved here. The service restarts above, so give it a moment to listen.
+    let difu = Ssh::new(&remote, "difu", &login);
+    let command = format!("difu remote config --name {}", shell_quote(name));
+    let named = (0..10).any(|attempt| {
+        if attempt > 0 {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        difu.output(&command, None)
+            .is_ok_and(|output| output.status.success())
+    });
+    if !named {
+        println!("Could not name the server {name}; run `difu remote config --name {name}` on it");
+    }
     println!("{name} now runs difu {VERSION}");
     Ok(())
 }
