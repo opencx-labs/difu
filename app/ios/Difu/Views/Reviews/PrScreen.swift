@@ -141,6 +141,7 @@ struct PrOverviewTab: View {
             }
             .listStyle(.insetGrouped)
             .refreshable { await model.loadOverview() }
+            .environment(\.prImages, model.images)
         }
         .task {
             if model.overview == nil { await model.loadOverview() }

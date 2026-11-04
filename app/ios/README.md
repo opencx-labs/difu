@@ -3,8 +3,8 @@
 A native iPhone companion for [difu](../../README.md). Pair it with difu on
 your Mac (over your Wi-Fi) and with difu cloud servers (from anywhere), and
 control everything: watch and steer coding agents, answer their questions and
-approvals, start new sessions, and review GitHub pull requests (overview,
-diff, guide, comment, approve, merge).
+approvals, start new sessions, and review GitHub pull requests (overview with
+its images, diff, guide, comment, approve, merge).
 
 The phone talks to each difu's background agent service using the protocol in
 [`docs/remote-protocol.md`](../../docs/remote-protocol.md) and its cloud
@@ -76,6 +76,11 @@ Choosing one runs it (asking first for destructive ones), opens its screen, or
 puts it in the message to add arguments. **Model & Effort** lists every
 provider's models; picking another provider's switches the session there once
 it's between turns.
+
+Images in a pull request's description and comments load through the computer
+or server showing the PR, which uses its own GitHub login, so private
+attachments work. Tap one to view it full screen and pinch to zoom; images that
+can't be shown offer **Open in browser**.
 
 **Forget** revokes the phone on that server first, then removes it from the
 phone. When another device pairs with one of your servers, a banner offers to

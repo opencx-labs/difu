@@ -401,6 +401,7 @@ commands existing methods run (`session.compact`, `session.clear`,
 | `pr.diff` | `repo`, `number` | `{"files": [DiffFile]}` |
 | `pr.guide` | `repo`, `number` | `Guide` |
 | `pr.generateGuide` | `repo`, `number` | `Guide` (status `running` or `ready`) |
+| `pr.image` | `repo`, `number`, `head` (`PrOverview.head`; needed for repository paths), `url` (an image source as written in the description or a comment) | `{"data": "<base64>", "mime": "image/png", "width": 1280, "height": 720}`; see *PR images* |
 | `pr.comment` | `repo`, `number`, `head`, `body` | `{"message": "Comment succeeded"}` |
 | `pr.review` | `repo`, `number`, `head`, `event` (`APPROVE` \| `COMMENT` \| `REQUEST_CHANGES`), `body` | `{"message"}` |
 | `pr.merge` | `repo`, `number`, `head`, `squash` (bool), `admin` (bool) | `{"message"}` |
@@ -446,3 +447,20 @@ Check `state`: `pass | fail | pending | skipping | cancelled | expected`.
 
 Line `kind`: `context | add | remove | meta`. Poll `pr.guide` every few seconds
 while `running`.
+
+### PR images
+
+Descriptions and timeline bodies are Markdown that may contain images:
+`![alt](src)`, linked images `[![alt](src)](link)`, and HTML `<img src alt>`
+(entities decoded), never inside code. The phone has no GitHub login, so
+`pr.image` makes the computer or server download one with the terminal's
+preview rules and disk cache: HTTPS and public addresses only (also after
+redirects), GitHub authentication (`gh`) only for `github.com`,
+`api.github.com` and `raw.githubusercontent.com` (so `user-attachments`
+images work and the signed URLs they redirect to never see the token), at most
+10 MiB and 8192 px per side, PNG, JPEG, WebP or GIF (show the first frame).
+`src` may be an absolute URL, a GitHub root path (`/owner/repo/raw/…`), or a
+repository path resolved at `head`. `data` is the original file. Other schemes
+(`file:`, `data:`, `javascript:`), plain HTTP, URLs with credentials,
+oversized or undecodable images fail with a message; offer the image's browser
+URL instead. SVG images are not drawn (as in the terminal); link to them.

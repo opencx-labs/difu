@@ -11,6 +11,8 @@ public enum MarkdownBlock: Hashable, Sendable {
     /// Pipe tables, kept verbatim so columns stay aligned in monospace.
     case table(String)
     case rule
+    /// An image on its own (Markdown or HTML `<img>`), split out of a paragraph.
+    case image(MarkdownImage)
 }
 
 public struct MarkdownListItem: Hashable, Sendable {
@@ -35,8 +37,17 @@ public enum Markdown {
 
         func flushParagraph() {
             let text = paragraph.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-            if !text.isEmpty { blocks.append(.paragraph(text)) }
             paragraph.removeAll()
+            guard !text.isEmpty else { return }
+            for segment in MarkdownImages.split(text) {
+                switch segment {
+                case .text(let prose):
+                    let prose = prose.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !prose.isEmpty { blocks.append(.paragraph(prose)) }
+                case .image(let image):
+                    blocks.append(.image(image))
+                }
+            }
         }
 
         while index < lines.count {

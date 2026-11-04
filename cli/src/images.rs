@@ -390,12 +390,60 @@ pub fn decode(bytes: &[u8]) -> Result<DynamicImage> {
 pub fn load(storage: &Storage, request: &Request, cancel: &Cancel) -> Result<DynamicImage> {
     cached_image(storage, request, cancel, || download(request, cancel))
 }
+
+/// A PR image's file as downloaded, after the same checks as a preview, for
+/// clients that draw it themselves (the phone, which has no GitHub login).
+#[derive(Debug)]
+pub struct Original {
+    pub bytes: Vec<u8>,
+    pub mime: &'static str,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The image's original bytes, from the preview cache or downloaded (and
+/// cached) with the preview rules: HTTPS and public hosts only, GitHub
+/// authentication only for GitHub, 10 MiB, 8192 px per side, PNG, JPEG, WebP
+/// or GIF (whose first frame is what previews show).
+pub fn original(storage: &Storage, request: &Request, cancel: &Cancel) -> Result<Original> {
+    cached_original(storage, request, cancel, || download(request, cancel))
+}
+fn cached_original(
+    storage: &Storage,
+    request: &Request,
+    cancel: &Cancel,
+    fetch: impl FnOnce() -> Result<Vec<u8>>,
+) -> Result<Original> {
+    let (bytes, image) = cached(storage, request, cancel, fetch)?;
+    let mime = match image::guess_format(&bytes)? {
+        ImageFormat::Png => "image/png",
+        ImageFormat::Jpeg => "image/jpeg",
+        ImageFormat::WebP => "image/webp",
+        ImageFormat::Gif => "image/gif",
+        _ => bail!("This image format is not supported; use Open in browser"),
+    };
+    Ok(Original {
+        mime,
+        width: image.width(),
+        height: image.height(),
+        bytes,
+    })
+}
 fn cached_image(
     storage: &Storage,
     request: &Request,
     cancel: &Cancel,
     fetch: impl FnOnce() -> Result<Vec<u8>>,
 ) -> Result<DynamicImage> {
+    cached(storage, request, cancel, fetch).map(|(_, image)| image)
+}
+/// The image's bytes and decoded preview, from the disk cache when present.
+fn cached(
+    storage: &Storage,
+    request: &Request,
+    cancel: &Cancel,
+    fetch: impl FnOnce() -> Result<Vec<u8>>,
+) -> Result<(Vec<u8>, DynamicImage)> {
     cancel.check()?;
     let directory = storage.cache.join("images");
     let path = directory.join(format!("{}.image", request.id()));
@@ -404,7 +452,8 @@ fn cached_image(
         fs::File::open(&path)?
             .take((MAX_BYTES + 1) as u64)
             .read_to_end(&mut bytes)?;
-        return decode(&bytes);
+        let image = decode(&bytes)?;
+        return Ok((bytes, image));
     }
     let bytes = fetch()?;
     let image = decode(&bytes)?;
@@ -414,7 +463,7 @@ fn cached_image(
     file.write_all(&bytes)?;
     file.persist(&path).context("Could not cache image")?;
     prune_cache(&directory, &path)?;
-    Ok(image)
+    Ok((bytes, image))
 }
 fn prune_cache(directory: &Path, keep: &Path) -> Result<()> {
     let mut entries = Vec::new();
@@ -1048,6 +1097,96 @@ Useful summary text.
         cancel.cancel();
         assert!(cached_image(&storage, &request, &cancel, png).is_err());
         assert!(decode(b"BM000000000000000000000000000000").is_err());
+        Ok(())
+    }
+    #[test]
+    fn originals_keep_their_file_and_size_and_come_from_the_cache() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config"),
+            cache: dir.path().join("cache"),
+        };
+        let request = Request::new(
+            "https://github.com/user-attachments/assets/1".into(),
+            "Shot".into(),
+            &pr(),
+        );
+        let file = png()?;
+        let original = cached_original(&storage, &request, &Cancel::default(), png)?;
+        assert_eq!(original.bytes, file, "sent as downloaded");
+        assert_eq!(original.mime, "image/png");
+        assert_eq!((original.width, original.height), (100, 100));
+        let cached = cached_original(&storage, &request, &Cancel::default(), || {
+            bail!("must not fetch a cached image")
+        })?;
+        assert_eq!(cached.bytes, file);
+        // Previews and originals share the cache.
+        let preview = cached_image(&storage, &request, &Cancel::default(), || {
+            bail!("must not fetch a cached image")
+        })?;
+        assert_eq!(preview.width(), 100);
+
+        let other = |source: &str| Request::new(source.into(), "x".into(), &pr());
+        let oversized = cached_original(
+            &storage,
+            &other("https://example.com/big.png"),
+            &Cancel::default(),
+            || Ok(vec![0; MAX_BYTES + 1]),
+        )
+        .err()
+        .context("oversized")?;
+        assert!(oversized.to_string().contains("10 MiB"), "{oversized}");
+        let tall = cached_original(
+            &storage,
+            &other("https://example.com/tall.png"),
+            &Cancel::default(),
+            || {
+                let mut bytes = Cursor::new(Vec::new());
+                DynamicImage::new_luma8(1, 8193).write_to(&mut bytes, ImageFormat::Png)?;
+                Ok(bytes.into_inner())
+            },
+        )
+        .err()
+        .context("too tall")?;
+        assert!(tall.to_string().contains("preview limits"), "{tall}");
+        let svg = cached_original(
+            &storage,
+            &other("https://example.com/a.svg"),
+            &Cancel::default(),
+            || Ok(b"<svg xmlns='http://www.w3.org/2000/svg'/>".to_vec()),
+        );
+        assert!(svg.is_err());
+        assert!(
+            !storage
+                .cache
+                .join("images")
+                .join(format!(
+                    "{}.image",
+                    other("https://example.com/big.png").id()
+                ))
+                .exists(),
+            "refused images are not cached"
+        );
+        Ok(())
+    }
+    #[test]
+    fn github_authentication_stays_on_github_hosts() -> Result<()> {
+        for host in [
+            "https://github.com/user-attachments/assets/1",
+            "https://api.github.com/repos/a/b/contents/c.png",
+            "https://raw.githubusercontent.com/a/b/main/c.png",
+        ] {
+            assert!(github_auth_host(&Url::parse(host)?), "{host}");
+        }
+        // Where user-attachments redirect (signed S3 URLs) never sees the token.
+        for host in [
+            "https://private-user-images.githubusercontent.com/1/a.png?jwt=x",
+            "https://objects.githubusercontent.com/a",
+            "https://github.com.evil.example/a",
+            "https://evilgithub.com/a",
+        ] {
+            assert!(!github_auth_host(&Url::parse(host)?), "{host}");
+        }
         Ok(())
     }
     #[test]

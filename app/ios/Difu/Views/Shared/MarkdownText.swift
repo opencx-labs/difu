@@ -87,6 +87,8 @@ private struct MarkdownBlockView: View {
             .fixedSize(horizontal: false, vertical: true)
         case .rule:
             Divider()
+        case .image(let image):
+            MarkdownImageView(image: image)
         }
     }
 

@@ -535,6 +535,7 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
         "pr.diff" => reviews::diff(&reviews::key(params)?),
         "pr.guide" => reviews::guide(&inner.storage, &reviews::key(params)?),
         "pr.generateGuide" => reviews::generate(&inner.storage, &reviews::key(params)?),
+        "pr.image" => reviews::image(&inner.storage, params),
         "pr.comment" | "pr.review" | "pr.merge" | "pr.close" | "pr.ready" => {
             reviews::act(method, params)
         }

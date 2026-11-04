@@ -369,6 +369,55 @@ pub fn act(method: &str, params: &Value) -> Result<Value> {
     Ok(json!({"message": message}))
 }
 
+/// A PR image for the phone, which has no GitHub login: this computer
+/// downloads it with the terminal's preview rules and cache (see
+/// `images::original`). `url` is the image's source as written in the PR's
+/// Markdown or HTML; repository-relative paths need the PR's `head`.
+pub fn image(storage: &Storage, params: &Value) -> Result<Value> {
+    image_with(params, |request| {
+        crate::images::original(storage, request, &Cancel::default())
+    })
+}
+
+fn image_with(
+    params: &Value,
+    load: impl FnOnce(&crate::images::Request) -> Result<crate::images::Original>,
+) -> Result<Value> {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    let key = key(params)?;
+    let source = params
+        .get("url")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .context("Missing image url")?;
+    anyhow::ensure!(source.len() <= 8192, "Image URL is too long");
+    let head = params
+        .get("head")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    anyhow::ensure!(
+        url::Url::parse(source).is_ok() || source.starts_with('/') || !head.is_empty(),
+        "Repository image paths need the pull request's head commit"
+    );
+    let request = crate::images::Request {
+        source: source.into(),
+        label: String::new(),
+        key,
+        head: head.into(),
+    };
+    // Refuse unsupported URLs before anything is fetched.
+    request.download_url()?;
+    let original = load(&request)?;
+    Ok(json!({
+        "data": STANDARD.encode(&original.bytes),
+        "mime": original.mime,
+        "width": original.width,
+        "height": original.height,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -392,5 +441,59 @@ mod tests {
             &json!({"repo": "o/r", "number": 1, "head": "abc", "event": "MERGE"}),
         );
         assert!(error.is_err());
+    }
+
+    #[test]
+    fn images_are_checked_before_download_and_sent_as_base64() -> Result<()> {
+        let pr = |url: &str| json!({"repo": "owner/app", "number": 7, "head": "abc", "url": url});
+        let never = |_: &crate::images::Request| -> Result<crate::images::Original> {
+            anyhow::bail!("must not download")
+        };
+        for (url, message) in [
+            ("javascript:alert(1)", "Unsupported image URL scheme"),
+            ("file:///etc/passwd", "Unsupported image URL scheme"),
+            ("data:image/png;base64,AAAA", "Unsupported image URL scheme"),
+            ("http://example.com/a.png", "Only HTTPS"),
+            ("https://user:secret@example.com/a.png", "credentials"),
+        ] {
+            let error = image_with(&pr(url), never).err().context(url)?;
+            assert!(error.to_string().contains(message), "{url}: {error}");
+        }
+        let error = image_with(
+            &json!({"repo": "owner/app", "number": 7, "url": "docs/a.png"}),
+            never,
+        )
+        .err()
+        .context("relative without head")?;
+        assert!(error.to_string().contains("head commit"), "{error}");
+        assert!(image_with(&json!({"repo": "owner/app", "number": 7}), never).is_err());
+        assert!(
+            image_with(
+                &json!({"repo": "app", "number": 7, "url": "https://a.example/a.png"}),
+                never
+            )
+            .is_err()
+        );
+
+        let mut requested = None;
+        let value = image_with(&pr("docs/shot.png"), |request| {
+            requested = Some(request.download_url()?.to_string());
+            Ok(crate::images::Original {
+                bytes: vec![1, 2, 3],
+                mime: "image/png",
+                width: 640,
+                height: 480,
+            })
+        })?;
+        assert_eq!(
+            requested.as_deref(),
+            Some("https://api.github.com/repos/owner/app/contents/docs/shot.png?ref=abc"),
+            "repository images resolve at the PR head"
+        );
+        assert_eq!(
+            value,
+            json!({"data": "AQID", "mime": "image/png", "width": 640, "height": 480})
+        );
+        Ok(())
     }
 }

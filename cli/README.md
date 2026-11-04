@@ -872,6 +872,10 @@ show an explanation and a browser link. Previews are limited to 10 MiB and
 requests can reuse your `gh` authentication; credentials are never forwarded
 to other image hosts.
 
+The iPhone app shows the same images: the computer or server it is connected to
+downloads them with these rules and cache (`pr.image`), so the phone needs no
+GitHub login.
+
 ### States, pinned repositories, and filters
 
 My PRs and repository PR lists default to **Open**. Click **Open / Merged / Closed /

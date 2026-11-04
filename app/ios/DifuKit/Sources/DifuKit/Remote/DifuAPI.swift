@@ -231,6 +231,15 @@ extension DifuAPI {
         try await request("pr.generateGuide", pr(repo, number), as: Guide.self)
     }
 
+    /// An image from the PR's description or activity, downloaded by the
+    /// computer or server. `url` is the source as written; repository paths
+    /// need `head`.
+    public func prImage(repo: String, number: Int, head: String?, url: String) async throws -> PrImage {
+        var params = pr(repo, number, head: head.flatMap { $0.isEmpty ? nil : $0 })
+        params["url"] = .string(url)
+        return try await request("pr.image", params, as: PrImage.self)
+    }
+
     public func comment(repo: String, number: Int, head: String, body: String) async throws -> String {
         var params = pr(repo, number, head: head)
         params["body"] = .string(body)
