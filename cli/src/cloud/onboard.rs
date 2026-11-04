@@ -344,7 +344,7 @@ fn pair_this_computer(
     key: &Path,
     retry: &str,
 ) -> Result<()> {
-    let output = difu.output(&remote_config(&hosts), None)?;
+    let output = difu.output(&remote_config(name, &hosts), None)?;
     ensure!(
         output.status.success(),
         "Could not save the server's address on the server ({}). Run `{retry}` again",
@@ -888,12 +888,13 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
 }
 
-fn remote_config(hosts: &[String]) -> String {
-    hosts
-        .iter()
-        .fold("difu remote config".to_owned(), |command, host| {
-            format!("{command} --host {}", shell_quote(host))
-        })
+/// Advertises `hosts` and names the server as this computer saves it, so
+/// phones and other clients show that name rather than the host name.
+fn remote_config(name: &str, hosts: &[String]) -> String {
+    hosts.iter().fold(
+        format!("difu remote config --name {}", shell_quote(name)),
+        |command, host| format!("{command} --host {}", shell_quote(host)),
+    )
 }
 
 /// `difu server add` again with what this run settled, for failure messages.
@@ -2232,8 +2233,8 @@ mod tests {
     fn commands_quote_what_they_pass_on() {
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(
-            remote_config(&["203.0.113.7".into(), "box.ts.net".into()]),
-            "difu remote config --host '203.0.113.7' --host 'box.ts.net'"
+            remote_config("aws", &["203.0.113.7".into(), "box.ts.net".into()]),
+            "difu remote config --name 'aws' --host '203.0.113.7' --host 'box.ts.net'"
         );
         let mut custom = options();
         assert_eq!(

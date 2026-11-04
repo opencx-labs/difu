@@ -17,7 +17,7 @@ difu://pair?v=1&n=<computer name>&h=<host>,<host>,...&p=<port>&f=<fingerprint>&c
 | Key | Meaning |
 | --- | --- |
 | `v` | Protocol version, currently `1`. |
-| `n` | Human-readable computer name, e.g. `Ali's MacBook Pro`. |
+| `n` | Human-readable computer name, e.g. `Ali's MacBook Pro`, or the name set with `difu remote config --name`. |
 | `h` | Comma-separated host candidates, best first: the Bonjour name (`Alis-MacBook-Pro.local`) then IPv4 addresses. |
 | `p` | TCP port. |
 | `f` | Base64url (no padding) SHA-256 of the server's TLS certificate (DER). |

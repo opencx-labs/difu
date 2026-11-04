@@ -310,7 +310,7 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
     let id = || param::<String>(params, "id");
     match method {
         "server.info" => Ok(json!({
-            "name": super::network::name(),
+            "name": inner.remote.name(),
             "version": env!("CARGO_PKG_VERSION"),
             "hosts": inner.remote.hosts(),
             "port": inner.port,

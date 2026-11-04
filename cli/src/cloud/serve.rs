@@ -53,14 +53,16 @@ pub fn remote(storage: &Storage, command: RemoteCommand) -> Result<()> {
             hosts,
             clear_hosts,
             port,
+            name,
         } => {
-            let command = if hosts.is_empty() && !clear_hosts && port.is_none() {
+            let command = if hosts.is_empty() && !clear_hosts && port.is_none() && name.is_none() {
                 Command::Status
             } else {
                 Command::Configure {
                     hosts,
                     clear_hosts,
                     port,
+                    name,
                 }
             };
             show_config(&send(storage, command)?);
@@ -261,6 +263,7 @@ fn prompt_secret(prompt: &str) -> Result<String> {
 }
 
 fn show_config(status: &Status) {
+    println!("Name: {}", status.name);
     println!(
         "Port: {}{}",
         status.port,

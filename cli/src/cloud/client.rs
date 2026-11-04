@@ -943,8 +943,10 @@ mod tests {
             hosts: vec!["localhost".into()],
             clear_hosts: false,
             port: None,
+            name: Some("aws".into()),
         })?;
         assert_eq!(status.configured_hosts, vec!["localhost".to_owned()]);
+        assert_eq!(status.name, "aws");
         let link = fixture.link()?;
         // A server with advertised hosts leaves out the discovered 127.0.0.1.
         assert_eq!(fixture.remote.status()?.hosts, vec!["localhost"]);
@@ -965,6 +967,7 @@ mod tests {
         assert_eq!(server.get("mode"), Some(&json!("server")));
         assert_eq!(server.get("passwordPairing"), Some(&json!(true)));
         assert_eq!(server.get("hosts"), Some(&json!(["localhost"])));
+        assert_eq!(server.get("name"), Some(&json!("aws")));
         assert!(
             fixture
                 .remote
@@ -972,6 +975,7 @@ mod tests {
                     hosts: vec!["example.com:80".into()],
                     clear_hosts: false,
                     port: None,
+                    name: None,
                 })
                 .is_err()
         );
@@ -979,6 +983,7 @@ mod tests {
             hosts: Vec::new(),
             clear_hosts: true,
             port: None,
+            name: None,
         })?;
         assert!(cleared.configured_hosts.is_empty());
         Ok(())

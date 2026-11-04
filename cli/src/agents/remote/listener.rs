@@ -563,7 +563,7 @@ fn authenticate(
         "token": authenticated.enrolled.as_ref().map(|e| e.token.clone()),
         "access": authenticated.access,
         "server": {
-            "name": super::network::name(),
+            "name": remote.name(),
             "version": env!("CARGO_PKG_VERSION"),
             "hosts": remote.hosts(),
             "port": socket.get_ref().sock.local_addr()?.port(),

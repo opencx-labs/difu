@@ -61,7 +61,7 @@ Server side (run on the server, usually over SSH):
 | `difu remote devices` | List paired devices with access level and last seen. |
 | `difu remote forget <device>` | Revoke a device. |
 | `difu remote password [--generate] [--disable]` | Set the server password (prompt or stdin), generate a strong one, or turn password pairing off. |
-| `difu remote config [--host H]... [--clear-hosts] [--port P]` | Addresses to advertise to clients (public IP, DNS or Tailscale name) and a fixed port. Once a server has advertised hosts, pairing links, `welcome` and `server.info` list only those, not the private addresses it discovers. |
+| `difu remote config [--host H]... [--clear-hosts] [--port P] [--name N]` | Addresses to advertise to clients (public IP, DNS or Tailscale name), a fixed port, and the name clients show for the server (`--name ""` returns to the host name). Once a server has advertised hosts, pairing links, `welcome` and `server.info` list only those, not the private addresses it discovers. |
 | `difu repos [list]` / `difu repos add [owner/name]` / `difu repos remove owner/name` / `difu repos refresh [owner/name]` | Server repositories. `add` without a name opens a picker built from `gh repo list`. |
 | `difu sandbox build` / `difu sandbox status` | Build (or pull) the configured sandbox image / show runtime, image and running sandboxes. |
 | `difu disk [status [--refresh]]` / `difu disk clean <archived-worktrees\|build-outputs\|sandbox>` | Free disk space and what uses it / run a cleanup. See *Disk space*. |
@@ -93,8 +93,10 @@ Server side (run on the server, usually over SSH):
 7. Choose the **server password** (or generate one) — the single password new
    clients use with the server's address.
 8. Pick server repositories from the server's `gh repo list`; clone them.
-9. Advertise the address used to connect (`difu remote config --host <ip>`), pair
-   this Mac as a **full** device, save the server, and print a phone pairing QR.
+9. Advertise the address used to connect and name the server as this Mac saves
+   it (`difu remote config --name <name> --host <ip>`), so phones show that
+   name rather than the host name; pair this Mac as a **full** device, save the
+   server, and print a phone pairing QR.
 
 ## Upgrades (`difu server upgrade`)
 
@@ -530,7 +532,8 @@ slots.
 ```
 
 `mode` is `"server"` for `difu serve`, `"computer"` otherwise. Clients key saved
-servers by `server.id`.
+servers by `server.id`. `server.name` (like the link's `n` and `server.info`'s
+`name`) is the name set with `difu remote config --name`, else the host name.
 
 ### Methods for every paired device
 
