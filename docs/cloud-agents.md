@@ -61,7 +61,7 @@ Server side (run on the server, usually over SSH):
 | `difu remote devices` | List paired devices with access level and last seen. |
 | `difu remote forget <device>` | Revoke a device. |
 | `difu remote password [--generate] [--disable]` | Set the server password (prompt or stdin), generate a strong one, or turn password pairing off. |
-| `difu remote config [--host H]... [--clear-hosts] [--port P]` | Addresses to advertise to clients (public IP, DNS or Tailscale name) and a fixed port. |
+| `difu remote config [--host H]... [--clear-hosts] [--port P]` | Addresses to advertise to clients (public IP, DNS or Tailscale name) and a fixed port. Once a server has advertised hosts, pairing links, `welcome` and `server.info` list only those, not the private addresses it discovers. |
 | `difu repos [list]` / `difu repos add [owner/name]` / `difu repos remove owner/name` / `difu repos refresh [owner/name]` | Server repositories. `add` without a name opens a picker built from `gh repo list`. |
 | `difu sandbox build` / `difu sandbox status` | Build (or pull) the configured sandbox image / show runtime, image and running sandboxes. |
 | `difu disk [status [--refresh]]` / `difu disk clean <archived-worktrees\|build-outputs\|sandbox>` | Free disk space and what uses it / run a cleanup. See *Disk space*. |

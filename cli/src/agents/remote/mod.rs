@@ -83,7 +83,8 @@ pub struct Status {
     pub pairing_expires: Option<i64>,
     pub devices: Vec<DeviceStatus>,
     pub error: Option<String>,
-    /// Hosts from `difu remote config`, advertised ahead of discovered ones.
+    /// Hosts from `difu remote config`, advertised ahead of discovered ones
+    /// (instead of them on a server).
     #[serde(default)]
     pub configured_hosts: Vec<String>,
     /// A server password is set, so password pairing is on.
@@ -410,7 +411,7 @@ impl Remote {
         })
     }
 
-    /// Configured hosts first, then the addresses discovered on this machine.
+    /// The hosts in pairing links, `welcome` and `server.info`; see [`advertise`].
     fn hosts(&self) -> Vec<String> {
         let configured = self
             .lock()
@@ -424,13 +425,7 @@ impl Remote {
             Some(bind) => vec![bind.clone()],
             None => network::hosts(),
         };
-        let mut hosts = configured.to_vec();
-        for host in discovered {
-            if !hosts.contains(&host) {
-                hosts.push(host);
-            }
-        }
-        hosts
+        advertise(configured, discovered, self.server_mode())
     }
 
     /// `difu serve` turned server mode on in this installation's settings.
@@ -617,6 +612,24 @@ fn home(storage: &Storage) -> PathBuf {
         .unwrap_or_else(|_| storage.cache.join("remote"))
 }
 
+/// Configured hosts first, then the addresses discovered on this machine. A
+/// server with configured hosts (`difu remote config --host`) advertises only
+/// those: what it discovers are private cloud addresses (`ip-172-31-….local`,
+/// `172.31.….`) that clients would save and try in vain. A computer keeps its
+/// discovered addresses, which are how phones on its network reach it.
+fn advertise(configured: &[String], discovered: Vec<String>, server: bool) -> Vec<String> {
+    let mut hosts = configured.to_vec();
+    if server && !configured.is_empty() {
+        return hosts;
+    }
+    for host in discovered {
+        if !hosts.contains(&host) {
+            hosts.push(host);
+        }
+    }
+    hosts
+}
+
 /// A host name or IP address for pairing links; the port is separate.
 fn advertised_host(host: &str) -> Result<String> {
     let host = host.trim();
@@ -801,6 +814,27 @@ mod tests {
         assert!(host("box.example.com:3438").is_none());
         assert!(host("a,b").is_none());
         assert!(host("").is_none());
+    }
+
+    #[test]
+    fn servers_advertise_only_configured_hosts_and_computers_add_discovered_ones() {
+        let discovered = || vec!["ip-172-31-33-39.local".into(), "172.31.33.39".into()];
+        let configured = ["63.185.13.36".to_owned()];
+        assert_eq!(advertise(&configured, discovered(), true), ["63.185.13.36"]);
+        // Nothing configured yet: discovered addresses are all a server has.
+        assert_eq!(
+            advertise(&[], discovered(), true),
+            ["ip-172-31-33-39.local", "172.31.33.39"]
+        );
+        // A computer on a LAN keeps them after its configured hosts.
+        assert_eq!(
+            advertise(
+                &["mac.tail1.ts.net".into(), "172.31.33.39".into()],
+                discovered(),
+                false
+            ),
+            ["mac.tail1.ts.net", "172.31.33.39", "ip-172-31-33-39.local"]
+        );
     }
 
     #[test]

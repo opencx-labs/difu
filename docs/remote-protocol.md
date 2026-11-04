@@ -75,7 +75,8 @@ The same protocol serves difu running on a Linux server (`difu serve`, port
   server's `proof`) for clients that know only the address and server password.
 * `welcome.server` gains `id` (the fingerprint), `mode` (`server` or `computer`)
   and `passwordPairing`. Hosts set with `difu remote config` come first in the
-  QR code, `welcome` and `server.info`.
+  QR code, `welcome` and `server.info`; a server with such hosts lists only
+  them, leaving out the private addresses it discovers.
 * Methods for every device: `device.unpair`, `server.devices`,
   `server.devices.forget`, `server.repos*`, `server.rules.*`, `server.login*`,
   `server.logout`, `server.disk`, `server.disk.clean`; the `device.paired`

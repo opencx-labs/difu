@@ -935,7 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn welcome_reports_identity_mode_and_configured_hosts_first() -> Result<()> {
+    fn welcome_reports_identity_mode_and_only_configured_hosts() -> Result<()> {
         let fixture = fixture()?;
         std::fs::write(&fixture.storage.config, r#"{"server": {"enabled": true}}"#)?;
         fixture.password()?;
@@ -946,11 +946,9 @@ mod tests {
         })?;
         assert_eq!(status.configured_hosts, vec!["localhost".to_owned()]);
         let link = fixture.link()?;
-        assert_eq!(
-            fixture.remote.status()?.hosts,
-            vec!["localhost", "127.0.0.1"]
-        );
-        assert_eq!(query(&link, "h")?, "localhost,127.0.0.1");
+        // A server with advertised hosts leaves out the discovered 127.0.0.1.
+        assert_eq!(fixture.remote.status()?.hosts, vec!["localhost"]);
+        assert_eq!(query(&link, "h")?, "localhost");
         let (mut socket, fingerprint) = open("127.0.0.1", query(&link, "p")?.parse()?, None)?;
         send(
             &mut socket,
@@ -966,10 +964,7 @@ mod tests {
         assert_eq!(server.get("fingerprint"), Some(&json!(fingerprint)));
         assert_eq!(server.get("mode"), Some(&json!("server")));
         assert_eq!(server.get("passwordPairing"), Some(&json!(true)));
-        assert_eq!(
-            server.get("hosts"),
-            Some(&json!(["localhost", "127.0.0.1"]))
-        );
+        assert_eq!(server.get("hosts"), Some(&json!(["localhost"])));
         assert!(
             fixture
                 .remote
