@@ -3129,16 +3129,29 @@ mod federation_tests {
         let first = super::super::transport::read_reply(&mut reader)?;
         assert!(matches!(first, Reply::Session(s) if s.id == "box:1"));
         drop(feed);
-        let last = loop {
-            match super::super::transport::read_reply(&mut reader)? {
-                Reply::Unchanged => continue,
-                other => break other,
-            }
-        };
-        assert!(matches!(last, Reply::Error(e) if e.contains("box")));
-        worker
+        // A dropped server watch is resumed, not reported as an error: the
+        // relay reopens it and keeps the terminal's stream alive meanwhile.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !fake
+            .watches
+            .lock()
+            .map_err(|_| anyhow::anyhow!("lock"))?
+            .iter()
+            .any(|(id, ..)| id == "1")
+        {
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the dropped watch was never reopened"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+        let next = super::super::transport::read_reply(&mut reader)?;
+        assert!(!matches!(next, Reply::Error(_)), "{next:?}");
+        // The terminal leaves; the relay notices and stops.
+        drop(reader);
+        let _ = worker
             .join()
-            .map_err(|_| anyhow::anyhow!("serve panicked"))??;
+            .map_err(|_| anyhow::anyhow!("serve panicked"))?;
         Ok(())
     }
 }
