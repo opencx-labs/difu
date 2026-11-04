@@ -215,7 +215,7 @@ impl Ui {
         }
         let tweaks = self.preferences.motion.tweaks(self.tweaks);
         let duration =
-            Duration::from_millis(u64::from(tweaks.capped(tweaks.input_clear_ms))).mul_f64(0.8);
+            Duration::from_millis(u64::from(tweaks.capped(tweaks.input_clear_ms))).mul_f64(0.4);
         let animate = !duration.is_zero() && self.preferences.motion.screen();
         self.inbox.sections.retain(|section| {
             self.summaries

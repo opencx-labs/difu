@@ -44,7 +44,7 @@ impl Size {
                 from: self.shown,
                 started: now,
                 duration: Duration::from_millis(u64::from(
-                    tweaks.capped(u32::from(self.shown.abs_diff(target)) * 30),
+                    tweaks.capped(u32::from(self.shown.abs_diff(target)) * 15),
                 )),
             });
         }
@@ -205,7 +205,7 @@ impl Ui {
                 position.question_reflow = Some(Reflow {
                     rows: previous.saturating_sub(height),
                     started: now,
-                    duration: Duration::from_millis(u64::from(self.tweaks.capped(220))),
+                    duration: Duration::from_millis(u64::from(self.tweaks.capped(110))),
                 });
             }
             let Some(reflow) = &position.question_reflow else {
@@ -627,7 +627,7 @@ impl Ui {
                 session: id.clone(),
                 rows: self.question_flip.drawn.clone(),
                 started: Instant::now(),
-                duration: Duration::from_millis(u64::from(clear)),
+                duration: Duration::from_millis(u64::from(clear / 2)),
                 settled: false,
             });
         }

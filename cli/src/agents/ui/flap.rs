@@ -250,7 +250,7 @@ fn cell_glyph(cell: &Cell) -> Option<char> {
 }
 
 /// How long a whole screen takes to flip in, before the longest animation.
-pub(super) const SCREEN_MS: u32 = 500;
+pub(super) const SCREEN_MS: u32 = 250;
 
 /// Flips a whole drawn screen in, in reading order over `duration` from
 /// `started`, as when switching tabs. Every cell participates, including blank
