@@ -53,8 +53,8 @@ impl Size {
             if elapsed >= resize.duration {
                 self.settle();
             } else {
-                let rows = (f64::from(resize.from.abs_diff(target)) * elapsed.as_secs_f64()
-                    / resize.duration.as_secs_f64()) as u16;
+                let rows = (f64::from(resize.from.abs_diff(target))
+                    * easing::progress(elapsed, resize.duration)) as u16;
                 self.shown = if target >= resize.from {
                     resize.from.saturating_add(rows)
                 } else {
@@ -67,7 +67,8 @@ impl Size {
     }
 }
 
-/// Release the question's old space gradually while keeping the chat at its end.
+/// Release the question's old space gradually, easing in and out, while keeping
+/// the chat at its end.
 pub(super) struct Reflow {
     rows: u16,
     started: Instant,
@@ -75,13 +76,8 @@ pub(super) struct Reflow {
 }
 impl Reflow {
     fn remaining(&self, now: Instant) -> u16 {
-        if self.duration.is_zero() {
-            return 0;
-        }
-        let progress = (now.saturating_duration_since(self.started).as_secs_f64()
-            / self.duration.as_secs_f64())
-        .min(1.0);
-        (f64::from(self.rows) * (1.0 - progress).powi(3)).round() as u16
+        let progress = easing::progress(now.saturating_duration_since(self.started), self.duration);
+        (f64::from(self.rows) * (1.0 - progress)).round() as u16
     }
 }
 
@@ -120,8 +116,12 @@ impl Leaving {
         flap::vanish(
             &mut rows,
             |index| {
-                let turn = total.saturating_sub(index + 1) as f64 / total.max(1) as f64;
-                self.started + self.duration.mul_f64(turn)
+                flap::turn(
+                    self.started,
+                    self.duration,
+                    total.saturating_sub(index + 1),
+                    total,
+                )
             },
             now,
             self.started,
@@ -1360,6 +1360,21 @@ mod settings_refresh_tests {
     use super::*;
     use anyhow::Context;
     #[test]
+    fn question_panel_resizes_ease_in_and_out() {
+        let tweaks = crate::storage::Tweaks {
+            max_animation_ms: 0,
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let mut size = Size::default();
+        let mut at = |ms| size.show(20, 40, tweaks, start + Duration::from_millis(ms));
+        // 20 rows at 15 ms each take 300 ms: slow to start, quick through the
+        // middle and slow to settle.
+        let rows: Vec<u16> = [0, 75, 151, 225, 300].into_iter().map(&mut at).collect();
+        assert_eq!(rows, [0, 3, 10, 16, 20]);
+        assert!(!size.animating());
+    }
+    #[test]
     fn question_space_collapses_smoothly_and_finishes_at_zero() {
         let started = Instant::now();
         let reflow = Reflow {
@@ -1368,7 +1383,10 @@ mod settings_refresh_tests {
             duration: Duration::from_millis(220),
         };
         assert_eq!(reflow.remaining(started), 32);
-        assert_eq!(reflow.remaining(started + Duration::from_millis(110)), 4);
+        // Eased: slow to start, half gone halfway, slow to finish.
+        assert_eq!(reflow.remaining(started + Duration::from_millis(55)), 27);
+        assert_eq!(reflow.remaining(started + Duration::from_millis(110)), 16);
+        assert_eq!(reflow.remaining(started + Duration::from_millis(165)), 5);
         assert_eq!(reflow.remaining(started + Duration::from_millis(220)), 0);
     }
     #[test]

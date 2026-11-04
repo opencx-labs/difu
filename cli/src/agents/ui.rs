@@ -8,6 +8,7 @@ mod cloud;
 mod codex_plan_picker;
 mod commands;
 mod defaults;
+mod easing;
 mod flap;
 mod folders;
 mod inbox;

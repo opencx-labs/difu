@@ -1,6 +1,7 @@
 //! Chat animations from `/tweaks`, played as Codex's split-flap: replies flip
 //! in at their speed, sent and queued messages flip in over their time, and the
-//! composer's text flips away after sending. None takes longer than the cap.
+//! composer's text flips away after sending. None takes longer than the cap,
+//! and each eases in and out (see [`easing`]).
 //! The flip keeps every character's cell, so wrapping never changes; rows
 //! still waiting for their first character are dropped by [`flap::grow`].
 use super::flap::{self, Look};
@@ -17,6 +18,87 @@ pub(super) struct Reply {
     started: Instant,
     /// When each shown character arrived.
     arrivals: Vec<Instant>,
+    /// The eased reveal toward everything received so far.
+    glide: Glide,
+}
+
+/// A reply's reveal from `from` characters at `start` to `to` characters
+/// after `window`: the time the reply speed, or the cap, gives that many
+/// characters. It eases in and out like every other animation, but one
+/// already moving when more text arrives keeps its speed instead of slowing
+/// down to start again, and it still lands when the paced reveal would.
+#[derive(Clone, Copy, Debug)]
+struct Glide {
+    start: Instant,
+    window: Duration,
+    from: f64,
+    to: f64,
+    /// How steeply it starts, as [`easing::ease_from`]'s slope.
+    slope: f64,
+}
+impl Glide {
+    fn rest(at: Instant) -> Self {
+        Self {
+            start: at,
+            window: Duration::ZERO,
+            from: 0.0,
+            to: 0.0,
+            slope: 0.0,
+        }
+    }
+    /// A reveal from `from` characters at `start`, moving at `speed`
+    /// characters per second, to `to` characters after `window`.
+    fn new(start: Instant, window: Duration, from: f64, to: f64, speed: f64) -> Self {
+        let from = from.min(to);
+        Self {
+            start,
+            window,
+            from,
+            to,
+            slope: if to > from {
+                speed * window.as_secs_f64() / (to - from)
+            } else {
+                0.0
+            },
+        }
+    }
+    fn end(&self) -> Instant {
+        self.start + self.window
+    }
+    /// Linear progress through the window at `now`.
+    fn progress(&self, now: Instant) -> f64 {
+        if self.window.is_zero() {
+            1.0
+        } else {
+            now.saturating_duration_since(self.start).as_secs_f64() / self.window.as_secs_f64()
+        }
+    }
+    /// Characters shown at `now`.
+    fn shown(&self, now: Instant) -> f64 {
+        self.from + (self.to - self.from) * easing::ease_from(self.progress(now), self.slope)
+    }
+    /// Characters per second at `now`.
+    fn speed(&self, now: Instant) -> f64 {
+        if self.window.is_zero() {
+            return 0.0;
+        }
+        (self.to - self.from) * easing::slope_from(self.progress(now), self.slope)
+            / self.window.as_secs_f64()
+    }
+    /// When the reveal passes `shown` characters.
+    fn passes(&self, shown: f64) -> Instant {
+        let fraction = if self.to > self.from {
+            (shown - self.from) / (self.to - self.from)
+        } else {
+            1.0
+        };
+        let t = easing::inverse_from(fraction, self.slope);
+        if t >= 1.0 {
+            self.end()
+        } else {
+            self.start + self.window.mul_f64(t)
+        }
+    }
 }
 impl Reply {
     pub(super) fn entry(&self) -> &str {
@@ -28,11 +110,14 @@ impl Reply {
         &self,
         received: usize,
         tweaks: crate::storage::Tweaks,
-        now: Instant,
     ) -> Option<Instant> {
         self.shown.is_finite().then(|| {
+            if (self.glide.to - received as f64).abs() < 0.5 {
+                return self.glide.end().max(self.at);
+            }
+            // More has arrived: [`apply`] plans the rest from the last frame.
             let remaining = (received as f64 - self.shown).max(0.0).ceil() as usize;
-            self.at.max(now) + flap::paced(tweaks, remaining)
+            self.at + flap::paced(tweaks, remaining)
         })
     }
     fn shown(entry: &str, at: Instant) -> Self {
@@ -42,6 +127,7 @@ impl Reply {
             at,
             started: at,
             arrivals: Vec::new(),
+            glide: Glide::rest(at),
         }
     }
 }
@@ -62,9 +148,9 @@ impl Typing {
             duration: Duration::from_millis(u64::from(duration_ms)),
         })
     }
-    /// When character `index` of `total` takes its turn.
+    /// When character `index` of `total` takes its turn along the eased sweep.
     fn at(&self, index: usize, total: usize) -> Instant {
-        self.started + self.duration.mul_f64(index as f64 / total.max(1) as f64)
+        flap::turn(self.started, self.duration, index, total)
     }
     fn done(&self, now: Instant) -> bool {
         now >= self.started + self.duration + flap::LIFETIME
@@ -191,6 +277,7 @@ pub(super) fn apply(
                 at: turn.max(now),
                 started: turn.max(now),
                 arrivals: Vec::new(),
+                glide: Glide::rest(turn.max(now)),
             }),
         };
         if now < reply.at {
@@ -211,24 +298,24 @@ pub(super) fn apply(
                 );
             }
         } else if reply.shown.is_finite() {
-            let (from, elapsed) = (reply.at, now.saturating_duration_since(reply.at));
-            let behind = received - reply.shown;
-            // The cap bounds how far a reply may trail what has been received.
-            let catch_up = if tweaks.max_animation_ms == 0 {
-                0.0
-            } else {
-                behind / (f64::from(tweaks.max_animation_ms) / 1000.0)
-            };
-            let rate = f64::from(tweaks.agent_reply_cps).max(catch_up);
+            let from = reply.at;
+            if (reply.glide.to - received).abs() >= 0.5 {
+                // Text arrived since the last frame: plan the rest from there at
+                // the reply speed, or faster so it never trails the stream by
+                // more than the cap, carrying on at the speed it had.
+                let speed = reply.glide.speed(from);
+                let shown = reply.shown.min(received);
+                let remaining = (received - shown).max(0.0).ceil() as usize;
+                reply.glide =
+                    Glide::new(from, flap::paced(tweaks, remaining), shown, received, speed);
+            }
             let before = reply.shown;
-            reply.shown = (reply.shown + rate * elapsed.as_secs_f64()).min(received);
+            reply.shown = reply.glide.shown(now).max(before).min(received);
             reply.at = now;
             // Each newly shown character arrived when the reveal passed it.
             while (reply.arrivals.len() as f64) < reply.shown.floor() {
-                let passed = (reply.arrivals.len() as f64 + 1.0 - before) / rate.max(1.0);
-                reply
-                    .arrivals
-                    .push(from + elapsed.min(Duration::from_secs_f64(passed.max(0.0))));
+                let passed = reply.glide.passes(reply.arrivals.len() as f64 + 1.0);
+                reply.arrivals.push(passed.max(from).min(now));
             }
             let streaming = entry.finished_at.is_none() && session.status.active();
             let settled = reply
@@ -737,6 +824,52 @@ mod tests {
     }
 
     #[test]
+    fn replies_ease_in_and_out_and_land_when_the_paced_reveal_would() -> anyhow::Result<()> {
+        use anyhow::{Context, ensure};
+        let tweaks = Tweaks {
+            agent_reply_cps: 100,
+            max_animation_ms: 0,
+            ..Default::default()
+        };
+        let t0 = Instant::now();
+        let mut session = session(Status::Running);
+        let mut position = Position {
+            replies_seen: true,
+            ..Default::default()
+        };
+        session.note("agentMessage", "x".repeat(100));
+        let shown = |position: &mut Position, session: &Session, ms: u64| {
+            frame(position, session, tweaks, t0 + Duration::from_millis(ms));
+            position
+                .reply
+                .as_ref()
+                .map(|reply| reply.shown)
+                .context("reply")
+        };
+        // 100 characters at 100 per second take a second, eased.
+        ensure!(shown(&mut position, &session, 0)? == 0.0);
+        let quarter = shown(&mut position, &session, 250)?;
+        ensure!(quarter > 10.0 && quarter < 20.0, "slow to start: {quarter}");
+        let half = shown(&mut position, &session, 500)?;
+        ensure!((half - 50.0).abs() < 0.01, "half way: {half}");
+        // More text mid-reveal keeps its speed instead of starting slowly again,
+        // and lands when the paced reveal would: 150 more at 100 per second.
+        session.entries.last_mut().context("reply")?.text = "x".repeat(200).into();
+        let next = shown(&mut position, &session, 516)?;
+        ensure!(next > 52.0, "kept moving: {next}");
+        let reply = position.reply.as_ref().context("reply")?;
+        ensure!(reply.finish(200, tweaks) == Some(t0 + Duration::from_millis(2000)));
+        let mut previous = next;
+        for ms in (532..2000).step_by(16) {
+            let now = shown(&mut position, &session, ms)?;
+            ensure!(now >= previous && now < 200.0, "{now} at {ms} ms");
+            previous = now;
+        }
+        ensure!(shown(&mut position, &session, 2000)? == 200.0);
+        Ok(())
+    }
+
+    #[test]
     fn a_new_reply_waits_for_the_entries_above_it() {
         let tweaks = Tweaks::default();
         let mut session = session(Status::Idle);
@@ -830,6 +963,8 @@ mod tests {
             clearing: Typing::start("abcdefghij", tweaks.capped(tweaks.input_clear_ms), t0),
             ..Position::default()
         };
+        // Halfway, half the characters have taken their turn; easing makes the
+        // first ones wait longer, so only the first has settled.
         let half = t0 + Duration::from_millis(250);
         let shown = frame(&mut position, &session, tweaks, half);
         assert!(
@@ -837,7 +972,7 @@ mod tests {
             "the end has not arrived: {shown:?}"
         );
         assert!(
-            shown.first().is_some_and(|row| row.starts_with("ab")),
+            shown.first().is_some_and(|row| row.starts_with('a')),
             "the start has settled: {shown:?}"
         );
         let vanishing = |position: &mut Position, at| {
@@ -847,7 +982,7 @@ mod tests {
             Some(text(&lines).concat())
         };
         let gone = vanishing(&mut position, half).unwrap_or_default();
-        assert!(gone.starts_with("abc") && gone.ends_with("  "), "{gone:?}");
+        assert!(gone.starts_with("abc") && gone.ends_with(' '), "{gone:?}");
         let end = t0 + Duration::from_millis(500) + flap::LIFETIME;
         assert_eq!(frame(&mut position, &session, tweaks, end), ["abcdefghij"]);
         assert!(vanishing(&mut position, end).is_none());

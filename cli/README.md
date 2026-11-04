@@ -491,6 +491,11 @@ Sidebar cards flip their changes too: status, timers, request counts and PRs;
 the selection highlight flips across a card a flap at a time, and a card that
 moves flips from the text that was in its place. Switching between the Agents
 and Reviews tabs flips the whole screen in.
+Every animation eases in and out instead of moving at a constant rate: flips,
+reveals, sweeps, the question panel growing and shrinking, and the inbox
+collapsing start slowly, speed up through the middle, and settle gently, still
+finishing in the same time. A reply that is already flipping in keeps its speed
+when more text streams in.
 **/tweaks** (also in the command palette) changes these four
 values, saved in the difu config; 0 turns an animation off (a reply speed of 0
 turns off the flip for all agent content), and a longest animation of 0 removes
