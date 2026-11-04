@@ -2462,13 +2462,41 @@ pub fn run(storage: Storage) -> Result<()> {
     fs::remove_file(path)?;
     Ok(())
 }
-fn serve(service: &Service, mut stream: UnixStream) -> Result<()> {
-    // The listener is nonblocking. On macOS accepted sockets inherit that flag;
-    // request JSON may arrive in several writes, so read it in blocking mode.
+/// Socket options for one client. The listener is nonblocking and on macOS
+/// accepted sockets inherit that flag; request JSON may arrive in several
+/// writes, so it is read in blocking mode.
+fn prepare(stream: &UnixStream) -> std::io::Result<()> {
     stream.set_nonblocking(false)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))
+}
+
+/// Whether preparing a client's socket failed only because the client had
+/// already hung up. macOS refuses socket options with EINVAL ("Invalid
+/// argument (os error 22)") on a socket whose peer is gone, which happens
+/// whenever a terminal app drops a watch right after opening it, as it does
+/// while the selection moves through the sessions list.
+fn hung_up(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(nix::libc::EINVAL)
+        || matches!(
+            error.kind(),
+            std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+        )
+}
+
+fn serve(service: &Service, mut stream: UnixStream) -> Result<()> {
+    match prepare(&stream) {
+        Err(error) if hung_up(&error) => return Ok(()),
+        result => result?,
+    }
     let mut reader = BufReader::new(stream.try_clone()?);
+    // A client that left before asking anything is not an error either.
+    if std::io::BufRead::fill_buf(&mut reader).is_ok_and(|buffer| buffer.is_empty()) {
+        return Ok(());
+    }
     let request: Request = serde_json::from_str(&super::client::read_line(&mut reader)?)?;
     if let Request::Watch { id, version } = request {
         if let Some(federation) = &service.federation
@@ -2942,6 +2970,33 @@ mod federation_tests {
             anyhow::bail!("one attachment");
         };
         super::super::media::validate(&server.store.storage, "local", uploaded)?;
+        Ok(())
+    }
+
+    #[test]
+    fn clients_that_hang_up_at_once_are_not_logged_as_errors() -> Result<()> {
+        assert!(hung_up(&std::io::Error::from_raw_os_error(
+            nix::libc::EINVAL
+        )));
+        assert!(hung_up(&std::io::Error::from(
+            std::io::ErrorKind::NotConnected
+        )));
+        assert!(!hung_up(&std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        let (_temp, service) = service(None)?;
+        // A terminal app that drops a watch right after connecting: macOS
+        // refuses the socket options, Linux reads an empty request.
+        let (client, accepted) = UnixStream::pair()?;
+        client.shutdown(std::net::Shutdown::Both)?;
+        drop(client);
+        serve(&service, accepted)?;
+        // A request still gets its answer.
+        let (mut client, accepted) = UnixStream::pair()?;
+        client.write_all(b"\"Ping\"\n")?;
+        serve(&service, accepted)?;
+        let reply = super::super::transport::read_reply(&mut BufReader::new(client))?;
+        assert!(!matches!(reply, Reply::Error(_)), "{reply:?}");
         Ok(())
     }
 
