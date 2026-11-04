@@ -390,7 +390,8 @@ the profile is still shared.
 ### `difu_environment`
 
 Offered to Codex (a dynamic tool) and Claude Code (the difu MCP server) in
-coding sessions on a server whose repository is a server repository:
+coding sessions on a server; it works when the session's repository is a
+server repository (sessions started on `owner/name`):
 
 ```json
 {}                                        // read
