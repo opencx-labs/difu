@@ -223,7 +223,7 @@ struct RepositorySheet: View {
 
     var body: some View {
         NavigationStack {
-            Form {
+            ThemedForm {
                 Section {
                     if let repositories {
                         ForEach(repositories) { repository in

@@ -149,7 +149,7 @@ struct SubagentTranscriptView: View {
             if let error = transcript.error {
                 Label("Couldn't refresh: \(error)", systemImage: "exclamationmark.triangle")
                     .font(.caption)
-                    .foregroundStyle(.red)
+                    .foregroundStyle(Color.failure)
             }
         }
         .padding(10)

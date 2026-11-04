@@ -21,7 +21,7 @@ struct ShellsSheet: View {
     var body: some View {
         NavigationStack(path: $path) {
             Loadable(value: shells, error: error, loadingText: "Loading shells…", retry: load) { shells in
-                List {
+                ThemedList {
                     ForEach(shells) { shell in
                         NavigationLink(value: shell.id) { ShellRow(shell: shell) }
                             .swipeActions(edge: .trailing) {
@@ -133,7 +133,7 @@ private struct ShellRow: View {
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: symbol)
-                .foregroundStyle(shell.running ? Color.accentColor : .secondary)
+                .foregroundStyle(shell.running ? Color.accent : .secondary)
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 3) {
                 Text(shell.title)

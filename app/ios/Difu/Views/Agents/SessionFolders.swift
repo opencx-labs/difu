@@ -11,7 +11,7 @@ struct FolderRow: View {
         let summaries = folder.items.map(\.summary)
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: summaries.contains(where: { $0.pending > 0 }) ? "folder.badge.questionmark" : "folder")
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(Color.accent)
                 .frame(width: 22, height: 22)
             VStack(alignment: .leading, spacing: 4) {
                 Text(folder.folder.name)
@@ -67,7 +67,7 @@ struct FolderSessionsView: View {
                 $0.server === server && folder.sessions.contains($0.summary.id) && $0.summary.archived == archived
             }
             let current = ServerFolder(server: server, folder: folder, items: rows)
-            List {
+            ThemedList {
                 Section {
                     Picker("Show", selection: $archived) {
                         Text("Active").tag(false)

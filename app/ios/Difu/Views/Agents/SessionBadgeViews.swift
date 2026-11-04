@@ -19,9 +19,9 @@ extension SessionBadge {
 
     var tint: Color {
         switch self {
-        case .pending: .orange
-        case .subagents(let running, _) where running > 0: .accentColor
-        case .moved: .indigo
+        case .pending: .warning
+        case .subagents(let running, _) where running > 0: .accent
+        case .moved: .violet
         default: .secondary
         }
     }

@@ -185,7 +185,7 @@ struct SessionRowActions: ViewModifier {
                             summary.archived ? "Unarchive" : "Archive",
                             systemImage: summary.archived ? "tray.and.arrow.up" : "archivebox")
                     }
-                    .tint(.indigo)
+                    .tint(Color.violet)
                 }
                 Button {
                     actions.startRename(item)
@@ -201,7 +201,7 @@ struct SessionRowActions: ViewModifier {
                     } label: {
                         Label(summary.pinned ? "Unpin" : "Pin", systemImage: summary.pinned ? "pin.slash" : "pin")
                     }
-                    .tint(.accentColor)
+                    .tint(Color.accent)
                 }
             }
             .contextMenu {
@@ -245,7 +245,7 @@ struct MoveToFolderSheet: View {
         let folders = item.server.sessions.folders
         let current = folders.first(where: { $0.sessions.contains(item.summary.id) })?.id ?? item.summary.folder
         NavigationStack {
-            Form {
+            ThemedForm {
                 Section {
                     ForEach(folders) { folder in
                         Button {
@@ -256,7 +256,7 @@ struct MoveToFolderSheet: View {
                                 Label(folder.name, systemImage: "folder")
                                 Spacer()
                                 if folder.id == current {
-                                    Image(systemName: "checkmark").foregroundStyle(Color.accentColor)
+                                    Image(systemName: "checkmark").foregroundStyle(Color.accent)
                                 }
                             }
                         }
