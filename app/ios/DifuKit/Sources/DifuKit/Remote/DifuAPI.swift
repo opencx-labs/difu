@@ -174,14 +174,19 @@ extension DifuAPI {
     /// Starts a session and returns its id. `repository` is a path from
     /// `repositories()`, an `owner/name` on a server (added and cloned first if
     /// it isn't listed), or nil for the default. `base` picks the branch to
-    /// start from (servers only).
+    /// start from (servers only). `startingMode` and `codexPreset` are sent
+    /// only when chosen; without them (and with a blank model or effort) the
+    /// location's effective defaults apply. Older computers ignore them.
     public func newSession(
-        repository: String?, base: String? = nil, model: String?, effort: String?, text: String?
+        repository: String?, base: String? = nil, model: String?, effort: String?,
+        startingMode: String? = nil, codexPreset: String? = nil, text: String?
     ) async throws -> String {
         var params: [String: JSONValue] = [
             "repository": JSONValue(repository), "model": JSONValue(model),
             "effort": JSONValue(effort),
         ]
+        if let startingMode { params["startingMode"] = .string(startingMode) }
+        if let codexPreset { params["codexPreset"] = .string(codexPreset) }
         if let text, !text.isEmpty { params["text"] = .string(text) }
         if let base = base?.trimmingCharacters(in: .whitespacesAndNewlines), !base.isEmpty {
             params["base"] = .string(base)

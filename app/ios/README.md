@@ -69,19 +69,30 @@ token), repositories (add, remove, **Refresh Mains**), new session defaults,
 repository rules and paired devices.
 
 **New Session** starts from the chosen computer's or server's new session
-defaults: its default repository, model and effort. When it saved no model, the
-sheet picks Claude Opus (the newest Opus that computer's Claude Code offers)
-with extra-high reasoning, or the highest it supports; without Claude Code
-there, it stays on Default. Repositories, models and defaults load
-independently, every control works while they do, and what you choose stays
-when lists arrive. Type another repository (`owner/name` on a server, a full
-path on a computer) to use one that isn't listed.
+defaults, as that computer or server works them out, so the phone, its
+terminal and its agents start sessions the same way: its default repository,
+model, effort and mode. When it saved no model, that's the newest Claude Opus
+its Claude Code offers with extra-high reasoning (or the highest it supports);
+without Claude Code there, the provider's configured model. **Mode** shows
+how the session starts: the provider's modes, and for Codex its approvals
+(Ask for approval, Approve for me, Full Access, Read Only). Servers start
+Claude Code in **Auto** and give Codex **Approve for me** unless you saved
+another mode; computers keep each provider's own default. In Auto and
+Approve for me, Claude Code and Codex still review risky actions themselves;
+bypass permissions and Full Access are never chosen automatically, and
+starting in one asks first. Anything you don't
+change is left to the computer or server; repositories, models and defaults
+load independently, every control works while they do, and what you choose
+stays when lists arrive. Type another repository (`owner/name` on a server, a
+full path on a computer) to use one that isn't listed. Computers with an older
+difu get the phone's own Claude Opus preselection and no Mode picker.
 
 **Settings › (server) › New Session Defaults** changes those defaults on that
 computer or server, where its terminal and agents use them too: provider and
-model, effort, starting mode and repository (each session gets its own
-worktree). **Use Claude Opus · xhigh** saves that in one tap. Computers with an
-older difu don't show the screen and still get the Opus preselection.
+model (**Automatic** shows what it picks), effort, starting mode, Codex
+approvals and repository (each session gets its own worktree). **Use Claude
+Opus · xhigh** saves that in one tap. Computers with an older difu don't show
+the screen and still get the Opus preselection.
 
 In a session, type **/** at the start of the message to see its commands:
 difu's (compact, model and effort, status and usage, permissions, rules,
@@ -91,6 +102,12 @@ Choosing one runs it (asking first for destructive ones), opens its screen, or
 puts it in the message to add arguments. **Model & Effort** lists every
 provider's models; picking another provider's switches the session there once
 it's between turns.
+
+The chip above the message field shows the session's mode (and Codex's
+approvals), with "next turn" while a change waits. Tap it to switch: modes
+that aren't available say why, and when the computer or server refuses a
+change the message says what to do. Switching to bypass permissions or Full
+Access asks first. **/permissions** and **⋯ › Permissions** do the same.
 
 When an agent asks a question, tap **Add a note** to send a note with the
 option, options or "Other" answer you choose, as the terminal does. Permission
@@ -208,6 +225,8 @@ swift run difu-remote-probe inbox --refresh
 swift run difu-remote-probe overview opencx-labs/difu 45
 swift run difu-remote-probe call agents.models          # any method, raw JSON
 swift run difu-remote-probe call agents.defaults.set '{"model":"claude/opus","effort":"xhigh"}'
+swift run difu-remote-probe call agents.defaults.set '{"provider":null,"model":null,"effort":null,"codexPreset":"Auto"}'
+swift run difu-remote-probe call agents.new '{"repository":null,"startingMode":"plan","text":"Plan the change"}'
 swift run difu-remote-probe call session.commands '{"id":"…"}'
 swift run difu-remote-probe call session.command '{"id":"…","name":"/compact"}'
 swift run difu-remote-probe call session.entry '{"id":"…","entry":"item_12"}'

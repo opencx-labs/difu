@@ -1,7 +1,9 @@
 import Foundation
 
-/// What a new session starts with on the phone: the location's saved defaults,
-/// or Claude Opus with extra-high reasoning when it saved no model.
+/// What a new session starts with on the phone: the location's effective
+/// defaults as it reports them (saved ones, else the newest Claude Opus with
+/// extra-high reasoning, and Auto modes on servers). For older computers that
+/// don't report them, the phone picks Claude Opus itself when nothing is saved.
 public enum NewSessionDefaults {
     /// A model and effort for the pickers (nil: the location's default).
     public struct Choice: Equatable, Sendable {
@@ -20,10 +22,15 @@ public enum NewSessionDefaults {
     /// Efforts from lowest to highest, for picking a model's highest.
     static let effortOrder = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
-    /// The model and effort to preselect. Saved defaults win; without a saved
-    /// model, the newest Claude Opus in `models` with `xhigh` (or its highest
-    /// effort); without Claude models (or before they load), the location's default.
+    /// The model and effort to preselect: the location's effective defaults
+    /// when it reports them. For older computers, saved defaults win; without
+    /// a saved model, the newest Claude Opus in `models` with `xhigh` (or its
+    /// highest effort); without Claude models (or before they load), the
+    /// location's default.
     public static func choice(saved: AgentDefaults?, models: [AgentModel]?) -> Choice {
+        if let effective = saved?.effective {
+            return Choice(model: effective.model, effort: effective.effort)
+        }
         if let model = saved?.model {
             return Choice(model: model, effort: saved?.effort)
         }
@@ -93,6 +100,88 @@ public enum NewSessionDefaults {
             return repositories
         }
         return [AgentRepository(path: saved, isDefault: true)] + repositories
+    }
+
+    /// The model and effort automatic defaults pick from `models`: the newest
+    /// Claude Opus with `xhigh` (or its highest), else the provider default.
+    /// For previews before the computer has saved and answered.
+    public static func automaticChoice(models: [AgentModel]?) -> Choice {
+        guard let models, let opus = newestOpus(in: models) else { return Choice(model: nil, effort: nil) }
+        return Choice(model: opus.id, effort: effort(for: opus))
+    }
+
+    /// The provider a new session runs on with `model` (nil: the location's
+    /// effective provider, else its saved one).
+    public static func provider(model: String?, models: [AgentModel]?, defaults: AgentDefaults?) -> String {
+        if let model { return ModelPicker.provider(of: model, in: models ?? []) }
+        return defaults?.effective?.provider ?? defaults?.provider ?? "codex"
+    }
+
+    /// How `provider`'s sessions start at the location when the person picks
+    /// nothing; nil from older computers.
+    public struct Start: Equatable, Sendable {
+        /// nil: the provider's default mode.
+        public var mode: String?
+        public var modeAutomatic: Bool
+        /// Codex only; nil: Codex's configured approvals.
+        public var preset: String?
+        public var presetAutomatic: Bool
+
+        public init(mode: String? = nil, modeAutomatic: Bool = false, preset: String? = nil, presetAutomatic: Bool = false) {
+            self.mode = mode
+            self.modeAutomatic = modeAutomatic
+            self.preset = preset
+            self.presetAutomatic = presetAutomatic
+        }
+    }
+
+    public static func start(for provider: String, defaults: AgentDefaults?) -> Start? {
+        guard let defaults, defaults.reportsEffective, let entry = defaults.entry(for: provider) else { return nil }
+        return Start(
+            mode: entry.startingMode, modeAutomatic: entry.startingModeAutomatic,
+            preset: provider == "codex" ? entry.codexPreset : nil,
+            presetAutomatic: provider == "codex" && entry.codexPresetAutomatic)
+    }
+
+    /// The label of the "leave it to the location" mode choice: "Auto ·
+    /// automatic" on servers, "Plan · default" when saved, "Manual · default".
+    public static func startLabel(for provider: String, defaults: AgentDefaults?) -> String {
+        let start = start(for: provider, defaults: defaults) ?? Start()
+        let label = defaults?.entry(for: provider)?.modeLabel(start.mode) ?? "Default"
+        return "\(label) · \(start.modeAutomatic ? "automatic" : "default")"
+    }
+
+    /// The label of the "leave it to the location" Codex approvals choice.
+    public static func presetLabel(defaults: AgentDefaults?) -> String {
+        let start = start(for: "codex", defaults: defaults) ?? Start()
+        let label = defaults?.entry(for: "codex")?.presetLabel(start.preset) ?? "Codex's configured approvals"
+        return "\(label) · \(start.presetAutomatic ? "automatic" : "default")"
+    }
+
+    /// What `agents.new` sends for the mode pickers: only choices the person
+    /// made that `provider` offers (nil leaves the location's start).
+    public static func startRequest(
+        provider: String, mode: String?, preset: String?, defaults: AgentDefaults?
+    ) -> (startingMode: String?, codexPreset: String?) {
+        guard let defaults, defaults.reportsEffective else { return (nil, nil) }
+        let mode = mode.flatMap { id in defaults.startingModes(for: provider).contains { $0.id == id } ? id : nil }
+        let preset = provider == "codex"
+            ? preset.flatMap { id in defaults.codexPresets.contains { $0.id == id } ? id : nil } : nil
+        return (mode, preset)
+    }
+
+    /// A chosen mode `provider` doesn't offer goes back to the location's start.
+    public static func keptMode(_ mode: String?, provider: String, defaults: AgentDefaults?) -> String? {
+        guard let mode, defaults?.startingModes(for: provider).contains(where: { $0.id == mode }) == true else {
+            return nil
+        }
+        return mode
+    }
+
+    /// Starting a session this way skips permission checks (Claude's bypass
+    /// mode or Codex's Full Access), so the phone asks first.
+    public static func skipsChecks(mode: String?, preset: String?) -> Bool {
+        mode == "bypassPermissions" || preset == "Full"
     }
 
     /// The model id without the provider prefix, lowercased.

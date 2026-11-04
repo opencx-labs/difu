@@ -21,6 +21,9 @@ public struct SessionView: Identifiable, Equatable, Sendable {
     public var activity: Activity?
     public var queue: [QueuedMessage]
     public var pending: [PendingView]
+    /// The provider mode (and Codex approval preset) the session runs in;
+    /// nil for other sessions and from older computers.
+    public var permissionMode: PermissionMode?
     public var entries: [EntryView]
 
     public var id: String { summary.id }
@@ -52,6 +55,7 @@ extension SessionView: Decodable {
         activity = f.value("activity", as: Activity.self)
         queue = f.list("queue")
         pending = f.list("pending")
+        permissionMode = f.value("permissionMode", as: PermissionMode.self)
         // Entries stay index-aligned with the server, so bad rows become
         // placeholders instead of being dropped.
         entries = (f.value("entries", as: [EntryOrPlaceholder].self) ?? []).map(\.entry)
@@ -86,5 +90,75 @@ public struct QueuedMessage: Identifiable, Hashable, Sendable, Decodable {
         }
         self.index = index
         text = f.string("text") ?? ""
+    }
+}
+
+/// A session's provider mode and, for Codex, approval preset, as the mode
+/// chip shows them (`SessionView.permissionMode`).
+public struct PermissionMode: Hashable, Sendable, Decodable {
+    /// The active mode, nil until the provider reports one.
+    public var id: String?
+    public var label: String?
+    /// A mode waiting for the next turn (or for the agent to restart).
+    public var pending: String?
+    public var pendingLabel: String?
+    /// Codex: the detected approval preset (nil: custom or inherited).
+    public var preset: String?
+    public var presetLabel: String?
+    public var pendingPreset: String?
+    public var pendingPresetLabel: String?
+
+    public init(
+        id: String? = nil, label: String? = nil, pending: String? = nil, pendingLabel: String? = nil,
+        preset: String? = nil, presetLabel: String? = nil, pendingPreset: String? = nil,
+        pendingPresetLabel: String? = nil
+    ) {
+        self.id = id
+        self.label = label
+        self.pending = pending
+        self.pendingLabel = pendingLabel
+        self.preset = preset
+        self.presetLabel = presetLabel
+        self.pendingPreset = pendingPreset
+        self.pendingPresetLabel = pendingPresetLabel
+    }
+
+    public init(from decoder: Decoder) throws {
+        let f = try decoder.fields()
+        func text(_ key: String) -> String? { f.string(key).flatMap { $0.isEmpty ? nil : $0 } }
+        id = text("id")
+        label = text("label")
+        pending = text("pending")
+        pendingLabel = text("pendingLabel")
+        preset = text("preset")
+        presetLabel = text("presetLabel")
+        pendingPreset = text("pendingPreset")
+        pendingPresetLabel = text("pendingPresetLabel")
+    }
+
+    /// A change waits for the next turn.
+    public var isPending: Bool {
+        (pending != nil && pending != id) || (pendingPreset != nil && pendingPreset != preset)
+    }
+
+    /// The mode the next turn uses.
+    public var nextMode: String? { pending ?? id }
+    /// The preset the next turn uses.
+    public var nextPreset: String? { pendingPreset ?? preset }
+
+    /// Skips permission checks: Claude's bypass mode or Codex's Full Access.
+    public var skipsChecks: Bool {
+        nextMode == "bypassPermissions" || nextPreset == "Full"
+    }
+
+    /// "Auto", "Regular · Approve for me", "Plan · next turn".
+    public var chipText: String {
+        let modeText = (pending != nil && pending != id ? pendingLabel ?? pending : nil) ?? label ?? id
+        let presetText =
+            (pendingPreset != nil && pendingPreset != preset ? pendingPresetLabel ?? pendingPreset : nil)
+            ?? presetLabel ?? preset
+        var parts = [modeText ?? (presetText == nil ? "Default mode" : nil), presetText].compactMap { $0 }
+        if isPending { parts.append("next turn") }
+        return parts.joined(separator: " · ")
     }
 }

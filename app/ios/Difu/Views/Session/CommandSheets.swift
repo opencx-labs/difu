@@ -171,7 +171,9 @@ private struct LimitRow: View {
     }
 }
 
-/// `/permissions`: the provider's modes and, for Codex, approval presets.
+/// `/permissions` and the session's mode chip: the provider's modes and, for
+/// Codex, approval presets. Unavailable ones say why; the computer's refusal
+/// is shown as it words it.
 struct PermissionsSheet: View {
     let sessionID: String
 
@@ -180,6 +182,8 @@ struct PermissionsSheet: View {
     @State private var info: PermissionsInfo?
     @State private var loadError: String?
     @State private var changing: String?
+    /// A choice that skips permission checks, waiting for confirmation.
+    @State private var confirming: PermissionChoice?
     @State private var error: String?
 
     var body: some View {
@@ -231,6 +235,16 @@ struct PermissionsSheet: View {
                 }
             }
             .task { if info == nil { await load() } }
+            .confirmationDialog(
+                "Switch to \(confirming?.label ?? "this mode")?",
+                isPresented: Binding(get: { confirming != nil }, set: { if !$0 { confirming = nil } }),
+                titleVisibility: .visible,
+                presenting: confirming
+            ) { choice in
+                Button("Switch to \(choice.label)", role: .destructive) { change(choice) }
+            } message: { _ in
+                Text("The agent runs every command and edit without asking until you switch back.")
+            }
             .errorAlert($error, title: "Couldn't change permissions")
         }
         .presentationDetents([.medium, .large])
@@ -246,6 +260,15 @@ struct PermissionsSheet: View {
     }
 
     private func select(_ choice: PermissionChoice) {
+        guard changing == nil else { return }
+        if NewSessionDefaults.skipsChecks(mode: choice.id, preset: choice.id) {
+            confirming = choice
+        } else {
+            change(choice)
+        }
+    }
+
+    private func change(_ choice: PermissionChoice) {
         guard changing == nil else { return }
         changing = choice.id
         Task {
@@ -291,5 +314,35 @@ private struct ChoiceRow: View {
         }
         .disabled(!choice.available || selected)
         .accessibilityAddTraits(selected ? .isSelected : [])
+    }
+}
+
+/// The session's mode (and Codex approvals) as a chip above the composer, like
+/// the terminal's mode indicator; tapping it opens the permissions sheet.
+struct PermissionModeChip: View {
+    let mode: PermissionMode
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 5) {
+                Image(systemName: mode.skipsChecks ? "exclamationmark.shield" : "lock.shield")
+                    .imageScale(.small)
+                Text(mode.chipText)
+                    .lineLimit(1)
+                Image(systemName: "chevron.up.chevron.down")
+                    .imageScale(.small)
+                    .foregroundStyle(.secondary)
+            }
+            .font(.caption.weight(.medium))
+            .foregroundStyle(mode.skipsChecks ? Color.red : (mode.isPending ? Color.secondary : Color.primary))
+            .padding(.horizontal, 10)
+            .padding(.vertical, 4)
+            .background(Color.secondary.opacity(0.12), in: Capsule())
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("Mode: \(mode.chipText)")
+        .accessibilityHint("Changes the session's mode")
     }
 }

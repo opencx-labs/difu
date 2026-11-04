@@ -182,6 +182,14 @@ struct SessionContent: View {
                         .padding(.horizontal, 12)
                         .padding(.top, 8)
                     }
+                    if let mode = view.permissionMode, view.kind == .coding {
+                        HStack {
+                            PermissionModeChip(mode: mode) { sheet = .permissions }
+                            Spacer()
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.top, 6)
+                    }
                     ComposerView(
                         composer: composer, view: view, commands: commands, serverName: server.name,
                         send: send, stop: stop, choose: choose,

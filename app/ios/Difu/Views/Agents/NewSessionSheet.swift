@@ -2,9 +2,9 @@ import DifuKit
 import SwiftUI
 
 /// Starts a session: server (when several are saved), repository, model and
-/// effort, first message. Choices start from the server's new-session
-/// defaults (Claude Opus · xhigh when it saved no model) and every control
-/// works while the lists load.
+/// effort, mode, first message. Choices start from the server's effective
+/// new-session defaults (Claude Opus · xhigh when it saved no model, Auto on
+/// servers) and every control works while the lists load.
 struct NewSessionSheet: View {
     /// The server picked first (a session's `/new` starts on its own server).
     var initialServerID: String?
@@ -24,12 +24,16 @@ struct NewSessionSheet: View {
     @State private var modelsError: String?
     @State private var model: String?
     @State private var effort: String?
+    /// Chosen starting mode and Codex approvals; nil leaves the location's.
+    @State private var mode: String?
+    @State private var preset: String?
     @State private var saved = Saved.loading
     /// Chosen by the person: lists and defaults arriving later keep them.
     @State private var choseRepository = false
     @State private var choseModel = false
     @State private var text = ""
     @State private var creating = false
+    @State private var confirmingChecks = false
     @State private var error: String?
     @FocusState private var focused: Bool
 
@@ -77,7 +81,11 @@ struct NewSessionSheet: View {
 
                 ModelPickerSection(
                     models: models, error: modelsError, model: modelChoice, effort: effortChoice,
-                    footer: modelFooter, retry: load)
+                    defaultLabel: defaultModelLabel, footer: modelFooter, retry: load)
+
+                if saved.defaults?.reportsEffective == true {
+                    modeSection
+                }
 
                 Section("First message") {
                     TextField("What should the agent do?", text: $text, axis: .vertical)
@@ -95,7 +103,7 @@ struct NewSessionSheet: View {
                     if creating {
                         ProgressView()
                     } else {
-                        Button("Start") { create() }
+                        Button("Start") { start() }
                             .disabled(server?.isConnected != true)
                     }
                 }
@@ -109,6 +117,16 @@ struct NewSessionSheet: View {
             }
             .onChange(of: serverID) { load() }
             .onChange(of: server?.generation) { load() }
+            .onChange(of: modeProvider) {
+                mode = NewSessionDefaults.keptMode(mode, provider: modeProvider, defaults: saved.defaults)
+            }
+            .confirmationDialog(
+                "Skip permission checks?", isPresented: $confirmingChecks, titleVisibility: .visible
+            ) {
+                Button("Start Without Checks", role: .destructive) { create() }
+            } message: {
+                Text("The agent runs every command and edit without asking. Only use this for work you'd let it do unsupervised.")
+            }
             .errorAlert($error, title: "Couldn't start the session")
         }
     }
@@ -170,8 +188,62 @@ struct NewSessionSheet: View {
         }
     }
 
+    /// The provider the chosen (or default) model runs on.
+    private var modeProvider: String {
+        NewSessionDefaults.provider(model: model, models: models, defaults: saved.defaults)
+    }
+
+    /// The mode and, for Codex, approvals the session starts with; "· automatic"
+    /// marks the location's own choice (Auto on servers).
+    @ViewBuilder private var modeSection: some View {
+        let defaults = saved.defaults
+        let provider = modeProvider
+        let modes = defaults?.startingModes(for: provider) ?? []
+        Section {
+            Picker("Mode", selection: $mode) {
+                Text(NewSessionDefaults.startLabel(for: provider, defaults: defaults)).tag(String?.none)
+                ForEach(modes) { Text($0.label).tag(Optional($0.id)) }
+            }
+            if provider == "codex", let presets = defaults?.codexPresets, !presets.isEmpty {
+                Picker("Approvals", selection: $preset) {
+                    Text(NewSessionDefaults.presetLabel(defaults: defaults)).tag(String?.none)
+                    ForEach(presets) { Text($0.label).tag(Optional($0.id)) }
+                }
+            }
+        } header: {
+            Text("Mode")
+        } footer: {
+            Text(modeFooter(provider: provider, modes: modes))
+        }
+    }
+
+    private func modeFooter(provider: String, modes: [StartingMode]) -> String {
+        var parts: [String] = []
+        if let mode, let description = modes.first(where: { $0.id == mode })?.description {
+            parts.append("\(modes.first { $0.id == mode }?.label ?? mode): \(description).")
+        }
+        if saved.defaults?.server == true {
+            parts.append("Servers start Claude Code in Auto and Codex with Approve for me; bypass and Full Access are never automatic.")
+        }
+        parts.append("Switch modes any time from the session.")
+        return parts.joined(separator: " ")
+    }
+
+    /// What "Default" means here: the location's effective model.
+    private var defaultModelLabel: String? {
+        guard let effective = saved.defaults?.effective else { return nil }
+        let name = effective.model.map { id in models?.first { $0.id == id }?.name ?? id }
+        return "Default (\(name ?? ModelPicker.providerLabel(effective.provider)))"
+    }
+
     private var modelFooter: String {
         let name = server?.name ?? "the computer"
+        if let effective = saved.defaults?.effective {
+            if effective.modelAutomatic {
+                return "Starts with the newest Claude Opus on \(name) with \(effective.effort ?? "default") reasoning, as \(name) and its terminal do when no default model is saved. Change it in Settings › \(name) › New Session Defaults."
+            }
+            return "Starts with \(name)'s default model. Change it in Settings › \(name) › New Session Defaults."
+        }
         if saved.defaults?.model != nil {
             return "Starts with \(name)'s default model. Change it in Settings › \(name) › New Session Defaults."
         }
@@ -212,6 +284,8 @@ struct NewSessionSheet: View {
             modelsError = nil
             model = nil
             effort = nil
+            mode = nil
+            preset = nil
             saved = .loading
             choseRepository = false
             choseModel = false
@@ -286,17 +360,37 @@ struct NewSessionSheet: View {
         effort = choice.effort
     }
 
+    /// The mode choices `agents.new` sends: only what the person picked.
+    private var startRequest: (startingMode: String?, codexPreset: String?) {
+        NewSessionDefaults.startRequest(provider: modeProvider, mode: mode, preset: preset, defaults: saved.defaults)
+    }
+
+    /// Asks first when the chosen mode skips permission checks.
+    private func start() {
+        let request = startRequest
+        if NewSessionDefaults.skipsChecks(mode: request.startingMode, preset: request.codexPreset) {
+            confirmingChecks = true
+        } else {
+            create()
+        }
+    }
+
     private func create() {
         guard let server else { return }
         creating = true
         let message = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let other = otherRepository.trimmingCharacters(in: .whitespacesAndNewlines)
+        let request = startRequest
+        // Untouched choices on a computer that reports its effective defaults
+        // stay blank, so it applies them itself.
+        let automatic = !choseModel && saved.defaults?.reportsEffective == true
         Task {
             defer { creating = false }
             do {
                 let id = try await server.api.newSession(
                     repository: other.isEmpty ? repository : other,
-                    model: model, effort: effort, text: message)
+                    model: automatic ? nil : model, effort: automatic ? nil : effort,
+                    startingMode: request.startingMode, codexPreset: request.codexPreset, text: message)
                 Haptics.send()
                 dismiss()
                 onCreated(SessionRef(server: server.id, session: id))
@@ -336,6 +430,8 @@ struct ModelPickerSection: View {
     @Binding var model: String?
     @Binding var effort: String?
     var provider: String?
+    /// The "Default" row's label; by default it names `provider`.
+    var defaultLabel: String?
     var footer = "Leave on Default to use the agent's configured model."
     var retry: (() -> Void)?
 
@@ -343,7 +439,7 @@ struct ModelPickerSection: View {
         let list = models ?? []
         Section {
             Picker("Model", selection: $model) {
-                Text(provider.map { "Default (\(ModelPicker.providerLabel($0)))" } ?? "Default")
+                Text(defaultLabel ?? provider.map { "Default (\(ModelPicker.providerLabel($0)))" } ?? "Default")
                     .tag(String?.none)
                 // A choice the list doesn't have (yet), so the picker shows it.
                 if let model, !list.contains(where: { $0.id == model }) {
