@@ -56,7 +56,7 @@ struct NewSessionSheet: View {
 
     var body: some View {
         NavigationStack {
-            Form {
+            ThemedForm {
                 if app.servers.count > 1 {
                     Section("Server") {
                         Picker("Server", selection: $serverID) {

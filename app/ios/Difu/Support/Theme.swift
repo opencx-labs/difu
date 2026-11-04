@@ -7,13 +7,47 @@ extension Font {
     static let monoBody = Font.system(.callout, design: .monospaced)
 }
 
-// `Color.accent` (matrix green), `.onAccent` (ink on accent fills) and
-// `.success` (the terminal's softer green) are generated from the asset catalog.
+// The chosen theme's colours (`ThemeStore`). Reading one in a view's body
+// redraws the view when the theme changes.
 extension Color {
-    static let addition = Color.success
-    static let deletion = Color.red
-    static let codeBackground = Color(.secondarySystemBackground)
-    static let cardBackground = Color(.secondarySystemGroupedBackground)
+    private static var theme: ThemeColors { ThemeStore.shared.colors }
+
+    static var accent: Color { theme.accent }
+    /// Text and icons on accent fills.
+    static var onAccent: Color { theme.onAccent }
+    /// Ready, passing, added (the terminal's green).
+    static var success: Color { theme.success }
+    /// Failed, destructive, deleted (the terminal's red).
+    static var failure: Color { theme.failure }
+    /// Needs input, pending (the terminal's yellow).
+    static var warning: Color { theme.warning }
+    /// Merged pull requests and server badges (the terminal's purple).
+    static var violet: Color { theme.violet }
+    /// Notices and renamed files.
+    static var info: Color { theme.info }
+    static var addition: Color { theme.success }
+    static var deletion: Color { theme.failure }
+    /// Code, diffs, cards and the composer's field.
+    static var codeBackground: Color { theme.code }
+    /// Rows of grouped lists.
+    static var cardBackground: Color { theme.surface }
+    /// Plain screens such as the transcript.
+    static var screenBackground: Color { theme.background }
+    /// Code and diff text: the theme's text colour where it paints its own background.
+    static var codeText: Color { theme.paintsBackgrounds ? theme.text : .primary }
+}
+
+extension ShapeStyle where Self == Color {
+    static var accent: Color { Color.accent }
+    static var onAccent: Color { Color.onAccent }
+    static var success: Color { Color.success }
+    static var failure: Color { Color.failure }
+    static var warning: Color { Color.warning }
+    static var violet: Color { Color.violet }
+    static var info: Color { Color.info }
+    static var addition: Color { Color.addition }
+    static var deletion: Color { Color.deletion }
+    static var codeText: Color { Color.codeText }
 }
 
 /// How a session status is drawn, matching the terminal's colours.
@@ -41,10 +75,10 @@ enum StatusTone: Equatable {
 
     var color: Color {
         switch self {
-        case .working: .accentColor
-        case .needsInput: .orange
+        case .working: .accent
+        case .needsInput: .warning
         case .ready: .success
-        case .failed: .red
+        case .failed: .failure
         case .interrupted, .neutral: .secondary
         }
     }
@@ -100,7 +134,7 @@ struct ElapsedText: View {
 
 /// A dot that pulses while something is in progress.
 struct PulsingDot: View {
-    var color: Color = .accentColor
+    var color: Color = .accent
     var size: CGFloat = 7
 
     var body: some View {
@@ -116,7 +150,7 @@ struct PulsingDot: View {
 struct CodeBlock: View {
     let text: String
     var font: Font = .mono
-    var color: Color = .primary
+    var color: Color = .codeText
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -147,6 +181,7 @@ struct OutputBlock: View {
             ScrollView([.horizontal, .vertical]) {
                 Text(text)
                     .font(.mono)
+                    .foregroundStyle(Color.codeText)
                     .textSelection(.enabled)
                     .padding(10)
                     .frame(maxWidth: .infinity, alignment: .leading)

@@ -114,7 +114,7 @@ struct ComposerView: View {
                     .focused($focused)
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
-                    .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 18))
+                    .background(Color.codeBackground, in: RoundedRectangle(cornerRadius: 18))
                     .disabled(!view.canSend)
 
                 actions
@@ -166,7 +166,7 @@ struct ComposerView: View {
                 Button(action: stop) {
                     Image(systemName: "stop.circle.fill")
                         .font(.system(size: 30))
-                        .foregroundStyle(.red)
+                        .foregroundStyle(.failure)
                 }
                 .accessibilityLabel("Stop the agent")
             }

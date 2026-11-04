@@ -145,7 +145,7 @@ private struct ComposeSheet: View {
 
     var body: some View {
         NavigationStack {
-            Form {
+            ThemedForm {
                 Section {
                     TextField(kind.placeholder, text: $text, axis: .vertical)
                         .lineLimit(6...16)
@@ -207,7 +207,7 @@ private struct MergeSheet: View {
 
     var body: some View {
         NavigationStack {
-            Form {
+            ThemedForm {
                 if let overview {
                     Section {
                         Text(overview.title).font(.headline)
@@ -216,7 +216,7 @@ private struct MergeSheet: View {
                         }
                         if overview.mergeable?.uppercased() == "CONFLICTING" {
                             Label("This branch has conflicts.", systemImage: "exclamationmark.triangle.fill")
-                                .foregroundStyle(.red)
+                                .foregroundStyle(.failure)
                         }
                     }
                 }

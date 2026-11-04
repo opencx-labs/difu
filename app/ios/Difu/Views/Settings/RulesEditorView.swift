@@ -18,7 +18,7 @@ struct RulesEditorView: View {
     @FocusState private var editing: Bool
 
     var body: some View {
-        Form {
+        ThemedForm {
             Section {
                 if let repositories {
                     if repositories.isEmpty {

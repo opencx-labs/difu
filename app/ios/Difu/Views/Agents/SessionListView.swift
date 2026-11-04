@@ -19,6 +19,7 @@ struct SessionListView: View {
     var body: some View {
         NavigationStack(path: $path) {
             content
+                .themedBackground()
                 .navigationTitle("Agents")
                 .searchable(text: $search, prompt: "Search sessions")
                 .refreshable { await app.refreshSessions() }
@@ -67,7 +68,7 @@ struct SessionListView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         } else {
-            List {
+            ThemedList {
                 Section {
                     Picker("Show", selection: $filter) {
                         ForEach(Filter.allCases, id: \.self) { Text($0.rawValue).tag($0) }

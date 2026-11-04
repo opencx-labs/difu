@@ -158,7 +158,7 @@ enum LockShield {
             #selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
         let shield = UIWindow(windowScene: scene)
         shield.windowLevel = .alert + 1
-        let host = UIHostingController(rootView: LockScreen().environment(lock))
+        let host = UIHostingController(rootView: LockScreen().environment(lock).themed())
         host.view.backgroundColor = .systemBackground
         shield.rootViewController = host
         shield.isHidden = false
@@ -175,7 +175,7 @@ struct LockScreen: View {
             Spacer()
             Image(systemName: "chevron.right.square.fill")
                 .font(.system(size: 64))
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(Color.accent)
                 .symbolRenderingMode(.hierarchical)
             Text("difu")
                 .font(.system(size: 34, weight: .bold, design: .monospaced))
@@ -197,6 +197,6 @@ struct LockScreen: View {
         }
         .padding(.bottom, 48)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(.systemBackground))
+        .background(Color.screenBackground)
     }
 }

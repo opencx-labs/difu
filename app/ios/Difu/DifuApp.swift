@@ -11,6 +11,7 @@ struct DifuApp: App {
             RootView()
                 .environment(app)
                 .environment(app.lock)
+                .themed()
                 .onOpenURL { app.open($0) }
                 .onChange(of: scenePhase, initial: true) { _, phase in
                     switch phase {

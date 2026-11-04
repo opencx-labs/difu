@@ -24,7 +24,7 @@ struct ModelSheet: View {
             ModelChange.evaluate(session: $0, model: model, effort: effort, models: models ?? [])
         } ?? .unchanged
         NavigationStack {
-            Form {
+            ThemedForm {
                 if let view {
                     Section {
                         LabeledContent("Provider", value: ModelPicker.providerLabel(view.provider))
@@ -88,7 +88,7 @@ struct ModelSheet: View {
                     Text(reason)
                 } icon: {
                     Image(systemName: "hourglass")
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(.warning)
                 }
                 .font(.callout)
             } footer: {

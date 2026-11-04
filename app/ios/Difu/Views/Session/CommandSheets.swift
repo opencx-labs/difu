@@ -40,6 +40,7 @@ struct SessionInfoSheet: View {
                     }
                 }
             }
+            .themedBackground()
             .navigationTitle(tab == .status ? "Status" : "Usage")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -80,7 +81,7 @@ private struct StatusForm: View {
     let status: SessionStatusInfo
 
     var body: some View {
-        Form {
+        ThemedForm {
             Section {
                 row("Title", status.title)
                 row("State", status.state)
@@ -115,7 +116,7 @@ private struct UsageForm: View {
     let usage: UsageReport
 
     var body: some View {
-        Form {
+        ThemedForm {
             if usage.limits.isEmpty && usage.details.isEmpty {
                 Text("The provider reported no usage.")
                     .foregroundStyle(.secondary)
@@ -158,7 +159,7 @@ private struct LimitRow: View {
                 Text(limit.caption).font(.callout.monospacedDigit()).foregroundStyle(.secondary)
             }
             ProgressView(value: limit.percent, total: 100)
-                .tint(limit.remaining ? (limit.percent < 15 ? .red : .accentColor) : (limit.percent > 85 ? .red : .purple))
+                .tint(limit.remaining ? (limit.percent < 15 ? .failure : .accent) : (limit.percent > 85 ? .failure : .violet))
             if let resetsAt = limit.resetsAt {
                 Text("Resets \(Date(milliseconds: resetsAt).formatted(date: .abbreviated, time: .shortened))")
                     .font(.caption)
@@ -184,7 +185,7 @@ struct PermissionsSheet: View {
     var body: some View {
         NavigationStack {
             Loadable(value: info, error: loadError, loadingText: "Asking the provider…", retry: load) { info in
-                Form {
+                ThemedForm {
                     Section {
                         ForEach(info.modes) { choice in
                             ChoiceRow(choice: choice, selected: info.selectedMode == choice.id, changing: changing == choice.id) {
@@ -284,7 +285,7 @@ private struct ChoiceRow: View {
                 if changing {
                     ProgressView()
                 } else if selected {
-                    Image(systemName: "checkmark").foregroundStyle(Color.accentColor)
+                    Image(systemName: "checkmark").foregroundStyle(Color.accent)
                 }
             }
         }

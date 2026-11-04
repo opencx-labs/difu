@@ -36,6 +36,7 @@ struct ReviewsView: View {
                         }
                 }
             }
+            .themedBackground()
             .navigationTitle("Reviews")
             .toolbar {
                 if app.servers.count > 1, let current = app.reviewsServer {
@@ -128,7 +129,7 @@ struct ReviewsView: View {
                     NavigationLink(value: RepoRoute(server: server.id, name: repository.name)) {
                         HStack(spacing: 8) {
                             Image(systemName: repository.pinned ? "pin.fill" : "folder")
-                                .foregroundStyle(repository.pinned ? Color.accentColor : .secondary)
+                                .foregroundStyle(repository.pinned ? Color.accent : .secondary)
                                 .frame(width: 20)
                             Text(repository.name)
                                 .font(.callout.monospaced())
@@ -198,16 +199,19 @@ struct RepositoryPrsView: View {
                     "No open pull requests", systemImage: "arrow.triangle.pull",
                     description: Text(repo))
             } else {
-                List(prs) { pr in
-                    NavigationLink(
-                        value: PrRoute(server: server.id, repo: pr.repo, number: pr.number, title: pr.title)
-                    ) {
-                        PrRow(pr: pr, showRepo: false)
+                ThemedList {
+                    ForEach(prs) { pr in
+                        NavigationLink(
+                            value: PrRoute(server: server.id, repo: pr.repo, number: pr.number, title: pr.title)
+                        ) {
+                            PrRow(pr: pr, showRepo: false)
+                        }
                     }
                 }
                 .listStyle(.insetGrouped)
             }
         }
+        .themedBackground()
         .refreshable { await load() }
         .navigationTitle(repo.split(separator: "/").last.map(String.init) ?? repo)
         .navigationBarTitleDisplayMode(.inline)
@@ -257,7 +261,7 @@ struct PrRow: View {
                         .foregroundStyle(.secondary)
                 }
                 if pr.draft { Pill(text: "Draft", systemImage: "pencil.circle") }
-                if pr.conflicts { Pill(text: "Conflicts", systemImage: "exclamationmark.triangle.fill", color: .red) }
+                if pr.conflicts { Pill(text: "Conflicts", systemImage: "exclamationmark.triangle.fill", color: .failure) }
             }
         }
         .padding(.vertical, 2)

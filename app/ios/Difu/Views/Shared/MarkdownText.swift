@@ -25,7 +25,7 @@ struct MarkdownText: View {
         }
         for run in attributed.runs where run.inlinePresentationIntent?.contains(.code) == true {
             attributed[run.range].font = .system(.callout, design: .monospaced)
-            attributed[run.range].foregroundColor = .accentColor
+            attributed[run.range].foregroundColor = .accent
         }
         return attributed
     }

@@ -110,6 +110,20 @@ revoke it.
 difu asks for Face ID (or your passcode) when it opens and after 5 minutes in
 the background. Turn it off in **Settings › Security**.
 
+## Themes
+
+**Settings › Appearance › Theme** offers the same themes as difu in the
+terminal, with the same names, and saves the choice on the phone. The theme
+colours the accent, lists and cards, code and diffs, statuses, badges and the
+composer, and changes the app icon to the theme's accent on its background
+(Default keeps the Matrix green icon). iOS confirms each icon change with an
+alert.
+
+Themes with their own background (Dracula, Nord, GitHub Light and the rest)
+switch the app to dark or light to match. Default, Amber and Ocean follow the
+phone's appearance, as difu follows the terminal's background, and ANSI and
+ANSI Light use iOS's system colours in dark and light.
+
 ## Troubleshooting
 
 - **"Can't reach …"**: for a Mac, the phone and Mac must be on the same
@@ -139,6 +153,8 @@ the background. Turn it off in **Settings › Security**.
 | `Config/Info.plist` | Camera, Face ID, Local Network and ATS keys, and the `difu://` URL scheme. Merged with the keys Xcode generates. ATS is relaxed (`NSAllowsArbitraryLoads`) because difu servers use self-signed certificates on arbitrary hosts, which the app pins itself; the app makes no other web requests. For App Store or TestFlight review, the justification is: "connects only to user-owned servers at user-entered addresses, using self-signed certificates pinned by SHA-256 fingerprint." |
 | `DifuKit/` | Swift package with everything that doesn't need UIKit: protocol models, pairing links, addresses and password pairing, the saved-server Keychain store, the pinned WebSocket client, transcript delta application, Markdown and diff helpers. Builds and tests on macOS. |
 | `DifuKit/Sources/difu-remote-probe/` | A command-line client for testing a real difu from the Mac. |
+| `DifuKit/Sources/DifuKit/Resources/themes.json` | The terminal's themes (`cli/src/theme.rs`), which a Rust test keeps identical. |
+| `scripts/` | `app-icons.sh` renders the app icons from `themes.json` with `app-icon.swift`. |
 
 ## Development
 
@@ -156,6 +172,22 @@ Build the app from the command line (the iOS platform must be installed):
 xcodebuild -project app/ios/Difu.xcodeproj -scheme Difu \
   -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO build
 ```
+
+### Themes and icons
+
+The themes come from the terminal. After changing `cli/src/theme.rs`, update
+the phone's copy and the icons from the repository root (`cargo test` fails
+until `themes.json` matches, and `swift test` until every theme has an icon):
+
+```sh
+(cd cli && DIFU_UPDATE_THEMES_JSON=1 cargo test iphone_themes_json)
+app/ios/scripts/app-icons.sh
+```
+
+`app-icons.sh` renders the primary icon (Default) and an `AppIcon-<id>` set
+per theme into `Difu/Assets.xcassets`: opaque 1024×1024 PNGs of "difu" in the
+theme's accent on its background. The build includes every icon set
+(`ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS`), so iOS can switch to it.
 
 ### Probing a real difu
 

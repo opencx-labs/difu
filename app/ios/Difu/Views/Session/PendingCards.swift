@@ -14,7 +14,7 @@ struct PendingCard: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Image(systemName: icon)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.warning)
                 Text(pending.title ?? defaultTitle)
                     .font(.headline)
                 Spacer(minLength: 0)
@@ -36,13 +36,13 @@ struct PendingCard: View {
             }
             content
             if let error {
-                Text(error).font(.caption).foregroundStyle(.red)
+                Text(error).font(.caption).foregroundStyle(.failure)
             }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.orange.opacity(0.35)))
+        .background(Color.warning.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(Color.warning.opacity(0.35)))
         .disabled(busy)
     }
 
@@ -228,7 +228,7 @@ struct QuestionForm: View {
                 } label: {
                     HStack(alignment: .firstTextBaseline) {
                         Image(systemName: isOn ? "checkmark.square.fill" : "square")
-                            .foregroundStyle(isOn ? Color.accentColor : .secondary)
+                            .foregroundStyle(isOn ? Color.accent : .secondary)
                         optionLabel(option)
                     }
                     .contentShape(Rectangle())
@@ -290,7 +290,7 @@ struct ChoiceButtonStyle: ButtonStyle {
     let destructive: Bool
 
     func makeBody(configuration: Configuration) -> some View {
-        let tint: Color = destructive ? .red : .accentColor
+        let tint: Color = destructive ? .failure : .accent
         configuration.label
             .font(.callout.weight(.medium))
             .foregroundStyle(prominent ? (destructive ? Color.white : Color.onAccent) : tint)

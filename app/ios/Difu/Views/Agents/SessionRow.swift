@@ -54,7 +54,7 @@ struct SessionRow: View {
                 HStack(spacing: 6) {
                     StatusBadge(summary: summary)
                     if summary.pending > 0 {
-                        Pill(text: "\(summary.pending)", systemImage: "questionmark.bubble.fill", color: .orange)
+                        Pill(text: "\(summary.pending)", systemImage: "questionmark.bubble.fill", color: .warning)
                     }
                     if summary.queued > 0 {
                         Pill(text: "\(summary.queued) queued", systemImage: "tray.full")
@@ -91,14 +91,14 @@ struct SessionRow: View {
         if summary.orchestrator {
             Image(systemName: "sparkles")
                 .font(.callout.weight(.semibold))
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(Color.accent)
         } else if summary.pinned {
             Text("◆")
                 .font(.callout)
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(Color.accent)
         } else if summary.kind == .conflicts {
             Image(systemName: "arrow.triangle.merge")
-                .foregroundStyle(.orange)
+                .foregroundStyle(.warning)
         } else {
             Image(systemName: "chevron.left.forwardslash.chevron.right")
                 .font(.caption.weight(.semibold))
@@ -117,7 +117,7 @@ struct ServerBadge: View {
     let server: ServerConnection
 
     var body: some View {
-        Pill(text: server.name, systemImage: server.isServer ? "server.rack" : "laptopcomputer", color: .indigo)
+        Pill(text: server.name, systemImage: server.isServer ? "server.rack" : "laptopcomputer", color: .violet)
             .lineLimit(1)
             .truncationMode(.tail)
             .layoutPriority(-1)

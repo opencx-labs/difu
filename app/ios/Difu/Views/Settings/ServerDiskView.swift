@@ -16,7 +16,7 @@ struct ServerDiskView: View {
 
     var body: some View {
         Loadable(value: disk, error: error, loadingText: "Loading disk space…", retry: load) { disk in
-            List {
+            ThemedList {
                 Section {
                     DiskUsageSummary(disk: disk)
                     Button {
@@ -341,7 +341,7 @@ private struct SessionUsageRow: View {
                 HStack(spacing: 6) {
                     Text(session.displayTitle).lineLimit(1)
                     if session.active {
-                        Pill(text: "Active", color: .accentColor)
+                        Pill(text: "Active", color: .accent)
                     }
                     if session.archived {
                         Pill(text: "Archived")
@@ -366,8 +366,8 @@ extension DiskStatus {
     fileprivate var color: Color {
         switch self {
         case .ok: .success
-        case .low: .orange
-        case .critical: .red
+        case .low: .warning
+        case .critical: .failure
         case .unknown: .secondary
         }
     }

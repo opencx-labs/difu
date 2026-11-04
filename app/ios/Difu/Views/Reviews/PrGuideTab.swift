@@ -89,11 +89,11 @@ struct PrGuideTab: View {
     private func chapters(_ guide: Guide) -> some View {
         let groups = Dictionary(grouping: guide.chapters, by: \.category)
             .sorted { $0.key.order < $1.key.order }
-        return List {
+        return ThemedList {
             if guide.outdated {
                 Section {
                     HStack(alignment: .top, spacing: 10) {
-                        Image(systemName: "clock.arrow.circlepath").foregroundStyle(.orange)
+                        Image(systemName: "clock.arrow.circlepath").foregroundStyle(.warning)
                         VStack(alignment: .leading, spacing: 6) {
                             Text("This guide was written for an older commit.")
                                 .font(.callout)
@@ -161,7 +161,7 @@ private struct GuideHunkView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 0) {
                     if !hunk.header.isEmpty {
-                        line(text: hunk.header, kind: .meta, old: nil, new: nil, color: .accentColor)
+                        line(text: hunk.header, kind: .meta, old: nil, new: nil, color: .accent)
                     }
                     ForEach(Array(hunk.lines.enumerated()), id: \.offset) { _, guideLine in
                         line(
@@ -208,7 +208,7 @@ private struct GuideHunkView: View {
         case .add: .addition
         case .remove: .deletion
         case .meta: .secondary
-        case .context: .primary
+        case .context: .codeText
         }
     }
 

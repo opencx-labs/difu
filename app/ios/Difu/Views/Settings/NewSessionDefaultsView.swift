@@ -45,7 +45,7 @@ struct NewSessionDefaultsView: View {
     }
 
     private var form: some View {
-        Form {
+        ThemedForm {
             opusSection
 
             Section {
@@ -126,7 +126,7 @@ struct NewSessionDefaultsView: View {
             if let error {
                 Section {
                     Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.red)
+                        .foregroundStyle(.failure)
                 }
             }
         }

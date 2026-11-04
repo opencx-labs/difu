@@ -71,7 +71,7 @@ struct CommandMenu: View {
             }
             footer(empty: matches.isEmpty)
         }
-        .background(Color(.secondarySystemBackground), in: RoundedRectangle(cornerRadius: 14))
+        .background(Color.codeBackground, in: RoundedRectangle(cornerRadius: 14))
         .overlay(RoundedRectangle(cornerRadius: 14).strokeBorder(Color.secondary.opacity(0.15)))
     }
 
@@ -146,7 +146,7 @@ private struct CommandRow: View {
             if command.confirm {
                 Image(systemName: "exclamationmark.triangle")
                     .imageScale(.small)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(.warning)
                     .accessibilityLabel("Asks before running")
             }
             if !command.isDifu {

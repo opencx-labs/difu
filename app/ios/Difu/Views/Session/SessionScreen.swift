@@ -60,6 +60,7 @@ struct SessionContent: View {
     var body: some View {
         let model = server.sessions.model(for: id)
         content(model)
+            .themedBackground(.plain)
             .navigationTitle(title(model))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
@@ -553,9 +554,9 @@ struct SessionPrStyle {
 
     init(_ pr: SessionPr) {
         switch pr.label {
-        case "Merged": (icon, color) = ("arrow.triangle.merge", .purple)
-        case "Closed": (icon, color) = ("xmark.circle", .red)
-        case "Has conflicts": (icon, color) = ("exclamationmark.triangle", .red)
+        case "Merged": (icon, color) = ("arrow.triangle.merge", .violet)
+        case "Closed": (icon, color) = ("xmark.circle", .failure)
+        case "Has conflicts": (icon, color) = ("exclamationmark.triangle", .failure)
         case "Draft": (icon, color) = ("pencil.circle", .secondary)
         case "Open": (icon, color) = ("arrow.triangle.pull", Color.success)
         default: (icon, color) = ("arrow.triangle.pull", .secondary)

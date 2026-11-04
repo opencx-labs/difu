@@ -18,7 +18,7 @@ struct ServerSettingsView: View {
 
     var body: some View {
         let credential = server.credential
-        Form {
+        ThemedForm {
             Section("Connection") {
                 LabeledContent("Name", value: server.name)
                 LabeledContent("Kind", value: server.isServer ? "Cloud server" : "Computer")
