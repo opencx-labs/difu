@@ -105,9 +105,16 @@ pub(super) fn request_at_boundary_with(
                     let mut line = String::new();
                     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
                     let request = serde_json::from_str(&line)?;
-                    // Background reads (the new-session form's defaults) are
-                    // not actions.
-                    if matches!(request, Request::AgentDefaults { .. }) {
+                    // Background reads (the new-session form's defaults,
+                    // server state and model lists) are not actions.
+                    if matches!(
+                        request,
+                        Request::AgentDefaults { .. }
+                            | Request::Servers
+                            | Request::Models { .. }
+                            | Request::Defaults { .. }
+                            | Request::List
+                    ) {
                         stream.write_all(b"{\"Error\":\"fixture\"}\n")?;
                         continue;
                     }
