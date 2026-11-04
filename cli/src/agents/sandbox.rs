@@ -2338,13 +2338,13 @@ mod tests {
 
     /// One session's setup container installs a tool with mise into the
     /// server's shared cache; another session's shell finds it through mise's
-    /// shims, offline. Runs only where rootless Podman works and an image with
-    /// mise is available (difu's sandbox image, or mise's own); skips
-    /// elsewhere. Without network for the download, a local build linked with
-    /// `mise link` stands in for the install.
+    /// shims, offline. Runs only where rootless Podman works and difu's own
+    /// sandbox image (which has mise and a shell) is built; skips elsewhere.
+    /// mise's published image has no shell, so it cannot stand in. Without
+    /// network for the download, a local build linked with `mise link` stands
+    /// in for the install.
     #[test]
     fn podman_sandboxes_share_tools_mise_installed_in_the_cache() -> Result<()> {
-        const MISE_IMAGE: &str = "docker.io/jdxcode/mise:latest";
         if !podman_ready("the shared toolchain cache test") {
             return Ok(());
         }
@@ -2353,16 +2353,11 @@ mod tests {
                 .podman(&os(args.iter().copied()))
                 .is_ok_and(|output| output.code == 0)
         };
-        let image = if succeeds(&["image", "exists", SandboxSettings::DEFAULT_IMAGE]) {
-            SandboxSettings::DEFAULT_IMAGE
-        } else if succeeds(&["image", "exists", MISE_IMAGE])
-            || succeeds(&["pull", "-q", MISE_IMAGE])
-        {
-            MISE_IMAGE
-        } else {
-            eprintln!("Skipping the shared toolchain cache test: no image with mise");
+        if !succeeds(&["image", "exists", SandboxSettings::DEFAULT_IMAGE]) {
+            eprintln!("Skipping the shared toolchain cache test: `difu sandbox build` has not run");
             return Ok(());
-        };
+        }
+        let image = SandboxSettings::DEFAULT_IMAGE;
         let temp = tempfile::tempdir()?;
         let root = temp.path().canonicalize()?;
         let cache = root.join("cache");
