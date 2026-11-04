@@ -67,6 +67,46 @@ impl Delta {
             subagents,
         }
     }
+    /// What changed from the copy `held` describes to `next`: every entry
+    /// whose hash differs or that is new, and all metadata. A client resuming
+    /// a watch applies it to its cached copy instead of a full baseline.
+    pub fn against(held: &Fingerprint, next: &Session) -> Self {
+        let _cpu = crate::cpu::measure(crate::cpu::Area::Transport);
+        let changed = |hashes: Option<&Vec<String>>, entries: &[Entry]| {
+            entries
+                .iter()
+                .enumerate()
+                .filter(|(i, entry)| {
+                    hashes.and_then(|hashes| hashes.get(*i)) != Some(&entry_hash(entry))
+                })
+                .map(|(i, entry)| (i, entry.clone()))
+                .collect::<Vec<_>>()
+        };
+        let entries = changed(Some(&held.entries), &next.entries);
+        let mut session = next.clone();
+        let count = session.entries.len();
+        session.entries.clear();
+        let subagents = session
+            .subagents
+            .iter_mut()
+            .map(|child| {
+                let delta = ChildDelta {
+                    id: child.id.clone(),
+                    count: child.entries.len(),
+                    entries: changed(held.subagents.get(&child.id), &child.entries),
+                };
+                child.entries.clear();
+                delta
+            })
+            .collect();
+        Self {
+            base: held.version,
+            session: Box::new(session),
+            count,
+            entries,
+            subagents,
+        }
+    }
     pub fn apply(mut self, current: &mut Session) -> Result<()> {
         let _cpu = crate::cpu::measure(crate::cpu::Area::SessionUpdates);
         ensure!(
@@ -126,6 +166,59 @@ impl Delta {
         current.entries = entries;
         Ok(())
     }
+}
+
+/// What a client holds of a session, so that a server can resume its watch
+/// with only what changed (`rpc.watch` with `fingerprint`,
+/// docs/cloud-agents.md).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Fingerprint {
+    pub version: u64,
+    /// SHA-256 of the whole session's JSON; equal means nothing changed.
+    pub digest: String,
+    /// A short hash of each entry, in order.
+    pub entries: Vec<String>,
+    /// The same for each sub-agent's entries, by sub-agent id.
+    #[serde(default)]
+    pub subagents: std::collections::BTreeMap<String, Vec<String>>,
+}
+impl Fingerprint {
+    pub fn of(session: &Session) -> Result<Self> {
+        let _cpu = crate::cpu::measure(crate::cpu::Area::Transport);
+        Ok(Self {
+            version: session.version,
+            digest: crate::storage::hash(serde_json::to_vec(session)?),
+            entries: session.entries.iter().map(entry_hash).collect(),
+            subagents: session
+                .subagents
+                .iter()
+                .map(|child| {
+                    (
+                        child.id.clone(),
+                        child.entries.iter().map(entry_hash).collect(),
+                    )
+                })
+                .collect(),
+        })
+    }
+}
+/// The first reply of a resumed watch: nothing when the client's copy is
+/// current, otherwise a delta on top of it.
+pub fn resume(held: &Fingerprint, session: &Session) -> Reply {
+    let current = serde_json::to_vec(session)
+        .ok()
+        .is_some_and(|json| crate::storage::hash(json) == held.digest);
+    if current {
+        Reply::Unchanged
+    } else {
+        Reply::SessionDelta(Delta::against(held, session))
+    }
+}
+/// 64 bits of an entry's SHA-256: comparisons only ever pair entries at the
+/// same index, so collisions are negligible.
+fn entry_hash(entry: &Entry) -> String {
+    let json = serde_json::to_vec(entry).unwrap_or_default();
+    crate::storage::hash(json).chars().take(16).collect()
 }
 
 struct FramedWriter<'a, W> {
@@ -376,6 +469,78 @@ mod delta_tests {
         next.touch();
         Delta::between(&original, &next).apply(&mut original)?;
         assert!(original.entries.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn resumed_watches_send_nothing_or_only_what_changed_since_the_cached_copy() -> Result<()> {
+        let mut cached = Session::new(
+            "test".into(),
+            super::super::Job::Coding(super::super::Launch {
+                repository: "/tmp/repo".into(),
+                isolated: false,
+                base: "HEAD".into(),
+                prompt: String::new(),
+                model: None,
+                effort: None,
+            }),
+        );
+        cached.note("commandExecution", "large output ".repeat(100_000));
+        cached.note("agentMessage", "first");
+        let mut child = super::super::subagents::Subagent::new(
+            super::super::provider::Provider::Codex,
+            "child-thread",
+        );
+        child
+            .entries
+            .push(cached.entries.first().context("entry")?.clone());
+        cached.subagents.push(child);
+        cached.touch();
+        // A copy that crossed the wire (and a cache file) resumes as current.
+        let copy: Session = serde_json::from_slice(&serde_json::to_vec(&cached)?)?;
+        let held = Fingerprint::of(&copy)?;
+        assert_eq!(held.version, cached.version);
+        assert_eq!(held.entries.len(), 2);
+        assert!(matches!(resume(&held, &cached), Reply::Unchanged));
+        // While the client was away: an entry grew, one was added and the
+        // title changed. Only those entries travel, not the large output.
+        let mut server = cached.clone();
+        server
+            .entries
+            .get_mut(1)
+            .context("entry")?
+            .text
+            .push_str(" and more");
+        server.note("agentMessage", "second");
+        server.title = "Renamed".into();
+        server.touch();
+        let Reply::SessionDelta(delta) = resume(&held, &server) else {
+            anyhow::bail!("expected a delta");
+        };
+        assert_eq!(delta.base, cached.version);
+        assert_eq!(
+            delta.entries.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(serde_json::to_vec(&delta)?.len() < 10_000);
+        let mut client = copy;
+        delta.apply(&mut client)?;
+        assert_eq!(
+            serde_json::to_value(&client)?,
+            serde_json::to_value(&server)?
+        );
+        // A cleared session truncates the copy.
+        server.entries.clear();
+        server.touch();
+        let Reply::SessionDelta(delta) = resume(&Fingerprint::of(&client)?, &server) else {
+            anyhow::bail!("expected a delta");
+        };
+        delta.apply(&mut client)?;
+        assert!(client.entries.is_empty());
+        assert_eq!(
+            serde_json::to_value(&client)?,
+            serde_json::to_value(&server)?
+        );
         Ok(())
     }
 }

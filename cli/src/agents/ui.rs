@@ -961,12 +961,15 @@ impl Ui {
                         }
                     }
                     (Task::List, Reply::Sessions(mut sessions)) => {
-                        // List replies may race a newer subscription snapshot.
+                        // List replies may race a newer subscription snapshot;
+                        // whether its server is reachable is always the list's.
                         for summary in &mut sessions {
                             if let Some(current) = self.sessions.get(&summary.id)
                                 && current.version > summary.version
                             {
+                                let offline = summary.offline.take();
                                 *summary = servers::summary(current);
+                                summary.offline = offline;
                             }
                         }
                         self.sidebar.observe(&sessions);
@@ -1211,6 +1214,7 @@ impl Ui {
             let source = self.change_source(&id);
             if self.drilled
                 && self.changes_visible
+                && self.offline(&id).is_none()
                 && self
                     .changing
                     .as_ref()
@@ -3969,7 +3973,7 @@ impl Ui {
             // The repository, then a tree for a worktree and a cloud for a
             // server session.
             let place = format!(
-                "{}{}{}",
+                "{}{}",
                 session
                     .repository
                     .as_ref()
@@ -3978,35 +3982,50 @@ impl Ui {
                     .unwrap_or_default()
                     .to_string_lossy(),
                 if session.worktree { " 🌳" } else { "" },
-                if servers::is_server_session(&session.id) {
-                    format!(" {}", servers::CLOUD)
-                } else {
-                    String::new()
-                }
             );
+            let cloud_mark = if servers::is_server_session(&session.id) {
+                format!(" {}", servers::CLOUD)
+            } else {
+                String::new()
+            };
             // In a narrow list the server's name gives way, so the icons stay;
-            // a server short of disk space says so when there is room.
+            // an unreachable server or one short of disk space says so when
+            // there is room.
             let fits = |name: &str| {
                 3 + unicode_width::UnicodeWidthStr::width(name)
                     + unicode_width::UnicodeWidthStr::width(place.as_str())
+                    + unicode_width::UnicodeWidthStr::width(cloud_mark.as_str())
                     <= usize::from(row.width)
             };
             let disk = session
                 .server
                 .as_deref()
                 .and_then(|server| self.cloud.mark(server));
+            let offline = session
+                .offline
+                .as_ref()
+                .filter(|_| servers::is_server_session(&session.id));
             let server_name = session
                 .server
                 .as_ref()
                 .and_then(|server| {
-                    let marked = disk
-                        .and_then(cloud::indicator)
-                        .map(|mark| format!("{server} · {mark} · "));
-                    marked
-                        .filter(|name| fits(name))
+                    let marks: Vec<&str> = offline
+                        .map(servers::offline_label)
+                        .into_iter()
+                        .chain(disk.and_then(cloud::indicator))
+                        .collect();
+                    let all =
+                        (marks.len() > 1).then(|| format!("{server} · {} · ", marks.join(" · ")));
+                    let first = marks.first().map(|mark| format!("{server} · {mark} · "));
+                    all.filter(|name| fits(name))
+                        .or_else(|| first.filter(|name| fits(name)))
                         .or_else(|| Some(format!("{server} · ")).filter(|name| fits(name)))
                 })
                 .unwrap_or_default();
+            let server_color = offline.map(servers::offline_color).unwrap_or_else(|| {
+                disk.filter(|status| *status != crate::cloud::disk::Status::Ok)
+                    .map_or(DIM, cloud::status_color)
+            });
             let mut lines = vec![
                 Line::from(Span::styled(
                     format!(
@@ -4028,22 +4047,29 @@ impl Ui {
                     Span::styled(
                         server_name,
                         Style::default()
-                            .fg(disk
-                                .filter(|status| *status != crate::cloud::disk::Status::Ok)
-                                .map_or(DIM, cloud::status_color))
+                            .fg(server_color)
                             .add_modifier(ratatui::style::Modifier::ITALIC),
                     ),
+                    Span::styled(place, Style::default().fg(DIM)),
+                    // The cloud dims while its server is unreachable.
                     Span::styled(
-                        format!(
-                            "{place}{}",
-                            if session.pending > 0 {
-                                format!(" · {} requests", session.pending)
-                            } else if session.queued > 0 {
-                                format!(" · {} queued", session.queued)
-                            } else {
-                                String::new()
-                            }
-                        ),
+                        cloud_mark,
+                        if offline.is_some() {
+                            Style::default()
+                                .fg(DIM)
+                                .add_modifier(ratatui::style::Modifier::DIM)
+                        } else {
+                            Style::default().fg(DIM)
+                        },
+                    ),
+                    Span::styled(
+                        if session.pending > 0 {
+                            format!(" · {} requests", session.pending)
+                        } else if session.queued > 0 {
+                            format!(" · {} queued", session.queued)
+                        } else {
+                            String::new()
+                        },
                         Style::default().fg(DIM),
                     ),
                 ]),
@@ -4150,14 +4176,22 @@ impl Ui {
                         s.status.label()
                     },
                     servers::server_name(&s.id)
-                        .map(|server| format!(
-                            " · on {server}{}",
-                            self.cloud
-                                .mark(server)
-                                .and_then(cloud::indicator)
-                                .map(|mark| format!(" ({mark})"))
-                                .unwrap_or_default()
-                        ))
+                        .map(|server| {
+                            let marks: Vec<&str> = self
+                                .offline(&s.id)
+                                .map(servers::offline_label)
+                                .into_iter()
+                                .chain(self.cloud.mark(server).and_then(cloud::indicator))
+                                .collect();
+                            format!(
+                                " · on {server}{}",
+                                if marks.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" ({})", marks.join(", "))
+                                }
+                            )
+                        })
                         .unwrap_or_default()
                 )
             })

@@ -2,16 +2,23 @@
 //! and forwarding of requests for `<server>:<session>` ids over `rpc`.
 //!
 //! A supervisor thread follows `servers.json`; one worker thread per saved
-//! server keeps a `client::Connection` open (reconnecting with backoff) and
-//! caches the server's session list while a terminal app is listing, so the
-//! local `Request::List` never waits on the network.
+//! server keeps a `client::Connection` open (reconnecting quickly with a
+//! jittered backoff, at once when a request needs the server) and refreshes
+//! the server's session list while a terminal app is listing, so the local
+//! `Request::List` never waits on the network.
+//!
+//! Server sessions never disappear because a server is unreachable: their
+//! list and the copies of opened sessions persist in `offline::Cache`, show
+//! marked offline, and stay readable; messages sent meanwhile wait in the
+//! server's outbox and go out in order once it is back.
 use super::{
     client::{self, Connection},
     disk,
+    offline::{self, Queued},
     servers::{self, SavedServer},
 };
 use crate::{
-    agents::{Control, Reply, Request, Summary, media},
+    agents::{Control, Held, Offline, Prompt, Reply, Request, Session, Summary, media},
     storage::Storage,
 };
 use anyhow::{Context, Result};
@@ -34,9 +41,6 @@ use std::{
 pub const SEPARATOR: char = ':';
 /// A terminal app that listed within this window is still showing the list.
 const LISTENING: Duration = Duration::from_secs(15);
-/// Cached server sessions stay in the list this long after their last refresh,
-/// so a brief network drop does not reshuffle the sidebar.
-const STALE: Duration = Duration::from_secs(60);
 const REPOSITORIES_STALE: Duration = Duration::from_secs(10);
 /// A server's disk status is read again this often while it is wanted; the
 /// server answers from its own cached measurement.
@@ -45,7 +49,28 @@ const DISK_STALE: Duration = Duration::from_secs(30);
 /// (and again when the `/cloud` panel refreshes).
 const LOGINS_STALE: Duration = Duration::from_secs(5 * 60);
 const POLL: Duration = Duration::from_secs(1);
-const MAX_BACKOFF: Duration = Duration::from_secs(60);
+/// Reconnects start this soon after a drop and back off to `MAX_BACKOFF`.
+const FIRST_RETRY: Duration = Duration::from_millis(500);
+const MAX_BACKOFF: Duration = Duration::from_secs(10);
+/// A connection that lasted this long resets the backoff.
+const STABLE: Duration = Duration::from_secs(30);
+/// How long a person's request waits for the reconnect it triggers.
+const PATIENCE: Duration = if cfg!(test) {
+    Duration::from_millis(300)
+} else {
+    Duration::from_secs(3)
+};
+/// After a drop, a server's sessions say "reconnecting…" this long, then
+/// "offline".
+const RECONNECTING: Duration = Duration::from_secs(30);
+/// How many recently updated idle sessions are copied ahead of time, so that
+/// they stay readable while their server is offline.
+const PREFETCH: usize = 12;
+/// A watched session's cached copy is written at most this often while it
+/// changes, and when its watch ends or loses the server.
+const SAVE_EVERY: Duration = Duration::from_secs(15);
+/// An unchanged session list is written to the cache at most this often.
+const LIST_EVERY: Duration = Duration::from_secs(60);
 /// Idle `rpc.watch` streams send heartbeats this often, like the local watch.
 const HEARTBEAT: Duration = Duration::from_secs(1);
 
@@ -58,6 +83,16 @@ pub trait Remote: Send + Sync {
     fn call(&self, method: &str, params: Value) -> Result<Value>;
     fn rpc(&self, request: &Request) -> Result<Reply>;
     fn watch(&self, id: &str, version: Option<u64>) -> Result<Box<dyn Replies>>;
+    /// `watch` resuming from a copy this computer holds: the first reply is
+    /// `Unchanged` or a delta on top of it (or a full baseline from a server
+    /// that cannot resume).
+    fn resume(
+        &self,
+        id: &str,
+        held: &crate::agents::transport::Fingerprint,
+    ) -> Result<Box<dyn Replies>> {
+        self.watch(id, Some(held.version))
+    }
 }
 
 /// A live `rpc.watch` stream; dropping it ends the watch.
@@ -109,6 +144,18 @@ impl Remote for Connection {
     }
     fn watch(&self, id: &str, version: Option<u64>) -> Result<Box<dyn Replies>> {
         Ok(Box::new(Connection::watch(self, id, version)?))
+    }
+    fn resume(
+        &self,
+        id: &str,
+        held: &crate::agents::transport::Fingerprint,
+    ) -> Result<Box<dyn Replies>> {
+        Ok(Box::new(Connection::watch_from(
+            self,
+            id,
+            Some(held.version),
+            Some(held),
+        )?))
     }
 }
 
@@ -323,13 +370,9 @@ fn upload(
     Ok(())
 }
 
-fn upload_attachment(
-    storage: &Storage,
-    local: &str,
-    id: &str,
-    remote: &dyn Remote,
-    attachment: &media::Attachment,
-) -> Result<media::Attachment> {
+/// A private copy this computer can upload for server session `local`:
+/// present, unchanged, the session's own, and within the upload limit.
+fn check_attachment(storage: &Storage, local: &str, attachment: &media::Attachment) -> Result<()> {
     let label = &attachment.label;
     let size = std::fs::metadata(&attachment.path)
         .with_context(|| format!("{label} is missing; paste it again"))?
@@ -340,7 +383,18 @@ fn upload_attachment(
         size as f64 / f64::from(1u32 << 20),
         media::UPLOAD_LIMIT >> 20
     );
-    media::validate(storage, local, attachment).with_context(|| format!("Cannot send {label}"))?;
+    media::validate(storage, local, attachment).with_context(|| format!("Cannot send {label}"))
+}
+
+fn upload_attachment(
+    storage: &Storage,
+    local: &str,
+    id: &str,
+    remote: &dyn Remote,
+    attachment: &media::Attachment,
+) -> Result<media::Attachment> {
+    let label = &attachment.label;
+    check_attachment(storage, local, attachment)?;
     let bytes = std::fs::read(&attachment.path)?;
     let extension = attachment
         .path
@@ -529,13 +583,135 @@ pub enum Route {
     Handled(Result<Reply>),
 }
 
+/// Reconnect delays: a doubling backoff from `FIRST_RETRY` to `MAX_BACKOFF`,
+/// spread ±25% so that several clients do not retry in step. Reset after a
+/// connection that lasted `STABLE`, so a flapping link keeps backing off.
+#[derive(Debug, Default)]
+pub(crate) struct Backoff {
+    failures: u32,
+}
+
+impl Backoff {
+    /// The wait before the next attempt; `jitter` is in `[0, 1)`.
+    pub(crate) fn next(&mut self, jitter: f64) -> Duration {
+        let base = FIRST_RETRY
+            .saturating_mul(1u32 << self.failures.min(8))
+            .min(MAX_BACKOFF);
+        self.failures = self.failures.saturating_add(1);
+        base.mul_f64(0.75 + jitter.clamp(0.0, 1.0) * 0.5)
+            .min(MAX_BACKOFF)
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.failures = 0;
+    }
+}
+
+/// A random number in `[0, 1)` for backoff jitter.
+fn jitter() -> f64 {
+    use ring::rand::SecureRandom;
+    let mut bytes = [0u8; 4];
+    match ring::rand::SystemRandom::new().fill(&mut bytes) {
+        Ok(()) => f64::from(u32::from_le_bytes(bytes)) / (f64::from(u32::MAX) + 1.0),
+        Err(_) => 0.5,
+    }
+}
+
+/// Requests the terminal app repeats on its own. While their server is
+/// unreachable they fail at once rather than wait for a reconnect.
+fn background(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Read { .. }
+            | Request::SessionPrs { .. }
+            | Request::PrChanges { .. }
+            | Request::Statistics { .. }
+            | Request::Skills { .. }
+            | Request::WorkspacePaths { .. }
+            | Request::Shells { .. }
+            | Request::Changes { .. }
+            | Request::ChangesContext { .. }
+            | Request::Usage { .. }
+            | Request::Subagent { .. }
+            | Request::Shell {
+                action: crate::agents::shells::Action::Exchange { .. },
+                ..
+            }
+    )
+}
+
+/// Whether an `rpc` failed because the connection closed before the request
+/// was written (the server never saw it).
+fn not_sent(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<client::NotSent>())
+}
+
+/// Whether the connection closed after the request was written.
+fn lost(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| cause.is::<client::Lost>())
+}
+
+fn now() -> i64 {
+    chrono::Utc::now().timestamp_millis()
+}
+
+/// A server session as this computer shows it: namespaced, with the messages
+/// it holds for the session at the end of its queue, and offline while the
+/// server is unreachable. Works on a full session and on a delta's metadata.
+pub(crate) fn dress(
+    server: &str,
+    session: &mut Session,
+    held: &[Queued],
+    offline: Option<Offline>,
+) {
+    session.id = namespace(server, &session.id);
+    session.queue.extend(held.iter().map(Queued::prompt));
+    session.held = held
+        .iter()
+        .map(|message| Held {
+            error: message.error.clone(),
+        })
+        .collect();
+    session.offline = offline;
+}
+
+/// How delivering a held message went.
+#[derive(Debug, PartialEq)]
+enum Delivery {
+    Sent,
+    /// The connection closed first; the server never saw it.
+    NotSent,
+    /// The connection closed after it was sent; it may have arrived.
+    Lost,
+    /// The server or a local check refused it.
+    Refused(String),
+}
+
 struct Link {
     saved: SavedServer,
     generation: u64,
     remote: Option<Arc<dyn Remote>>,
     error: Option<String>,
+    /// The server's sessions: read this run, or loaded from the cache.
     sessions: Vec<Summary>,
+    /// When `sessions` was last read from the server in this run.
     sessions_at: Option<Instant>,
+    /// When the server last answered a session list, in milliseconds since
+    /// the epoch (from the cache until it answers in this run).
+    answered: Option<i64>,
+    /// Since when the server has been unreachable (or since the service
+    /// started); `None` while connected.
+    down_since: Option<Instant>,
+    /// A request needs the server: reconnect now instead of after the backoff.
+    urgent: bool,
+    /// This server's persistent cache; `None` when it cannot be created.
+    cache: Option<offline::Cache>,
+    /// Messages waiting for the server, in order (also in the cache).
+    outbox: Vec<Queued>,
+    /// The held message being delivered now; edits wait until it is done.
+    sending: Option<u64>,
+    /// A digest of the session list last written to the cache, and when.
+    list_written: Option<(String, Instant)>,
     repositories: Vec<Repository>,
     repositories_at: Option<Instant>,
     defaults: Option<crate::agents::effective::Defaults>,
@@ -549,8 +725,77 @@ struct Link {
 }
 
 impl Link {
+    fn new(storage: &Storage, saved: SavedServer, generation: u64) -> Self {
+        let cache = offline::Cache::open(storage, &saved.name, &saved.id)
+            .map_err(|error| eprintln!("Server {}: cannot keep its cache: {error:#}", saved.name))
+            .ok();
+        let listed = cache
+            .as_ref()
+            .and_then(offline::Cache::list)
+            .unwrap_or_default();
+        let prefix = format!("{}{SEPARATOR}", saved.name);
+        let outbox = cache
+            .as_ref()
+            .map(offline::Cache::outbox)
+            .unwrap_or_default();
+        Self {
+            generation,
+            remote: None,
+            error: None,
+            sessions: listed
+                .sessions
+                .into_iter()
+                .filter(|summary| summary.id.starts_with(&prefix))
+                .collect(),
+            sessions_at: None,
+            answered: (listed.at > 0).then_some(listed.at),
+            down_since: Some(Instant::now()),
+            urgent: false,
+            cache,
+            outbox,
+            sending: None,
+            list_written: None,
+            saved,
+            repositories: Vec::new(),
+            repositories_at: None,
+            defaults: None,
+            disk: None,
+            disk_problem: None,
+            disk_at: None,
+            logins: Vec::new(),
+            logins_at: None,
+            refresh: true,
+        }
+    }
+
     fn live(&self) -> Option<Arc<dyn Remote>> {
         self.remote.clone().filter(|remote| !remote.closed())
+    }
+
+    /// How the server's sessions are marked while it is unreachable.
+    fn offline(&self) -> Option<Offline> {
+        self.live().is_none().then(|| Offline {
+            since: self.answered,
+            reconnecting: self
+                .down_since
+                .is_none_or(|since| since.elapsed() < RECONNECTING),
+        })
+    }
+
+    /// The messages held for one of the server's sessions, in order.
+    fn held(&self, session: &str) -> Vec<Queued> {
+        self.outbox
+            .iter()
+            .filter(|message| message.session == session)
+            .cloned()
+            .collect()
+    }
+
+    fn save_outbox(&self) -> Result<()> {
+        self.cache
+            .as_ref()
+            .with_context(|| format!("difu cannot keep messages for {}", self.saved.name))?
+            .save_outbox(&self.outbox)
     }
 }
 
@@ -572,6 +817,22 @@ impl State {
     fn listening(&self) -> bool {
         self.listed.is_some_and(|at| at.elapsed() < LISTENING)
     }
+}
+
+/// What a watched server session shows on top of the server's copy.
+struct Overlay {
+    /// A usable connection, if the server is reachable.
+    remote: Option<Arc<dyn Remote>>,
+    held: Vec<Queued>,
+    offline: Option<Offline>,
+}
+
+/// What a terminal app watching a server session was last sent.
+#[derive(Debug, PartialEq)]
+struct Shown {
+    version: u64,
+    held: Vec<Queued>,
+    offline: Option<Offline>,
 }
 
 pub struct Federation {
@@ -618,6 +879,14 @@ impl Federation {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Waits on the shared condition variable (connections, outbox changes).
+    fn wait<'a>(&self, state: MutexGuard<'a, State>, timeout: Duration) -> MutexGuard<'a, State> {
+        match self.wake.wait_timeout(state, timeout) {
+            Ok((state, _)) => state,
+            Err(error) => error.into_inner().0,
+        }
+    }
+
     fn supervise(self: Arc<Self>) {
         while !self.stopped.load(Ordering::Relaxed) {
             for (name, generation) in self.reload() {
@@ -625,12 +894,13 @@ impl Federation {
                 thread::spawn(move || federation.work(&name, generation));
             }
             let state = self.lock();
-            drop(self.wake.wait_timeout(state, Duration::from_secs(2)));
+            drop(self.wait(state, Duration::from_secs(2)));
         }
     }
 
     /// Follows `servers.json`: drops removed or changed servers (their workers
-    /// exit) and returns the new links whose workers must start.
+    /// exit) and returns the new links whose workers must start. A server's
+    /// cache goes only when the server is removed.
     pub(crate) fn reload(&self) -> Vec<(String, u64)> {
         let modified = servers::path(&self.storage)
             .and_then(|path| Ok(std::fs::metadata(path)?.modified()?))
@@ -640,6 +910,7 @@ impl Federation {
             return Vec::new();
         }
         // Report a broken file once per change, keeping the current links.
+        let first = state.loaded.is_none();
         state.loaded = Some(modified);
         let saved = match servers::load(&self.storage) {
             Ok(saved) => saved,
@@ -648,11 +919,28 @@ impl Federation {
                 return Vec::new();
             }
         };
+        let names: BTreeSet<String> = saved.iter().map(|server| server.name.clone()).collect();
+        let removed: Vec<String> = state
+            .links
+            .keys()
+            .filter(|name| !names.contains(*name))
+            .cloned()
+            .collect();
         state.links.retain(|name, link| {
             saved
                 .iter()
                 .any(|server| &server.name == name && *server == link.saved)
         });
+        let caches = if first {
+            offline::retain(&self.storage, &names)
+        } else {
+            removed
+                .iter()
+                .try_for_each(|name| offline::remove(&self.storage, name))
+        };
+        if let Err(error) = caches {
+            eprintln!("Saved servers: cannot remove a cache: {error:#}");
+        }
         let mut started = Vec::new();
         for server in saved {
             if state.links.contains_key(&server.name) {
@@ -663,23 +951,7 @@ impl Federation {
             started.push((server.name.clone(), generation));
             state.links.insert(
                 server.name.clone(),
-                Link {
-                    saved: server,
-                    generation,
-                    remote: None,
-                    error: None,
-                    sessions: Vec::new(),
-                    sessions_at: None,
-                    repositories: Vec::new(),
-                    repositories_at: None,
-                    defaults: None,
-                    disk: None,
-                    disk_problem: None,
-                    disk_at: None,
-                    logins: Vec::new(),
-                    logins_at: None,
-                    refresh: true,
-                },
+                Link::new(&self.storage, server, generation),
             );
         }
         self.wake.notify_all();
@@ -696,42 +968,43 @@ impl Federation {
     }
 
     fn work(self: Arc<Self>, name: &str, generation: u64) {
-        let mut backoff = Duration::from_secs(1);
+        let mut backoff = Backoff::default();
         while let Some(saved) = self.saved(name, generation) {
             if let Some(remote) = self.connect(name, generation, &saved) {
-                backoff = Duration::from_secs(1);
+                let connected = Instant::now();
                 while self.saved(name, generation).is_some() && !remote.closed() {
                     self.poll(name, generation, &remote);
-                    self.pause(name, generation, POLL, true);
+                    self.flush(name, generation, &remote);
+                    self.pause(name, generation, POLL, Until::Refresh);
                 }
-                if let Some(link) = self.lock().link(name, generation) {
-                    link.remote = None;
-                    link.error = Some("Connection closed".into());
+                self.disconnected(name, generation);
+                if connected.elapsed() >= STABLE {
+                    backoff.reset();
                 }
             }
-            self.pause(name, generation, backoff, false);
-            backoff = (backoff * 2).min(MAX_BACKOFF);
+            let delay = backoff.next(jitter());
+            self.pause(name, generation, delay, Until::Urgent);
         }
     }
 
-    /// Sleeps until `duration` passes, the link is retired, or (when asked)
-    /// someone wants fresh data.
-    fn pause(&self, name: &str, generation: u64, duration: Duration, refresh: bool) {
+    /// Sleeps until `duration` passes, the link is retired, or someone wants
+    /// fresh data (while connected) or the server (while reconnecting).
+    fn pause(&self, name: &str, generation: u64, duration: Duration, until: Until) {
         let deadline = Instant::now() + duration;
         let mut state = self.lock();
         loop {
             let now = Instant::now();
             let wanted = match state.link(name, generation) {
-                Some(link) => refresh && link.refresh,
+                Some(link) => match until {
+                    Until::Refresh => link.refresh,
+                    Until::Urgent => link.urgent,
+                },
                 None => true,
             };
             if now >= deadline || wanted || self.stopped.load(Ordering::Relaxed) {
                 return;
             }
-            state = match self.wake.wait_timeout(state, deadline - now) {
-                Ok((state, _)) => state,
-                Err(error) => error.into_inner().0,
-            };
+            state = self.wait(state, deadline - now);
         }
     }
 
@@ -741,13 +1014,18 @@ impl Federation {
         generation: u64,
         saved: &SavedServer,
     ) -> Option<Arc<dyn Remote>> {
+        // Requests arriving during this attempt ask for the next one.
+        if let Some(link) = self.lock().link(name, generation) {
+            link.urgent = false;
+        }
         let result = (self.connect)(saved);
         let mut state = self.lock();
         let link = state.link(name, generation)?;
-        match result {
+        let remote = match result {
             Ok(remote) => {
                 link.remote = Some(remote.clone());
                 link.error = None;
+                link.down_since = None;
                 link.refresh = true;
                 Some(remote)
             }
@@ -756,7 +1034,19 @@ impl Federation {
                 link.error = Some(format!("{error:#}"));
                 None
             }
+        };
+        drop(state);
+        self.wake.notify_all();
+        remote
+    }
+
+    fn disconnected(&self, name: &str, generation: u64) {
+        if let Some(link) = self.lock().link(name, generation) {
+            link.remote = None;
+            link.error = Some("Connection closed".into());
+            link.down_since = Some(Instant::now());
         }
+        self.wake.notify_all();
     }
 
     /// Refreshes the cached sessions while someone lists them, and the
@@ -765,7 +1055,7 @@ impl Federation {
     pub(crate) fn poll(&self, name: &str, generation: u64, remote: &Arc<dyn Remote>) {
         let stale =
             |at: Option<Instant>, limit: Duration| at.is_none_or(|at| at.elapsed() >= limit);
-        let (sessions, repos, disk, logins) = {
+        let (sessions, prefetch, repos, disk, logins) = {
             let mut state = self.lock();
             let listening = state.listening();
             let Some(link) = state.link(name, generation) else {
@@ -773,8 +1063,10 @@ impl Federation {
             };
             let refresh = std::mem::take(&mut link.refresh);
             let wanted = refresh || listening;
+            let sessions = wanted && usable(name, remote.as_ref()).is_ok();
             (
-                wanted && usable(name, remote.as_ref()).is_ok(),
+                sessions,
+                sessions && listening,
                 wanted && stale(link.repositories_at, REPOSITORIES_STALE),
                 wanted && stale(link.disk_at, DISK_STALE),
                 wanted && stale(link.logins_at, LOGINS_STALE),
@@ -807,6 +1099,9 @@ impl Federation {
             let reply = remote.rpc(&Request::List);
             self.store_sessions(name, remote, reply);
         }
+        if prefetch {
+            self.prefetch(name, generation, remote.as_ref());
+        }
         if repos {
             let reply = remote
                 .call("server.repos", serde_json::json!({}))
@@ -831,6 +1126,43 @@ impl Federation {
         }
     }
 
+    /// Copies one recently updated idle session whose cached copy is missing
+    /// or older, so that it stays previewable while the server is offline.
+    /// At most one per poll; busy sessions wait until they are idle.
+    fn prefetch(&self, name: &str, generation: u64, remote: &dyn Remote) {
+        let (cache, mut candidates) = {
+            let mut state = self.lock();
+            let Some(link) = state.link(name, generation) else {
+                return;
+            };
+            let Some(cache) = link.cache.clone() else {
+                return;
+            };
+            let candidates: Vec<(i64, String, u64)> = link
+                .sessions
+                .iter()
+                .filter(|summary| !summary.archived && !summary.status.active())
+                .filter_map(|summary| {
+                    let (_, id) = split(&summary.id)?;
+                    Some((summary.updated, id.to_owned(), summary.version))
+                })
+                .collect();
+            (cache, candidates)
+        };
+        candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
+        let versions = cache.versions();
+        let wanted = candidates
+            .into_iter()
+            .take(PREFETCH)
+            .find(|(_, id, version)| versions.get(id).is_none_or(|cached| cached < version));
+        if let Some((_, id, _)) = wanted
+            && let Ok(Reply::Session(session)) = remote.rpc(&Request::Read { id, version: None })
+            && let Err(error) = cache.save_snapshot(&session)
+        {
+            eprintln!("Server {name}: cannot cache a session: {error:#}");
+        }
+    }
+
     fn store_disk(&self, name: &str, generation: u64, result: Result<disk::Report>) {
         if let Some(link) = self.lock().link(name, generation) {
             link.disk_at = Some(Instant::now());
@@ -844,6 +1176,9 @@ impl Federation {
         }
     }
 
+    /// Keeps a connected server's session list, in memory and in the cache.
+    /// Copies of sessions it no longer lists are dropped with their held
+    /// messages, which can no longer be delivered.
     fn store_sessions(&self, name: &str, remote: &Arc<dyn Remote>, reply: Result<Reply>) {
         let mut state = self.lock();
         let Some(link) = state.links.get_mut(name).filter(|link| {
@@ -853,22 +1188,76 @@ impl Federation {
         }) else {
             return;
         };
-        match reply.map(|reply| prefix_reply(name, reply)) {
-            Ok(Reply::Sessions(sessions)) => {
-                // Server-side Slack threads and orchestrators stay on the server.
-                link.sessions = sessions
-                    .into_iter()
-                    .filter(|summary| summary.kind != "Orchestrator")
-                    .collect();
-                link.sessions_at = Some(Instant::now());
+        let sessions = match reply.map(|reply| prefix_reply(name, reply)) {
+            Ok(Reply::Sessions(sessions)) => sessions,
+            Ok(Reply::Error(error)) => {
+                link.error = Some(error);
+                return;
             }
-            Ok(Reply::Error(error)) => link.error = Some(error),
-            Ok(_) => link.error = Some("Unexpected session list reply".into()),
-            Err(error) => link.error = Some(format!("{error:#}")),
+            Ok(_) => {
+                link.error = Some("Unexpected session list reply".into());
+                return;
+            }
+            Err(error) => {
+                link.error = Some(format!("{error:#}"));
+                return;
+            }
+        };
+        // Server-side Slack threads and orchestrators stay on the server.
+        link.sessions = sessions
+            .into_iter()
+            .filter(|summary| summary.kind != "Orchestrator")
+            .collect();
+        link.sessions_at = Some(Instant::now());
+        let at = now();
+        link.answered = Some(at);
+        let listed: BTreeSet<String> = link
+            .sessions
+            .iter()
+            .filter_map(|summary| split(&summary.id).map(|(_, id)| id.to_owned()))
+            .collect();
+        let held = link.outbox.len();
+        link.outbox
+            .retain(|message| listed.contains(&message.session));
+        if link.outbox.len() != held {
+            eprintln!(
+                "Server {name}: dropped {} queued messages for sessions it deleted",
+                held - link.outbox.len()
+            );
+            if let Err(error) = link.save_outbox() {
+                eprintln!("Server {name}: {error:#}");
+            }
+        }
+        // The list is read every second while a terminal app is open; write
+        // it when it changed, and otherwise only now and then for `at`.
+        let digest = serde_json::to_vec(&link.sessions)
+            .map(crate::storage::hash)
+            .unwrap_or_default();
+        let due = link
+            .list_written
+            .as_ref()
+            .is_none_or(|(written, when)| *written != digest || when.elapsed() >= LIST_EVERY);
+        let cache = link.cache.clone().filter(|_| due);
+        let snapshot = due.then(|| offline::Listed {
+            at,
+            sessions: link.sessions.clone(),
+        });
+        if due {
+            link.list_written = Some((digest, Instant::now()));
+        }
+        drop(state);
+        if let (Some(cache), Some(snapshot)) = (cache, snapshot)
+            && let Err(error) = cache
+                .save_list(&snapshot)
+                .and_then(|()| cache.prune(&listed))
+        {
+            eprintln!("Server {name}: cannot cache its sessions: {error:#}");
         }
     }
 
-    /// Local sessions plus every usable server's cached sessions.
+    /// Local sessions plus every server's sessions: fresh from a connected
+    /// server, or from the cache, marked offline, while it is unreachable.
+    /// Servers this computer cannot use (another difu version) are left out.
     pub fn list(&self, mut local: Vec<Summary>) -> Vec<Summary> {
         let mut state = self.lock();
         let returning = !state.listening();
@@ -884,8 +1273,18 @@ impl Federation {
                 link.refresh = true;
                 wake = true;
             }
-            if link.sessions_at.is_some_and(|at| at.elapsed() < STALE) {
-                local.extend(link.sessions.iter().cloned());
+            let offline = link.offline();
+            for summary in &link.sessions {
+                let mut summary = summary.clone();
+                if let Some((_, id)) = split(&summary.id) {
+                    summary.queued += link
+                        .outbox
+                        .iter()
+                        .filter(|message| message.session == id)
+                        .count();
+                }
+                summary.offline = offline.clone();
+                local.push(summary);
             }
         }
         drop(state);
@@ -975,31 +1374,80 @@ impl Federation {
     }
 
     /// `remote`, waiting up to `patience` while saved servers are still being
-    /// loaded or `name` is still connecting (right after the service starts).
+    /// loaded or `name` is not connected yet; its worker reconnects at once.
     pub fn remote_within(&self, name: &str, patience: Duration) -> Result<Arc<dyn Remote>> {
         let deadline = Instant::now() + patience;
+        let mut state = self.lock();
         loop {
-            let connecting = {
-                let state = self.lock();
-                state.loaded.is_none()
-                    || state
-                        .links
-                        .get(name)
-                        .is_some_and(|link| link.live().is_none() && link.error.is_none())
+            let waiting = match state.links.get_mut(name) {
+                Some(link) if link.live().is_none() => {
+                    link.urgent = true;
+                    true
+                }
+                Some(_) => false,
+                None => state.loaded.is_none(),
             };
-            if !connecting || Instant::now() >= deadline {
+            let now = Instant::now();
+            if !waiting || now >= deadline {
+                drop(state);
                 return self.remote(name);
             }
-            thread::sleep(Duration::from_millis(100));
+            self.wake.notify_all();
+            state = self.wait(state, (deadline - now).min(Duration::from_millis(100)));
         }
+    }
+
+    /// `name`'s live connection, whatever version it runs, waiting up to
+    /// `patience` for a reconnect, which its worker then attempts at once.
+    /// `None` while the server stays unreachable.
+    fn await_live(&self, name: &str, patience: Duration) -> Result<Option<Arc<dyn Remote>>> {
+        let deadline = Instant::now() + patience;
+        let mut state = self.lock();
+        let mut asked = false;
+        loop {
+            let link = state
+                .links
+                .get_mut(name)
+                .with_context(|| format!("No saved server named {name}"))?;
+            if let Some(remote) = link.live() {
+                return Ok(Some(remote));
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(None);
+            }
+            if !asked {
+                link.urgent = true;
+                asked = true;
+                self.wake.notify_all();
+            }
+            state = self.wait(state, deadline - now);
+        }
+    }
+
+    /// A usable connection to `name` (see `await_live`), or why it cannot be used.
+    fn reach(&self, name: &str, patience: Duration) -> Result<Option<Arc<dyn Remote>>> {
+        let remote = self.await_live(name, patience)?;
+        if let Some(remote) = &remote {
+            usable(name, remote.as_ref())?;
+        }
+        Ok(remote)
+    }
+
+    fn offline_error(name: &str) -> anyhow::Error {
+        anyhow::anyhow!(
+            "{name} is offline; try again when it reconnects (messages you send are queued until then)"
+        )
     }
 
     fn known(&self) -> BTreeSet<String> {
         self.lock().links.keys().cloned().collect()
     }
 
-    /// A saved server's live connection, whatever version it runs.
+    /// A saved server's live connection, whatever version it runs, after a
+    /// short wait for a reconnect.
     fn connected(&self, name: &str) -> Result<(Arc<dyn Remote>, u64)> {
+        self.await_live(name, PATIENCE)?;
         let state = self.lock();
         let link = state
             .links
@@ -1119,8 +1567,61 @@ impl Federation {
     }
 
     /// Sends `request` to a saved server; replies come back namespaced.
+    ///
+    /// While the server is unreachable, messages are held in its outbox (and
+    /// queued messages held there can be edited), reads are answered from the
+    /// cache, and anything else is refused: user actions after a short wait
+    /// for the reconnect they trigger, background reads at once.
     pub(crate) fn forward(&self, name: &str, request: &Request) -> Result<Reply> {
-        let remote = self.remote(name)?;
+        if let Request::Control {
+            id,
+            control:
+                Control::ReplaceQueued {
+                    expected,
+                    replacement,
+                    ..
+                },
+        } = request
+            && let Some(result) = self.edit_held(name, id, expected, replacement.as_ref())
+        {
+            return result;
+        }
+        if matches!(
+            request,
+            Request::Control {
+                control: Control::Message { .. } | Control::MessageWithAttachments { .. },
+                ..
+            }
+        ) {
+            return self.message(name, request);
+        }
+        let patience = if background(request) {
+            Duration::ZERO
+        } else {
+            PATIENCE
+        };
+        let Some(remote) = self.reach(name, patience)? else {
+            if let Request::Read { id, .. } = request
+                && let Some(session) = self.cached(name, id)
+            {
+                return Ok(Reply::Session(Box::new(session)));
+            }
+            return Err(Self::offline_error(name));
+        };
+        if let Request::Read { id, .. } = request {
+            return match remote.rpc(request)? {
+                Reply::Session(session) => {
+                    Ok(Reply::Session(Box::new(self.keep(name, id, *session))))
+                }
+                reply => Ok(prefix_reply(name, reply)),
+            };
+        }
+        self.send_now(name, &remote, request)
+    }
+
+    /// `request` over `remote` now: a message's attachments are uploaded
+    /// first, and the session list is read again after a change.
+    fn send_now(&self, name: &str, remote: &Arc<dyn Remote>, request: &Request) -> Result<Reply> {
         // Only messages with attachments are copied, to swap in the server's paths.
         let uploaded = match request {
             Request::Control {
@@ -1138,11 +1639,294 @@ impl Federation {
         let request = uploaded.as_ref().unwrap_or(request);
         let reply = prefix_reply(name, remote.rpc(request)?);
         remember(&self.storage, name, request, &reply);
+        if let (Request::Delete { id }, Reply::Ok) = (request, &reply)
+            && let Some(cache) = self.cache(name)
+        {
+            cache.forget_snapshot(id);
+        }
         if changes_list(request) && !matches!(reply, Reply::Error(_)) {
             let sessions = remote.rpc(&Request::List);
-            self.store_sessions(name, &remote, sessions);
+            self.store_sessions(name, remote, sessions);
         }
         Ok(reply)
+    }
+
+    /// A message for a server session: sent now when the server is reachable
+    /// and nothing is held for the session before it; otherwise held in the
+    /// server's outbox until it reconnects.
+    fn message(&self, name: &str, request: &Request) -> Result<Reply> {
+        let Request::Control {
+            id,
+            control:
+                Control::Message {
+                    text,
+                    skills,
+                    attachments,
+                    ..
+                }
+                | Control::MessageWithAttachments {
+                    text,
+                    skills,
+                    attachments,
+                    ..
+                },
+        } = request
+        else {
+            anyhow::bail!("Not a message");
+        };
+        anyhow::ensure!(!text.trim().is_empty(), "Message cannot be empty");
+        // Problems with the attachments show now, not when the server is back.
+        let local = namespace(name, id);
+        for attachment in attachments {
+            check_attachment(&self.storage, &local, attachment)?;
+        }
+        let (remote, waiting) = {
+            let state = self.lock();
+            let link = state
+                .links
+                .get(name)
+                .with_context(|| format!("No saved server named {name}"))?;
+            // Refused messages wait for an edit and hold nothing back.
+            (
+                link.live(),
+                link.outbox
+                    .iter()
+                    .any(|message| &message.session == id && message.error.is_none()),
+            )
+        };
+        if let Some(remote) = remote {
+            usable(name, remote.as_ref())?;
+            if !waiting {
+                match self.send_now(name, &remote, request) {
+                    // The connection dropped just now: hold it.
+                    Err(error) if not_sent(&error) => {}
+                    result => return result,
+                }
+            }
+        }
+        self.hold(name, id, text, skills, attachments)?;
+        Ok(Reply::Ok)
+    }
+
+    /// Adds a message to `name`'s outbox and asks for a reconnect (or, while
+    /// connected, a flush).
+    fn hold(
+        &self,
+        name: &str,
+        session: &str,
+        text: &str,
+        skills: &[crate::agents::Skill],
+        attachments: &[media::Attachment],
+    ) -> Result<()> {
+        let mut state = self.lock();
+        let link = state
+            .links
+            .get_mut(name)
+            .with_context(|| format!("No saved server named {name}"))?;
+        let id = link
+            .outbox
+            .iter()
+            .map(|message| message.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        link.outbox.push(Queued {
+            id,
+            session: session.to_owned(),
+            text: text.to_owned(),
+            skills: skills.to_vec(),
+            attachments: attachments.to_vec(),
+            queued_at: now(),
+            error: None,
+            uncertain: false,
+        });
+        if let Err(error) = link.save_outbox() {
+            link.outbox.pop();
+            return Err(error.context(format!("Cannot queue the message until {name} reconnects")));
+        }
+        link.urgent = true;
+        link.refresh = true;
+        drop(state);
+        self.wake.notify_all();
+        Ok(())
+    }
+
+    /// Edits or removes a held message from the session's queue. `None` when
+    /// `expected` is not held here (it is in the server's own queue).
+    fn edit_held(
+        &self,
+        name: &str,
+        session: &str,
+        expected: &Prompt,
+        replacement: Option<&Prompt>,
+    ) -> Option<Result<Reply>> {
+        let mut state = self.lock();
+        let link = state.links.get_mut(name)?;
+        let index = link
+            .outbox
+            .iter()
+            .position(|message| message.session == session && message.prompt() == *expected)?;
+        if link
+            .outbox
+            .get(index)
+            .is_some_and(|message| Some(message.id) == link.sending)
+        {
+            return Some(Err(anyhow::anyhow!(
+                "That message is being sent to {name} right now; refresh the queue. Your draft is retained."
+            )));
+        }
+        let previous = link.outbox.clone();
+        match replacement {
+            Some(prompt) => {
+                if let Some(message) = link.outbox.get_mut(index) {
+                    message.replace(prompt);
+                }
+            }
+            None => {
+                link.outbox.remove(index);
+            }
+        }
+        if let Err(error) = link.save_outbox() {
+            link.outbox = previous;
+            return Some(Err(error));
+        }
+        link.refresh = true;
+        drop(state);
+        self.wake.notify_all();
+        Some(Ok(Reply::Ok))
+    }
+
+    /// Delivers `name`'s held messages in order over a fresh connection.
+    /// Stops when the connection drops; a refused message stays, with the
+    /// server's reason, until it is edited or removed.
+    pub(crate) fn flush(&self, name: &str, generation: u64, remote: &Arc<dyn Remote>) {
+        if usable(name, remote.as_ref()).is_err() {
+            return;
+        }
+        let mut delivered = false;
+        loop {
+            let message = {
+                let mut state = self.lock();
+                let Some(link) = state.link(name, generation) else {
+                    return;
+                };
+                let Some(message) = link
+                    .outbox
+                    .iter()
+                    .find(|message| message.error.is_none())
+                    .cloned()
+                else {
+                    break;
+                };
+                link.sending = Some(message.id);
+                message
+            };
+            let outcome = self.deliver(name, remote.as_ref(), &message);
+            let mut state = self.lock();
+            let Some(link) = state.link(name, generation) else {
+                return;
+            };
+            link.sending = None;
+            let index = link.outbox.iter().position(|held| held.id == message.id);
+            let stop = match outcome {
+                Delivery::Sent => {
+                    if let Some(index) = index {
+                        link.outbox.remove(index);
+                    }
+                    delivered = true;
+                    false
+                }
+                Delivery::NotSent => true,
+                Delivery::Lost => {
+                    if let Some(held) = index.and_then(|index| link.outbox.get_mut(index)) {
+                        held.uncertain = true;
+                    }
+                    true
+                }
+                Delivery::Refused(error) => {
+                    if let Some(held) = index.and_then(|index| link.outbox.get_mut(index)) {
+                        held.error = Some(error);
+                    }
+                    false
+                }
+            };
+            if let Err(error) = link.save_outbox() {
+                eprintln!("Server {name}: {error:#}");
+            }
+            drop(state);
+            self.wake.notify_all();
+            if stop {
+                break;
+            }
+        }
+        if delivered {
+            let sessions = remote.rpc(&Request::List);
+            self.store_sessions(name, remote, sessions);
+        }
+    }
+
+    fn deliver(&self, name: &str, remote: &dyn Remote, message: &Queued) -> Delivery {
+        if message.uncertain && arrived(remote, message) {
+            return Delivery::Sent;
+        }
+        let mut request = Request::Control {
+            id: message.session.clone(),
+            control: message.control(),
+        };
+        let result =
+            upload(&self.storage, name, remote, &mut request).and_then(|()| remote.rpc(&request));
+        match result {
+            Ok(Reply::Ok) => Delivery::Sent,
+            Ok(Reply::Error(error)) => Delivery::Refused(error),
+            Ok(_) => Delivery::Refused("Unexpected reply to the message".into()),
+            Err(error) if not_sent(&error) => Delivery::NotSent,
+            Err(error) if lost(&error) => Delivery::Lost,
+            Err(error) => Delivery::Refused(format!("{error:#}")),
+        }
+    }
+
+    fn cache(&self, name: &str) -> Option<offline::Cache> {
+        self.lock()
+            .links
+            .get(name)
+            .and_then(|link| link.cache.clone())
+    }
+
+    /// What a server session shows on top of the server's copy right now;
+    /// `None` once the server is no longer saved.
+    fn overlay(&self, name: &str, session: &str) -> Option<Overlay> {
+        let state = self.lock();
+        let link = state.links.get(name)?;
+        Some(Overlay {
+            remote: link
+                .live()
+                .filter(|remote| usable(name, remote.as_ref()).is_ok()),
+            held: link.held(session),
+            offline: link.offline(),
+        })
+    }
+
+    /// The cached copy of a server session, dressed for the terminal app.
+    fn cached(&self, name: &str, id: &str) -> Option<Session> {
+        let mut session = self.cache(name)?.snapshot(id)?;
+        let overlay = self.overlay(name, id)?;
+        dress(name, &mut session, &overlay.held, overlay.offline);
+        Some(session)
+    }
+
+    /// Caches a session the server sent and dresses it for the terminal app.
+    fn keep(&self, name: &str, id: &str, mut session: Session) -> Session {
+        if let Some(cache) = self.cache(name)
+            && let Err(error) = cache.save_snapshot(&session)
+        {
+            eprintln!("Server {name}: cannot cache a session: {error:#}");
+        }
+        let (held, offline) = self
+            .overlay(name, id)
+            .map(|overlay| (overlay.held, overlay.offline))
+            .unwrap_or_default();
+        dress(name, &mut session, &held, offline);
+        session
     }
 
     /// The server and its session id when `id` belongs to a saved server.
@@ -1154,37 +1938,284 @@ impl Federation {
             .then(|| (server.to_owned(), session.to_owned()))
     }
 
-    /// Relays `rpc.watch` for a server session exactly like the local watch:
-    /// a baseline, then deltas, with heartbeats while the server is quiet so a
-    /// closed terminal is noticed. Returns after sending an error.
+    /// Relays a server session to a terminal app exactly like the local watch
+    /// (a baseline, then deltas, with heartbeats so a closed terminal is
+    /// noticed), but never ends because the server is unreachable:
+    ///
+    /// * The cached copy is shown at once, marked offline until the server
+    ///   answers, and kept up to date in the cache.
+    /// * `rpc.watch` resumes from that copy, so an unchanged session costs
+    ///   nothing and a changed one only its changes.
+    /// * A dropped watch or connection is reopened when the server is back.
+    /// * Held messages appear at the end of the session's queue.
+    ///
+    /// Returns after sending an error: the server is no longer saved, cannot
+    /// be used from here, or ended the watch (the session was deleted).
     pub fn watch(
         &self,
         server: &str,
         id: &str,
         mut send: impl FnMut(&Reply) -> Result<()>,
     ) -> Result<()> {
-        // Like the local watch, every subscription starts from a full baseline
-        // (the terminal app applies deltas only on top of one), so the
-        // subscriber's version is not passed on.
-        let mut stream = match self
-            .remote(server)
-            .and_then(|remote| remote.watch(id, None))
+        if let Ok(Some(remote)) = self.await_live(server, Duration::ZERO)
+            && let Err(error) = usable(server, remote.as_ref())
         {
-            Ok(stream) => stream,
-            Err(error) => return send(&Reply::Error(format!("{error:#}"))),
+            return send(&Reply::Error(format!("{error:#}")));
+        }
+        let cache = self.cache(server);
+        let mut relay = Relay {
+            server,
+            id,
+            copy: cache.as_ref().and_then(|cache| cache.snapshot(id)),
+            shown: None,
+            unsaved: false,
+            saved: Instant::now(),
         };
-        loop {
-            let reply = match stream.next(HEARTBEAT) {
-                Next::Reply(Ok(reply)) => prefix_reply(server, reply),
-                Next::Reply(Err(error)) => Reply::Error(format!("{error:#}")),
-                Next::Idle => Reply::Unchanged,
-                Next::Closed => Reply::Error(format!("Lost the connection to {server}")),
-            };
-            send(&reply)?;
-            if matches!(reply, Reply::Error(_)) {
-                return Ok(());
+        let mut stream: Option<Box<dyn Replies>> = None;
+        let mut retry = Instant::now();
+        let mut failures = Backoff::default();
+        let result = (|| -> Result<()> {
+            // The cached copy shows at once, before the server answers.
+            if relay.copy.is_some()
+                && let Some(overlay) = self.overlay(server, id)
+            {
+                relay.show(&overlay, &mut send)?;
+            }
+            loop {
+                let Some(overlay) = self.overlay(server, id) else {
+                    return send(&Reply::Error(format!("No saved server named {server}")));
+                };
+                if stream.is_none()
+                    && Instant::now() >= retry
+                    && let Some(remote) = &overlay.remote
+                {
+                    let opened = match &relay.copy {
+                        Some(copy) => crate::agents::transport::Fingerprint::of(copy)
+                            .and_then(|held| remote.resume(id, &held)),
+                        None => remote.watch(id, None),
+                    };
+                    match opened {
+                        Ok(opened) => stream = Some(opened),
+                        Err(error) if remote.closed() || not_sent(&error) || lost(&error) => {}
+                        Err(error) => {
+                            if format!("{error:#}").contains("Session not found") {
+                                return relay.gone(cache.as_ref(), &mut send, &error);
+                            }
+                            retry = Instant::now() + failures.next(jitter());
+                        }
+                    }
+                }
+                let next = match stream.as_mut() {
+                    Some(stream) => stream.next(HEARTBEAT),
+                    None => {
+                        drop(self.wait(self.lock(), HEARTBEAT));
+                        Next::Idle
+                    }
+                };
+                match next {
+                    Next::Reply(Ok(Reply::Session(session))) => {
+                        failures.reset();
+                        relay.copy = Some(*session);
+                        relay.unsaved = true;
+                        relay.show(&overlay, &mut send)?;
+                    }
+                    Next::Reply(Ok(Reply::SessionDelta(delta))) => {
+                        failures.reset();
+                        if !relay.apply(delta, &overlay, &mut send)? {
+                            // Out of step: start again from a full baseline.
+                            relay.copy = None;
+                            stream = None;
+                        }
+                    }
+                    Next::Reply(Ok(Reply::Unchanged)) | Next::Idle => {
+                        relay.heartbeat(&overlay, &mut send)?;
+                    }
+                    Next::Reply(Ok(Reply::Error(error))) => {
+                        return relay.gone(cache.as_ref(), &mut send, &anyhow::anyhow!(error));
+                    }
+                    Next::Reply(Ok(_)) => {
+                        return send(&Reply::Error(format!(
+                            "Unexpected session update from {server}"
+                        )));
+                    }
+                    // The server ended the watch without a reason, or the
+                    // connection dropped: reopen it once the server is back.
+                    Next::Reply(Err(_)) | Next::Closed => {
+                        stream = None;
+                        relay.save(cache.as_ref(), true);
+                        if overlay
+                            .remote
+                            .as_ref()
+                            .is_some_and(|remote| !remote.closed())
+                        {
+                            retry = Instant::now() + failures.next(jitter());
+                        }
+                        relay.heartbeat(&overlay, &mut send)?;
+                    }
+                }
+                relay.save(cache.as_ref(), false);
+            }
+        })();
+        relay.save(cache.as_ref(), true);
+        result
+    }
+}
+
+/// Whether a message whose delivery was not confirmed reached the session:
+/// it is in the server's queue or among the latest user messages.
+fn arrived(remote: &dyn Remote, message: &Queued) -> bool {
+    let Ok(Reply::Session(session)) = remote.rpc(&Request::Read {
+        id: message.session.clone(),
+        version: None,
+    }) else {
+        return false;
+    };
+    session
+        .queue
+        .iter()
+        .any(|prompt| prompt.text() == message.text)
+        || session
+            .entries
+            .iter()
+            .rev()
+            .take(10)
+            .any(|entry| entry.kind == "userMessage" && entry.text.as_str() == message.text)
+}
+
+#[derive(Clone, Copy)]
+enum Until {
+    /// Someone wants fresh data from the connected server.
+    Refresh,
+    /// A request needs the server: reconnect now.
+    Urgent,
+}
+
+/// One terminal app's watch of a server session (`Federation::watch`).
+struct Relay<'a> {
+    server: &'a str,
+    id: &'a str,
+    /// The server's session as this computer last saw it, with its own id.
+    copy: Option<Session>,
+    /// What the terminal app was last sent.
+    shown: Option<Shown>,
+    /// `copy` changed since it was last cached.
+    unsaved: bool,
+    saved: Instant,
+}
+
+impl Relay<'_> {
+    fn current(&self, overlay: &Overlay) -> Option<Shown> {
+        self.copy.as_ref().map(|copy| Shown {
+            version: copy.version,
+            held: overlay.held.clone(),
+            offline: overlay.offline.clone(),
+        })
+    }
+
+    /// Sends the whole dressed copy.
+    fn show(
+        &mut self,
+        overlay: &Overlay,
+        send: &mut impl FnMut(&Reply) -> Result<()>,
+    ) -> Result<()> {
+        let Some(copy) = &self.copy else {
+            return send(&Reply::Unchanged);
+        };
+        let mut session = copy.clone();
+        dress(
+            self.server,
+            &mut session,
+            &overlay.held,
+            overlay.offline.clone(),
+        );
+        send(&Reply::Session(Box::new(session)))?;
+        self.shown = self.current(overlay);
+        Ok(())
+    }
+
+    /// A quiet moment: the whole copy again if what it shows on top changed
+    /// (held messages, the offline mark), else a heartbeat.
+    fn heartbeat(
+        &mut self,
+        overlay: &Overlay,
+        send: &mut impl FnMut(&Reply) -> Result<()>,
+    ) -> Result<()> {
+        if self.copy.is_some() && self.shown != self.current(overlay) {
+            self.show(overlay, send)
+        } else {
+            send(&Reply::Unchanged)
+        }
+    }
+
+    /// Applies a server delta to the copy and passes it on, dressed, when the
+    /// terminal app holds exactly its base; otherwise sends the whole copy.
+    /// `false` when the delta does not fit the copy.
+    fn apply(
+        &mut self,
+        delta: crate::agents::transport::Delta,
+        overlay: &Overlay,
+        send: &mut impl FnMut(&Reply) -> Result<()>,
+    ) -> Result<bool> {
+        let Some(copy) = self.copy.as_mut() else {
+            return Ok(false);
+        };
+        let in_step = self.shown.as_ref().is_some_and(|shown| {
+            shown.version == delta.base
+                && shown.held == overlay.held
+                && shown.offline == overlay.offline
+        });
+        let mut forwarded = in_step.then(|| delta.clone());
+        if delta.apply(copy).is_err() {
+            return Ok(false);
+        }
+        self.unsaved = true;
+        match forwarded.as_mut() {
+            Some(delta) => {
+                dress(
+                    self.server,
+                    &mut delta.session,
+                    &overlay.held,
+                    overlay.offline.clone(),
+                );
+                send(&Reply::SessionDelta(delta.clone()))?;
+                self.shown = self.current(overlay);
+            }
+            None => self.show(overlay, send)?,
+        }
+        Ok(true)
+    }
+
+    /// Caches the copy when it changed: every `SAVE_EVERY` at most, or now
+    /// (`force`) when the watch ends or loses the server.
+    fn save(&mut self, cache: Option<&offline::Cache>, force: bool) {
+        let due = force || self.saved.elapsed() >= SAVE_EVERY;
+        if !(self.unsaved && due) {
+            return;
+        }
+        self.unsaved = false;
+        self.saved = Instant::now();
+        if let (Some(cache), Some(copy)) = (cache, &self.copy)
+            && let Err(error) = cache.save_snapshot(copy)
+        {
+            eprintln!("Server {}: cannot cache a session: {error:#}", self.server);
+        }
+    }
+
+    /// The server ended the watch with a reason, such as a deleted session.
+    fn gone(
+        &mut self,
+        cache: Option<&offline::Cache>,
+        send: &mut impl FnMut(&Reply) -> Result<()>,
+        error: &anyhow::Error,
+    ) -> Result<()> {
+        let message = format!("{error:#}");
+        if message.contains("Session not found") {
+            self.unsaved = false;
+            if let Some(cache) = cache {
+                cache.forget_snapshot(self.id);
             }
         }
+        send(&Reply::Error(message))
     }
 }
 
@@ -1211,6 +2242,14 @@ pub(crate) mod tests {
         pub calls: Mutex<Vec<(String, Value)>>,
         /// What `server.disk` answers; `None` answers like an older server.
         pub disk: Mutex<Option<Value>>,
+        /// The fingerprint of every resumed watch.
+        pub fingerprints: Mutex<Vec<crate::agents::transport::Fingerprint>>,
+        /// Every `rpc` fails like a busy server.
+        pub failing: AtomicBool,
+        /// Messages are refused with this reason.
+        pub refuse: Mutex<Option<String>>,
+        /// Messages arrive (in the session's queue) but the reply is lost.
+        pub lose: AtomicBool,
     }
 
     impl Fake {
@@ -1232,6 +2271,10 @@ pub(crate) mod tests {
                         "sandbox": {"available": true, "images": 4, "containers": 5, "volumes": 6, "reclaimable": 7},
                         "other": 8}
                 }))),
+                fingerprints: Mutex::new(Vec::new()),
+                failing: AtomicBool::new(false),
+                refuse: Mutex::new(None),
+                lose: AtomicBool::new(false),
             })
         }
         pub(crate) fn calls(&self) -> Vec<(String, Value)> {
@@ -1300,11 +2343,38 @@ pub(crate) mod tests {
             }
         }
         fn rpc(&self, request: &Request) -> Result<Reply> {
+            // Like `client::Connection`: nothing is written once closed.
+            if self.closed() {
+                return Err(client::NotSent.into());
+            }
             self.requests
                 .lock()
                 .map_err(|_| anyhow::anyhow!("lock"))?
                 .push(request.clone());
+            anyhow::ensure!(!self.failing.load(Ordering::Relaxed), "The server is busy");
             let mut sessions = self.sessions.lock().map_err(|_| anyhow::anyhow!("lock"))?;
+            if let Request::Control {
+                id,
+                control:
+                    Control::Message { text, .. } | Control::MessageWithAttachments { text, .. },
+            } = request
+            {
+                if let Some(reason) = self
+                    .refuse
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("lock"))?
+                    .clone()
+                {
+                    return Ok(Reply::Error(reason));
+                }
+                if self.lose.load(Ordering::Relaxed) {
+                    if let Some(session) = sessions.iter_mut().find(|s| &s.id == id) {
+                        session.queue.push(text.as_str().into());
+                        session.touch();
+                    }
+                    return Err(client::Lost.into());
+                }
+            }
             Ok(match request {
                 Request::List => Reply::Sessions(sessions.iter().map(Session::summary).collect()),
                 Request::Read { id, .. } => match sessions.iter().find(|s| &s.id == id) {
@@ -1386,12 +2456,26 @@ pub(crate) mod tests {
             })
         }
         fn watch(&self, id: &str, version: Option<u64>) -> Result<Box<dyn Replies>> {
+            if self.closed() {
+                return Err(client::NotSent.into());
+            }
             let (tx, rx) = mpsc::channel();
             self.watches
                 .lock()
                 .map_err(|_| anyhow::anyhow!("lock"))?
                 .push((id.into(), version, tx));
             Ok(Box::new(rx))
+        }
+        fn resume(
+            &self,
+            id: &str,
+            held: &crate::agents::transport::Fingerprint,
+        ) -> Result<Box<dyn Replies>> {
+            self.fingerprints
+                .lock()
+                .map_err(|_| anyhow::anyhow!("lock"))?
+                .push(held.clone());
+            self.watch(id, Some(held.version))
         }
     }
 
@@ -2527,7 +3611,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn watch_relays_server_replies_with_heartbeats_and_ends_on_close() -> Result<()> {
+    fn watch_relays_server_replies_and_reopens_a_dropped_watch_from_its_copy() -> Result<()> {
         let fake = Fake::new(vec![session("1")]);
         let (_dir, federation) = connected(vec![("box", fake.clone())])?;
         assert_eq!(
@@ -2536,35 +3620,73 @@ pub(crate) mod tests {
         );
         assert_eq!(federation.watch_target("other:1"), None);
         assert_eq!(federation.watch_target("1"), None);
+        let mut base = session("1");
+        base.note("agentMessage", "first");
+        base.touch();
+        let mut next = base.clone();
+        next.note("agentMessage", "second");
+        next.touch();
+        let delta = crate::agents::transport::Delta::between(&base, &next);
+        let resumed = Arc::new(AtomicBool::new(false));
+        let next_watch = |fake: &Fake| -> Result<OpenWatch> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Some(watch) = fake
+                    .watches
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("lock"))?
+                    .pop()
+                {
+                    return Ok(watch);
+                }
+                anyhow::ensure!(Instant::now() < deadline, "watch never opened");
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
         let feeder = {
             let fake = fake.clone();
+            let resumed = resumed.clone();
+            let base = base.clone();
+            let version = next.version;
             thread::spawn(move || -> Result<()> {
-                let deadline = Instant::now() + Duration::from_secs(3);
-                let tx = loop {
-                    if let Some((id, version, tx)) = fake
-                        .watches
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("lock"))?
-                        .pop()
-                    {
-                        anyhow::ensure!(id == "1" && version.is_none(), "watch params");
-                        break tx;
-                    }
-                    anyhow::ensure!(Instant::now() < deadline, "watch never opened");
-                    thread::sleep(Duration::from_millis(2));
-                };
-                tx.send(Ok(Reply::Session(Box::new(session("1")))))?;
-                // A quiet stream produces a heartbeat before the stream closes.
+                // Nothing cached yet: a plain watch and a full baseline.
+                let (id, version_asked, tx) = next_watch(&fake)?;
+                anyhow::ensure!(id == "1" && version_asked.is_none(), "watch params");
+                tx.send(Ok(Reply::Session(Box::new(base))))?;
+                // A quiet stream produces a heartbeat before the delta.
                 thread::sleep(HEARTBEAT + Duration::from_millis(200));
+                tx.send(Ok(Reply::SessionDelta(delta)))?;
+                thread::sleep(Duration::from_millis(100));
+                // The watch is lost while the server stays connected.
                 drop(tx);
+                let (id, version_asked, tx) = next_watch(&fake)?;
+                anyhow::ensure!(
+                    id == "1" && version_asked == Some(version),
+                    "resumed from the copy: {version_asked:?}"
+                );
+                let held = fake
+                    .fingerprints
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("lock"))?
+                    .pop()
+                    .context("fingerprint")?;
+                anyhow::ensure!(held.version == version && held.entries.len() == 2);
+                // The copy is current: nothing more crosses the wire.
+                tx.send(Ok(Reply::Unchanged))?;
+                resumed.store(true, Ordering::SeqCst);
+                thread::sleep(Duration::from_secs(1));
                 Ok(())
             })
         };
         let mut sent = Vec::new();
-        federation.watch("box", "1", |reply| {
+        let result = federation.watch("box", "1", |reply| {
             sent.push(reply.clone());
+            if resumed.load(Ordering::SeqCst) && matches!(reply, Reply::Unchanged) {
+                anyhow::bail!("the terminal app left");
+            }
             Ok(())
-        })?;
+        });
+        assert!(result.is_err(), "ends only when the terminal app leaves");
         feeder
             .join()
             .map_err(|_| anyhow::anyhow!("feeder panicked"))??;
@@ -2572,11 +3694,26 @@ pub(crate) mod tests {
             anyhow::bail!("baseline first: {sent:?}");
         };
         assert_eq!(first.id, "box:1");
+        assert!(first.offline.is_none());
         assert!(
             rest.iter().any(|r| matches!(r, Reply::Unchanged)),
             "{sent:?}"
         );
-        assert!(matches!(rest.last(), Some(Reply::Error(e)) if e.contains("box")));
+        let mut client = (**first).clone();
+        for reply in rest {
+            if let Reply::SessionDelta(delta) = reply {
+                assert_eq!(delta.session.id, "box:1");
+                delta.clone().apply(&mut client)?;
+            }
+        }
+        assert_eq!(client.entries.len(), 2, "the delta reached the terminal");
+        assert!(
+            !rest.iter().any(|r| matches!(r, Reply::Error(_))),
+            "a lost watch is not an error: {sent:?}"
+        );
+        // The copy was kept for the next watch, offline or not.
+        let cache = federation.cache("box").context("cache")?;
+        assert_eq!(cache.version("1"), Some(next.version));
         Ok(())
     }
 
@@ -2585,6 +3722,8 @@ pub(crate) mod tests {
         let fake = Fake::new(Vec::new());
         let (_dir, federation) = connected(vec![("box", fake)])?;
         assert!(federation.reload().is_empty(), "unchanged file");
+        let cache = crate::agents::server::home(&federation.storage)?.join("servers/box");
+        assert!(cache.is_dir());
         servers::forget(&federation.storage, "box")?;
         servers::save(&federation.storage, server("home", "id-home"))?;
         // Some filesystems keep whole-second modification times.
@@ -2606,11 +3745,481 @@ pub(crate) mod tests {
             vec!["home"]
         );
         assert_eq!(federation.known(), BTreeSet::from(["home".to_owned()]));
+        // A removed server's cached sessions and outbox go with it.
+        assert!(!cache.exists());
         let error = format!(
             "{:#}",
             federation.remote("home").err().context("not connected")?
         );
         assert!(error.contains("not connected"), "{error}");
+        Ok(())
+    }
+
+    fn generation(federation: &Federation, name: &str) -> Result<u64> {
+        federation
+            .lock()
+            .links
+            .get(name)
+            .map(|link| link.generation)
+            .context("link")
+    }
+
+    fn message(id: &str, text: &str, attachments: Vec<media::Attachment>) -> Request {
+        Request::Control {
+            id: id.into(),
+            control: if attachments.is_empty() {
+                Control::Message {
+                    text: text.into(),
+                    queue: false,
+                    skills: Vec::new(),
+                    attachments,
+                }
+            } else {
+                Control::MessageWithAttachments {
+                    text: text.into(),
+                    queue: false,
+                    skills: Vec::new(),
+                    attachments,
+                }
+            },
+        }
+    }
+
+    fn handled(federation: &Federation, request: Request) -> Result<Reply> {
+        let Route::Handled(reply) = federation.route(request) else {
+            anyhow::bail!("expected a server request");
+        };
+        reply
+    }
+
+    fn controls(fake: &Fake) -> Vec<(String, Control)> {
+        fake.requests()
+            .into_iter()
+            .filter_map(|request| match request {
+                Request::Control { id, control } => Some((id, control)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn text(control: &Control) -> &str {
+        match control {
+            Control::Message { text, .. } | Control::MessageWithAttachments { text, .. } => text,
+            _ => "",
+        }
+    }
+
+    #[test]
+    fn reconnects_start_fast_back_off_with_jitter_and_reset_after_a_stable_link() {
+        let mut backoff = Backoff::default();
+        let low: Vec<Duration> = (0..8).map(|_| backoff.next(0.0)).collect();
+        assert_eq!(low.first(), Some(&Duration::from_millis(375)));
+        assert!(low.windows(2).all(|pair| matches!(pair, [a, b] if a <= b)));
+        // Capped: ten seconds at most, less the jitter's lower spread.
+        assert_eq!(low.last(), Some(&Duration::from_millis(7_500)));
+        let mut high = Backoff::default();
+        let first = high.next(0.999);
+        assert!(
+            (Duration::from_millis(601)..Duration::from_millis(630)).contains(&first),
+            "{first:?}"
+        );
+        for _ in 0..20 {
+            assert!(high.next(0.999) <= MAX_BACKOFF);
+        }
+        // A connection that lasted resets it.
+        high.reset();
+        assert_eq!(high.next(0.5), FIRST_RETRY);
+        assert!((0..100).map(|_| jitter()).all(|j| (0.0..1.0).contains(&j)));
+    }
+
+    #[test]
+    fn a_failed_or_slow_request_does_not_take_the_server_offline() -> Result<()> {
+        let fake = Fake::new(vec![session("1")]);
+        let (_dir, federation) = connected(vec![("box", fake.clone())])?;
+        fake.failing.store(true, Ordering::Relaxed);
+        federation.list(Vec::new());
+        federation.poll(
+            "box",
+            generation(&federation, "box")?,
+            &federation.remote("box")?,
+        );
+        let error = handled(
+            &federation,
+            Request::Read {
+                id: "box:1".into(),
+                version: None,
+            },
+        )
+        .err()
+        .context("the read fails")?;
+        assert!(format!("{error:#}").contains("busy"), "{error:#}");
+        // Only transport errors close a link; the sessions stay current.
+        assert!(federation.remote("box").is_ok());
+        assert!(federation.servers().first().is_some_and(|s| s.connected));
+        let list = federation.list(Vec::new());
+        let [summary] = list.as_slice() else {
+            anyhow::bail!("one session: {list:?}");
+        };
+        assert_eq!(summary.id, "box:1");
+        assert!(summary.offline.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn dressing_a_server_session_adds_held_messages_and_the_offline_mark() -> Result<()> {
+        let mut shown = session("1");
+        shown.queue.push("on the server".into());
+        let held = offline::Queued {
+            id: 1,
+            session: "1".into(),
+            text: "written offline".into(),
+            skills: Vec::new(),
+            attachments: Vec::new(),
+            queued_at: 1,
+            error: Some("refused".into()),
+            uncertain: false,
+        };
+        let mark = Offline {
+            since: Some(5),
+            reconnecting: false,
+        };
+        dress("aws", &mut shown, &[held], Some(mark.clone()));
+        assert_eq!(shown.id, "aws:1");
+        assert_eq!(
+            shown.queue.iter().map(Prompt::text).collect::<Vec<_>>(),
+            vec!["on the server", "written offline"]
+        );
+        assert_eq!(
+            shown.held,
+            vec![Held {
+                error: Some("refused".into())
+            }]
+        );
+        assert_eq!(shown.offline.as_ref(), Some(&mark));
+        let summary = shown.summary();
+        assert_eq!(summary.offline, Some(mark));
+        assert_eq!(summary.queued, 2);
+        // Servers never send either field.
+        let wire = serde_json::to_value(session("1"))?;
+        assert!(wire.get("offline").is_none() && wire.get("held").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn offline_sessions_stay_listed_and_readable_from_the_cache_after_a_restart() -> Result<()> {
+        let mut opened = session("1");
+        opened.title = "Kept".into();
+        opened.note("agentMessage", "cached reply");
+        opened.touch();
+        let fake = Fake::new(vec![opened, session("2")]);
+        let (_dir, federation) = connected(vec![("box", fake.clone())])?;
+        // Opening a session keeps its copy.
+        let Reply::Session(read) = handled(
+            &federation,
+            Request::Read {
+                id: "box:1".into(),
+                version: None,
+            },
+        )?
+        else {
+            anyhow::bail!("session");
+        };
+        assert_eq!((read.id.as_str(), read.offline.as_ref()), ("box:1", None));
+        // The connection drops: the sessions stay, marked as reconnecting.
+        fake.closed.store(true, Ordering::Relaxed);
+        let list = federation.list(Vec::new());
+        assert_eq!(list.len(), 2, "{list:?}");
+        assert!(list.iter().all(|summary| {
+            summary
+                .offline
+                .as_ref()
+                .is_some_and(|offline| offline.reconnecting && offline.since.is_some())
+        }));
+        // The service restarts while the server is still unreachable: the
+        // cache answers before any connection.
+        let storage = federation.storage().clone();
+        drop(federation);
+        let restarted = Federation::new(storage, Box::new(|_| anyhow::bail!("unreachable")));
+        restarted.reload();
+        let list = restarted.list(Vec::new());
+        let titles: Vec<_> = list
+            .iter()
+            .map(|s| (s.id.as_str(), s.title.as_str()))
+            .collect();
+        assert!(titles.contains(&("box:1", "Kept")), "{titles:?}");
+        assert!(list.iter().all(|s| s.offline.is_some()));
+        let Reply::Session(cached) = handled(
+            &restarted,
+            Request::Read {
+                id: "box:1".into(),
+                version: None,
+            },
+        )?
+        else {
+            anyhow::bail!("cached session");
+        };
+        assert_eq!(cached.id, "box:1");
+        assert!(cached.offline.is_some());
+        assert!(
+            cached
+                .entries
+                .iter()
+                .any(|e| e.text.as_str() == "cached reply")
+        );
+        // The watch shows the copy, marked offline, and keeps heartbeating
+        // instead of failing.
+        let mut sent = Vec::new();
+        let result = restarted.watch("box", "1", |reply| {
+            sent.push(reply.clone());
+            if sent.len() >= 3 {
+                anyhow::bail!("the terminal app left");
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        let [Reply::Session(shown), Reply::Unchanged, Reply::Unchanged] = sent.as_slice() else {
+            anyhow::bail!("copy then heartbeats: {sent:?}");
+        };
+        assert!(shown.offline.is_some() && shown.title == "Kept");
+        // Background reads fail at once; actions wait briefly for the
+        // reconnect they trigger, then say why.
+        let started = Instant::now();
+        let error = handled(&restarted, Request::Statistics { id: "box:1".into() })
+            .err()
+            .context("offline")?;
+        assert!(started.elapsed() < PATIENCE);
+        assert!(format!("{error:#}").contains("box is offline"), "{error:#}");
+        let error = handled(&restarted, Request::Delete { id: "box:1".into() })
+            .err()
+            .context("offline")?;
+        assert!(
+            format!("{error:#}").contains("try again when it reconnects"),
+            "{error:#}"
+        );
+        assert!(
+            restarted
+                .lock()
+                .links
+                .get("box")
+                .is_some_and(|link| link.urgent),
+            "the action asked for a reconnect"
+        );
+        // A session never opened here has no copy to read.
+        assert!(
+            handled(
+                &restarted,
+                Request::Read {
+                    id: "box:2".into(),
+                    version: None
+                }
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn messages_to_an_offline_server_wait_in_its_outbox_and_go_out_in_order() -> Result<()> {
+        let fake = Fake::new(vec![session("1"), session("2")]);
+        let (_dir, federation) = connected(vec![("box", fake.clone())])?;
+        let image = png()?;
+        let copies = pasted(&federation, &[("shot.png", &image)])?;
+        fake.closed.store(true, Ordering::Relaxed);
+        for request in [
+            message("box:1", "first [image 1]", copies.clone()),
+            message("box:1", "second", Vec::new()),
+            message("box:2", "other", Vec::new()),
+        ] {
+            assert!(matches!(handled(&federation, request)?, Reply::Ok));
+        }
+        assert!(controls(&fake).is_empty(), "nothing reached the server");
+        let list = federation.list(Vec::new());
+        assert_eq!(
+            list.iter().find(|s| s.id == "box:1").map(|s| s.queued),
+            Some(2)
+        );
+        // The queue shows them at its end; they can be edited and removed
+        // like any queued message.
+        let edited = handled(
+            &federation,
+            Request::Control {
+                id: "box:1".into(),
+                control: Control::ReplaceQueued {
+                    index: 1,
+                    expected: Prompt::WithSkills {
+                        text: "second".into(),
+                        skills: Vec::new(),
+                        attachments: Vec::new(),
+                    },
+                    replacement: Some(Prompt::WithSkills {
+                        text: "second, edited".into(),
+                        skills: Vec::new(),
+                        attachments: Vec::new(),
+                    }),
+                },
+            },
+        )?;
+        assert!(matches!(edited, Reply::Ok));
+        assert!(controls(&fake).is_empty(), "edited here");
+        let cached = federation
+            .cache("box")
+            .context("cache")?
+            .outbox()
+            .into_iter()
+            .map(|message| message.text)
+            .collect::<Vec<_>>();
+        assert_eq!(cached, vec!["first [image 1]", "second, edited", "other"]);
+
+        // The outbox survives a restart, and the server is reachable again.
+        let storage = federation.storage().clone();
+        drop(federation);
+        let server = Fake::new(vec![session("1"), session("2")]);
+        let restarted = linked(
+            storage,
+            BTreeMap::from([("box".to_owned(), server.clone() as Arc<dyn Remote>)]),
+        )?;
+        restarted.flush(
+            "box",
+            generation(&restarted, "box")?,
+            &restarted.remote("box")?,
+        );
+        let sent = controls(&server);
+        let order: Vec<_> = sent
+            .iter()
+            .map(|(id, control)| (id.as_str(), text(control)))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("1", "first [image 1]"),
+                ("1", "second, edited"),
+                ("2", "other")
+            ]
+        );
+        // Queued behind any running turn, with the attachment uploaded first.
+        assert!(sent.iter().all(|(_, control)| matches!(
+            control,
+            Control::Message { queue: true, .. }
+                | Control::MessageWithAttachments { queue: true, .. }
+        )));
+        let Some((_, Control::MessageWithAttachments { attachments, .. })) = sent.first() else {
+            anyhow::bail!("the first message carries its image: {sent:?}");
+        };
+        assert!(
+            attachments
+                .iter()
+                .all(|a| a.path.starts_with("/srv/difu/agents/attachments/1")),
+            "{attachments:?}"
+        );
+        let requests = server.requests();
+        let upload = requests
+            .iter()
+            .position(|r| matches!(r, Request::UploadAttachment { .. }));
+        let first = requests
+            .iter()
+            .position(|r| matches!(r, Request::Control { .. }));
+        assert!(upload < first && upload.is_some(), "{requests:?}");
+        assert!(restarted.cache("box").context("cache")?.outbox().is_empty());
+        let list = restarted.list(Vec::new());
+        assert!(list.iter().all(|s| s.queued == 0 && s.offline.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn refused_messages_wait_for_an_edit_and_unconfirmed_ones_are_not_sent_twice() -> Result<()> {
+        let fake = Fake::new(vec![session("1")]);
+        let (_dir, federation) = connected(vec![("box", fake.clone())])?;
+        fake.closed.store(true, Ordering::Relaxed);
+        for text in ["moved away", "check me"] {
+            handled(&federation, message("box:1", text, Vec::new()))?;
+        }
+        fake.closed.store(false, Ordering::Relaxed);
+        let reason = "This session moved to home:9; it takes no more messages";
+        if let Ok(mut refuse) = fake.refuse.lock() {
+            *refuse = Some(reason.into());
+        }
+        let remote = federation.remote("box")?;
+        let generation = generation(&federation, "box")?;
+        federation.flush("box", generation, &remote);
+        let outbox = federation.cache("box").context("cache")?.outbox();
+        assert_eq!(outbox.len(), 2, "refused messages are never dropped");
+        let attempts = |fake: &Fake| {
+            controls(fake)
+                .iter()
+                .filter(|(_, control)| text(control) == "check me")
+                .count()
+        };
+        let refused = attempts(&fake);
+        assert!(outbox.iter().all(|m| m.error.as_deref() == Some(reason)));
+        // The watched session shows them with the server's reason.
+        let overlay = federation.overlay("box", "1").context("overlay")?;
+        assert_eq!(overlay.held.len(), 2);
+        // Editing one sends it again; this time the reply is lost.
+        if let Ok(mut refuse) = fake.refuse.lock() {
+            *refuse = None;
+        }
+        fake.lose.store(true, Ordering::Relaxed);
+        handled(
+            &federation,
+            Request::Control {
+                id: "box:1".into(),
+                control: Control::ReplaceQueued {
+                    index: 0,
+                    expected: Prompt::WithSkills {
+                        text: "check me".into(),
+                        skills: Vec::new(),
+                        attachments: Vec::new(),
+                    },
+                    replacement: Some(Prompt::WithSkills {
+                        text: "check me".into(),
+                        skills: Vec::new(),
+                        attachments: Vec::new(),
+                    }),
+                },
+            },
+        )?;
+        federation.flush("box", generation, &remote);
+        let outbox = federation.cache("box").context("cache")?.outbox();
+        let unconfirmed = outbox
+            .iter()
+            .find(|m| m.text == "check me")
+            .context("still held")?;
+        assert!(unconfirmed.uncertain && unconfirmed.error.is_none());
+        // Next time difu sees it arrived and does not send it again.
+        fake.lose.store(false, Ordering::Relaxed);
+        federation.flush("box", generation, &remote);
+        assert_eq!(attempts(&fake), refused + 1, "sent once after the edit");
+        let outbox = federation.cache("box").context("cache")?.outbox();
+        assert_eq!(
+            outbox.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            vec!["moved away"]
+        );
+        // The refused one goes only when removed.
+        handled(
+            &federation,
+            Request::Control {
+                id: "box:1".into(),
+                control: Control::ReplaceQueued {
+                    index: 1,
+                    expected: Prompt::WithSkills {
+                        text: "moved away".into(),
+                        skills: Vec::new(),
+                        attachments: Vec::new(),
+                    },
+                    replacement: None,
+                },
+            },
+        )?;
+        assert!(
+            federation
+                .cache("box")
+                .context("cache")?
+                .outbox()
+                .is_empty()
+        );
+        // Messages to a reachable server with nothing held go straight out.
+        handled(&federation, message("box:1", "direct", Vec::new()))?;
+        assert!(controls(&fake).iter().any(|(_, c)| text(c) == "direct"));
         Ok(())
     }
 }

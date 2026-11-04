@@ -8,6 +8,7 @@ pub mod disk;
 pub mod environments;
 pub mod federation;
 pub mod logins;
+pub mod offline;
 pub mod onboard;
 pub mod password;
 pub mod repos;

@@ -1372,6 +1372,16 @@ so. `difu server list|remove|ssh|pair|upgrade`
 manage saved servers; on the server, `difu repos` and `difu remote` manage
 repositories, pairing, devices and the password.
 
+**Offline servers.** Your Mac keeps a copy of each server's session list and
+of the sessions you open (plus a dozen recent ones), so server sessions appear
+as soon as difu starts and never vanish when the connection drops: the sidebar
+dims their ☁️ and says *reconnecting…* or *offline* next to the server's name,
+and you can still read them. Messages you send meanwhile wait on your Mac, at
+the end of the session's queue where you can edit or remove them, and go out
+in order once the server is back; other actions that need the server say it
+is offline. A dead connection is noticed within 25 seconds and replaced within
+seconds, even when your Mac's address changes (iCloud Private Relay, WARP).
+
 **Cmd+K → /cloud** lists every saved server: whether it is connected (or why
 not), its difu version (with `difu server upgrade <name>` when it differs from
 this Mac's), address, active and total sessions, GitHub, Codex and Claude Code

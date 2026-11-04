@@ -831,13 +831,34 @@ feature without a second API.
 | Method | Params | Result |
 | --- | --- | --- |
 | `rpc` | `{"request": Request}` | `{"reply": Reply}` |
-| `rpc.watch` | `{"id","version"?}` | `{"stream": n}`, then events `{"event":"rpc.watch","data":{"stream":n,"reply":Reply}}` until `rpc.unwatch` or `{"event":"rpc.watch.closed","data":{"stream":n,"message":"..."}}` |
+| `rpc.watch` | `{"id","version"?,"fingerprint"?}` | `{"stream": n}`, then events `{"event":"rpc.watch","data":{"stream":n,"reply":Reply}}` until `rpc.unwatch` or `{"event":"rpc.watch.closed","data":{"stream":n,"message":"..."}}` |
 | `rpc.unwatch` | `{"stream"}` | `{}` |
 
 `standard` devices get an error for these. A service error comes back as the
 call's `error`; `Request::Watch` must use `rpc.watch`. Clients must check that the
 server's `version` equals their own before using `rpc` (`difu server upgrade`
 fixes a mismatch).
+
+`rpc.watch` normally starts with the full session (`Session`), then deltas. A
+client that already holds a copy (a Mac resuming from its cache) sends its
+`fingerprint`, and the first event is `Unchanged` when that copy is current,
+otherwise a `SessionDelta` on top of it; later events build on it as usual:
+
+```json
+{"method": "rpc.watch", "params": {"id": "1790000000000-ab12cd34", "version": 41,
+  "fingerprint": {"version": 41, "digest": "<sha-256 of the session JSON, hex>",
+                  "entries": ["<16 hex digits per entry>", "..."],
+                  "subagents": {"<sub-agent id>": ["..."]}}}}
+```
+
+* `digest` is the SHA-256 (hex) of the session's JSON as the service sends
+  it; equal means nothing changed.
+* `entries` (and each sub-agent's list) hold the first 16 hex digits of the
+  SHA-256 of each entry's JSON, in order. The delta's `base` is the
+  fingerprint's `version`; it carries every entry whose hash differs or that
+  is new, the new entry count (a shorter session truncates the copy) and all
+  metadata.
+* Servers that predate `fingerprint` ignore it and send the full session.
 
 Three service requests exist for clients whose sessions live elsewhere:
 
@@ -863,7 +884,8 @@ Three service requests exist for clients whose sessions live elsewhere:
 * Saved servers live in `<config>/servers.json` (0600): name, server id, hosts,
   port, fingerprint, device id and token.
 * The local agent service connects to every saved server as a `full` device and
-  merges their sessions into `Request::List` replies. Server session ids are
+  merges their sessions into `Request::List` replies, from its cache while a
+  server is unreachable (see *Staying connected, and offline servers*). Server session ids are
   namespaced as `<server name>:<session id>` and summaries carry `server`: the
   sessions list shows a ☁️ after the worktree 🌳 and the server's name before
   the repository when the row has room. Requests for a namespaced id are forwarded with `rpc`; watches
@@ -942,6 +964,85 @@ Three service requests exist for clients whose sessions live elsewhere:
   critical server with the server's message before sending anything.
 * The phone API of a Mac hides relayed server sessions, because phones connect to
   servers directly.
+
+### Staying connected, and offline servers (Mac)
+
+Laptops sleep and change networks, and iCloud Private Relay or WARP change
+the Mac's public address, which silently kills long-lived connections. The
+Mac's local service therefore treats every server connection as unreliable,
+and server sessions never disappear because a server cannot be reached.
+
+* **Liveness.** The client pings a quiet server every 10 s and drops a
+  connection that sent nothing at all (no frame, no pong) for 25 s. TCP
+  keepalive (probes after 15 s idle, every 5 s, 3 probes) lets the kernel
+  notice a dead path as well. A failed or slow request (an error reply, a
+  long answer) never closes the connection; only transport errors do.
+* **Reconnects** start 0.5 s after a drop and double up to 10 s, spread
+  ±25%; a connection that lasted 30 s resets the delay, so a flapping link
+  keeps backing off. A person's request (a message, an approval, a `/cloud`
+  action) that finds the server unreachable makes its worker reconnect at
+  once and waits up to 3 s for it.
+* **Cache.** Each saved server has `<config>/agents/servers/<server>/` (0700,
+  every file written atomically):
+  * `server.json`: the server id; another server saved under the same name
+    starts with an empty cache.
+  * `sessions.json`: the server's last session list and when it was read.
+  * `snapshots/<session>@<version>.json`: the last full copy (with the
+    server's own session id) of every session this Mac opened, and of the
+    12 most recently updated idle, unarchived sessions, which the service
+    copies one per second while a terminal app is open and their copy is
+    missing or older. Copies of sessions a connected server no longer lists
+    are dropped, then the least recently used beyond 100 copies or 256 MB
+    (the newest always stays).
+  * `outbox.json`: held messages, below.
+
+  The cache is loaded when the service starts, so server sessions appear
+  before any connection. Removing the server (`difu server remove`, or from
+  `servers.json`) removes its directory.
+* **Never hidden.** While a server is unreachable its sessions stay listed,
+  with `Summary.offline` = `{"since", "reconnecting"}` (`since`: when the
+  server last answered, in milliseconds; `reconnecting`: the first 30 s
+  after the drop). The sessions list dims the ☁️ and says "reconnecting…"
+  (yellow) or "offline" (red) after the server's name when the row has room,
+  and the conversation title says "on aws (offline)". Selecting one shows its
+  cached copy, read-only (`Session.offline` is set); a session that was never
+  copied shows nothing until the server is back. Requests the terminal app
+  repeats on its own (statistics, changes, PRs, shells, skills) fail at once
+  instead of waiting, and it stops polling statistics and changes for
+  offline sessions. A server running another difu version still hides its
+  sessions until `difu server upgrade`.
+* **Resumed watches.** A watch of a server session (`Request::Watch` to the
+  local service) sends the cached copy first, then opens `rpc.watch` with its
+  `fingerprint`, so an unchanged session costs nothing and a changed one
+  only its changes. A dropped watch or connection is reopened when the
+  server is back; the terminal app sees heartbeats, never an error, and the
+  same baseline-then-deltas stream as for a local session. The copy is
+  written at most every 15 s while it changes and when the watch ends or
+  loses the server; an unchanged session list at most once a minute.
+* **Outbox.** A message (with its attachments) for a session whose server is
+  unreachable is held in `outbox.json` and the send succeeds. Attachments are
+  checked when the message is held (present, the session's own, unchanged,
+  at most 32 MB), so a bad file fails at once. Held messages appear at the end
+  of the session's `queue`; `Session.held` (one `{"error"?}` per message)
+  marks those last prompts, which the terminal app lists as "Messages queued
+  until aws reconnects" (and in the queue editor as "queued until aws
+  reconnects"). They are edited and removed like queued messages:
+  `ReplaceQueued` naming a held prompt is answered by the local service. A
+  session with held messages keeps its later messages behind them even while
+  connected, so their order holds. After a reconnect the worker sends them in
+  order, each with `queue: true` (so they wait for a running turn), uploading
+  the attachments first. A message the server refuses stays with the reason
+  ("Not accepted by aws: …") until it is edited, which sends it again, or
+  removed. When the connection drops after a message was written but before
+  the server confirmed it, the next attempt first looks for it in the
+  session's queue and latest user messages, so it is not sent twice. Held
+  messages for a session a connected server no longer lists (deleted) go
+  with the session.
+* **Other actions** that need the server (answers, approvals, mode changes,
+  renames, deletes, shells, new sessions, `/cloud` actions) are not queued:
+  replayed later they could act on a session that has moved on. After the 3 s
+  wait they fail with "aws is offline; try again when it reconnects (messages
+  you send are queued until then)".
 
 ### iPhone
 

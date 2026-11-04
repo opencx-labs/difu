@@ -25,6 +25,37 @@ pub(super) fn summary(session: &Session) -> Summary {
     summary
 }
 
+/// How a session of an unreachable server is marked: "reconnecting…" just
+/// after the connection dropped, then "offline".
+pub(super) fn offline_label(offline: &crate::agents::Offline) -> &'static str {
+    if offline.reconnecting {
+        "reconnecting…"
+    } else {
+        "offline"
+    }
+}
+
+pub(super) fn offline_color(offline: &crate::agents::Offline) -> ratatui::style::Color {
+    if offline.reconnecting {
+        crate::ui::YELLOW
+    } else {
+        RED
+    }
+}
+
+/// Labels for the last `session.held.len()` queued messages, which wait on
+/// this computer for the session's server.
+pub(super) fn held_label(session: &Session, index: usize) -> Option<String> {
+    let first = session.queue.len().checked_sub(session.held.len())?;
+    let held = session.held.get(index.checked_sub(first)?)?;
+    let server = server_name(&session.id).unwrap_or("the server");
+    Some(match (&held.error, &session.offline) {
+        (Some(_), _) => format!("not accepted by {server}"),
+        (None, Some(_)) => format!("queued until {server} reconnects"),
+        (None, None) => format!("sending to {server}"),
+    })
+}
+
 impl Ui {
     /// The saved server running the selected session; `None` is this Mac.
     pub(super) fn selected_server(&self) -> Option<String> {
@@ -32,6 +63,18 @@ impl Ui {
             .as_deref()
             .and_then(server_name)
             .map(str::to_owned)
+    }
+
+    /// How a server session is marked while its server is unreachable: from
+    /// the latest list, else from the session itself.
+    pub(super) fn offline(&self, id: &str) -> Option<&crate::agents::Offline> {
+        if !is_server_session(id) {
+            return None;
+        }
+        match self.summaries.iter().find(|summary| summary.id == id) {
+            Some(summary) => summary.offline.as_ref(),
+            None => self.sessions.get(id).and_then(|s| s.offline.as_ref()),
+        }
     }
 }
 
@@ -160,6 +203,140 @@ mod tests {
             .iter()
             .any(|cell| cell.symbol() == "h" && cell.fg == crate::ui::YELLOW);
         assert!(colored, "the server name takes the low-disk color");
+        Ok(())
+    }
+
+    #[test]
+    fn unreachable_server_sessions_stay_listed_with_an_offline_mark() -> Result<()> {
+        let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
+        ui.preferences.layout.sidebar_width = 40;
+        let mut session = crate::cloud::federation::tests::session("aws:1");
+        session.title = "Server task".into();
+        let mark = |reconnecting| {
+            Some(crate::agents::Offline {
+                since: Some(1_790_000_000_000),
+                reconnecting,
+            })
+        };
+        session.offline = mark(true);
+        ui.summaries.push(summary(&session));
+        ui.sessions.insert(session.id.clone(), session);
+        ui.selected = Some("aws:1".into());
+        ui.drilled = false;
+        ui.focus = Focus::List;
+        let draw = |ui: &mut Ui| -> Result<ratatui::buffer::Buffer> {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40))?;
+            terminal.draw(|frame| ui.draw(frame))?;
+            Ok(terminal.backend().buffer().clone())
+        };
+        let text = |buffer: &ratatui::buffer::Buffer| -> String {
+            buffer.content.iter().map(|c| c.symbol()).collect()
+        };
+        let buffer = draw(&mut ui)?;
+        let shown = text(&buffer);
+        assert!(shown.contains("aws · reconnecting… · api"), "{shown}");
+        assert!(shown.contains("on aws (reconnecting…)"), "{shown}");
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "w" && cell.fg == crate::ui::YELLOW),
+            "the server name takes the reconnecting color"
+        );
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|cell| cell.symbol().starts_with('☁')
+                    && cell.modifier.contains(ratatui::style::Modifier::DIM)),
+            "the cloud dims"
+        );
+        // After a while it is simply offline; the list's mark wins over a
+        // session snapshot that predates the drop.
+        for summary in &mut ui.summaries {
+            summary.offline = mark(false);
+        }
+        let buffer = draw(&mut ui)?;
+        let shown = text(&buffer);
+        assert!(shown.contains("aws · offline · api"), "{shown}");
+        assert!(shown.contains("on aws (offline)"), "{shown}");
+        assert!(
+            buffer
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "w" && cell.fg == RED)
+        );
+        // Reconnected: no mark at all.
+        for summary in &mut ui.summaries {
+            summary.offline = None;
+        }
+        let shown = text(&draw(&mut ui)?);
+        assert!(
+            !shown.contains("offline") && !shown.contains("reconnecting"),
+            "{shown}"
+        );
+        assert!(shown.contains("aws · api"), "{shown}");
+        Ok(())
+    }
+
+    #[test]
+    fn messages_held_for_an_unreachable_server_show_in_the_queue() -> Result<()> {
+        let mut session = crate::cloud::federation::tests::session("aws:1");
+        session.queue = vec![
+            "already on the server".into(),
+            "written offline".into(),
+            "refused".into(),
+        ];
+        session.held = vec![
+            crate::agents::Held::default(),
+            crate::agents::Held {
+                error: Some("This session moved to home:9".into()),
+            },
+        ];
+        session.offline = Some(crate::agents::Offline {
+            since: None,
+            reconnecting: false,
+        });
+        let rows = |session: &Session| -> String {
+            super::super::transcript::waiting_messages(session, 140, &[])
+                .iter()
+                .map(|line| {
+                    line.spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let text = rows(&session);
+        let order = [
+            "Messages queued for the next turn",
+            "already on the server",
+            "Messages queued until aws reconnects",
+            "written offline",
+            "Not accepted by aws: This session moved to home:9",
+            "refused",
+        ]
+        .map(|needle| text.find(needle));
+        assert!(order.iter().all(Option::is_some), "{text}");
+        assert!(
+            order.windows(2).all(|pair| matches!(pair, [a, b] if a < b)),
+            "{text}"
+        );
+        assert_eq!(held_label(&session, 0), None);
+        assert_eq!(
+            held_label(&session, 1).as_deref(),
+            Some("queued until aws reconnects")
+        );
+        assert_eq!(
+            held_label(&session, 2).as_deref(),
+            Some("not accepted by aws")
+        );
+        // Back online, the rest is on its way.
+        session.offline = None;
+        assert!(rows(&session).contains("Messages being sent to aws"));
+        assert_eq!(held_label(&session, 1).as_deref(), Some("sending to aws"));
         Ok(())
     }
 

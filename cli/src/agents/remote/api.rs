@@ -669,7 +669,18 @@ fn devices(inner: &Inner) -> Result<Vec<Value>> {
 
 /// Answer with the stream number, then forward every service reply for the
 /// session until `rpc.unwatch`, a closed connection, or the service ending it.
+///
+/// With a `fingerprint` of the copy the client already holds (a Mac resuming
+/// from its cache), the first reply is `Unchanged` when that copy is current
+/// and otherwise a delta on top of it, instead of the full session.
 fn rpc_watch(inner: &Arc<Inner>, id: Value, params: &Value) {
+    let mut resume: Option<transport::Fingerprint> = match optional(params, "fingerprint") {
+        Ok(fingerprint) => fingerprint,
+        Err(error) => {
+            inner.push(&response(id, Err(error)));
+            return;
+        }
+    };
     let opened = (|| -> Result<(u64, Arc<AtomicBool>, BufReader<UnixStream>)> {
         inner.full()?;
         let session: String = param(params, "id")?;
@@ -714,6 +725,12 @@ fn rpc_watch(inner: &Arc<Inner>, id: Value, params: &Value) {
     while !stop.load(Ordering::Relaxed) && !inner.closed.load(Ordering::Relaxed) {
         match transport::read_reply(&mut reader) {
             Ok(reply) => {
+                // The service always starts with a full baseline; later
+                // deltas build on it, which the client's copy now matches.
+                let reply = match (resume.take(), reply) {
+                    (Some(held), Reply::Session(session)) => transport::resume(&held, &session),
+                    (_, reply) => reply,
+                };
                 if let Reply::Error(error) = &reply {
                     message = Some(error.clone());
                 }
