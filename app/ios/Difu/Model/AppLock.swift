@@ -133,9 +133,19 @@ enum LockShield {
         if visible {
             show(lock)
         } else {
-            window?.isHidden = true
-            window = nil
+            hide()
         }
+    }
+
+    /// Hides the shield and hands key status back to the app's window, so
+    /// text fields in it and its sheets get the keyboard again.
+    private static func hide() {
+        guard let shield = window else { return }
+        shield.isHidden = true
+        window = nil
+        shield.windowScene?.windows
+            .first { $0 !== shield && !$0.isHidden && $0.windowLevel == .normal }?
+            .makeKey()
     }
 
     private static func show(_ lock: AppLock) {

@@ -65,8 +65,23 @@ list (with a server badge once there's more than one). New sessions start by
 picking a server. Each server's page in Settings shows its disk space (free
 space, status, what uses it, and cleanups for archived worktrees, build outputs
 and sandbox storage), logins (GitHub and Codex device-code login, Claude Code
-token), repositories (add, remove, **Refresh Mains**), repository rules and
-paired devices.
+token), repositories (add, remove, **Refresh Mains**), new session defaults,
+repository rules and paired devices.
+
+**New Session** starts from the chosen computer's or server's new session
+defaults: its default repository, model and effort. When it saved no model, the
+sheet picks Claude Opus (the newest Opus that computer's Claude Code offers)
+with extra-high reasoning, or the highest it supports; without Claude Code
+there, it stays on Default. Repositories, models and defaults load
+independently, every control works while they do, and what you choose stays
+when lists arrive. Type another repository (`owner/name` on a server, a full
+path on a computer) to use one that isn't listed.
+
+**Settings › (server) › New Session Defaults** changes those defaults on that
+computer or server, where its terminal and agents use them too: provider and
+model, effort, starting mode and repository (each session gets its own
+worktree). **Use Claude Opus · xhigh** saves that in one tap. Computers with an
+older difu don't show the screen and still get the Opus preselection.
 
 In a session, type **/** at the start of the message to see its commands:
 difu's (compact, model and effort, status and usage, permissions, rules,
@@ -156,6 +171,7 @@ swift run difu-remote-probe send <session-id> "Run the tests" --queue
 swift run difu-remote-probe inbox --refresh
 swift run difu-remote-probe overview opencx-labs/difu 45
 swift run difu-remote-probe call agents.models          # any method, raw JSON
+swift run difu-remote-probe call agents.defaults.set '{"model":"claude/opus","effort":"xhigh"}'
 swift run difu-remote-probe call session.commands '{"id":"…"}'
 swift run difu-remote-probe call session.command '{"id":"…","name":"/compact"}'
 swift run difu-remote-probe call session.entry '{"id":"…","entry":"item_12"}'

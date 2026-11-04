@@ -281,6 +281,8 @@ all other fields with `session` (including `version`).
 | `agents.new` | `repository` (path or null for the default), `model`, `effort`, `text` (first message, optional) | `{"id": "..."}` — a `model` picks its own provider; the saved provider, effort and starting mode apply only when they belong to it |
 | `agents.repositories` | – | `{"repositories": [{"path": "...", "name": "difu", "default": true}]}` |
 | `agents.models` | – | `{"models": [{"id": "gpt-5.6-luna", "name": "GPT-5.6 Luna", "provider": "codex", "efforts": ["low","medium","high"]}]}` (slow: seconds) |
+| `agents.defaults` | – | `AgentDefaults`; see *New-session defaults* |
+| `agents.defaults.set` | any of `provider`, `model`, `effort`, `repository`, `startingMode`, `isolated` | `AgentDefaults` as saved |
 | `server.info` | – | `{"name", "version", "hosts", "port"}` |
 
 **Switching providers.** `agents.models` lists both providers' models, and
@@ -292,6 +294,40 @@ effort only between turns too; otherwise the call fails with "Finish the current
 turn and pending requests before switching models or providers". A provider is
 derived from a model the same way everywhere: `claude/…`, `claude-…`, `sonnet`,
 `opus` and `haiku` are Claude Code, everything else Codex.
+
+**New-session defaults.** `agents.defaults` reads the defaults a computer or
+server applies to new sessions: the ones its terminal edits under "Default
+repository, model, reasoning and worktree" and in `/settings` › Agent defaults,
+also used by `agents.new` and by its terminal's new-session form for that
+location. `agents.defaults.set` saves them there with the terminal's settings
+transaction (other settings and unknown fields stay untouched).
+
+`AgentDefaults`:
+
+```json
+{
+  "provider": "claude",             // codex | claude: the saved provider, or the saved model's
+  "model": "claude/claude-opus-4-7",// null = the provider's configured model
+  "effort": "xhigh",                // null = the model's default
+  "repository": "/Users/ali/code/difu",   // null = none
+  "startingMode": null,             // a startingModes[].id of the provider; null = its default
+  "isolated": true,                 // saved for the terminal; sessions always get their own worktree
+  "providers": [{"id": "codex", "label": "Codex",
+                 "startingModes": [{"id": "default", "label": "Regular", "description": "Native coding mode"},
+                                   {"id": "plan", "label": "Plan", "description": "Native planning mode"}]},
+                {"id": "claude", "label": "Claude Code", "startingModes": [...]}]
+}
+```
+
+Models and their efforts come from `agents.models`, repositories from
+`agents.repositories`. `agents.defaults.set` changes only the keys it is given;
+`null` or `""` sets one back to automatic. A `model` of the other provider (or
+a `provider` alone) switches the provider and drops the saved model, effort and
+starting mode of the old one unless they are given too. It fails without saving
+anything when the model belongs to a different `provider`, the starting mode
+isn't one of the provider's, or `repository` isn't a folder on that machine.
+Computers without these methods answer `Unknown method`; the iOS app then hides
+its defaults screen.
 
 `DiffFile`: `{"path": "src/a.rs", "oldPath": null, "status": "modified", "additions": 3, "deletions": 1, "patch": "@@ ...", "truncated": false}`;
 `status` is `added | deleted | modified | renamed`. `patch` contains hunks only

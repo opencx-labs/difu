@@ -194,6 +194,18 @@ extension DifuAPI {
         try await request("agents.models", as: ModelsResult.self).models
     }
 
+    /// The new-session defaults saved on the computer or server. Older
+    /// computers answer `Unknown method` (`RemoteError.isUnknownMethod`).
+    public func agentDefaults() async throws -> AgentDefaults {
+        try await request("agents.defaults", as: AgentDefaults.self)
+    }
+
+    /// Saves new-session defaults there and returns them as saved.
+    @discardableResult
+    public func setAgentDefaults(_ change: AgentDefaultsChange) async throws -> AgentDefaults {
+        try await request("agents.defaults.set", change.params, as: AgentDefaults.self)
+    }
+
     public func serverInfo() async throws -> ServerInfo {
         try await request("server.info", as: ServerInfo.self)
     }

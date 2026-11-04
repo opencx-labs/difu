@@ -8,6 +8,7 @@
 //! docs/cloud-agents.md.
 mod api;
 mod commands;
+mod defaults;
 mod identity;
 mod listener;
 mod network;

@@ -525,6 +525,8 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
         "agents.new" => new_session(inner, params),
         "agents.repositories" => Ok(json!({"repositories": repositories(inner)?})),
         "agents.models" => models(inner),
+        "agents.defaults" => Ok(super::defaults::get(&inner.storage)),
+        "agents.defaults.set" => super::defaults::set(&inner.storage, params),
         "reviews.inbox" => reviews::inbox(
             &inner.storage,
             optional::<bool>(params, "refresh")?.unwrap_or(false),
