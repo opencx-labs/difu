@@ -33,6 +33,10 @@ struct SessionRow: View {
     let summary: SessionSummary
     /// The session's server, shown as a badge when several are saved.
     var server: ServerConnection?
+    /// The session runs on a cloud server (☁️).
+    var onServer = false
+    /// The folder holding it, shown in search results.
+    var folder: String?
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
@@ -51,16 +55,10 @@ struct SessionRow: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                HStack(spacing: 6) {
+                FlowLayout {
                     StatusBadge(summary: summary)
-                    if summary.pending > 0 {
-                        Pill(text: "\(summary.pending)", systemImage: "questionmark.bubble.fill", color: .warning)
-                    }
-                    if summary.queued > 0 {
-                        Pill(text: "\(summary.queued) queued", systemImage: "tray.full")
-                    }
-                    if summary.archived {
-                        Pill(text: "Archived", systemImage: "archivebox")
+                    ForEach(badges.filter { !$0.isPlaceMarker }, id: \.self) { badge in
+                        SessionBadgePill(badge: badge)
                     }
                     if let pr = summary.prs.first {
                         let style = SessionPrStyle(pr)
@@ -74,12 +72,12 @@ struct SessionRow: View {
                         ServerBadge(server: server)
                     }
                 }
-                if let subtitle {
-                    Text(subtitle)
-                        .font(.monoCaption)
+                SessionPlaceText(summary: summary, badges: badges)
+                if let folder {
+                    Label(folder, systemImage: "folder")
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
-                        .truncationMode(.middle)
                 }
             }
         }
@@ -106,9 +104,8 @@ struct SessionRow: View {
         }
     }
 
-    private var subtitle: String? {
-        let parts = [summary.repository, summary.branch].compactMap { $0 }.filter { !$0.isEmpty }
-        return parts.isEmpty ? nil : parts.joined(separator: " · ")
+    private var badges: [SessionBadge] {
+        SessionBadge.row(summary, onServer: onServer)
     }
 }
 

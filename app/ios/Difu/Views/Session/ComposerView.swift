@@ -20,6 +20,8 @@ struct QueueSection: View {
     let view: SessionView
     let remove: (Int) -> Void
     let sendNow: () -> Void
+    /// Opens a queued message to edit; shortened ones can't be edited here.
+    var edit: ((QueuedMessage) -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -41,6 +43,12 @@ struct QueueSection: View {
                         .font(.callout)
                         .lineLimit(2)
                         .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            if !message.truncated { edit?(message) }
+                        }
+                        .accessibilityAddTraits(edit != nil && !message.truncated ? .isButton : [])
+                        .accessibilityHint(edit != nil && !message.truncated ? "Edit the queued message" : "")
                     Button {
                         remove(message.index)
                     } label: {

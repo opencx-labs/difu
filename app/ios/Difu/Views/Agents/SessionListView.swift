@@ -10,11 +10,9 @@ struct SessionListView: View {
     @Environment(AppModel.self) private var app
     @State private var filter = Filter.active
     @State private var search = ""
-    @State private var path: [SessionRef] = []
+    @State private var path = NavigationPath()
     @State private var showingNewSession = false
-    @State private var renaming: ServerSession?
-    @State private var renameText = ""
-    @State private var error: String?
+    @State private var actions = SessionListActions()
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -36,6 +34,9 @@ struct SessionListView: View {
                 .navigationDestination(for: SessionRef.self) { ref in
                     SessionScreen(ref: ref)
                 }
+                .navigationDestination(for: FolderRef.self) { ref in
+                    FolderSessionsView(ref: ref)
+                }
                 .sheet(isPresented: $showingNewSession) {
                     NewSessionSheet { ref in path.append(ref) }
                 }
@@ -44,12 +45,7 @@ struct SessionListView: View {
                     app.requestedSession = nil
                     path.append(ref)
                 }
-                .alert("Rename Session", isPresented: renameBinding) {
-                    TextField("Title", text: $renameText)
-                    Button("Cancel", role: .cancel) {}
-                    Button("Rename") { rename() }
-                }
-                .errorAlert($error)
+                .modifier(SessionActionsHost(actions: actions))
         }
     }
 
@@ -77,37 +73,37 @@ struct SessionListView: View {
                     .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                     .listRowBackground(Color.clear)
                 }
-                Section {
-                    ForEach(filtered) { item in
-                        let summary = item.summary
-                        NavigationLink(value: item.id) {
-                            SessionRow(summary: summary, server: app.showsServerBadges ? item.server : nil)
+                if isSearching {
+                    Section {
+                        ForEach(filtered) { item in
+                            row(item, folder: item.server.sessions.folder(folderID(item))?.name)
                         }
-                        .swipeActions(edge: .trailing, allowsFullSwipe: false) {
-                            if !summary.orchestrator {
-                                Button {
-                                    archive(item)
-                                } label: {
-                                    Label(
-                                        summary.archived ? "Unarchive" : "Archive",
-                                        systemImage: summary.archived ? "tray.and.arrow.up" : "archivebox")
+                    }
+                } else {
+                    let arranged = arrangement
+                    let top = arranged.loose.filter { $0.summary.orchestrator }
+                    let rest = arranged.loose.filter { !$0.summary.orchestrator }
+                    if arranged.folders.isEmpty {
+                        Section {
+                            ForEach(top + rest) { item in row(item) }
+                        }
+                    } else {
+                        if !top.isEmpty {
+                            Section {
+                                ForEach(top) { item in row(item) }
+                            }
+                        }
+                        Section("Folders") {
+                            ForEach(arranged.folders) { folder in
+                                NavigationLink(value: folder.id) {
+                                    FolderRow(folder: folder, showsServer: app.showsServerBadges)
                                 }
-                                .tint(.indigo)
+                                .contextMenu { FolderMenuItems(folder: folder, actions: actions) }
                             }
-                            Button {
-                                startRename(item)
-                            } label: {
-                                Label("Rename", systemImage: "pencil")
-                            }
-                            .tint(.gray)
                         }
-                        .contextMenu {
-                            Button("Rename", systemImage: "pencil") { startRename(item) }
-                            if !summary.orchestrator {
-                                Button(
-                                    summary.archived ? "Unarchive" : "Archive",
-                                    systemImage: summary.archived ? "tray.and.arrow.up" : "archivebox"
-                                ) { archive(item) }
+                        if !rest.isEmpty {
+                            Section {
+                                ForEach(rest) { item in row(item) }
                             }
                         }
                     }
@@ -115,7 +111,7 @@ struct SessionListView: View {
             }
             .listStyle(.insetGrouped)
             .overlay {
-                if filtered.isEmpty {
+                if isSearching ? filtered.isEmpty : (filtered.isEmpty && arrangement.folders.isEmpty) {
                     if !search.isEmpty {
                         ContentUnavailableView.search(text: search)
                     } else if filter == .archived {
@@ -139,47 +135,49 @@ struct SessionListView: View {
         }
     }
 
+    private var isSearching: Bool {
+        !search.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+
+    /// The rows of the chosen view (active or archived) that match the search;
+    /// a search also matches server and folder names.
     private var filtered: [ServerSession] {
-        let query = search.trimmingCharacters(in: .whitespaces)
-        return app.sessions.filter { item in
+        app.sessions.filter { item in
             let summary = item.summary
             guard summary.archived == (filter == .archived) else { return false }
-            guard !query.isEmpty else { return true }
-            return [summary.displayTitle, summary.repository, summary.branch, summary.id, item.server.name]
-                .compactMap { $0 }
-                .contains { $0.localizedCaseInsensitiveContains(query) }
+            let folder = item.server.sessions.folder(folderID(item))?.name
+            return SessionGrouping.matches(summary, query: search, extra: [item.server.name, folder])
         }
     }
 
-    private var renameBinding: Binding<Bool> {
-        Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } })
+    private func folderID(_ item: ServerSession) -> String? {
+        item.server.sessions.folders.first(where: { $0.sessions.contains(item.summary.id) })?.id ?? item.summary.folder
     }
 
-    private func startRename(_ item: ServerSession) {
-        renameText = item.summary.displayTitle
-        renaming = item
-    }
-
-    private func rename() {
-        guard let item = renaming else { return }
-        let title = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty else { return }
-        Task {
-            do {
-                try await item.server.api.rename(item.summary.id, title: title)
-            } catch {
-                self.error = error.localizedDescription
+    /// Unfiled rows in list order, and every server's folders in order.
+    private var arrangement: (loose: [ServerSession], folders: [ServerFolder]) {
+        let rows = filtered
+        var filed = Set<SessionRef>()
+        var folders: [ServerFolder] = []
+        for server in app.servers {
+            let arranged = SessionGrouping.arrange(
+                rows.filter { $0.server === server }, folders: server.sessions.folders,
+                archived: filter == .archived
+            ) { $0.summary }
+            for group in arranged.groups {
+                folders.append(ServerFolder(server: server, folder: group.folder, items: group.items))
+                filed.formUnion(group.items.map(\.id))
             }
         }
+        return (rows.filter { !filed.contains($0.id) }, folders)
     }
 
-    private func archive(_ item: ServerSession) {
-        Task {
-            do {
-                try await item.server.api.archive(item.summary.id, archived: !item.summary.archived)
-            } catch {
-                self.error = error.localizedDescription
-            }
+    private func row(_ item: ServerSession, folder: String? = nil) -> some View {
+        NavigationLink(value: item.id) {
+            SessionRow(
+                summary: item.summary, server: app.showsServerBadges ? item.server : nil,
+                onServer: item.server.isServer, folder: folder)
         }
+        .sessionRowActions(item, actions: actions)
     }
 }

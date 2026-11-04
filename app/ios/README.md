@@ -108,6 +108,29 @@ approvals), with "next turn" while a change waits. Tap it to switch: modes
 that aren't available say why, and when the computer or server refuses a
 change the message says what to do. Switching to bypass permissions or Full
 Access asks first. **/permissions** and **⋯ › Permissions** do the same.
+Session rows show what the terminal's sidebar and session controls show:
+requests waiting, queued messages, HTML artifacts, open shells, sub-agents
+(how many work out of how many), pull requests, and 🌳 for a session in its
+own worktree and ☁️ for one on a cloud server. Folders from the terminal's
+sidebar appear under **Folders**; open one to see its sessions (sessions
+started there are filed in it) and rename, reorder or delete it from its
+menu. Swipe right on a session to pin it, or long-press for **Pin**,
+**Rename**, **Move to Folder…**, **Archive** and **Delete…** (which, as in
+the terminal, also removes its difu worktree). Search matches titles,
+repositories, branches, servers and folders. Pins and folders are saved on
+that computer or server, so its terminal shows them too.
+
+In a session, the bar above the chat holds **Artifacts**, **Shells**,
+**Sub-agents** and the session's pull requests. Artifacts open in a web view
+(**Refresh** reads them again; share one to open it elsewhere). A shell shows
+its text and takes typed lines plus the keys a phone lacks (Ctrl-C, Tab, Esc,
+arrows); it's shared with difu and the agent, which waits while you type. Open
+a new shell or run a command from the Shells list, and swipe one to
+terminate it. Start a message with **!** to run a command in the worktree, as
+in the terminal. Sub-agents open read-only and follow along while they work.
+Tap a queued message to edit or remove it. The session menu also pins it,
+files it into a folder, attaches a pull request by URL, changes its
+repository, and, on a computer with saved cloud servers, moves it to one.
 
 When an agent asks a question, tap **Add a note** to send a note with the
 option, options or "Other" answer you choose, as the terminal does. Permission
@@ -230,5 +253,8 @@ swift run difu-remote-probe call agents.new '{"repository":null,"startingMode":"
 swift run difu-remote-probe call session.commands '{"id":"…"}'
 swift run difu-remote-probe call session.command '{"id":"…","name":"/compact"}'
 swift run difu-remote-probe call session.entry '{"id":"…","entry":"item_12"}'
+swift run difu-remote-probe call session.shells '{"id":"…"}'
+swift run difu-remote-probe call session.shell.write '{"id":"…","shell":"difu-shell-…","text":"ls","enter":true}'
+swift run difu-remote-probe call folders.list
 swift run difu-remote-probe forget --revoke             # device.unpair, then delete the token
 ```

@@ -22,6 +22,8 @@ public enum RemoteEvent: Sendable {
     case session(SessionView)
     case sessionDelta(SessionDelta)
     case sessionClosed(id: String, message: String?)
+    /// The sidebar folders changed (renamed, reordered, added or removed).
+    case folders([SessionFolder])
     /// Another device was paired with this server.
     case devicePaired(PairedDevice)
     case unknown(String)
@@ -133,6 +135,9 @@ struct IncomingFrame: Decodable {
             } else {
                 event = .unknown(name)
             }
+        case "folders":
+            event = f.value("data", as: [Lossy<SessionFolder>].self)
+                .map { .folders($0.compactMap(\.value)) } ?? .unknown(name)
         case "device.paired":
             event = f.value("data", as: PairedDevice.self).map(RemoteEvent.devicePaired)
                 ?? .unknown(name)

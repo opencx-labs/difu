@@ -40,6 +40,8 @@ struct SessionContent: View {
     @State private var notice: String?
     /// The pull request opened from the PR strip.
     @State private var pr: PrRoute?
+    /// Artifacts, shells, sub-agents and the actions beyond messages.
+    @State private var extras = SessionExtrasModel()
 
     enum Sheet: String, Identifiable {
         case model, changes, rules, usage, status, permissions, newSession
@@ -71,6 +73,7 @@ struct SessionContent: View {
             .onDisappear { server.sessions.close(id) }
             .sheet(item: $sheet) { sheet in sheetContent(sheet, model: model) }
             .modifier(commandFeedback)
+            .modifier(SessionExtrasHost(id: id, server: server, view: model.view, model: extras))
             .sheet(item: $pr) { route in
                 // Its own stack keeps the transcript watched underneath and
                 // the PR screen's toolbar actions available.
@@ -108,7 +111,7 @@ struct SessionContent: View {
                 case .clear:
                     Text("Starts a fresh conversation and worktree. The current transcript is discarded.")
                 case .delete:
-                    Text("Removes the chat and its worktree on \(server.name). This can't be undone.")
+                    Text(deleteSessionMessage(serverName: server.name))
                 }
             }
             .alert("Rename Session", isPresented: $showingRename) {
@@ -163,13 +166,13 @@ struct SessionContent: View {
                 stop: stop, loadFull: { loadFull($0, model: model) }
             )
             .safeAreaInset(edge: .top, spacing: 0) {
-                let prs = view.prs.isEmpty ? (server.sessions.summary(for: id)?.prs ?? []) : view.prs
-                if !prs.isEmpty {
-                    SessionPrStrip(prs: prs) { pr in
+                let listed = server.sessions.summary(for: id)
+                SessionResourcesBar(
+                    view: view, listed: listed, prs: view.prs.isEmpty ? (listed?.prs ?? []) : view.prs,
+                    open: { extras.sheet = $0 },
+                    openPr: { pr in
                         self.pr = PrRoute(server: server.id, repo: pr.repo, number: pr.number, title: pr.title)
-                    }
-                    .background(.bar)
-                }
+                    })
             }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 VStack(spacing: 0) {
@@ -177,7 +180,8 @@ struct SessionContent: View {
                         QueueSection(
                             view: view,
                             remove: { index in perform { try await server.api.unqueue(id, index: index) } },
-                            sendNow: { perform { try await server.api.sendNow(id) } }
+                            sendNow: { perform { try await server.api.sendNow(id) } },
+                            edit: { extras.sheet = .editQueued($0) }
                         )
                         .padding(.horizontal, 12)
                         .padding(.top, 8)
@@ -273,6 +277,8 @@ struct SessionContent: View {
                 Button("Changes", systemImage: "plus.forwardslash.minus") { sheet = .changes }
             }
             Divider()
+            SessionExtrasMenu(summary: summary, view: view, server: server, model: extras)
+            Divider()
             if summary?.orchestrator != true {
                 let archived = summary?.archived ?? false
                 Button(
@@ -298,6 +304,7 @@ struct SessionContent: View {
         let text = composer.text.trimmingCharacters(in: .whitespacesAndNewlines)
         let images = composer.attachments
         guard !text.isEmpty || !images.isEmpty else { return }
+        if images.isEmpty, runBang(text) { return }
         var skills: [String] = []
         switch SlashCommands.submission(text, commands: commands.commands) {
         case .command(let command, let arguments) where images.isEmpty:
@@ -334,6 +341,28 @@ struct SessionContent: View {
                 self.error = error.localizedDescription
             }
         }
+    }
+
+    /// `!command` runs in the session's worktree right away, as in the
+    /// terminal; its output streams into the chat. False for other text.
+    private func runBang(_ text: String) -> Bool {
+        guard text.hasPrefix("!"), server.sessions.model(for: id).view?.kind == .coding else { return false }
+        let command = String(text.dropFirst()).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !command.isEmpty else { return false }
+        Haptics.send()
+        composer.text = ""
+        scrollTrigger += 1
+        Task {
+            do {
+                _ = try await server.api.openShell(id, command: command)
+            } catch {
+                if composer.text.isEmpty { composer.text = text }
+                self.error = (error as? RemoteError)?.isUnknownMethod == true
+                    ? "Update difu on \(server.name) to run ! commands from the phone."
+                    : error.localizedDescription
+            }
+        }
+        return true
     }
 
     /// Chose a command from the `/` list.
@@ -518,7 +547,7 @@ struct SessionPrStrip: View {
     }
 }
 
-private struct SessionPrChip: View {
+struct SessionPrChip: View {
     let pr: SessionPr
 
     var body: some View {

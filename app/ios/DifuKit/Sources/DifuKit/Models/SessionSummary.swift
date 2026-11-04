@@ -26,6 +26,18 @@ public struct SessionSummary: Identifiable, Hashable, Sendable {
     public var canReadChanges: Bool
     /// Attached and discovered pull requests, current open ones first.
     public var prs: [SessionPr]
+    /// Presented HTML artifacts (`session.artifact`); 0 from older computers.
+    public var artifacts: Int
+    /// Open shells: shared shells, running `!` commands and Codex's
+    /// background shells (`session.shells`).
+    public var shells: Int
+    /// Sub-agents, and how many still work (`session.subagent`).
+    public var subagents: Int
+    public var runningSubagents: Int
+    /// The id of the sidebar folder holding the session (`folders.list`).
+    public var folder: String?
+    /// The `<server>:<session>` this session moved to; it takes no messages.
+    public var movedTo: String?
 
     public var displayTitle: String {
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -62,5 +74,14 @@ extension SessionSummary: Decodable {
         queued = f.int("queued") ?? f.value("queue", as: [JSONValue].self)?.count ?? 0
         canReadChanges = f.bool("canReadChanges") ?? false
         prs = f.list("prs")
+        // In a SessionView these are lists rather than counts.
+        artifacts = f.int("artifacts") ?? f.value("artifacts", as: [JSONValue].self)?.count ?? 0
+        shells = f.int("shells") ?? 0
+        let agents = f.value("subagents", as: [JSONValue].self)
+        subagents = f.int("subagents") ?? agents?.count ?? 0
+        runningSubagents = f.int("runningSubagents")
+            ?? agents?.filter { $0["active"] == .bool(true) }.count ?? 0
+        folder = f.string("folder").flatMap { $0.isEmpty ? nil : $0 }
+        movedTo = f.string("movedTo").flatMap { $0.isEmpty ? nil : $0 }
     }
 }

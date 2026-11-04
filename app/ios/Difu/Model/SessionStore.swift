@@ -7,6 +7,8 @@ import SwiftUI
 @Observable
 final class SessionStore {
     private(set) var summaries: [SessionSummary] = []
+    /// The sidebar folders, in the terminal's order; empty on computers without them.
+    private(set) var folders: [SessionFolder] = []
     private(set) var loaded = false
     private(set) var error: String?
 
@@ -32,7 +34,7 @@ final class SessionStore {
     /// Subscribes to the list and re-watches open sessions after (re)connecting.
     func connected() async {
         do {
-            receive(try await api.subscribeSessions())
+            receive(try await api.subscribeSessionList())
         } catch {
             self.error = error.localizedDescription
         }
@@ -43,7 +45,7 @@ final class SessionStore {
 
     func refresh() async {
         do {
-            receive(try await api.listSessions())
+            receive(try await api.sessionList())
         } catch {
             self.error = error.localizedDescription
         }
@@ -51,6 +53,7 @@ final class SessionStore {
 
     func reset() {
         summaries = []
+        folders = []
         loaded = false
         error = nil
         models = [:]
@@ -92,6 +95,21 @@ final class SessionStore {
         summaries = list
         loaded = true
         error = nil
+    }
+
+    func receive(_ list: SessionList) {
+        if let folders = list.folders { self.folders = folders }
+        receive(list.sessions)
+    }
+
+    /// The folders changed: from the `folders` event, or saved by this phone.
+    func receive(folders: [SessionFolder]) {
+        self.folders = folders
+    }
+
+    func folder(_ id: String?) -> SessionFolder? {
+        guard let id else { return nil }
+        return folders.first { $0.id == id }
     }
 
     func receive(_ view: SessionView) {

@@ -25,6 +25,10 @@ public struct SessionView: Identifiable, Equatable, Sendable {
     /// nil for other sessions and from older computers.
     public var permissionMode: PermissionMode?
     public var entries: [EntryView]
+    /// Presented HTML artifacts; empty from older computers.
+    public var artifacts: [SessionArtifact]
+    /// Provider sub-agents, without their transcripts.
+    public var subagents: [SubagentSummary]
 
     public var id: String { summary.id }
 
@@ -56,11 +60,18 @@ extension SessionView: Decodable {
         queue = f.list("queue")
         pending = f.list("pending")
         permissionMode = f.value("permissionMode", as: PermissionMode.self)
+        artifacts = f.list("artifacts")
+        subagents = f.list("subagents")
         // Entries stay index-aligned with the server, so bad rows become
         // placeholders instead of being dropped.
         entries = (f.value("entries", as: [EntryOrPlaceholder].self) ?? []).map(\.entry)
         summary.pending = pending.count
         summary.queued = queue.count
+        if f.has("artifacts") { summary.artifacts = artifacts.count }
+        if f.has("subagents") {
+            summary.subagents = subagents.count
+            summary.runningSubagents = subagents.filter(\.active).count
+        }
     }
 }
 
@@ -79,6 +90,8 @@ public struct Activity: Hashable, Sendable, Decodable {
 public struct QueuedMessage: Identifiable, Hashable, Sendable, Decodable {
     public var index: Int
     public var text: String
+    /// `text` was shortened, so it can't be edited on the phone.
+    public var truncated: Bool
 
     public var id: Int { index }
 
@@ -90,6 +103,7 @@ public struct QueuedMessage: Identifiable, Hashable, Sendable, Decodable {
         }
         self.index = index
         text = f.string("text") ?? ""
+        truncated = f.bool("truncated") ?? false
     }
 }
 
