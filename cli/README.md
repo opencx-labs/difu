@@ -307,7 +307,8 @@ conversation, and they also run after the turn. On purpose, no tool changes
 permission modes, presets or approvals, so an agent can never loosen its own
 permissions. UI-only commands (`/cpu`, `/settings`, `/theme`, …) have no tool. A
 server session's tools run on its server. They are available in new Codex threads
-and in Claude sessions.
+and in Claude sessions. Server sessions also get **difu_environment**, which
+reads and records the repository's environment profile (see *Cloud servers*).
 
 Press **n** (or `/new`) to open an empty session immediately while its isolated Git
 worktree is created in the background. The composer stays enabled and shows the
@@ -1371,6 +1372,16 @@ so. `difu server list|remove|ssh|pair|upgrade`
 manage saved servers; on the server, `difu repos` and `difu remote` manage
 repositories, pairing, devices and the password.
 
+**Offline servers.** Your Mac keeps a copy of each server's session list and
+of the sessions you open (plus a dozen recent ones), so server sessions appear
+as soon as difu starts and never vanish when the connection drops: the sidebar
+dims their ☁️ and says *reconnecting…* or *offline* next to the server's name,
+and you can still read them. Messages you send meanwhile wait on your Mac, at
+the end of the session's queue where you can edit or remove them, and go out
+in order once the server is back; other actions that need the server say it
+is offline. A dead connection is noticed within 25 seconds and replaced within
+seconds, even when your Mac's address changes (iCloud Private Relay, WARP).
+
 **Cmd+K → /cloud** lists every saved server: whether it is connected (or why
 not), its difu version (with `difu server upgrade <name>` when it differs from
 this Mac's), address, active and total sessions, GitHub, Codex and Claude Code
@@ -1389,6 +1400,27 @@ with a pointer to these cleanups, and running sessions continue. On the server,
 archived-worktrees|build-outputs|sandbox` runs a cleanup; `difu server list`
 shows each server's free space. The iPhone app shows the same in each server's
 settings.
+
+**Environments.** Each server remembers what each repository's sandboxes need:
+its **environment profile** of tools and versions (`node = 24`, `pnpm = 9`,
+`python = 3.12`), setup commands (`pnpm install --frozen-lockfile`), non-secret
+variables and notes for agents. The sandbox image ships
+[mise](https://mise.jdx.dev) and corepack, and every sandbox on a server shares
+one toolchain cache (mise installs, corepack, pnpm, npm, yarn, pip, uv, cargo
+and Go caches), so a runtime downloads once per server. Before a session's
+agent starts, difu installs the versions the repository's own files declare
+(`.nvmrc`, `.tool-versions`, `mise.toml`, `.python-version`,
+`rust-toolchain.toml`, `go.mod`, `package.json` `packageManager`) plus the
+profile's tools for anything they leave out, enables corepack and runs the
+setup commands, skipping setup when the lockfiles, commands and tools have not
+changed in that worktree. Progress and failures appear in the chat; a failure
+never blocks the session, and the agent is told what failed. Versions the
+repository declares are remembered in the profile automatically, and agents
+read and extend it with the **difu_environment** tool when they find something
+missing, so the next session starts ready; other running sessions of the
+repository are told. Secrets are refused. Edit profiles in **/cloud** (**e** on
+a server) or on the iPhone under the server's **Repositories**. Run `difu
+server upgrade <name>` once so an existing server rebuilds its image with mise.
 
 ## Slack control (macOS)
 

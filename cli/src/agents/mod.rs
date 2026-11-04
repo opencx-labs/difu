@@ -6,6 +6,7 @@ pub mod connections;
 pub mod effective;
 mod elicitation;
 mod engine;
+mod environment;
 pub mod folders;
 mod guidance;
 mod management;
@@ -34,7 +35,7 @@ mod startup;
 mod subagents;
 mod suggestions;
 mod title;
-mod transport;
+pub(crate) mod transport;
 pub mod ui;
 mod voice_control;
 mod workspace;
@@ -332,6 +333,10 @@ pub struct Session {
     /// `SERVER_VALIDATION_RULE` applies.
     #[serde(default)]
     pub server_mode: bool,
+    /// The last environment preparation's outcome (`environment`), shown to
+    /// the agent in its instructions; `None` before the first one.
+    #[serde(default)]
+    pub environment: Option<String>,
     /// New sessions inherit provider policy; missing fields preserve legacy setup.
     #[serde(default)]
     pub native_setup: bool,
@@ -451,6 +456,36 @@ pub struct Session {
     /// What difu's session tools asked to do once the turn ends.
     #[serde(skip)]
     pub scheduled: session_tools::Schedule,
+    /// Set by this computer's service on a server session while the server is
+    /// unreachable and the session is shown from its cache; servers never set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<Offline>,
+    /// Messages this computer holds for a server session until they can be
+    /// sent: they are the last `held.len()` prompts in `queue`. Set only by the
+    /// local service (`cloud::federation`); servers never set it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held: Vec<Held>,
+}
+/// A server session listed or shown from this computer's cache because its
+/// server cannot be reached right now.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Offline {
+    /// When the server last answered, in milliseconds since the epoch.
+    #[serde(default)]
+    pub since: Option<i64>,
+    /// The connection dropped moments ago and difu is reconnecting; otherwise
+    /// the server has been unreachable for a while.
+    #[serde(default)]
+    pub reconnecting: bool,
+}
+/// A message waiting on this computer for its server (see `Session::held`).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Held {
+    /// Why the server refused it; it stays until edited (which sends it
+    /// again) or removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 impl Session {
     pub fn new(id: String, job: Job) -> Self {
@@ -481,6 +516,7 @@ impl Session {
             provider_context: None,
             repository_rules: String::new(),
             server_mode: false,
+            environment: None,
             native_setup: true,
             job,
             status: Status::Starting,
@@ -545,6 +581,8 @@ impl Session {
             moved_to: None,
             move_scheduled: None,
             scheduled: Default::default(),
+            offline: None,
+            held: Vec::new(),
         }
     }
     /// Freeze completed output and pending-request origins before another UI or
@@ -707,6 +745,7 @@ impl Session {
             // Codex's background shells; the service adds its shared shells.
             shells: self.shells.len(),
             moved_to: self.moved_to.clone(),
+            offline: self.offline.clone(),
         }
     }
 }
@@ -760,6 +799,10 @@ pub struct Summary {
     /// The `<server>:<session>` this session moved to.
     #[serde(default)]
     pub moved_to: Option<String>,
+    /// A server session listed from this computer's cache while its server
+    /// is unreachable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offline: Option<Offline>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Skill {
@@ -1145,6 +1188,19 @@ pub enum Request {
         server: Option<String>,
         action: crate::cloud::disk::Action,
     },
+    /// Reads (`profile: None`) or replaces a server repository's environment
+    /// profile (`server`: a saved cloud server; `None`: this machine in server
+    /// mode). `repository` is `owner/name` or a path in its base clone; `by`
+    /// names who changed it, for the profile's history.
+    Environment {
+        #[serde(default)]
+        server: Option<String>,
+        repository: String,
+        #[serde(default)]
+        profile: Option<crate::cloud::environments::Profile>,
+        #[serde(default)]
+        by: Option<String>,
+    },
     /// Move a session on this computer to a saved cloud server; replies
     /// `Launched` with the new `<server>:<session>` id.
     Move {
@@ -1204,6 +1260,7 @@ pub enum Reply {
     Servers(Vec<crate::cloud::federation::ServerStatus>),
     Disk(crate::cloud::disk::Report),
     DiskCleaned(crate::cloud::disk::Cleaned),
+    Environment(crate::cloud::environments::View),
     SessionPrs(pr_cache::Lookup),
     Attachment(media::Attachment),
     /// Base64 file contents.

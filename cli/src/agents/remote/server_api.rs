@@ -1,6 +1,6 @@
 //! Server settings methods for paired clients (`server.repos.*`, `server.rules.*`,
-//! `server.logins`, `server.login.*`, `server.logout`, `server.disk*`); see
-//! docs/cloud-agents.md.
+//! `server.logins`, `server.login.*`, `server.logout`, `server.disk*`,
+//! `server.environment.*`); see docs/cloud-agents.md.
 //! Returns `None` for methods this module does not own.
 use crate::{
     agents::{Reply, Request},
@@ -11,10 +11,17 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{path::PathBuf, thread};
 
-pub fn dispatch(storage: &Storage, method: &str, params: &Value) -> Option<Result<Value>> {
+/// `device` names the calling device, for the history of what it changes.
+pub fn dispatch(
+    storage: &Storage,
+    method: &str,
+    params: &Value,
+    device: Option<&str>,
+) -> Option<Result<Value>> {
     let server_only = method.starts_with("server.repos")
         || method.starts_with("server.login")
         || method.starts_with("server.disk")
+        || method.starts_with("server.environment")
         || method == "server.logout";
     let result = match method {
         _ if server_only && !super::api::config(storage).server.enabled => Err(anyhow::anyhow!(
@@ -82,6 +89,15 @@ pub fn dispatch(storage: &Storage, method: &str, params: &Value) -> Option<Resul
                 _ => anyhow::bail!("Unexpected cleanup reply"),
             }
         }),
+        "server.environment.get" => environment(storage, params, None, device),
+        "server.environment.set" => params
+            .get("profile")
+            .cloned()
+            .context("Invalid or missing parameter `profile`")
+            .and_then(|profile| {
+                serde_json::from_value(profile).context("Invalid parameter `profile`")
+            })
+            .and_then(|profile| environment(storage, params, Some(profile), device)),
         "server.rules.get" => rules(storage, params, None),
         "server.rules.set" => {
             text(params, "rules").and_then(|text| rules(storage, params, Some(text)))
@@ -159,6 +175,29 @@ fn repository(storage: &Storage, params: &Value) -> Result<PathBuf> {
     Ok(PathBuf::from(repository))
 }
 
+/// Reads or replaces a repository's environment profile through the service,
+/// which also tells the repository's running sessions about a change.
+fn environment(
+    storage: &Storage,
+    params: &Value,
+    profile: Option<crate::cloud::environments::Profile>,
+    device: Option<&str>,
+) -> Result<Value> {
+    let repository = text(params, "repository")?;
+    match crate::agents::client::request(
+        storage,
+        Request::Environment {
+            server: None,
+            repository,
+            profile,
+            by: device.map(str::to_owned),
+        },
+    )? {
+        Reply::Environment(view) => Ok(serde_json::to_value(view)?),
+        _ => anyhow::bail!("Unexpected environment reply"),
+    }
+}
+
 fn rules(storage: &Storage, params: &Value, rules: Option<String>) -> Result<Value> {
     let set = rules.is_some();
     match super::super::rules::request(storage, &repository(storage, params)?, rules)? {
@@ -174,7 +213,7 @@ mod tests {
     use std::{fs, path::Path, process::Command};
 
     fn call(storage: &Storage, method: &str, params: Value) -> Result<Value> {
-        dispatch(storage, method, &params).context("Method not handled")?
+        dispatch(storage, method, &params, Some("Ali's iPhone")).context("Method not handled")?
     }
 
     fn git(root: &Path, args: &[&str]) -> Result<()> {
@@ -192,13 +231,15 @@ mod tests {
             config: dir.path().join("config.json"),
             cache: dir.path().join("cache"),
         };
-        assert!(dispatch(&storage, "sessions.list", &json!({})).is_none());
+        assert!(dispatch(&storage, "sessions.list", &json!({}), None).is_none());
         for method in [
             "server.repos",
             "server.login.start",
             "server.logout",
             "server.disk",
             "server.disk.clean",
+            "server.environment.get",
+            "server.environment.set",
         ] {
             let error = call(&storage, method, json!({"tool": "codex"}))
                 .err()
@@ -316,6 +357,92 @@ mod tests {
             assert!(call(&storage, "server.disk.clean", params).is_err());
         }
         assert!(call(&storage, "server.disk", json!({"refresh": "yes"})).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn environment_profiles_reach_the_service_with_the_documented_shapes() -> Result<()> {
+        use crate::cloud::environments::{Change, Detected, Profile, View};
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        storage.update_config(|config| config.server.enabled = true)?;
+        let mut profile = Profile::default();
+        profile.tools.insert("node".into(), "24".into());
+        profile.setup = vec!["pnpm install --frozen-lockfile".into()];
+        profile
+            .env
+            .insert("NODE_OPTIONS".into(), "--max-old-space-size=4096".into());
+        profile.notes = vec!["backend tests need Postgres".into()];
+        profile.history = vec![Change {
+            at: 1790000000000,
+            by: "Claude Code in session 1 (Billing)".into(),
+            summary: "node 24".into(),
+        }];
+        profile.updated_at = Some(1790000000000);
+        let view = View {
+            repository: "acme/widgets".into(),
+            profile: profile.clone(),
+            detected: vec![Detected {
+                tool: "pnpm".into(),
+                version: "9.12.0".into(),
+                source: "package.json packageManager".into(),
+                corepack: true,
+            }],
+        };
+        let served = answer(&storage, Reply::Environment(view.clone()))?;
+        let value = call(
+            &storage,
+            "server.environment.get",
+            json!({"repository": "acme/widgets"}),
+        )?;
+        let request = served.join().map_err(|_| anyhow::anyhow!("socket"))??;
+        assert!(matches!(
+            request,
+            Request::Environment { server: None, ref repository, profile: None, .. } if repository == "acme/widgets"
+        ));
+        assert_eq!(
+            value,
+            json!({
+                "repository": "acme/widgets",
+                "profile": {
+                    "tools": {"node": "24"},
+                    "setup": ["pnpm install --frozen-lockfile"],
+                    "env": {"NODE_OPTIONS": "--max-old-space-size=4096"},
+                    "notes": ["backend tests need Postgres"],
+                    "history": [{"at": 1790000000000i64, "by": "Claude Code in session 1 (Billing)", "summary": "node 24"}],
+                    "updatedAt": 1790000000000i64
+                },
+                "detected": [{"tool": "pnpm", "version": "9.12.0", "source": "package.json packageManager", "corepack": true}]
+            })
+        );
+        fs::remove_file(crate::agents::server::socket(&storage)?)?;
+        let served = answer(&storage, Reply::Environment(view))?;
+        call(
+            &storage,
+            "server.environment.set",
+            json!({"repository": "acme/widgets", "profile": {"tools": {"node": "24"}, "setup": [], "env": {}, "notes": []}}),
+        )?;
+        let request = served.join().map_err(|_| anyhow::anyhow!("socket"))??;
+        let Request::Environment {
+            profile: Some(sent),
+            by,
+            ..
+        } = request
+        else {
+            anyhow::bail!("expected a profile to save");
+        };
+        assert_eq!(sent.tools.get("node").map(String::as_str), Some("24"));
+        assert_eq!(by.as_deref(), Some("Ali's iPhone"));
+        for params in [
+            json!({"repository": "acme/widgets"}),
+            json!({"repository": "acme/widgets", "profile": {"tools": ["node"]}}),
+        ] {
+            assert!(call(&storage, "server.environment.set", params).is_err());
+        }
+        assert!(call(&storage, "server.environment.get", json!({})).is_err());
         Ok(())
     }
 

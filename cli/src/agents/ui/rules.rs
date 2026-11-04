@@ -1,8 +1,80 @@
 use super::*;
-use crate::shortcuts::{Bindings, contexts::*, ids::*};
+use crate::{
+    cloud::environments,
+    shortcuts::{Bindings, contexts::*, ids::*},
+};
 use std::path::PathBuf;
 
 type Loaded = std::result::Result<(PathBuf, String), String>;
+
+/// What the modal edits: a repository's rules, or a server repository's
+/// environment profile (as `environments::to_text`'s sectioned text).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Kind {
+    #[default]
+    Rules,
+    /// Opened from `/cloud`; closing returns there.
+    Environment,
+}
+
+/// Reads or replaces a server repository's environment profile with
+/// `Request::Environment`; the agent service forwards a saved server's to it.
+fn environment_request(
+    storage: &Storage,
+    server: Option<String>,
+    repository: PathBuf,
+    text: Option<String>,
+) -> Loaded {
+    let profile = match text {
+        Some(text) => Some(environments::from_text(&text).map_err(|error| format!("{error:#}"))?),
+        None => None,
+    };
+    let request = Request::Environment {
+        server,
+        repository: repository.to_string_lossy().into_owned(),
+        profile,
+        by: Some("the difu terminal app".into()),
+    };
+    match client::request(storage, request) {
+        Ok(Reply::Environment(view)) => {
+            Ok((PathBuf::from(&view.repository), environment_text(&view)))
+        }
+        Ok(_) => Err("Unexpected environment reply".into()),
+        Err(error) => Err(format!("{error:#}")),
+    }
+}
+
+/// The profile as editable text, after comments with what the repository's
+/// files declare and the latest change.
+pub(super) fn environment_text(view: &environments::View) -> String {
+    let mut text = String::new();
+    if !view.detected.is_empty() {
+        text.push_str(&format!(
+            "# {} declares on its main branch: {}.\n# The repository's files win over [tools]; the profile fills gaps.\n",
+            view.repository,
+            environments::describe(&view.detected)
+        ));
+    }
+    if let Some(change) = view.profile.history.last() {
+        let at = chrono::DateTime::from_timestamp_millis(change.at)
+            .map(|at| {
+                at.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d %H:%M")
+                    .to_string()
+            })
+            .unwrap_or_default();
+        text.push_str(&format!(
+            "# Last changed {at} by {}: {}\n",
+            change.by,
+            environments::short(&change.summary, 160)
+        ));
+    }
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text.push_str(&environments::to_text(&view.profile));
+    text
+}
 
 /// Reads or replaces rules with `Request::RepositoryRules`; the agent service
 /// answers for this computer and forwards a saved server's to that server.
@@ -28,6 +100,7 @@ pub struct Settings {
     /// The saved cloud server whose rules these are; `None` is this computer.
     server: Option<String>,
     saving: Option<mpsc::Receiver<Loaded>>,
+    kind: Kind,
 }
 
 impl Settings {
@@ -53,20 +126,29 @@ impl Settings {
         self.error = None;
         self.root = None;
         let server = self.server.clone();
+        let kind = self.kind;
         std::thread::spawn(move || {
-            let result = request(
-                &storage,
-                Request::RepositoryRules {
-                    server,
-                    repository: path,
-                    rules: None,
-                },
-            );
+            let result = match kind {
+                Kind::Rules => request(
+                    &storage,
+                    Request::RepositoryRules {
+                        server,
+                        repository: path,
+                        rules: None,
+                    },
+                ),
+                Kind::Environment => environment_request(&storage, server, path, None),
+            };
             let _ = tx.send(result);
+            crate::repaint::request();
         });
     }
     fn busy(&self) -> bool {
         self.loading.is_some() || self.saving.is_some()
+    }
+    /// Whether this edits an environment profile rather than rules.
+    pub(super) fn environment(&self) -> bool {
+        self.kind == Kind::Environment
     }
 }
 
@@ -145,6 +227,7 @@ impl Ui {
             return_to,
             server,
             saving: None,
+            kind: Kind::Rules,
         };
         if let Some(path) = path {
             form.load(self.storage.clone(), path);
@@ -179,8 +262,50 @@ impl Ui {
     }
     pub(super) fn close_rules(&mut self) {
         if let Some(Modal::RepositoryRules(form)) = self.modal.take() {
-            self.modal = form.return_to.map(Modal::AgentDefaults);
+            self.modal = match form.kind {
+                Kind::Rules => form.return_to.map(Modal::AgentDefaults),
+                Kind::Environment => Some(Modal::Cloud),
+            };
         }
+    }
+    /// Edits the environment profiles of `server`'s repositories (from
+    /// `/cloud`), starting with the first one.
+    pub(super) fn open_environment(&mut self, server: String, repositories: Vec<String>) {
+        let mut candidates: Vec<PathBuf> = repositories.into_iter().map(PathBuf::from).collect();
+        candidates.sort();
+        candidates.dedup();
+        let first = candidates.first().cloned();
+        let mut form = Settings {
+            repository: Editor::from(
+                first
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+                    .as_str(),
+            ),
+            text: Editor::default(),
+            field: 0,
+            root: None,
+            saved: String::new(),
+            candidates,
+            selected: 0,
+            loading: None,
+            error: None,
+            return_to: None,
+            server: Some(server),
+            saving: None,
+            kind: Kind::Environment,
+        };
+        match first {
+            Some(path) => form.load(self.storage.clone(), path),
+            None => {
+                form.error = Some(
+                    "This server has no repositories yet; add one with `difu repos add` on it"
+                        .into(),
+                )
+            }
+        }
+        self.modal = Some(Modal::RepositoryRules(Box::new(form)));
     }
     pub(super) fn save_rules(&mut self) {
         let select_hint = Bindings::new(&self.shortcut_config)
@@ -198,17 +323,36 @@ impl Ui {
         if form.busy() {
             return;
         }
-        let change = Request::RepositoryRules {
-            server: form.server.clone(),
-            repository: root.clone(),
-            rules: Some(form.text.text()),
-        };
+        let (server, repository, text, kind) = (
+            form.server.clone(),
+            root.clone(),
+            form.text.text(),
+            form.kind,
+        );
+        if kind == Kind::Environment
+            && let Err(error) = environments::from_text(&text)
+        {
+            form.error = Some(format!("{error:#}"));
+            return;
+        }
         let (tx, rx) = mpsc::channel();
         form.saving = Some(rx);
         form.error = None;
         let storage = self.storage.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(request(&storage, change));
+            let result = match kind {
+                Kind::Rules => request(
+                    &storage,
+                    Request::RepositoryRules {
+                        server,
+                        repository,
+                        rules: Some(text),
+                    },
+                ),
+                Kind::Environment => environment_request(&storage, server, repository, Some(text)),
+            };
+            let _ = tx.send(result);
+            crate::repaint::request();
         });
     }
     fn rules_saved(&mut self, result: Loaded) {
@@ -217,14 +361,25 @@ impl Ui {
         };
         match result {
             Ok(_) => {
-                let notice = match &form.server {
-                    Some(server) => format!("Repository rules saved on {server} for new sessions"),
-                    None => "Repository rules saved for new sessions".into(),
+                let notice = match (&form.server, form.kind) {
+                    (Some(server), Kind::Environment) => format!(
+                        "Environment saved on {server}; new sessions use it and running ones were told"
+                    ),
+                    (None, Kind::Environment) => "Environment saved".into(),
+                    (Some(server), Kind::Rules) => {
+                        format!("Repository rules saved on {server} for new sessions")
+                    }
+                    (None, Kind::Rules) => "Repository rules saved for new sessions".into(),
                 };
                 self.close_rules();
                 self.notice = Some((notice, false));
             }
-            Err(error) => form.error = Some(format!("Cannot save rules: {error}")),
+            Err(error) => {
+                form.error = Some(match form.kind {
+                    Kind::Rules => format!("Cannot save rules: {error}"),
+                    Kind::Environment => format!("Cannot save the environment: {error}"),
+                })
+            }
         }
     }
     pub(super) fn rules_option(&mut self, index: usize) {
@@ -356,18 +511,27 @@ impl Ui {
         editor(
             frame,
             text,
-            "Rules",
+            match form.kind {
+                Kind::Rules => "Rules",
+                Kind::Environment => "Environment · [tools] [setup] [env] [notes]",
+            },
             &form.text,
             form.field == 1 && form.root.is_some(),
         );
         self.hits.push((text, Action::RulesField(1)));
         let footer = area.bottom().saturating_sub(3);
         frame.render_widget(
-            Paragraph::new(match &form.server {
-                Some(server) => format!(
+            Paragraph::new(match (&form.server, form.kind) {
+                (Some(server), Kind::Environment) => format!(
+                    "Installed and run in new sessions' sandboxes on {server}; agents read and extend it with difu_environment. Never secrets."
+                ),
+                (None, Kind::Environment) => {
+                    "Installed and run in new sessions' sandboxes; agents read and extend it with difu_environment. Never secrets.".into()
+                }
+                (Some(server), Kind::Rules) => format!(
                     "Included in the initial instructions for new sessions in this repository on {server}."
                 ),
-                None => {
+                (None, Kind::Rules) => {
                     "Included in the initial instructions for new sessions in this repository."
                         .into()
                 }
@@ -402,10 +566,11 @@ impl Ui {
             );
         } else if form.busy() {
             frame.render_widget(
-                Paragraph::new(if form.saving.is_some() {
-                    "Saving repository rules…"
-                } else {
-                    "Loading repository rules…"
+                Paragraph::new(match (form.saving.is_some(), form.kind) {
+                    (true, Kind::Rules) => "Saving repository rules…",
+                    (false, Kind::Rules) => "Loading repository rules…",
+                    (true, Kind::Environment) => "Saving the environment…",
+                    (false, Kind::Environment) => "Loading the environment…",
                 })
                 .style(Style::default().fg(DIM)),
                 Rect::new(area.x, footer + 2, area.width, 1),
@@ -516,6 +681,24 @@ pub(super) mod service {
                 root: repository.clone(),
                 rules: rules.clone().unwrap_or_else(|| "server rule".into()),
             },
+            Request::Environment {
+                repository,
+                profile,
+                ..
+            } => Reply::Environment(crate::cloud::environments::View {
+                repository: repository.clone(),
+                profile: profile.clone().unwrap_or_else(|| {
+                    let mut profile = crate::cloud::environments::Profile::default();
+                    profile.tools.insert("python".into(), "3.12".into());
+                    profile
+                }),
+                detected: vec![crate::cloud::environments::Detected {
+                    tool: "node".into(),
+                    version: "24".into(),
+                    source: ".nvmrc".into(),
+                    corepack: false,
+                }],
+            }),
             _ => Reply::Error("Unexpected request".into()),
         };
         serde_json::to_writer(&mut stream, &reply)?;
@@ -570,6 +753,7 @@ mod tests {
                 return_to: None,
                 server: None,
                 saving: None,
+                kind: Kind::Rules,
             }))
         };
         ui.modal = Some(form(""));
@@ -732,6 +916,7 @@ mod shortcut_regressions {
             return_to: None,
             server: None,
             saving: None,
+            kind: Kind::Rules,
         })));
     }
     fn form(ui: &Ui) -> Result<&Settings> {
@@ -740,6 +925,88 @@ mod shortcut_regressions {
         };
         Ok(f)
     }
+    #[test]
+    fn server_environments_load_as_text_save_parsed_and_return_to_cloud() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let storage = Storage {
+            config: dir.path().join("config.json"),
+            cache: dir.path().join("cache"),
+        };
+        let config = Config::default();
+        storage.save_config(&config)?;
+        let service = Service::start(&storage, false)?;
+        let mut ui = Ui::new(storage.clone(), &config);
+        ui.open_environment("hetzner".into(), vec!["acme/web".into(), "acme/api".into()]);
+        settle(&mut ui)?;
+        let loaded = form(&ui)?;
+        assert!(loaded.environment());
+        assert_eq!(
+            loaded.root.as_deref(),
+            Some(std::path::Path::new("acme/api"))
+        );
+        let text = loaded.text.text();
+        assert!(
+            text.contains("# acme/api declares on its main branch: node 24 (.nvmrc)."),
+            "{text}"
+        );
+        assert!(text.contains("[tools]\npython = 3.12\n"), "{text}");
+        // An invalid profile is explained before anything is sent.
+        if let Some(Modal::RepositoryRules(form)) = &mut ui.modal {
+            form.text = Editor::from("[env]\nNPM_TOKEN = abc\n");
+        }
+        ui.save_rules();
+        let refused = form(&ui)?;
+        assert!(refused.saving.is_none());
+        assert!(
+            refused
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("looks like a secret")),
+            "{:?}",
+            refused.error
+        );
+        if let Some(Modal::RepositoryRules(form)) = &mut ui.modal {
+            form.text = Editor::from("[tools]\nnode = 24\n\n[setup]\npnpm install\n");
+        }
+        ui.save_rules();
+        settle(&mut ui)?;
+        assert!(matches!(ui.modal, Some(Modal::Cloud)));
+        assert!(
+            ui.notice.as_ref().is_some_and(
+                |(text, error)| !error && text.contains("Environment saved on hetzner")
+            ),
+            "{:?}",
+            ui.notice
+        );
+        // No repositories: explained, and Esc returns to /cloud.
+        ui.open_environment("hetzner".into(), Vec::new());
+        assert!(
+            form(&ui)?
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("no repositories"))
+        );
+        ui.rules_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(ui.modal, Some(Modal::Cloud)));
+        let requests = service.requests()?;
+        anyhow::ensure!(
+            requests.iter().any(|request| matches!(
+                request,
+                Request::Environment {
+                    server: Some(server),
+                    repository,
+                    profile: Some(profile),
+                    ..
+                } if server == "hetzner"
+                    && repository == "acme/api"
+                    && profile.setup == ["pnpm install"]
+                    && profile.tools.get("node").map(String::as_str) == Some("24")
+            )),
+            "{requests:?}"
+        );
+        Ok(())
+    }
+
     #[test]
     fn rules_focus_navigation_and_repository_selection_are_contextual() -> Result<()> {
         for field in 0..4 {

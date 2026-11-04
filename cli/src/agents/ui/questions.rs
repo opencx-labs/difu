@@ -228,7 +228,14 @@ impl Ui {
                         if queue {
                             s.queue
                                 .iter()
-                                .map(|p| crate::model::clean(p.text()))
+                                .enumerate()
+                                .map(|(index, p)| {
+                                    let text = crate::model::clean(p.text());
+                                    match super::servers::held_label(s, index) {
+                                        Some(label) => format!("{text} · {label}"),
+                                        None => text,
+                                    }
+                                })
                                 .collect::<Vec<_>>()
                         } else {
                             s.pending

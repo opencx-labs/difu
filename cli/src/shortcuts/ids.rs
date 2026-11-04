@@ -122,6 +122,7 @@ pub const CLOUD_REFRESH: ActionId = ActionId("cloud.refresh");
 pub const CLOUD_CLEAN_ARCHIVED: ActionId = ActionId("cloud.clean_archived");
 pub const CLOUD_CLEAR_BUILDS: ActionId = ActionId("cloud.clear_builds");
 pub const CLOUD_PRUNE_SANDBOX: ActionId = ActionId("cloud.prune_sandbox");
+pub const CLOUD_ENVIRONMENT: ActionId = ActionId("cloud.environment");
 pub const CLOUD_BACK: ActionId = ActionId("cloud.back");
 pub const USAGE_REFRESH: ActionId = ActionId("usage.refresh");
 pub const RULES_SAVE: ActionId = ActionId("rules.save");

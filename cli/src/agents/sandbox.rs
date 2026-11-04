@@ -32,6 +32,15 @@
 //!   host user cannot manage. Mounted repositories look root-owned inside,
 //!   matching the process, so Git's ownership check passes. `IS_SANDBOX=1`
 //!   tells Claude Code that running as root is intended.
+//! * Shared toolchain caches ([`Toolchains`]): the server's
+//!   `<cache>/toolchains` is mounted read-write at
+//!   [`environments::CACHE_MOUNT`] in every sandbox, with mise, corepack and
+//!   every package manager's cache pointed into it and mise's shims on `PATH`,
+//!   so a runtime is downloaded once per server and every session and every
+//!   container of a session (agent, shells, setup) sees it. The worktree's
+//!   generated mise config (`MISE_GLOBAL_CONFIG_FILE`) and its corepack shims
+//!   live in its Git directory ([`environments::state_dir`]), and the
+//!   repository profile's variables are set in every container.
 //! * A [`Container`] guard removes its container when dropped: difu stops
 //!   process groups with SIGKILL, which `podman run` cannot forward, so the
 //!   container would otherwise keep running. Deleting, clearing or cleaning up
@@ -39,7 +48,9 @@
 //!   containers a stopped service left behind ([`sweep`]).
 use super::{Job, Session};
 use crate::{
-    cloud::{SandboxSettings, ServerSettings, claude_config, cli::SandboxCommand},
+    cloud::{
+        SandboxSettings, ServerSettings, claude_config, cli::SandboxCommand, environments, repos,
+    },
     process::{self, Cancel},
     storage::Storage,
 };
@@ -89,6 +100,9 @@ pub(crate) enum Role {
     Claude,
     Codex,
     Shell,
+    /// Installs the repository's toolchains and runs its setup commands
+    /// before the agent starts (`agents::environment`).
+    Setup,
 }
 impl Role {
     fn name(self) -> &'static str {
@@ -96,7 +110,50 @@ impl Role {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Shell => "shell",
+            Self::Setup => "setup",
         }
+    }
+}
+
+/// A sandbox's shared toolchain caches and its worktree's environment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Toolchains {
+    /// The server's cache directory, mounted at [`environments::CACHE_MOUNT`].
+    pub(crate) cache: PathBuf,
+    /// The worktree's environment directory (generated mise config, corepack
+    /// shims), when the workspace is a Git checkout.
+    pub(crate) state: Option<PathBuf>,
+    /// The repository profile's variables, validated again here.
+    pub(crate) env: Vec<(String, String)>,
+}
+
+impl Toolchains {
+    /// The host directory every sandbox on this server shares.
+    pub(crate) fn cache(storage: &Storage) -> Result<PathBuf> {
+        let cache = storage.cache.join("toolchains");
+        fs::create_dir_all(&cache).with_context(|| format!("Cannot create {}", cache.display()))?;
+        Ok(cache)
+    }
+
+    fn for_session(storage: &Storage, repository: &Path, workspace: &Path) -> Result<Self> {
+        let env = repos::name_of(storage, repository)
+            .and_then(|name| environments::load(storage, &name).ok())
+            .map(|profile| {
+                profile
+                    .env
+                    .into_iter()
+                    .filter(|(name, value)| environments::validate_variable(name, value).is_ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            cache: Self::cache(storage)?,
+            state: workspace
+                .is_dir()
+                .then(|| environments::state_dir(workspace))
+                .flatten(),
+            env,
+        })
     }
 }
 
@@ -112,6 +169,8 @@ pub(crate) struct Sandbox {
     workspace: PathBuf,
     /// The session's attachment directory (`media::directory`).
     attachments: Option<PathBuf>,
+    /// Shared toolchain caches; `None` only in tests.
+    toolchains: Option<Toolchains>,
 }
 
 impl Sandbox {
@@ -130,7 +189,17 @@ impl Sandbox {
         share_claude_config(&sandbox.home)?;
         // Created now, so media sent later appears inside the running sandbox.
         sandbox.attachments = Some(super::media::directory(storage, &session.id)?);
+        sandbox.toolchains = Some(Toolchains::for_session(
+            storage,
+            session.job.root(),
+            &sandbox.workspace,
+        )?);
         Ok(Some(sandbox))
+    }
+
+    /// The host directory of the shared toolchain caches.
+    pub(crate) fn toolchains(&self) -> Option<&Toolchains> {
+        self.toolchains.as_ref()
     }
 
     fn decide(
@@ -158,6 +227,7 @@ impl Sandbox {
                 .clone()
                 .unwrap_or_else(|| launch.repository.clone()),
             attachments: None,
+            toolchains: None,
         }))
     }
 
@@ -257,6 +327,10 @@ impl Sandbox {
             args.push("-v".into());
             args.push(mount.volume()?);
         }
+        if let Some(toolchains) = &self.toolchains {
+            args.push("-v".into());
+            args.push(cache_volume(&toolchains.cache)?);
+        }
         let mut env = Vec::new();
         for variable in self.variables(program) {
             args.push("-e".into());
@@ -276,10 +350,22 @@ impl Sandbox {
         Ok(Invocation { args, env })
     }
 
-    /// The sandbox's own variables, then the command's. `HOME`, `PATH` and
-    /// `CLAUDE_CONFIG_DIR` always describe the sandbox, never the host process.
+    /// The sandbox's own variables, the shared caches' and the repository
+    /// profile's, then the command's. `HOME`, `PATH`, `CLAUDE_CONFIG_DIR` and
+    /// the cache variables always describe the sandbox, never the host process.
     fn variables(&self, program: &Program) -> Vec<Variable> {
         let mut path = self.home.join(".local/bin").into_os_string();
+        if let Some(toolchains) = &self.toolchains {
+            // The worktree's corepack shims first, so `packageManager` wins.
+            if let Some(state) = &toolchains.state {
+                path.push(":");
+                path.push(state.join("bin"));
+            }
+            for directory in environments::CACHE_PATH {
+                path.push(":");
+                path.push(Path::new(environments::CACHE_MOUNT).join(directory));
+            }
+        }
         path.push(":");
         path.push(SYSTEM_PATH);
         let mut variables = vec![
@@ -295,8 +381,16 @@ impl Sandbox {
             // temporary files, shared with every other session and the host.
             Variable::plain(claude_config::VARIABLE, claude_config::dir(&self.home)),
         ];
+        if let Some(toolchains) = &self.toolchains {
+            variables.extend(self.toolchain_variables(toolchains));
+        }
         for (key, value) in &program.env {
-            if key == "HOME" || key == "PATH" || key == claude_config::VARIABLE {
+            if key == "HOME"
+                || key == "PATH"
+                || key == claude_config::VARIABLE
+                || (self.toolchains.is_some()
+                    && environments::CACHES.iter().any(|(own, _)| key == *own))
+            {
                 continue;
             }
             variables.retain(|variable| &variable.key != key);
@@ -305,6 +399,40 @@ impl Sandbox {
                 value: value.clone(),
                 secret: !podman_reads(key),
             });
+        }
+        variables
+    }
+
+    /// mise, corepack and the package managers' caches in the shared
+    /// directory, the worktree's mise config, then the profile's variables.
+    fn toolchain_variables(&self, toolchains: &Toolchains) -> Vec<Variable> {
+        let mount = Path::new(environments::CACHE_MOUNT);
+        let mut variables: Vec<Variable> = environments::CACHES
+            .iter()
+            .map(|(key, directory)| Variable::plain(key, mount.join(directory)))
+            .collect();
+        variables.extend([
+            Variable::plain("MISE_YES", "1"),
+            // The sandbox is the trust boundary: mise may read the worktree's
+            // config files without asking.
+            Variable::plain("MISE_TRUSTED_CONFIG_PATHS", &self.workspace),
+            Variable::plain("COREPACK_ENABLE_DOWNLOAD_PROMPT", "0"),
+            // Never add `packageManager` to the repository's package.json.
+            Variable::plain("COREPACK_ENABLE_AUTO_PIN", "0"),
+        ]);
+        if let Some(state) = &toolchains.state {
+            variables.push(Variable::plain(
+                "MISE_GLOBAL_CONFIG_FILE",
+                state.join("mise.toml"),
+            ));
+        }
+        for (key, value) in &toolchains.env {
+            if !variables
+                .iter()
+                .any(|variable| variable.key.to_str() == Some(key.as_str()))
+            {
+                variables.push(Variable::plain(key, value));
+            }
         }
         variables
     }
@@ -562,6 +690,19 @@ fn container_name(pod: &str, role: Role) -> String {
         chrono::Utc::now().timestamp_millis(),
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     )
+}
+
+/// The shared caches' host directory at [`environments::CACHE_MOUNT`].
+fn cache_volume(cache: &Path) -> Result<OsString> {
+    ensure!(
+        cache.is_absolute() && !cache.as_os_str().as_bytes().contains(&b':'),
+        "Cannot mount the toolchain cache {} into a sandbox: it needs an absolute path without ':'",
+        cache.display()
+    );
+    let mut volume = cache.as_os_str().to_owned();
+    volume.push(":");
+    volume.push(environments::CACHE_MOUNT);
+    Ok(volume)
 }
 
 /// Variables Podman itself reads. Setting them on the Podman process would
@@ -1123,6 +1264,7 @@ mod tests {
             home: "/home/difu".into(),
             workspace: "/srv/worktrees/1791-abc".into(),
             attachments: None,
+            toolchains: None,
         }
     }
 
@@ -1544,6 +1686,175 @@ mod tests {
         );
     }
 
+    fn toolchains() -> Toolchains {
+        Toolchains {
+            cache: "/home/difu/.cache/difu/toolchains".into(),
+            state: Some("/srv/repos/owner/name/.git/worktrees/1791-abc/difu-environment".into()),
+            env: vec![
+                ("NODE_OPTIONS".into(), "--max-old-space-size=4096".into()),
+                // A profile can never redirect the shared caches.
+                ("PNPM_HOME".into(), "/tmp/elsewhere".into()),
+            ],
+        }
+    }
+
+    #[test]
+    fn every_container_shares_the_toolchain_cache_with_mise_first_on_path() -> Result<()> {
+        let shared = Sandbox {
+            toolchains: Some(toolchains()),
+            ..sandbox()
+        };
+        let mut command = Command::new("codex");
+        command
+            .current_dir("/srv/worktrees/1791-abc")
+            .env("CARGO_HOME", "/root/.cargo")
+            .env("RUST_LOG", "info");
+        for role in [Role::Codex, Role::Shell, Role::Setup] {
+            let invocation = shared.invocation(
+                role,
+                "name",
+                &Program::from_command(&command),
+                role == Role::Shell,
+                &[],
+            )?;
+            let args = strings(&invocation.args);
+            ensure!(
+                args.windows(2).any(|pair| pair
+                    == [
+                        "-v",
+                        "/home/difu/.cache/difu/toolchains:/opt/difu/toolchains"
+                    ]),
+                "{role:?}: {args:?}"
+            );
+            let value = |key: &str| -> Option<String> {
+                let prefix = format!("{key}=");
+                args.iter()
+                    .find_map(|arg| arg.strip_prefix(&prefix).map(str::to_owned))
+            };
+            assert_eq!(
+                value("PATH").as_deref(),
+                Some(
+                    "/home/difu/.local/bin:/srv/repos/owner/name/.git/worktrees/1791-abc/difu-environment/bin:/opt/difu/toolchains/mise/shims:/opt/difu/toolchains/cargo/bin:/opt/difu/toolchains/pnpm:/opt/difu/toolchains/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+                ),
+                "{role:?}"
+            );
+            for (key, expected) in [
+                ("MISE_DATA_DIR", "/opt/difu/toolchains/mise"),
+                ("MISE_CACHE_DIR", "/opt/difu/toolchains/cache/mise"),
+                ("COREPACK_HOME", "/opt/difu/toolchains/corepack"),
+                ("PNPM_HOME", "/opt/difu/toolchains/pnpm"),
+                ("npm_config_cache", "/opt/difu/toolchains/npm"),
+                ("PIP_CACHE_DIR", "/opt/difu/toolchains/pip"),
+                ("UV_CACHE_DIR", "/opt/difu/toolchains/uv"),
+                ("CARGO_HOME", "/opt/difu/toolchains/cargo"),
+                ("RUSTUP_HOME", "/opt/difu/toolchains/rustup"),
+                ("GOMODCACHE", "/opt/difu/toolchains/go/pkg/mod"),
+                (
+                    "MISE_GLOBAL_CONFIG_FILE",
+                    "/srv/repos/owner/name/.git/worktrees/1791-abc/difu-environment/mise.toml",
+                ),
+                ("MISE_TRUSTED_CONFIG_PATHS", "/srv/worktrees/1791-abc"),
+                ("MISE_YES", "1"),
+                ("COREPACK_ENABLE_AUTO_PIN", "0"),
+                ("NODE_OPTIONS", "--max-old-space-size=4096"),
+            ] {
+                assert_eq!(value(key).as_deref(), Some(expected), "{role:?} {key}");
+            }
+            // The cache variables are the sandbox's; neither the profile nor
+            // the host process moves them.
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| arg.starts_with("PNPM_HOME="))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                args.iter()
+                    .filter(|arg| arg.starts_with("CARGO_HOME="))
+                    .count(),
+                1
+            );
+            ensure!(!args.iter().any(|arg| arg.contains("/tmp/elsewhere")));
+            ensure!(!args.iter().any(|arg| arg.contains("/root/.cargo")));
+        }
+        // Without a Git checkout there is no worktree config or corepack shims.
+        let bare = Sandbox {
+            toolchains: Some(Toolchains {
+                state: None,
+                env: Vec::new(),
+                ..toolchains()
+            }),
+            ..sandbox()
+        };
+        let args = strings(
+            &bare
+                .invocation(
+                    Role::Shell,
+                    "name",
+                    &Program::from_command(&command),
+                    true,
+                    &[],
+                )?
+                .args,
+        );
+        ensure!(
+            !args
+                .iter()
+                .any(|arg| arg.starts_with("MISE_GLOBAL_CONFIG_FILE="))
+        );
+        ensure!(
+            args.iter().any(|arg| arg
+                .starts_with("PATH=/home/difu/.local/bin:/opt/difu/toolchains/mise/shims:")),
+            "{args:?}"
+        );
+        ensure!(cache_volume(Path::new("relative")).is_err());
+        ensure!(cache_volume(Path::new("/a:b")).is_err());
+        assert_eq!(Role::Setup.name(), "setup");
+        Ok(())
+    }
+
+    #[test]
+    fn sandboxes_read_the_repository_profile_and_worktree_state() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let storage = Storage {
+            config: temp.path().join("config").join("config.json"),
+            cache: temp.path().join("cache"),
+        };
+        fs::create_dir_all(temp.path().join("config"))?;
+        let repository = repos::path(&storage, "owner/name")?;
+        fs::create_dir_all(&repository)?;
+        process::checked(
+            Command::new("git")
+                .arg("-C")
+                .arg(&repository)
+                .args(["init", "-q", "-b", "main"]),
+            &Cancel::default(),
+        )?;
+        environments::update(&storage, "owner/name", "test", |profile| {
+            profile.env.insert("CI".into(), "1".into());
+            Ok(vec!["CI=1".into()])
+        })?;
+        let toolchains = Toolchains::for_session(&storage, &repository, &repository)?;
+        assert_eq!(
+            toolchains.cache,
+            temp.path().join("cache").join("toolchains")
+        );
+        ensure!(toolchains.cache.is_dir());
+        assert_eq!(toolchains.env, [("CI".to_owned(), "1".to_owned())]);
+        let state = toolchains
+            .state
+            .context("a Git checkout has a state directory")?;
+        ensure!(
+            state.ends_with(".git/difu-environment"),
+            "{}",
+            state.display()
+        );
+        // Outside the server's repositories there is no profile.
+        let other = Toolchains::for_session(&storage, temp.path(), &temp.path().join("missing"))?;
+        ensure!(other.env.is_empty() && other.state.is_none());
+        Ok(())
+    }
+
     #[test]
     fn pods_are_created_once_started_and_a_missing_local_image_is_explained() -> Result<()> {
         let sandbox = sandbox();
@@ -1730,6 +2041,7 @@ mod tests {
             "ripgrep",
             "jq",
             "unzip",
+            "xz-utils",
         ] {
             assert!(
                 CONTAINERFILE
@@ -1738,6 +2050,9 @@ mod tests {
                 "{package} is missing from the Containerfile"
             );
         }
+        // mise lives outside the mounted home; corepack serves every Node.
+        assert!(CONTAINERFILE.contains("MISE_INSTALL_PATH=/usr/local/bin/mise"));
+        assert!(CONTAINERFILE.contains("npm install -g corepack"));
         assert_eq!(
             strings(&build_args(
                 SandboxSettings::DEFAULT_IMAGE,
@@ -1941,6 +2256,7 @@ mod tests {
             home: home.clone(),
             workspace: workspace.clone(),
             attachments: Some(attachments.clone()),
+            toolchains: None,
         };
         let exists = |kind: &str, name: &str| -> Result<bool> {
             Ok(podman.podman(&os([kind, "exists", name]))?.code == 0)
@@ -2020,6 +2336,155 @@ mod tests {
         result
     }
 
+    /// One session's setup container installs a tool with mise into the
+    /// server's shared cache; another session's shell finds it through mise's
+    /// shims, offline. Runs only where rootless Podman works and difu's own
+    /// sandbox image (which has mise and a shell) is built; skips elsewhere.
+    /// mise's published image has no shell, so it cannot stand in. Without
+    /// network for the download, a local build linked with `mise link` stands
+    /// in for the install.
+    #[test]
+    fn podman_sandboxes_share_tools_mise_installed_in_the_cache() -> Result<()> {
+        if !podman_ready("the shared toolchain cache test") {
+            return Ok(());
+        }
+        let succeeds = |args: &[&str]| {
+            Podman
+                .podman(&os(args.iter().copied()))
+                .is_ok_and(|output| output.code == 0)
+        };
+        if !succeeds(&["image", "exists", SandboxSettings::DEFAULT_IMAGE]) {
+            eprintln!("Skipping the shared toolchain cache test: `difu sandbox build` has not run");
+            return Ok(());
+        }
+        let image = SandboxSettings::DEFAULT_IMAGE;
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().canonicalize()?;
+        let cache = root.join("cache");
+        let home = root.join("home");
+        fs::create_dir_all(&cache)?;
+        fs::create_dir_all(&home)?;
+        let sandboxes = ["a", "b"]
+            .into_iter()
+            .map(|name| -> Result<Sandbox> {
+                let workspace = root.join(name);
+                let state = workspace.join(environments::STATE);
+                fs::create_dir_all(&state)?;
+                let session = test_session(&format!("mise-{name}"));
+                Ok(Sandbox {
+                    pod: pod_name(&session)?,
+                    session,
+                    image: image.into(),
+                    cpus: String::new(),
+                    memory: String::new(),
+                    home: home.clone(),
+                    workspace,
+                    attachments: None,
+                    toolchains: Some(Toolchains {
+                        cache: cache.clone(),
+                        state: Some(state),
+                        env: Vec::new(),
+                    }),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let [first, second] = sandboxes.as_slice() else {
+            bail!("Expected two sandboxes");
+        };
+        // What difu writes for each worktree: the same resolved tools.
+        let configure = |tools: &str| -> Result<()> {
+            for sandbox in [first, second] {
+                let state = sandbox
+                    .toolchains
+                    .as_ref()
+                    .and_then(|toolchains| toolchains.state.clone())
+                    .context("state")?;
+                fs::write(state.join("mise.toml"), format!("[tools]\n{tools}\n"))?;
+            }
+            Ok(())
+        };
+        let run = |sandbox: &Sandbox, role: Role, script: &str, offline: bool| {
+            let mut command = Command::new("sh");
+            command.args(["-c", script]).current_dir(&sandbox.workspace);
+            if offline {
+                command.env("MISE_OFFLINE", "1");
+            }
+            let program = Program::from_command(&command);
+            let (mut invocation, mut container) =
+                sandbox.prepare(Arc::new(Podman), role, &program, false)?;
+            // mise's own image has an entrypoint; run the command itself.
+            let position = invocation
+                .args
+                .iter()
+                .position(|arg| arg.to_str() == Some(image))
+                .context("The invocation names its image")?;
+            invocation.args.insert(position, "--entrypoint=".into());
+            let mut wrapped = Environment::current().command();
+            wrapped.args(&invocation.args).envs(invocation.env.clone());
+            let output = bounded(&mut wrapped, Duration::from_secs(300))?;
+            container.exited();
+            Ok::<_, anyhow::Error>(output)
+        };
+        let text = |output: &process::Output| {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        };
+        let result = (|| -> Result<()> {
+            configure("jq = \"1.7.1\"")?;
+            let installed = run(first, Role::Setup, "mise install", false)?;
+            let (program, expected) = if installed.code == 0 {
+                ("jq", "jq-1.7.1")
+            } else {
+                eprintln!(
+                    "mise could not download jq, linking a local build instead: {}",
+                    text(&installed).trim()
+                );
+                let fixture = cache.join("fixtures/node-difu/bin");
+                fs::create_dir_all(&fixture)?;
+                fs::write(fixture.join("node"), "#!/bin/sh\necho difu-shared\n")?;
+                fs::set_permissions(fixture.join("node"), fs::Permissions::from_mode(0o755))?;
+                configure("node = \"0.0.1-difu\"")?;
+                let linked = run(
+                    first,
+                    Role::Setup,
+                    "mise link --force node@0.0.1-difu /opt/difu/toolchains/fixtures/node-difu && mise reshim",
+                    false,
+                )?;
+                ensure!(linked.code == 0, "mise link failed: {}", text(&linked));
+                ("node", "difu-shared")
+            };
+            // The install landed in the server's cache, outside both containers.
+            ensure!(
+                fs::read_dir(cache.join("mise/installs"))?.next().is_some(),
+                "Nothing was installed in the shared cache"
+            );
+            let found = run(
+                second,
+                Role::Shell,
+                &format!("command -v {program} && {program} --version"),
+                true,
+            )?;
+            let output = text(&found);
+            ensure!(
+                found.code == 0,
+                "The other session could not run {program}: {output}"
+            );
+            ensure!(
+                output.contains(&format!("/opt/difu/toolchains/mise/shims/{program}")),
+                "{program} did not come from mise's shims: {output}"
+            );
+            ensure!(output.contains(expected), "{output}");
+            Ok(())
+        })();
+        for sandbox in &sandboxes {
+            remove_pod_with(&Podman, &sandbox.session)?;
+        }
+        result
+    }
+
     /// Two sessions' sandboxes rewrite the shared Claude Code config at the
     /// same time the way Claude Code does: under the `.claude.json.lock`
     /// directory, by renaming a temporary file over `.claude.json`. Every read
@@ -2070,6 +2535,7 @@ done
                         home: home.clone(),
                         workspace: workspace.clone(),
                         attachments: None,
+                        toolchains: None,
                     },
                 ))
             })

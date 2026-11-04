@@ -399,7 +399,8 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                 || session.command_tools
                     && !session.orchestrator
                     && tool.is_some_and(|tool| super::session_tools::TOOLS.contains(&tool))
-                || !session.orchestrator && tool == Some(super::moving::TOOL))
+                || !session.orchestrator && tool == Some(super::moving::TOOL)
+                || super::environment::offered(session) && tool == Some(super::environment::TOOL))
         {
             session.orchestrator_requests.push(Pending {
                 id: id.clone(),
@@ -1983,6 +1984,10 @@ pub fn run(
         })?;
         super::guidance::confirm(store, id, &session, &controls, cancel)?;
     }
+    // Install the repository's tools and run its setup before the agent starts.
+    if !session.waiting_for_workspace() {
+        super::environment::prepare(store, id, cancel);
+    }
     let (mut rpc, resuming) = connect(store, id, cancel)?;
     let Job::Coding(launch) = &session.job else {
         anyhow::bail!("Not a coding session");
@@ -2102,6 +2107,8 @@ pub fn run(
                         super::folders::handle_tool(store, id, &args)
                     } else if tool == Some(super::moving::TOOL) {
                         super::moving::schedule(store, id, &args)
+                    } else if tool == Some(super::environment::TOOL) {
+                        super::environment::handle(store, id, &args)
                     } else if let Some(tool) =
                         tool.filter(|tool| super::session_tools::TOOLS.contains(tool))
                     {

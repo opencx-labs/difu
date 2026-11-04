@@ -66,7 +66,11 @@ picking a server. Each server's page in Settings shows its disk space (free
 space, status, what uses it, and cleanups for archived worktrees, build outputs
 and sandbox storage), logins (GitHub and Codex device-code login, Claude Code
 token), repositories (add, remove, **Refresh Mains**), new session defaults,
-repository rules and paired devices.
+repository rules and paired devices. Tap a repository for its **Environment**:
+the tool versions its files declare, and the tools, setup commands, variables
+and notes the server installs and runs before every new session in it (agents
+add to it as they learn what the repository needs; never put secrets there),
+with the recent changes and who made them.
 
 **New Session** starts from the chosen computer's or server's new session
 defaults, as that computer or server works them out, so the phone, its

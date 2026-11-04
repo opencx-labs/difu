@@ -4,7 +4,8 @@ Your diff shifu: the `difu` terminal app and background agent service live in `c
 
 ## Local env
 
-- Run the Rust checks from `cli/` before every commit that touches it, in this order: `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked`.
+- Before committing changes under `cli/`, run `cargo fmt --all` and, at most, one low-parallelism compile check: `CARGO_BUILD_JOBS=2 cargo clippy --locked --all-targets -- -D warnings`.
+- Don't run test suites locally (`cargo test`, `swift test`, `xcodebuild`): pull-request CI runs them on macOS, Linux and iOS. Push and fix what CI reports.
 - Lints deny `indexing_slicing` and `panic` even in tests. Use `.get()`, slice patterns and `anyhow::bail!`, and write tests as `-> anyhow::Result<()>`.
 
 ## Git

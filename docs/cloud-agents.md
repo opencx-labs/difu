@@ -190,6 +190,15 @@ before. Running sessions switch modes from any client: Shift+Tab and
 
 Permission prompts are otherwise unchanged.
 
+Sandboxed sessions also get the environment instructions (see
+*Environments*): check the repository's environment profile with
+`difu_environment` before builds and tests, install what is missing with mise
+and record it so future sessions start ready, never apt-install runtimes or
+record secrets. The outcome of the session's last environment preparation
+follows them.
+
+Permission prompts are unchanged.
+
 ## Sandboxes
 
 * Runtime: rootless Podman. One **pod** per session (`difu-<session id>`), so the
@@ -210,6 +219,10 @@ Permission prompts are otherwise unchanged.
   * the session's attachment directory (`<data>/agents/attachments/<id>`)
     mounted read-only, so Codex can read images sent from a Mac or a phone by
     path and the agent can open mentioned videos;
+  * the server's shared toolchain cache mounted read-write at
+    `/opt/difu/toolchains`, mise's shims and the cache's program directories
+    on `PATH`, the worktree's mise config and the repository profile's
+    variables (see *Environments*);
   * secrets passed by variable name only, so they never appear in `ps`.
 * CPU and memory limits from `config.server.sandbox` apply to the whole pod, one
   budget per session.
@@ -225,7 +238,12 @@ Permission prompts are otherwise unchanged.
   shells, removes the session's pod, its worktree (uncommitted files included),
   attachments and saved session.
 * `difu sandbox build` builds `localhost/difu-sandbox:latest` from a bundled
-  Containerfile (Ubuntu LTS with git, gh, build tools, Python, Node, ripgrep).
+  Containerfile (Ubuntu LTS with git, gh, build tools, Python, Node, ripgrep,
+  plus [mise](https://mise.jdx.dev) in `/usr/local/bin` and corepack). No
+  toolchains are baked in: they go to the shared cache (see *Environments*);
+  the Ubuntu Node and Python are only the fallback for repositories that
+  declare nothing. `difu server upgrade` rebuilds the image, so existing
+  servers get mise with the upgrade.
   A custom `config.server.sandbox.image` under `localhost/` is built from the
   same Containerfile and tagged with that name; any other image comes from a
   registry, so `difu sandbox build` pulls it instead (and says so).
@@ -237,6 +255,205 @@ Permission prompts are otherwise unchanged.
 * Sessions are always worktrees, exactly as on a local difu. Worktrees share the
   base clone's object store and refs, so a sandbox could rewrite another session's
   branch refs (not its files); this is accepted, as it is locally.
+
+## Environments
+
+A sandbox starts from the same image for every repository, but repositories
+need different runtimes ("the backend needs Node 24 and pnpm"). Each server
+remembers what each repository needs, installs it once into a cache every
+sandbox shares, and applies it before a session's agent starts, so no session
+repeats another's setup.
+
+### Environment profiles
+
+Stored on the server in `<data>/agents/repos/.environments.json`, next to the
+base clones and keyed by `owner/name` (matched case-insensitively, saved in
+the listed spelling), changed under `.environments.lock`:
+
+| Field | Meaning | Limits |
+| --- | --- | --- |
+| `tools` | mise tool name → version (`node` → `24`, `pnpm` → `9`, `python` → `3.12`, `npm:prettier` → `3`) | 40; names `[A-Za-z0-9][A-Za-z0-9._:/@-]*`, versions `[A-Za-z0-9][A-Za-z0-9._+:/-]*` (≤ 64) |
+| `setup` | Commands run with `bash -lc` in each new worktree before the agent starts (`pnpm install --frozen-lockfile`) | 20, one line each, ≤ 1000 characters |
+| `env` | Non-secret variables for the agent and its shells | 50; values one line, ≤ 2000 characters |
+| `notes` | Free text for agents ("backend tests need Postgres via docker compose") | 30, ≤ 1000 characters |
+| `history` | The last 20 changes: `{at, by, summary}`, oldest first; only difu writes it | |
+| `updatedAt` | Milliseconds since the epoch of the last change | |
+
+Profiles are plain text every client of the server reads, so nothing secret
+may go in: variables named like secrets (`*TOKEN*`, `*SECRET*`, `*PASSWORD*`,
+`*API_KEY*`, `*_KEY`, ...) and values, commands or notes containing what looks
+like a token (`ghp_…`, `sk-…`, `AKIA…`, `xox…`, JWTs, private keys, long
+random strings mixing cases and digits) are refused. Variables difu or the
+sandbox sets (`PATH`, `HOME`, the cache variables below, `MISE_*`, `DIFU_*`,
+`LD_PRELOAD`, the login tokens, ...) cannot be overridden.
+
+### Shared toolchain cache
+
+`<cache>/toolchains` on the server (`~/.cache/difu/toolchains`; part of
+*Caches* in the disk breakdown) is mounted read-write at
+`/opt/difu/toolchains` in every container of every session: agent, shells and
+setup. A runtime is downloaded once per server.
+
+| Variable | Directory under `/opt/difu/toolchains` |
+| --- | --- |
+| `MISE_DATA_DIR` | `mise` (installs, shims, plugins) |
+| `MISE_CACHE_DIR`, `MISE_STATE_DIR` | `cache/mise`, `state/mise` |
+| `COREPACK_HOME` | `corepack` |
+| `PNPM_HOME` | `pnpm` (pnpm's store is `pnpm/store`) |
+| `npm_config_cache` | `npm` |
+| `YARN_CACHE_FOLDER`, `YARN_GLOBAL_FOLDER` | `yarn`, `yarn-berry` |
+| `PIP_CACHE_DIR`, `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR` | `pip`, `uv`, `uv-python` |
+| `CARGO_HOME`, `RUSTUP_HOME` | `cargo` (registry, git, installed binaries), `rustup` |
+| `GOPATH`, `GOMODCACHE`, `GOCACHE` | `go`, `go/pkg/mod`, `go/build` |
+| `BUN_INSTALL_CACHE_DIR` | `bun` |
+
+`PATH` is `~/.local/bin` (the agent CLIs), the worktree's corepack shims, then
+`mise/shims`, `cargo/bin`, `pnpm` and `go/bin` under the cache, then the
+image's directories. Every container also gets `MISE_YES=1`,
+`MISE_TRUSTED_CONFIG_PATHS=<worktree>` (the sandbox is the trust boundary),
+`COREPACK_ENABLE_DOWNLOAD_PROMPT=0`, `COREPACK_ENABLE_AUTO_PIN=0` (corepack
+never adds `packageManager` to the repository) and
+`MISE_GLOBAL_CONFIG_FILE=<git dir>/difu-environment/mise.toml`. The cache
+variables are always the sandbox's: neither the profile nor the agent CLIs'
+environment moves them.
+
+Every sandbox on a server can write the cache, so one session could change a
+toolchain another uses; this is accepted like the shared object store of base
+clones. pnpm cannot hard-link from the store across the two mounts and copies
+packages instead.
+
+### Resolution
+
+difu reads the version files a worktree declares, each tool once, in mise's
+order of precedence: `mise.toml` (and `.mise.toml`, `mise/config.toml`,
+`.config/mise.toml`, ...) `[tools]`, `.tool-versions`, idiomatic files
+(`.nvmrc`, `.node-version`, `.python-version`, `.ruby-version`, `.go-version`,
+`.java-version`, `.terraform-version`, `.bun-version`), `rust-toolchain.toml` /
+`rust-toolchain`, then `go.mod` (`toolchain`, else `go`) and `package.json`
+(`packageManager` for pnpm and yarn, provided by corepack; `engines.node`,
+whose last alternative's major version is used: `^20.10.0 || >=22` → `22`).
+Symlinks are never followed: the agent controls the worktree and difu reads it
+on the host. The repository's files win; the profile's tools fill the gaps.
+
+The resolved tools (except corepack's) are written to the worktree's
+`<git dir>/difu-environment/mise.toml`, mise's global config there, with
+idiomatic version files enabled for node, python, ruby, go, java, rust, bun,
+deno and terraform. mise reads the worktree's own files over it, so a version
+file the agent changes still wins, and every container of the session
+(agent, shells, setup) resolves the same versions through the shims.
+
+### Preparation
+
+Before a sandboxed session's agent starts (every time its agent process
+starts, and for a new session as soon as its worktree exists, so tools install
+while the user writes the first message), the service:
+
+1. Records versions the repository's files declare that the profile does not
+   have yet ("node 24 (from .nvmrc)", by "difu, from the repository's files in
+   session `<id>`") and tells the session.
+2. Writes the worktree's mise config.
+3. Decides what to run, from `<git dir>/difu-environment/state.json`:
+   * **tools** (`mise install`, then `corepack enable --install-directory
+     <git dir>/difu-environment/bin pnpm|yarn` when `packageManager` asks)
+     when the resolved tools changed since the last successful install in
+     this worktree or a tool's install directory is missing from the cache;
+   * **setup** (each profile command, in order) when its fingerprint changed
+     since the last success in this worktree. The fingerprint hashes the
+     tools, the setup commands and variables, and the worktree's lockfiles and
+     manifests (`package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml`,
+     `package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `.yarnrc.yml`,
+     `bun.lock(b)`, `Cargo.lock`, `go.sum`, `poetry.lock`, `uv.lock`,
+     `Pipfile.lock`, `requirements(-dev).txt`, `pyproject.toml`,
+     `Gemfile.lock`, `composer.lock`, `mix.lock`).
+4. Runs what is needed in one setup container (`--label difu.role=setup`) in
+   the session's pod, bounded by 20 minutes; each step reads `/dev/null`,
+   and the script ends with `mise ls --current --json`, whose tools from files
+   in the worktree are learned like step 1.
+5. Reports in the chat: "Preparing the environment for acme/widgets: node 24
+   (.nvmrc), pnpm 9.12.0 (package.json packageManager, via corepack); then
+   `pnpm install --frozen-lockfile`…", then "Environment for acme/widgets
+   ready (in 48s): …" or an error entry naming the failed step, its exit code
+   and its last lines. When nothing needs to run, the first preparation of a
+   session says so once ("ready (already installed) … Setup … skipped: its
+   lockfiles, commands and tools are unchanged since it last succeeded in this
+   worktree").
+
+The outcome is stored with the session and appended to the agent's
+instructions as "Environment status: …". A failure, a timeout or a Podman
+error never fails the session: the agent starts anyway and knows what failed.
+Concurrent preparations of one worktree (the background one and the agent's)
+wait for each other under `<git dir>/difu-environment/lock`; the later one
+finds nothing left to do. The state lives in the worktree's Git directory, so
+removing the worktree removes it. Without sandboxing nothing is installed;
+the profile is still shared.
+
+### `difu_environment`
+
+Offered to Codex (a dynamic tool) and Claude Code (the difu MCP server) in
+coding sessions on a server; it works when the session's repository is a
+server repository (sessions started on `owner/name`):
+
+```json
+{}                                        // read
+{"remember": {"tools": {"node": "24", "pnpm": "9"},
+              "setup": ["pnpm install --frozen-lockfile"],
+              "env": {"NODE_OPTIONS": "--max-old-space-size=4096"},
+              "notes": ["backend tests need Postgres via docker compose"]},
+ "forget": {"tools": [], "setup": [], "env": [], "notes": []}}
+```
+
+It answers `repository`, `profile` (tools, setup, env, notes), `detected`
+(this worktree's version files), `resolved` (with each tool's source),
+`recorded` (what this call changed), `lastPreparation`, `recentChanges` (the
+last five history entries), `sharedCache` and a note. `setup` and `notes`
+also take a single string; versions may be numbers. Changes are validated as
+above (an invalid call changes nothing), recorded in the history as "Claude
+Code in session `<id>` (`<title>`)", noted in the calling session's chat, and
+then:
+
+* every ready worktree of the repository's sessions gets its mise config
+  rewritten, so new commands and shells use the new tools at once (`mise
+  install` installs one that is missing);
+* every other active session of the repository gets a system entry: "Another
+  session recorded in the acme/widgets environment: node 24; setup `pnpm
+  install --frozen-lockfile`. New commands and shells use it; run `mise
+  install` if a new tool is missing."
+
+### Editing from clients
+
+Clients read and replace a profile's tools, setup, variables and notes
+(never its history). A change from a client is recorded with the device's
+name and reaches running sessions like an agent's ("Ali's iPhone updated the
+acme/widgets environment: …").
+
+```json
+{"method": "server.environment.get", "params": {"repository": "acme/widgets"}}
+→ {"repository": "acme/widgets",
+   "profile": {"tools": {"node": "24"}, "setup": ["pnpm install --frozen-lockfile"],
+               "env": {"NODE_OPTIONS": "--max-old-space-size=4096"},
+               "notes": ["backend tests need Postgres via docker compose"],
+               "history": [{"at": 1790000000000, "by": "Claude Code in session 1790000000000-ab12cd34 (Billing allowlist)",
+                            "summary": "node 24; setup `pnpm install --frozen-lockfile`"}],
+               "updatedAt": 1790000000000},
+   "detected": [{"tool": "pnpm", "version": "9.12.0", "source": "package.json packageManager", "corepack": true}]}
+
+{"method": "server.environment.set", "params": {"repository": "acme/widgets",
+  "profile": {"tools": {"node": "24"}, "setup": [], "env": {}, "notes": []}}}
+→ the saved profile, in the same shape
+```
+
+* `repository` is `owner/name` or a path in a server repository's base clone.
+  `detected` lists the base clone's files (its default branch); `corepack` is
+  omitted when false.
+* Both require server mode. The phone API asks the service with
+  `Request::Environment {server: null, repository, profile, by}` →
+  `Reply::Environment({repository, profile, detected})`; `by` is the calling
+  device's name.
+* The terminal app's `Request::Environment {server: "<name>", ...}` is
+  answered by the local service with these phone-API calls on its connection
+  (like `server.disk`), so it works whatever difu version the server runs; an
+  older server answers "runs an older difu without environment profiles; run
+  `difu server upgrade <name>`".
 
 ## Disk space
 
@@ -589,9 +806,11 @@ servers by `server.id`. `server.name` (like the link's `n` and `server.info`'s
 | `server.logout` | `{"tool"}` | `{}` |
 | `server.disk` | `{"refresh"?}` | Disk space, status and breakdown; see *Disk space*. |
 | `server.disk.clean` | `{"action"}` | `{"freed","summary"}`; `action` is `archivedWorktrees`, `buildOutputs` or `sandbox`. |
+| `server.environment.get` | `{"repository"}` | `{"repository","profile","detected"}`; see *Environments*. |
+| `server.environment.set` | `{"repository","profile"}` | The saved profile, in the same shape. |
 
-`server.repos*`, `server.login*`/`server.logout*` and `server.disk*` require
-server mode, so a phone paired with a Mac cannot change the Mac's logins;
+`server.repos*`, `server.login*`/`server.logout*`, `server.disk*` and
+`server.environment*` require server mode, so a phone paired with a Mac cannot change the Mac's logins;
 `server.rules.*` work everywhere. `agents.repositories` on a server returns the server repositories
 (`name` is `owner/name`). `agents.new` accepts `repository` as a path or
 `owner/name` (an unlisted name is added and cloned first); `base` is reserved and
@@ -612,13 +831,34 @@ feature without a second API.
 | Method | Params | Result |
 | --- | --- | --- |
 | `rpc` | `{"request": Request}` | `{"reply": Reply}` |
-| `rpc.watch` | `{"id","version"?}` | `{"stream": n}`, then events `{"event":"rpc.watch","data":{"stream":n,"reply":Reply}}` until `rpc.unwatch` or `{"event":"rpc.watch.closed","data":{"stream":n,"message":"..."}}` |
+| `rpc.watch` | `{"id","version"?,"fingerprint"?}` | `{"stream": n}`, then events `{"event":"rpc.watch","data":{"stream":n,"reply":Reply}}` until `rpc.unwatch` or `{"event":"rpc.watch.closed","data":{"stream":n,"message":"..."}}` |
 | `rpc.unwatch` | `{"stream"}` | `{}` |
 
 `standard` devices get an error for these. A service error comes back as the
 call's `error`; `Request::Watch` must use `rpc.watch`. Clients must check that the
 server's `version` equals their own before using `rpc` (`difu server upgrade`
 fixes a mismatch).
+
+`rpc.watch` normally starts with the full session (`Session`), then deltas. A
+client that already holds a copy (a Mac resuming from its cache) sends its
+`fingerprint`, and the first event is `Unchanged` when that copy is current,
+otherwise a `SessionDelta` on top of it; later events build on it as usual:
+
+```json
+{"method": "rpc.watch", "params": {"id": "1790000000000-ab12cd34", "version": 41,
+  "fingerprint": {"version": 41, "digest": "<sha-256 of the session JSON, hex>",
+                  "entries": ["<16 hex digits per entry>", "..."],
+                  "subagents": {"<sub-agent id>": ["..."]}}}}
+```
+
+* `digest` is the SHA-256 (hex) of the session's JSON as the service sends
+  it; equal means nothing changed.
+* `entries` (and each sub-agent's list) hold the first 16 hex digits of the
+  SHA-256 of each entry's JSON, in order. The delta's `base` is the
+  fingerprint's `version`; it carries every entry whose hash differs or that
+  is new, the new entry count (a shorter session truncates the copy) and all
+  metadata.
+* Servers that predate `fingerprint` ignore it and send the full session.
 
 Three service requests exist for clients whose sessions live elsewhere:
 
@@ -644,7 +884,8 @@ Three service requests exist for clients whose sessions live elsewhere:
 * Saved servers live in `<config>/servers.json` (0600): name, server id, hosts,
   port, fingerprint, device id and token.
 * The local agent service connects to every saved server as a `full` device and
-  merges their sessions into `Request::List` replies. Server session ids are
+  merges their sessions into `Request::List` replies, from its cache while a
+  server is unreachable (see *Staying connected, and offline servers*). Server session ids are
   namespaced as `<server name>:<session id>` and summaries carry `server`: the
   sessions list shows a ☁️ after the worktree 🌳 and the server's name before
   the repository when the row has room. Requests for a namespaced id are forwarded with `rpc`; watches
@@ -708,7 +949,13 @@ Three service requests exist for clients whose sessions live elsewhere:
   Refresh (`r`, `Request::Disk` with `refresh`, which also rereads logins and
   repositories), Clean archived worktrees (`a`), Clear build outputs (`b`) and
   Prune sandbox images (`p`), each confirmed with what it removes and the space
-  it should free before `Request::DiskClean`, then the summary. Without saved
+  it should free before `Request::DiskClean`, then the summary. `e` (in the
+  list or the details) edits the selected server's repository environments:
+  pick a repository, edit its profile as text with `[tools]` (`name =
+  version`), `[setup]` (one command per line), `[env]` (`NAME = value`) and
+  `[notes]` sections, after comments with what the repository's files declare
+  and the latest change; the profile is checked before it is sent
+  (`Request::Environment`), and Esc returns to `/cloud`. Without saved
   servers it explains `difu server add` and `difu server join`.
 * A low or critical server is marked where its sessions appear: the server name
   in the sessions list turns yellow or red (with "disk low"/"disk critical" when
@@ -717,6 +964,85 @@ Three service requests exist for clients whose sessions live elsewhere:
   critical server with the server's message before sending anything.
 * The phone API of a Mac hides relayed server sessions, because phones connect to
   servers directly.
+
+### Staying connected, and offline servers (Mac)
+
+Laptops sleep and change networks, and iCloud Private Relay or WARP change
+the Mac's public address, which silently kills long-lived connections. The
+Mac's local service therefore treats every server connection as unreliable,
+and server sessions never disappear because a server cannot be reached.
+
+* **Liveness.** The client pings a quiet server every 10 s and drops a
+  connection that sent nothing at all (no frame, no pong) for 25 s. TCP
+  keepalive (probes after 15 s idle, every 5 s, 3 probes) lets the kernel
+  notice a dead path as well. A failed or slow request (an error reply, a
+  long answer) never closes the connection; only transport errors do.
+* **Reconnects** start 0.5 s after a drop and double up to 10 s, spread
+  ±25%; a connection that lasted 30 s resets the delay, so a flapping link
+  keeps backing off. A person's request (a message, an approval, a `/cloud`
+  action) that finds the server unreachable makes its worker reconnect at
+  once and waits up to 3 s for it.
+* **Cache.** Each saved server has `<config>/agents/servers/<server>/` (0700,
+  every file written atomically):
+  * `server.json`: the server id; another server saved under the same name
+    starts with an empty cache.
+  * `sessions.json`: the server's last session list and when it was read.
+  * `snapshots/<session>@<version>.json`: the last full copy (with the
+    server's own session id) of every session this Mac opened, and of the
+    12 most recently updated idle, unarchived sessions, which the service
+    copies one per second while a terminal app is open and their copy is
+    missing or older. Copies of sessions a connected server no longer lists
+    are dropped, then the least recently used beyond 100 copies or 256 MB
+    (the newest always stays).
+  * `outbox.json`: held messages, below.
+
+  The cache is loaded when the service starts, so server sessions appear
+  before any connection. Removing the server (`difu server remove`, or from
+  `servers.json`) removes its directory.
+* **Never hidden.** While a server is unreachable its sessions stay listed,
+  with `Summary.offline` = `{"since", "reconnecting"}` (`since`: when the
+  server last answered, in milliseconds; `reconnecting`: the first 30 s
+  after the drop). The sessions list dims the ☁️ and says "reconnecting…"
+  (yellow) or "offline" (red) after the server's name when the row has room,
+  and the conversation title says "on aws (offline)". Selecting one shows its
+  cached copy, read-only (`Session.offline` is set); a session that was never
+  copied shows nothing until the server is back. Requests the terminal app
+  repeats on its own (statistics, changes, PRs, shells, skills) fail at once
+  instead of waiting, and it stops polling statistics and changes for
+  offline sessions. A server running another difu version still hides its
+  sessions until `difu server upgrade`.
+* **Resumed watches.** A watch of a server session (`Request::Watch` to the
+  local service) sends the cached copy first, then opens `rpc.watch` with its
+  `fingerprint`, so an unchanged session costs nothing and a changed one
+  only its changes. A dropped watch or connection is reopened when the
+  server is back; the terminal app sees heartbeats, never an error, and the
+  same baseline-then-deltas stream as for a local session. The copy is
+  written at most every 15 s while it changes and when the watch ends or
+  loses the server; an unchanged session list at most once a minute.
+* **Outbox.** A message (with its attachments) for a session whose server is
+  unreachable is held in `outbox.json` and the send succeeds. Attachments are
+  checked when the message is held (present, the session's own, unchanged,
+  at most 32 MB), so a bad file fails at once. Held messages appear at the end
+  of the session's `queue`; `Session.held` (one `{"error"?}` per message)
+  marks those last prompts, which the terminal app lists as "Messages queued
+  until aws reconnects" (and in the queue editor as "queued until aws
+  reconnects"). They are edited and removed like queued messages:
+  `ReplaceQueued` naming a held prompt is answered by the local service. A
+  session with held messages keeps its later messages behind them even while
+  connected, so their order holds. After a reconnect the worker sends them in
+  order, each with `queue: true` (so they wait for a running turn), uploading
+  the attachments first. A message the server refuses stays with the reason
+  ("Not accepted by aws: …") until it is edited, which sends it again, or
+  removed. When the connection drops after a message was written but before
+  the server confirmed it, the next attempt first looks for it in the
+  session's queue and latest user messages, so it is not sent twice. Held
+  messages for a session a connected server no longer lists (deleted) go
+  with the session.
+* **Other actions** that need the server (answers, approvals, mode changes,
+  renames, deletes, shells, new sessions, `/cloud` actions) are not queued:
+  replayed later they could act on a session that has moved on. After the 3 s
+  wait they fail with "aws is offline; try again when it reconnects (messages
+  you send are queued until then)".
 
 ### iPhone
 
@@ -740,7 +1066,12 @@ Three service requests exist for clients whose sessions live elsewhere:
 * Per-server settings: disk space (bar, status, breakdown, and the three
   cleanups with confirmations), logins (status, device-code login, Claude
   token), server repositories (add from `server.repos.available`, remove,
-  refresh mains), repository rules, paired devices (revoke).
+  refresh mains; tapping one opens its environment and rules), repository
+  rules, paired devices (revoke).
+* Repository environment (Settings → server → Repositories → a repository →
+  Environment): the versions the repository declares, then tools, setup
+  commands, variables and notes as editable lists, and the recent changes
+  with who made them; Save calls `server.environment.set`.
 * Face ID / passcode app lock when opening and after 5 minutes in the background.
 * "Forget" calls `device.unpair` before deleting the credential.
 * `device.paired` events show a banner with a Revoke action.
@@ -756,3 +1087,8 @@ Three service requests exist for clients whose sessions live elsewhere:
   both of which keep the providers' own checks; bypass permissions and Full
   Access are never applied automatically.
 * Revocation works from any paired client and from `difu remote forget`.
+* Environment profiles hold no secrets (difu refuses what looks like one) and
+  every client can read them. Their setup commands run in the repository's
+  sandboxes with the agent's own privileges; only agents in that server's
+  sessions and its paired devices can change them, and every change is
+  recorded with who made it and announced in running sessions.

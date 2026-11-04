@@ -35,9 +35,93 @@ use tungstenite::{Message, protocol::WebSocketConfig};
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
 /// Initial transcripts can be several MB.
 const MAX_MESSAGE: usize = 64 << 20;
-/// The server pings every 15 s; this much silence means the connection is gone.
-const SILENCE: Duration = Duration::from_secs(45);
+/// The client pings a quiet server this often; the server answers with a pong
+/// (and pings every 15 s itself).
+const PING: Duration = Duration::from_secs(10);
+/// No frame at all for this long means the connection is gone. NAT and VPN
+/// egress changes (iCloud Private Relay, WARP) drop connections silently, so
+/// waiting for a request to fail would notice far too late.
+const SILENCE: Duration = Duration::from_secs(25);
+/// TCP keepalive: probe after this much idle time, then every `KEEPALIVE_INTERVAL`,
+/// giving up after `KEEPALIVE_PROBES` unanswered probes.
+const KEEPALIVE_IDLE: u32 = 15;
+const KEEPALIVE_INTERVAL: u32 = 5;
+const KEEPALIVE_PROBES: u32 = 3;
 const CLOSED: &str = "Server connection closed";
+
+/// The connection closed before a request was written: the server never saw
+/// it, so sending it again cannot duplicate it.
+#[derive(Debug)]
+pub struct NotSent;
+impl std::fmt::Display for NotSent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(CLOSED)
+    }
+}
+impl std::error::Error for NotSent {}
+
+/// The connection closed after a request was written and before its reply:
+/// the server may or may not have acted on it.
+#[derive(Debug)]
+pub struct Lost;
+impl std::fmt::Display for Lost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(CLOSED)
+    }
+}
+impl std::error::Error for Lost {}
+
+/// What the socket thread should do about a quiet connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Pulse {
+    Fine,
+    Ping,
+    Dead,
+}
+
+/// Client-side liveness: ping a quiet server, and call the connection dead
+/// after `SILENCE` without any frame. Takes the time as an argument so tests
+/// can drive it with a fake clock.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Liveness {
+    heard: Instant,
+    pinged: Instant,
+}
+
+impl Liveness {
+    pub(crate) fn new(now: Instant) -> Self {
+        Self {
+            heard: now,
+            pinged: now,
+        }
+    }
+
+    /// Any frame from the server, pongs included.
+    pub(crate) fn heard(&mut self, now: Instant) {
+        self.heard = now;
+    }
+
+    /// Checked only when nothing is waiting to be read, so a long upload that
+    /// kept the socket thread busy is not mistaken for silence.
+    pub(crate) fn check(&mut self, now: Instant) -> Pulse {
+        let quiet = now.saturating_duration_since(self.heard);
+        if quiet >= SILENCE {
+            Pulse::Dead
+        } else if quiet >= PING && now.saturating_duration_since(self.pinged) >= PING {
+            self.pinged = now;
+            Pulse::Ping
+        } else {
+            Pulse::Fine
+        }
+    }
+}
+
+/// A frame for the socket thread; requests carry their id so that a frame
+/// the thread never wrote can be failed as `NotSent`.
+struct Frame {
+    id: Option<u64>,
+    text: String,
+}
 
 pub(crate) type Socket =
     tungstenite::WebSocket<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>;
@@ -150,7 +234,7 @@ pub struct Welcome {
 pub struct Connection {
     shared: Arc<Shared>,
     /// Frames for the socket thread; it hangs up once every clone is gone.
-    outgoing: mpsc::Sender<String>,
+    outgoing: mpsc::Sender<Frame>,
 }
 
 struct Shared {
@@ -250,13 +334,17 @@ impl Connection {
     fn request(&self, id: u64, method: &str, params: Value) -> Result<Value> {
         let (sender, receiver) = mpsc::channel();
         lock(&self.shared.pending).insert(id, sender);
-        // The socket thread marks the connection closed before it drops waiters.
-        let frame = json!({"id": id, "method": method, "params": params}).to_string();
+        // The socket thread marks the connection closed before it drops waiters,
+        // and fails the frames it never wrote with `NotSent`.
+        let frame = Frame {
+            id: Some(id),
+            text: json!({"id": id, "method": method, "params": params}).to_string(),
+        };
         if self.closed() || self.outgoing.send(frame).is_err() {
             lock(&self.shared.pending).remove(&id);
-            anyhow::bail!(CLOSED);
+            return Err(NotSent.into());
         }
-        receiver.recv().map_err(|_| anyhow::anyhow!(CLOSED))?
+        receiver.recv().map_err(|_| anyhow::Error::from(Lost))?
     }
 
     /// The internal service protocol over `rpc` (full devices only).
@@ -274,11 +362,27 @@ impl Connection {
     /// `rpc.watch`: replies arrive on the receiver until the watch is dropped,
     /// the server closes it, or the connection drops (the channel then closes).
     pub fn watch(&self, id: &str, version: Option<u64>) -> Result<Watch> {
+        self.watch_from(id, version, None)
+    }
+
+    /// `rpc.watch` resuming from a copy this computer already holds: the first
+    /// reply is `Unchanged` or a delta on top of that copy (from a server that
+    /// knows `fingerprint`; others send a full baseline).
+    pub fn watch_from(
+        &self,
+        id: &str,
+        version: Option<u64>,
+        fingerprint: Option<&crate::agents::transport::Fingerprint>,
+    ) -> Result<Watch> {
         let (sender, replies) = mpsc::channel();
         let request = self.shared.next.fetch_add(1, Ordering::Relaxed);
+        let mut params = json!({"id": id, "version": version});
+        if let (Some(fingerprint), Some(params)) = (fingerprint, params.as_object_mut()) {
+            params.insert("fingerprint".into(), serde_json::to_value(fingerprint)?);
+        }
         // The socket thread files the stream before handling any later frame.
         lock(&self.shared.opening).insert(request, sender);
-        let result = self.request(request, "rpc.watch", json!({"id": id, "version": version}));
+        let result = self.request(request, "rpc.watch", params);
         lock(&self.shared.opening).remove(&request);
         let stream = result?
             .get("stream")
@@ -306,7 +410,10 @@ impl Drop for Watch {
             let id = shared.next.fetch_add(1, Ordering::Relaxed);
             let frame =
                 json!({"id": id, "method": "rpc.unwatch", "params": {"stream": self.stream}});
-            let _ = self.connection.outgoing.send(frame.to_string());
+            let _ = self.connection.outgoing.send(Frame {
+                id: None,
+                text: frame.to_string(),
+            });
         }
     }
 }
@@ -381,8 +488,14 @@ impl Shared {
         }
     }
 
-    fn close(&self) {
+    fn close(&self, unsent: &mpsc::Receiver<Frame>) {
         self.closed.store(true, Ordering::SeqCst);
+        // Frames still queued never reached the socket.
+        while let Ok(frame) = unsent.try_recv() {
+            if let Some(sender) = frame.id.and_then(|id| lock(&self.pending).remove(&id)) {
+                let _ = sender.send(Err(NotSent.into()));
+            }
+        }
         lock(&self.pending).clear();
         lock(&self.opening).clear();
         lock(&self.streams).clear();
@@ -390,28 +503,40 @@ impl Shared {
     }
 }
 
-/// The socket thread: short reads alternate with sending queued frames.
-fn pump(mut socket: Socket, queue: &mpsc::Receiver<String>, shared: &Shared) {
-    let mut heard = Instant::now();
+/// The socket thread: short reads alternate with sending queued frames, and a
+/// quiet server is pinged until it answers or counts as gone.
+fn pump(mut socket: Socket, queue: &mpsc::Receiver<Frame>, shared: &Shared) {
+    let mut liveness = Liveness::new(Instant::now());
     let _ = (|| -> Result<()> {
         loop {
+            let mut idle = false;
             match socket.read() {
                 Ok(Message::Text(text)) => {
-                    heard = Instant::now();
+                    liveness.heard(Instant::now());
                     shared.route(text.as_str());
                 }
                 Ok(Message::Close(_)) => return Ok(()),
-                Ok(_) => heard = Instant::now(),
+                Ok(_) => liveness.heard(Instant::now()),
                 Err(tungstenite::Error::Io(error))
                     if matches!(
                         error.kind(),
                         io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) => {}
+                    ) =>
+                {
+                    idle = true;
+                }
                 Err(error) => return Err(error.into()),
+            }
+            if idle {
+                match liveness.check(Instant::now()) {
+                    Pulse::Fine => {}
+                    Pulse::Ping => socket.write(Message::Ping(Vec::<u8>::new().into()))?,
+                    Pulse::Dead => anyhow::bail!("The server stopped responding"),
+                }
             }
             loop {
                 match queue.try_recv() {
-                    Ok(frame) => socket.write(Message::text(frame))?,
+                    Ok(frame) => socket.write(Message::text(frame.text))?,
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => {
                         hang_up(&mut socket);
@@ -421,10 +546,9 @@ fn pump(mut socket: Socket, queue: &mpsc::Receiver<String>, shared: &Shared) {
             }
             // Also sends the pongs queued while reading the server's pings.
             socket.flush()?;
-            ensure!(heard.elapsed() < SILENCE, "The server stopped responding");
         }
     })();
-    shared.close();
+    shared.close(queue);
 }
 
 /// A parsed `difu://pair?...` link.
@@ -568,6 +692,7 @@ pub(crate) fn open(host: &str, port: u16, pinned: Option<&str>) -> Result<(Socke
         }
     };
     tcp.set_nodelay(true)?;
+    keepalive(&tcp)?;
     tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
     tcp.set_write_timeout(Some(Duration::from_secs(20)))?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -622,6 +747,20 @@ pub(crate) fn open(host: &str, port: u16, pinned: Option<&str>) -> Result<(Socke
     let (socket, _) = tungstenite::client::client_with_config(url.as_str(), tls, Some(config))
         .map_err(|error| anyhow::anyhow!("WebSocket handshake failed: {error}"))?;
     Ok((socket, presented))
+}
+
+/// TCP keepalive, so the kernel also notices a path that died silently (an
+/// idle connection otherwise shows nothing until the next write).
+fn keepalive(tcp: &TcpStream) -> Result<()> {
+    use nix::sys::socket::{setsockopt, sockopt};
+    setsockopt(tcp, sockopt::KeepAlive, &true)?;
+    #[cfg(target_vendor = "apple")]
+    setsockopt(tcp, sockopt::TcpKeepAlive, &KEEPALIVE_IDLE)?;
+    #[cfg(not(target_vendor = "apple"))]
+    setsockopt(tcp, sockopt::TcpKeepIdle, &KEEPALIVE_IDLE)?;
+    setsockopt(tcp, sockopt::TcpKeepInterval, &KEEPALIVE_INTERVAL)?;
+    setsockopt(tcp, sockopt::TcpKeepCount, &KEEPALIVE_PROBES)?;
+    Ok(())
 }
 
 fn send(socket: &mut Socket, message: &Value) -> Result<()> {
@@ -1147,7 +1286,12 @@ mod tests {
         assert!(Connection::connect(&saved(&phone)).is_err());
         assert_eq!(connection.call("device.unpair", json!({}))?, json!({}));
         wait(|| connection.closed())?;
-        assert!(connection.call("server.devices", json!({})).is_err());
+        // Never written, so safe to send again on another connection.
+        let unsent = connection
+            .call("server.devices", json!({}))
+            .err()
+            .context("a closed connection must refuse requests")?;
+        assert!(unsent.is::<NotSent>(), "{unsent:#}");
         assert!(Connection::connect(&saved(&mac)).is_err());
         assert!(fixture.remote.status()?.devices.is_empty());
         Ok(())
@@ -1174,6 +1318,14 @@ mod tests {
                     match request {
                         Request::List => reply(&Reply::Sessions(Vec::new()))?,
                         Request::Changes { .. } => reply(&Reply::Changes("x".repeat(large)))?,
+                        // Like the service: a full baseline first, whatever
+                        // the subscriber holds.
+                        Request::Watch { id, .. } if id == "resumable" => {
+                            reply(&Reply::Session(Box::new(resumable())))?;
+                            while reply(&Reply::Unchanged).is_ok() {
+                                thread::sleep(Duration::from_millis(20));
+                            }
+                        }
                         Request::Watch { id, .. } if id == "gone" => {
                             reply(&Reply::Unchanged)?;
                             reply(&Reply::Error("Session not found".into()))?;
@@ -1191,6 +1343,112 @@ mod tests {
             }
         });
         Ok(observed)
+    }
+
+    /// A server session with some history, as `fake_service` watches it.
+    /// Built once: a new session and its entries carry the current time, so
+    /// the fake service and the test must share one copy to compare them.
+    fn resumable() -> crate::agents::Session {
+        static RESUMABLE: std::sync::OnceLock<crate::agents::Session> = std::sync::OnceLock::new();
+        RESUMABLE.get_or_init(build_resumable).clone()
+    }
+
+    fn build_resumable() -> crate::agents::Session {
+        let mut session = crate::agents::Session::new(
+            "resumable".into(),
+            crate::agents::Job::Coding(crate::agents::Launch {
+                repository: "/srv/difu/repos/acme/api".into(),
+                isolated: true,
+                base: "origin/main".into(),
+                prompt: "task".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.note("commandExecution", "output ".repeat(10_000));
+        session.note("agentMessage", "done");
+        session.updated = 1_790_000_000_000;
+        session
+    }
+
+    #[test]
+    fn resumed_watches_send_only_what_the_cached_copy_lacks() -> Result<()> {
+        use crate::agents::transport::Fingerprint;
+        let fixture = fixture()?;
+        let _observed = fake_service(&fixture.storage, 1)?;
+        let (_, connection) = fixture.pair("Mac", true)?;
+        let current = resumable();
+        let held = Fingerprint::of(&current)?;
+        let resumed = connection.watch_from("resumable", Some(held.version), Some(&held))?;
+        assert!(matches!(
+            resumed.replies.recv_timeout(Duration::from_secs(5))?,
+            Ok(Reply::Unchanged)
+        ));
+        // A copy from before the last message gets a delta, not the output.
+        let mut older = current.clone();
+        older.entries.pop();
+        older.version = 0;
+        let stale = Fingerprint::of(&older)?;
+        let resumed = connection.watch_from("resumable", Some(0), Some(&stale))?;
+        let Ok(Reply::SessionDelta(delta)) =
+            resumed.replies.recv_timeout(Duration::from_secs(5))?
+        else {
+            anyhow::bail!("expected a delta");
+        };
+        assert_eq!(delta.entries.len(), 1);
+        delta.apply(&mut older)?;
+        assert_eq!(
+            serde_json::to_value(&older)?,
+            serde_json::to_value(&current)?
+        );
+        // Without a fingerprint the server sends its full baseline.
+        let fresh = connection.watch("resumable", None)?;
+        assert!(matches!(
+            fresh.replies.recv_timeout(Duration::from_secs(5))?,
+            Ok(Reply::Session(_))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn liveness_pings_a_quiet_server_and_gives_up_after_silence() {
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
+        let mut liveness = Liveness::new(start);
+        assert_eq!(liveness.check(at(5)), Pulse::Fine);
+        assert_eq!(liveness.check(at(10)), Pulse::Ping);
+        // One ping per interval while waiting for the answer.
+        assert_eq!(liveness.check(at(12)), Pulse::Fine);
+        // The pong.
+        liveness.heard(at(13));
+        assert_eq!(liveness.check(at(22)), Pulse::Fine);
+        assert_eq!(liveness.check(at(23)), Pulse::Ping);
+        assert_eq!(liveness.check(at(33)), Pulse::Ping);
+        assert_eq!(liveness.check(at(37)), Pulse::Fine);
+        // 25 s without a single frame: the path is gone.
+        assert_eq!(liveness.check(at(38)), Pulse::Dead);
+        // Traffic keeps a busy connection alive without pings.
+        let mut busy = Liveness::new(start);
+        for second in 1..60 {
+            busy.heard(at(second));
+            assert_eq!(busy.check(at(second)), Pulse::Fine);
+        }
+    }
+
+    #[test]
+    fn server_connections_use_tcp_keepalive() -> Result<()> {
+        use nix::sys::socket::{getsockopt, sockopt};
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        let tcp = TcpStream::connect(listener.local_addr()?)?;
+        assert!(!getsockopt(&tcp, sockopt::KeepAlive)?);
+        keepalive(&tcp)?;
+        assert!(getsockopt(&tcp, sockopt::KeepAlive)?);
+        assert_eq!(
+            getsockopt(&tcp, sockopt::TcpKeepInterval)?,
+            KEEPALIVE_INTERVAL
+        );
+        assert_eq!(getsockopt(&tcp, sockopt::TcpKeepCount)?, KEEPALIVE_PROBES);
+        Ok(())
     }
 
     #[test]

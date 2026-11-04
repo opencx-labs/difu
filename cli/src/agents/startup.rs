@@ -5,10 +5,13 @@ use super::{
 };
 use crate::process::Cancel;
 use anyhow::{Context, Result};
-use std::{sync::mpsc, time::Duration};
+use std::{
+    sync::{Arc, mpsc},
+    time::Duration,
+};
 
 pub(super) fn prepare(
-    store: &Store,
+    store: &Arc<Store>,
     id: &str,
     controls: &mpsc::Receiver<Command>,
     cancel: &Cancel,
@@ -40,6 +43,8 @@ pub(super) fn prepare(
         store.update(id, |s| s.clearing = false)?;
     }
     prepared?;
+    // On a server, install the repository's tools while the user writes.
+    super::environment::prepare_in_background(store, id, cancel);
 
     // Keep ownership of the control channel until handing it to the provider.
     // No provider process starts for an empty session until the first message.
@@ -119,7 +124,7 @@ mod tests {
             }),
         );
         session.clearing = true;
-        let store = Store::fixture(temp.path().join("home"), vec![session]);
+        let store = Arc::new(Store::fixture(temp.path().join("home"), vec![session]));
         let (_send, receive) = mpsc::channel();
         assert!(prepare(&store, "one", &receive, &Cancel::default()).is_err());
         assert!(!store.get("one")?.clearing);

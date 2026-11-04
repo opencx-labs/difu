@@ -289,7 +289,9 @@ pub(super) fn waiting_messages(
     outgoing: &[PendingSend],
 ) -> Vec<Line<'static>> {
     let mut rows = Vec::new();
-    let mut group = |heading: &str, messages: Vec<&str>| {
+    // `local`: messages this computer holds for the server, which Esc cannot
+    // send early.
+    let mut group = |heading: &str, messages: Vec<&str>, local: bool| {
         if messages.is_empty() {
             return;
         }
@@ -298,7 +300,7 @@ pub(super) fn waiting_messages(
             format!("• {heading}"),
             Style::default().fg(TEXT),
         )];
-        if session.can_send_waiting() {
+        if !local && session.can_send_waiting() {
             spans.push(Span::styled(
                 if synchronous_permission_index(session).is_some() {
                     " (permission needed; esc opens approval)"
@@ -340,7 +342,14 @@ pub(super) fn waiting_messages(
         .filter(|_| session.tool_running())
         .map(|entry| entry.text.as_str())
         .collect::<Vec<_>>();
-    let mut queue = session.queue.iter().map(Prompt::text).collect::<Vec<_>>();
+    // The last `held` prompts wait on this computer for the session's server.
+    let on_server = session.queue.len().saturating_sub(session.held.len());
+    let mut queue = session
+        .queue
+        .iter()
+        .take(on_server)
+        .map(Prompt::text)
+        .collect::<Vec<_>>();
     for outgoing in outgoing {
         if outgoing.failed.is_some() {
             continue;
@@ -354,6 +363,7 @@ pub(super) fn waiting_messages(
     group(
         "Messages to be submitted after the next tool call",
         steering,
+        false,
     );
     group(
         if session
@@ -366,7 +376,39 @@ pub(super) fn waiting_messages(
             "Messages queued for the next turn"
         },
         queue,
+        false,
     );
+    let server = servers::server_name(&session.id).unwrap_or("the server");
+    let held = session
+        .queue
+        .iter()
+        .skip(on_server)
+        .zip(&session.held)
+        .collect::<Vec<_>>();
+    group(
+        &if session.offline.is_some() {
+            format!("Messages queued until {server} reconnects")
+        } else {
+            format!("Messages being sent to {server}")
+        },
+        held.iter()
+            .filter(|(_, held)| held.error.is_none())
+            .map(|(prompt, _)| prompt.text())
+            .collect(),
+        true,
+    );
+    for (prompt, held) in &held {
+        if let Some(error) = &held.error {
+            group(
+                &format!(
+                    "Not accepted by {server}: {} (edit it to send again, or remove it)",
+                    crate::model::clean(error)
+                ),
+                vec![prompt.text()],
+                true,
+            );
+        }
+    }
     rows
 }
 

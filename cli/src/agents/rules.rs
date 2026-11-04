@@ -75,6 +75,11 @@ pub(super) fn instructions(session: &Session, base: String) -> String {
     } else {
         base
     };
+    let base = if super::environment::offered(session) {
+        format!("{base}\n\n{}", super::environment::instructions(session))
+    } else {
+        base
+    };
     if session.repository_rules.trim().is_empty() {
         base
     } else {
@@ -196,7 +201,11 @@ mod tests {
         let prompt = instructions(&session, "Base".into());
         assert_eq!(
             prompt,
-            format!("Base\n\n{}", super::super::SERVER_VALIDATION_RULE)
+            format!(
+                "Base\n\n{}\n\n{}",
+                super::super::SERVER_VALIDATION_RULE,
+                super::super::environment::INSTRUCTIONS
+            )
         );
         let mut saved = serde_json::to_value(&session)?;
         saved

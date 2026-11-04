@@ -55,7 +55,9 @@ impl State {
         self.refreshed.insert(id.to_owned(), Instant::now());
     }
     fn due(&self, session: &Summary) -> bool {
+        // An unreachable server's sessions keep their last counts.
         session.can_read_changes
+            && session.offline.is_none()
             && !self.pending.contains(&session.id)
             && (self.dirty.contains(&session.id)
                 || self.refreshed.get(&session.id).is_none_or(|at| {
