@@ -210,6 +210,8 @@ mod tests {
     fn unreachable_server_sessions_stay_listed_with_an_offline_mark() -> Result<()> {
         let (mut ui, _dir, _) = shortcut_tests::fixture(None)?;
         ui.preferences.layout.sidebar_width = 40;
+        // Show each mark at once instead of flipping it in over a few frames.
+        ui.tweaks.agent_reply_cps = 0;
         let mut session = crate::cloud::federation::tests::session("aws:1");
         session.title = "Server task".into();
         let mark = |reconnecting| {

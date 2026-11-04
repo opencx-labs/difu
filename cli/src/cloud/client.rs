@@ -1346,7 +1346,14 @@ mod tests {
     }
 
     /// A server session with some history, as `fake_service` watches it.
+    /// Built once: a new session and its entries carry the current time, so
+    /// the fake service and the test must share one copy to compare them.
     fn resumable() -> crate::agents::Session {
+        static RESUMABLE: std::sync::OnceLock<crate::agents::Session> = std::sync::OnceLock::new();
+        RESUMABLE.get_or_init(build_resumable).clone()
+    }
+
+    fn build_resumable() -> crate::agents::Session {
         let mut session = crate::agents::Session::new(
             "resumable".into(),
             crate::agents::Job::Coding(crate::agents::Launch {
