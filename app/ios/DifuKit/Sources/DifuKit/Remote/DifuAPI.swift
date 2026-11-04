@@ -124,16 +124,20 @@ extension DifuAPI {
         try await perform("session.unqueue", ["id": .string(id), "index": JSONValue(index)])
     }
 
-    /// Answers one question; `answer == nil` skips it.
+    /// Answers one question; `answer == nil` skips it. A `note` goes with the
+    /// answer like a note added in the terminal (only for questions that
+    /// accept one: `PendingQuestion.acceptsNote`).
     public func answer(
-        _ id: String, request: JSONValue, question: String, answer: String?
+        _ id: String, request: JSONValue, question: String, answer: String?, note: String? = nil
     ) async throws {
-        try await perform(
-            "session.answer",
-            [
-                "id": .string(id), "request": request, "question": .string(question),
-                "answer": JSONValue(answer),
-            ])
+        var params: [String: JSONValue] = [
+            "id": .string(id), "request": request, "question": .string(question),
+            "answer": JSONValue(answer),
+        ]
+        if let note = note?.trimmingCharacters(in: .whitespacesAndNewlines), !note.isEmpty {
+            params["note"] = .string(note)
+        }
+        try await perform("session.answer", params)
     }
 
     public func decide(_ id: String, request: JSONValue, choice: String) async throws {

@@ -229,7 +229,8 @@ diffs. `plan` renders a checklist.
   "questions": [{
     "id": "difu-decision", "header": "Permission", "question": "Allow Bash?\nrm -rf target",
     "options": [{"label": "Allow once", "description": ""}, {"label": "Deny", "description": ""}],
-    "multiSelect": false, "secret": false, "answered": false
+    "multiSelect": false, "secret": false, "answered": false,
+    "acceptsNote": false            // session.answer takes a `note`; absent (false) on older computers
   }],
   "choices": [{"id": "accept", "label": "Allow once"}, {"id": "decline", "label": "Decline"}]
 }
@@ -239,6 +240,14 @@ diffs. `plan` renders a checklist.
   options plus free text ("Other"). For `multiSelect`, join chosen labels with
   `", "`. Permission questions (`id` = `difu-decision`) must be answered with
   an option label exactly.
+* Notes: when `acceptsNote` is true, `session.answer` may carry a `note`, which
+  the computer appends to the answer the way the terminal sends a note added to
+  a chosen option (`<answer>\n\nNote: <note>`), for Codex and Claude Code
+  alike. Permission and other tool-form questions, difu's own setup questions
+  and secret questions don't accept one (`acceptsNote` false; a `note` there
+  fails with "This question needs an exact answer"). A note needs an answer:
+  skipping with one fails. Older computers ignore `note`, so send it only when
+  `acceptsNote` is true.
 * `approval` / `permissions`: show `choices` as buttons; send `session.decide`.
 * `unsupported`: a single choice `stop` that interrupts the agent.
 
@@ -268,7 +277,7 @@ all other fields with `session` (including `version`).
 | `session.resume` | `id` | `{}` — "Continue session" |
 | `session.compact` | `id` | `{}` |
 | `session.unqueue` | `id`, `index` | `{}` — remove a queued message |
-| `session.answer` | `id`, `request`, `question`, `answer` (string, or `null` to skip) | `{}` |
+| `session.answer` | `id`, `request`, `question`, `answer` (string, or `null` to skip), `note` (optional string, only where `acceptsNote`) | `{}` |
 | `session.decide` | `id`, `request`, `choice` (a `choices[].id`) | `{}` |
 | `session.model` | `id`, `model`, `effort` (either may be null) | `{}` — a model of the other provider switches the session to it (see below) |
 | `session.rename` | `id`, `title` | `{}` |

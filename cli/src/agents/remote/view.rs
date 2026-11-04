@@ -606,6 +606,8 @@ pub struct QuestionView {
     pub multi_select: bool,
     pub secret: bool,
     pub answered: bool,
+    /// `session.answer` takes a `note` for this question.
+    pub accepts_note: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -759,6 +761,7 @@ impl PendingView {
                         .collect(),
                     multi_select: q.get("multiSelect").and_then(Value::as_bool) == Some(true),
                     secret: q.get("isSecret").and_then(Value::as_bool) == Some(true),
+                    accepts_note: super::super::questions::accepts_note(pending, q),
                 }
             })
             .collect();
@@ -992,6 +995,51 @@ mod tests {
                 .get(1)
                 .is_some_and(|q| !q.answered && q.options.is_empty())
         );
+    }
+
+    #[test]
+    fn questions_say_whether_answers_take_a_note() -> anyhow::Result<()> {
+        let mut session = session();
+        session.pending.push(Pending {
+            id: json!("ask"),
+            method: "item/tool/requestUserInput".into(),
+            params: json!({"questions": [
+                {"id": "scope", "question": "Scope?", "options": [{"label": "Small"}]},
+                {"id": "token", "question": "Token?", "isSecret": true}
+            ]}),
+            responded: false,
+        });
+        let mut form = Pending {
+            id: json!("form"),
+            method: "mcpServer/elicitation/request".into(),
+            params: json!({"serverName": "Claude Code", "message": "Allow?",
+                           "requestedSchema": {"type": "object", "properties": {"n": {"type": "integer"}}}}),
+            responded: false,
+        };
+        super::super::super::elicitation::normalize(&mut form);
+        session.pending.push(form);
+        let view = SessionView::new(&session, &BTreeSet::new());
+        let notes: Vec<Vec<(String, bool)>> = view
+            .header
+            .pending
+            .iter()
+            .map(|p| {
+                p.questions
+                    .iter()
+                    .map(|q| (q.id.clone(), q.accepts_note))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                vec![("scope".into(), true), ("token".into(), false)],
+                vec![("difu-decision".into(), false), ("field:n".into(), false)],
+            ]
+        );
+        let json = serde_json::to_value(view.header.pending.first())?;
+        assert_eq!(json.pointer("/questions/0/acceptsNote"), Some(&json!(true)));
+        Ok(())
     }
 
     #[test]

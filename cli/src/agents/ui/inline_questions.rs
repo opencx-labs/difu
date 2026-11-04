@@ -394,16 +394,14 @@ impl Ui {
             }
             text
         } else if let Some(label) = label(*selected) {
-            let mut text = label.to_owned();
-            if let Some(note) = self
+            match self
                 .question_note()
                 .map(Editor::text)
                 .filter(|note| !note.trim().is_empty())
             {
-                text.push_str("\n\nNote: ");
-                text.push_str(&note);
+                Some(note) => super::super::questions::with_note(label, &note),
+                None => label.to_owned(),
             }
-            text
         } else {
             answers.get(*field).map(Editor::text).unwrap_or_default()
         };

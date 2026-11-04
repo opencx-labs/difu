@@ -200,6 +200,21 @@ pub(super) fn prepare_answer(
     Ok((updated, text))
 }
 
+/// An answer with the user's note, as the terminal sends a note added to a
+/// chosen option.
+pub(super) fn with_note(answer: &str, note: &str) -> String {
+    format!("{answer}\n\nNote: {note}")
+}
+
+/// Whether an answer to `question` may carry a note: permission and form
+/// answers, difu's own setup questions and secrets must stay exactly as chosen.
+pub(super) fn accepts_note(pending: &Pending, question: &Value) -> bool {
+    pending.method == "item/tool/requestUserInput"
+        && !super::elicitation::is_form(pending)
+        && pending.id != "difu-missing-guidance"
+        && question.get("isSecret").and_then(Value::as_bool) != Some(true)
+}
+
 pub(super) fn save_answer(store: &super::server::Store, id: &str, updated: Pending) -> Result<()> {
     store.update(id, |session| {
         record_answer(session, updated);
@@ -366,6 +381,31 @@ mod tests {
             "id":id,"type":"agentMessage","delivery":"async","text":"Choose scope",
             "questions":[{"title":"Scope?","options":["Small","Large"]},{"title":"Any notes?"}]
         }}})
+    }
+
+    #[test]
+    fn a_noted_answer_is_delivered_and_recorded_with_its_note() -> Result<()> {
+        let mut session = session();
+        apply_event(&mut session, &question_event("q", "item/completed"));
+        let request = json!("difu-async:q");
+        let noted = with_note("Small", "only the API");
+        let (updated, text) = prepare_answer(&session, &request, "0", Some(&noted))?;
+        assert_eq!(text, "> Scope?\n\nSmall\n\nNote: only the API");
+        assert_eq!(
+            updated.params.pointer("/difuAnswers/0/answers/0"),
+            Some(&json!(noted))
+        );
+        let pending = session.pending.first().context("pending")?;
+        let question = json!({"id": "0", "question": "Scope?"});
+        assert!(accepts_note(pending, &question));
+        assert!(!accepts_note(
+            pending,
+            &json!({"id": "0", "question": "Key?", "isSecret": true})
+        ));
+        let mut guidance = pending.clone();
+        guidance.id = json!("difu-missing-guidance");
+        assert!(!accepts_note(&guidance, &question));
+        Ok(())
     }
 
     #[test]

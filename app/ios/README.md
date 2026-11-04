@@ -92,6 +92,10 @@ puts it in the message to add arguments. **Model & Effort** lists every
 provider's models; picking another provider's switches the session there once
 it's between turns.
 
+When an agent asks a question, tap **Add a note** to send a note with the
+option, options or "Other" answer you choose, as the terminal does. Permission
+prompts, tool forms and secret answers take no note.
+
 Images in a pull request's description and comments load through the computer
 or server showing the PR, which uses its own GitHub login, so private
 attachments work. Tap one to view it full screen and pinch to zoom; images that

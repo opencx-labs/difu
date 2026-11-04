@@ -464,14 +464,7 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
                 },
             )
         }
-        "session.answer" => inner.control(
-            id()?,
-            Control::AnswerQuestion {
-                request: param(params, "request")?,
-                question: param(params, "question")?,
-                answer: optional(params, "answer")?,
-            },
-        ),
+        "session.answer" => answer(inner, params),
         "session.decide" => {
             let id = id()?;
             let request: Value = param(params, "request")?;
@@ -551,6 +544,50 @@ fn dispatch(inner: &Arc<Inner>, method: &str, params: &Value) -> Result<Value> {
 #[derive(Deserialize)]
 struct Upload {
     data: String,
+}
+
+/// Answers one question (`answer: null` skips it). A `note` is added to the
+/// answer the way the terminal adds a note to a chosen option.
+fn answer(inner: &Inner, params: &Value) -> Result<Value> {
+    let id: String = param(params, "id")?;
+    let request: Value = param(params, "request")?;
+    let question: String = param(params, "question")?;
+    let mut answer: Option<String> = optional(params, "answer")?;
+    let note = optional::<String>(params, "note")?
+        .map(|note| note.trim().to_owned())
+        .filter(|note| !note.is_empty());
+    if let Some(note) = note {
+        let text = answer
+            .as_deref()
+            .context("Choose or enter an answer to send a note with it")?;
+        let session = inner.session(&id)?;
+        let pending = session
+            .pending
+            .iter()
+            .find(|p| p.id == request)
+            .context("This question is no longer pending")?;
+        let asked = pending
+            .params
+            .get("questions")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|q| q.get("id").and_then(Value::as_str) == Some(question.as_str()))
+            .context("This question was already answered or skipped")?;
+        ensure!(
+            super::super::questions::accepts_note(pending, asked),
+            "This question needs an exact answer; send it without a note"
+        );
+        answer = Some(super::super::questions::with_note(text, &note));
+    }
+    inner.control(
+        id,
+        Control::AnswerQuestion {
+            request,
+            question,
+            answer,
+        },
+    )
 }
 
 fn devices(inner: &Inner) -> Result<Vec<Value>> {
@@ -1700,6 +1737,104 @@ mod tests {
                 ("$lint the docs".to_owned(), false, vec!["lint".to_owned()]),
             ]
         );
+        Ok(())
+    }
+
+    fn questions(id: &str, questions: Value) -> super::super::super::Pending {
+        super::super::super::Pending {
+            id: json!(id),
+            method: "item/tool/requestUserInput".into(),
+            params: json!({"questions": questions}),
+            responded: false,
+        }
+    }
+
+    #[test]
+    fn answers_carry_a_note_the_way_the_terminal_adds_one() -> Result<()> {
+        for provider in [Provider::Codex, Provider::Claude] {
+            let dir = tempfile::tempdir()?;
+            let storage = storage(&dir);
+            let mut session = coding(provider);
+            session.pending.push(questions(
+                "ask",
+                json!([
+                    {"id": "scope", "question": "Scope?", "options": [{"label": "Small"}, {"label": "Large"}]},
+                    {"id": "token", "question": "Token?", "isSecret": true}
+                ]),
+            ));
+            let mut form = super::super::super::Pending {
+                id: json!("form"),
+                method: "mcpServer/elicitation/request".into(),
+                params: json!({"serverName": "Claude Code", "message": "Allow?",
+                               "requestedSchema": {"type": "object", "properties": {}}}),
+                responded: false,
+            };
+            super::super::super::elicitation::normalize(&mut form);
+            session.pending.push(form);
+            let fake = serve(&storage, session, Vec::new())?;
+            let connection = connection(&storage);
+            let answer = |params: Value| dispatch(&connection.0, "session.answer", &params);
+            answer(json!({"id": "one", "request": "ask", "question": "scope",
+                          "answer": "Small", "note": "  keep it tiny  "}))?;
+            // Older phones send no note; a blank one is no note.
+            answer(json!({"id": "one", "request": "ask", "question": "scope", "answer": "Large"}))?;
+            answer(json!({"id": "one", "request": "ask", "question": "scope",
+                          "answer": "Other text", "note": " "}))?;
+            let refusals = [
+                json!({"id": "one", "request": "ask", "question": "scope", "answer": null, "note": "why"}),
+                json!({"id": "one", "request": "ask", "question": "token", "answer": "s3cret", "note": "hm"}),
+                json!({"id": "one", "request": "form", "question": "difu-decision",
+                       "answer": "Allow once", "note": "just this once"}),
+                json!({"id": "one", "request": "gone", "question": "scope", "answer": "Small", "note": "late"}),
+            ];
+            let mut errors = Vec::new();
+            for params in refusals {
+                errors.push(answer(params).err().context("refused")?.to_string());
+            }
+            assert!(
+                errors
+                    .first()
+                    .is_some_and(|e| e.contains("Choose or enter an answer"))
+            );
+            assert!(errors.get(1).is_some_and(|e| e.contains("exact answer")));
+            assert!(errors.get(2).is_some_and(|e| e.contains("exact answer")));
+            assert!(
+                errors
+                    .get(3)
+                    .is_some_and(|e| e.contains("no longer pending"))
+            );
+            let sent: Vec<_> = fake
+                .actions()?
+                .into_iter()
+                .filter_map(|r| match r {
+                    Request::Control {
+                        control:
+                            Control::AnswerQuestion {
+                                request,
+                                question,
+                                answer,
+                            },
+                        ..
+                    } => Some((request, question, answer)),
+                    _ => None,
+                })
+                .collect();
+            let terminal = super::super::super::questions::with_note("Small", "keep it tiny");
+            assert_eq!(terminal, "Small\n\nNote: keep it tiny");
+            assert_eq!(
+                sent,
+                [
+                    (json!("ask"), "scope".to_owned(), Some(terminal)),
+                    (json!("ask"), "scope".to_owned(), Some("Large".to_owned())),
+                    (
+                        json!("ask"),
+                        "scope".to_owned(),
+                        Some("Other text".to_owned())
+                    ),
+                ],
+                "{provider:?}"
+            );
+        }
         Ok(())
     }
 
