@@ -335,7 +335,7 @@ struct PermissionModeChip: View {
                     .foregroundStyle(.secondary)
             }
             .font(.caption.weight(.medium))
-            .foregroundStyle(mode.skipsChecks ? Color.red : (mode.isPending ? Color.secondary : Color.primary))
+            .foregroundStyle(mode.skipsChecks ? Color.failure : (mode.isPending ? Color.secondary : Color.primary))
             .padding(.horizontal, 10)
             .padding(.vertical, 4)
             .background(Color.secondary.opacity(0.12), in: Capsule())
