@@ -393,12 +393,23 @@ impl Service {
                 .collect::<String>()
         ))
     }
-    /// This machine's new-session defaults as sessions get them.
+    /// This machine's new-session defaults as screens show them; discovers
+    /// the model catalog when it is stale.
     fn effective(&self) -> Result<super::effective::Defaults> {
         let config = self.store.storage.load_config()?;
         Ok(super::effective::Defaults::new(
             config.agent_defaults,
             || self.catalog.get(),
+            config.server.enabled,
+        ))
+    }
+    /// The defaults a session being created gets, without starting a
+    /// provider for model discovery (see `Catalog::for_launch`).
+    fn effective_for_launch(&self) -> Result<super::effective::Defaults> {
+        let config = self.store.storage.load_config()?;
+        Ok(super::effective::Defaults::new(
+            config.agent_defaults,
+            || self.catalog.for_launch(),
             config.server.enabled,
         ))
     }
@@ -1150,7 +1161,7 @@ impl Service {
                 remember_repository,
                 server: None,
             } => {
-                let start = self.effective()?.resolve(&defaults)?;
+                let start = self.effective_for_launch()?.resolve(&defaults)?;
                 crate::cloud::disk::guard(&self.store.storage)?;
                 let root = match super::workspace::repository(
                     defaults.repository.as_deref().unwrap_or(&cwd),
@@ -1189,13 +1200,13 @@ impl Service {
                 effective_defaults,
             } => {
                 let start = match (&*job, effective_defaults) {
-                    (Job::Coding(launch), true) => {
-                        Some(self.effective()?.resolve(&crate::storage::AgentDefaults {
+                    (Job::Coding(launch), true) => Some(self.effective_for_launch()?.resolve(
+                        &crate::storage::AgentDefaults {
                             model: launch.model.clone(),
                             effort: launch.effort.clone(),
                             ..crate::storage::AgentDefaults::default()
-                        })?)
-                    }
+                        },
+                    )?),
                     _ => None,
                 };
                 let _launch_guard = self
