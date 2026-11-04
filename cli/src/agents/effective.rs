@@ -373,23 +373,11 @@ impl Catalog {
         models
     }
     /// The catalog for creating a session, which never starts a provider:
-    /// fresh discovered models, or else Claude Code's `opus` alias (which it
-    /// resolves to its newest Opus) when the Claude CLI is installed.
-    /// Discovery can take seconds and must not delay or precede a session's
-    /// worktree; screens that show defaults run it instead.
+    /// the last discovered models, however old, or `None` before the first
+    /// discovery. Discovery can take seconds and must not delay or precede a
+    /// session's worktree; the new-session screens run it when they open.
     pub fn for_launch(&self) -> Option<Vec<ModelInfo>> {
-        if let Some(Some(models)) = self.fresh() {
-            return Some(models);
-        }
-        installed("claude").then(|| {
-            vec![ModelInfo {
-                id: "claude/opus".into(),
-                name: "Claude Code · Opus".into(),
-                efforts: ["low", "medium", "high", "xhigh", "max"]
-                    .map(String::from)
-                    .to_vec(),
-            }]
-        })
+        self.cached.lock().ok()?.as_ref()?.1.clone()
     }
     /// Keeps models discovered elsewhere (the model picker's list).
     pub fn remember(&self, models: &[ModelInfo]) {
@@ -397,17 +385,6 @@ impl Catalog {
             *cached = Some((Instant::now(), Some(models.to_vec())));
         }
     }
-}
-
-/// Whether `program` is an executable on `PATH`, without running it.
-fn installed(program: &str) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|directory| {
-            std::fs::metadata(directory.join(program))
-                .is_ok_and(|file| file.is_file() && file.permissions().mode() & 0o111 != 0)
-        })
-    })
 }
 
 #[cfg(test)]
