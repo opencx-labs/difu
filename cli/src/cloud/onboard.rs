@@ -268,13 +268,12 @@ pub fn add(storage: &Storage, options: Options) -> Result<()> {
     pair_this_computer(storage, &difu, &name, hosts, &key, &retry)?;
 
     progress.next("Pairing a phone");
-    if confirm("Show a QR code for the difu iPhone app now?", true)? {
-        let status = difu.interactive(Some("difu remote pair"))?;
-        if !status.success() {
-            warn(&format!(
-                "No QR code was shown. Later: `difu server pair {name}`."
-            ));
-        }
+    if confirm("Show a QR code for the difu iPhone app now?", true)?
+        && let Err(error) = show_pairing(&difu)
+    {
+        warn(&format!(
+            "No QR code was shown ({error:#}). Later: `difu server pair {name}`."
+        ));
     }
     println!(
         "\n{name} is ready: pick it when you start a new session in difu.\n\
@@ -357,7 +356,7 @@ fn pair_this_computer(
          `difu server ssh {name}` and `systemctl status difu-agent`, then run `{retry}` again",
         stderr(&output)
     );
-    let link = pairing_link(&String::from_utf8_lossy(&output.stdout))?;
+    let (link, _) = pairing_answer(&String::from_utf8_lossy(&output.stdout))?;
     let device = computer_name();
     let paired = client::pair_with_link(&link, &device, true).with_context(|| {
         format!(
@@ -409,13 +408,12 @@ pub fn pair(storage: &Storage, name: &str) -> Result<()> {
     let access = access(storage, name)?;
     let remote = Remote::saved(&access);
     let login = Login::Key(access.key.clone());
-    let status = Ssh::new(&remote, "difu", &login).interactive(Some("difu remote pair"))?;
-    ensure!(
-        status.success(),
-        "Could not show a pairing code for {name}. Check the service with \
-         `difu server ssh {name}`, then `systemctl status difu-agent`"
-    );
-    Ok(())
+    show_pairing(&Ssh::new(&remote, "difu", &login)).with_context(|| {
+        format!(
+            "Could not show a pairing code for {name}. Check the service with \
+             `difu server ssh {name}`, then `systemctl status difu-agent`"
+        )
+    })
 }
 
 /// Brings a saved server up to this computer's difu: the binary, Codex and
@@ -1157,8 +1155,10 @@ fn parse_tailscale(stdout: &str) -> Result<(String, Option<String>)> {
     Ok((ip.to_owned(), dns))
 }
 
-/// `{"link":"difu://pair?...","expires":...}` from `difu remote pair --json`.
-fn pairing_link(stdout: &str) -> Result<String> {
+/// `{"link":"difu://pair?...","expires":...,"expiresIn":...}` from
+/// `difu remote pair --json`: the link, and when it expires by this
+/// computer's clock (from `expiresIn`, which older servers leave out).
+fn pairing_answer(stdout: &str) -> Result<(String, Option<i64>)> {
     let line = stdout
         .lines()
         .rev()
@@ -1171,7 +1171,27 @@ fn pairing_link(stdout: &str) -> Result<String> {
         .and_then(serde_json::Value::as_str)
         .filter(|link| link.starts_with("difu://"))
         .context("`difu remote pair --json` printed no pairing link")?;
-    Ok(link.to_owned())
+    let expires = match value.get("expiresIn").and_then(serde_json::Value::as_i64) {
+        Some(seconds) => Some(
+            chrono::Utc::now()
+                .timestamp_millis()
+                .saturating_add(seconds.saturating_mul(1000)),
+        ),
+        None => value.get("expires").and_then(serde_json::Value::as_i64),
+    };
+    Ok((link.to_owned(), expires))
+}
+
+/// A phone pairing code for the server, printed here so its expiry is in this
+/// computer's time; the server's own `difu remote pair` uses the server's
+/// clock and time zone (often UTC).
+fn show_pairing(difu: &Ssh) -> Result<()> {
+    let output = difu.output("difu remote pair --json", None)?;
+    ensure!(output.status.success(), "{}", stderr(&output));
+    let (link, expires) = pairing_answer(&String::from_utf8_lossy(&output.stdout))?;
+    let now = chrono::Utc::now().timestamp_millis();
+    // Codes last 10 minutes when an older server says nothing.
+    super::serve::print_pairing(&link, expires.unwrap_or(now + 10 * 60_000), now)
 }
 
 fn replace_root_password(root: &Ssh, name: &str) -> Result<()> {
@@ -2220,12 +2240,20 @@ mod tests {
             ("100.101.102.103".into(), None)
         );
         assert!(parse_tailscale("\n").is_err());
+        // An older server: only the expiry by its own clock.
         assert_eq!(
-            pairing_link("note\n{\"link\":\"difu://pair?c=1\",\"expires\":1790000000000}\n")?,
-            "difu://pair?c=1"
+            pairing_answer("note\n{\"link\":\"difu://pair?c=1\",\"expires\":1790000000000}\n")?,
+            ("difu://pair?c=1".to_owned(), Some(1_790_000_000_000))
         );
-        assert!(pairing_link("{\"link\":\"https://example.com\"}").is_err());
-        assert!(pairing_link("nothing").is_err());
+        // `expiresIn` counts from now on this computer, whatever the server's clock.
+        let before = chrono::Utc::now().timestamp_millis();
+        let (_, expires) =
+            pairing_answer("{\"link\":\"difu://pair?c=1\",\"expires\":1,\"expiresIn\":600}")?;
+        let expires = expires.context("expiry")?;
+        assert!(expires >= before + 600_000, "{expires}");
+        assert!(expires <= chrono::Utc::now().timestamp_millis() + 600_000);
+        assert!(pairing_answer("{\"link\":\"https://example.com\"}").is_err());
+        assert!(pairing_answer("nothing").is_err());
         Ok(())
     }
 

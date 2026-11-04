@@ -48,7 +48,7 @@ Client side (your Mac):
 | `difu server list` | Saved servers, whether they are reachable, and each one's free disk space. |
 | `difu server remove <name>` | Revoke this computer on the server (when reachable) and forget it locally. |
 | `difu server ssh <name>` | Open a shell on the server as the `difu` user. |
-| `difu server pair <name>` | Show a phone pairing QR for that server in this terminal. |
+| `difu server pair <name>` | Show a phone pairing QR for that server in this terminal, with when it expires in this computer's time. |
 | `difu server upgrade <name>` | Install this computer's difu version on the server, update Codex and Claude Code, rebuild the sandbox image when sandboxing is on, refresh `difu-agent.service` and restart it. Safe to repeat. |
 | `difu session move <session> <server>` | Move a session on this computer to a saved server; prints the new `<server>:<id>`. See *Moving a session to a server*. |
 
@@ -57,7 +57,7 @@ Server side (run on the server, usually over SSH):
 | Command | What it does |
 | --- | --- |
 | `difu serve [--port P]` | Run the agent service in the foreground with server mode and remote control on. Default port **3438**. |
-| `difu remote pair [--json]` | Print a pairing QR and `difu://pair` link from the running service. |
+| `difu remote pair [--json]` | Print a pairing QR and `difu://pair` link from the running service, and when the code expires ("in 10 minutes", then the time). `--json` prints `{"link", "expires", "expiresIn"}` (milliseconds since the epoch; seconds left). |
 | `difu remote devices` | List paired devices with access level and last seen. |
 | `difu remote forget <device>` | Revoke a device. |
 | `difu remote password [--generate] [--disable]` | Set the server password (prompt or stdin), generate a strong one, or turn password pairing off. |
