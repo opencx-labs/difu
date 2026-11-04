@@ -219,10 +219,14 @@ changes persist in that shell. **Esc** hides the pane while the process keeps
 running; reopen it from **Shells**. Shared shells use normal local-terminal access
 for both providers and remain running when the difu UI closes. They stop when the
 session is archived/deleted, its worktree is discarded, or the service exits.
+Like a terminal app, a shared shell answers cursor-position and device queries, so
+prompts that wait for those answers, such as `gh auth login` (also over `ssh -t`),
+take input from the pane and from agents.
 
 Agents can list, open, read, write to and close these shells through `difu_shell`.
 While a human focuses a shell, agent writes are rejected without queueing; reads
-remain available. Agent input is enabled again when the human leaves the pane. Existing
+remain available. Agent input is enabled again when the human leaves the pane. A newline
+in agent text is sent as Enter (`\r`), as a terminal sends it. Existing
 Codex conversations can use the same actions through the compatibility command:
 
 ```sh
