@@ -19,16 +19,20 @@ struct ServerRepositoriesView: View {
             ThemedList {
                 Section {
                     ForEach(result.repositories) { repository in
-                        RepositoryRow(repository: repository)
-                            .swipeActions(edge: .trailing) {
-                                Button("Remove", role: .destructive) { removing = repository }
-                                Button("Refresh") { refresh(repository.name) }
-                                    .tint(.indigo)
-                            }
-                            .contextMenu {
-                                Button("Refresh", systemImage: "arrow.clockwise") { refresh(repository.name) }
-                                Button("Remove", systemImage: "trash", role: .destructive) { removing = repository }
-                            }
+                        NavigationLink {
+                            ServerRepositoryView(server: server, repository: repository)
+                        } label: {
+                            RepositoryRow(repository: repository)
+                        }
+                        .swipeActions(edge: .trailing) {
+                            Button("Remove", role: .destructive) { removing = repository }
+                            Button("Refresh") { refresh(repository.name) }
+                                .tint(.indigo)
+                        }
+                        .contextMenu {
+                            Button("Refresh", systemImage: "arrow.clockwise") { refresh(repository.name) }
+                            Button("Remove", systemImage: "trash", role: .destructive) { removing = repository }
+                        }
                     }
                 } footer: {
                     if let minutes = result.refreshMinutes {
@@ -144,6 +148,42 @@ struct ServerRepositoriesView: View {
                 actionError = error.localizedDescription
             }
         }
+    }
+}
+
+/// One server repository: what new sessions in it get.
+private struct ServerRepositoryView: View {
+    let server: ServerConnection
+    let repository: ServerRepository
+
+    var body: some View {
+        ThemedList {
+            Section {
+                RepositoryRow(repository: repository)
+            }
+            Section {
+                NavigationLink {
+                    EnvironmentEditorView(server: server, repository: repository.name)
+                } label: {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Label("Environment", systemImage: "wrench.and.screwdriver")
+                        Text("Tools, setup commands, variables and notes")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                NavigationLink {
+                    RulesEditorView(server: server, initialRepository: repository.path ?? repository.name)
+                } label: {
+                    Label("Rules", systemImage: "list.bullet.rectangle")
+                }
+            } footer: {
+                Text("Every new session in this repository on \(server.name) starts with these. Agents add to the environment as they learn what the repository needs.")
+            }
+        }
+        .listStyle(.insetGrouped)
+        .navigationTitle(repository.name)
+        .navigationBarTitleDisplayMode(.inline)
     }
 }
 

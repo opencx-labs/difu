@@ -201,6 +201,73 @@ final class ServerModelTests: XCTestCase {
         XCTAssertEqual(calls[5].1, ["repository": nil, "model": nil, "effort": nil])
     }
 
+    func testRepositoryEnvironment() throws {
+        let environment = try decode(
+            RepositoryEnvironment.self,
+            #"""
+            {"repository":"acme/widgets",
+             "profile":{"tools":{"pnpm":"9","node":"24","bad":{"x":1}},
+                        "setup":["pnpm install --frozen-lockfile"],
+                        "env":{"NODE_OPTIONS":"--max-old-space-size=4096","WORKERS":4},
+                        "notes":["backend tests need Postgres via docker compose"],
+                        "history":[{"at":1790000000000,"by":"Claude Code in session 1 (Billing)","summary":"node 24"}],
+                        "updatedAt":1790000000000,"future":true},
+             "detected":[{"tool":"pnpm","version":"9.12.0","source":"package.json packageManager","corepack":true},
+                         {"tool":"node","version":"24","source":".nvmrc"},
+                         {"version":"1"}]}
+            """#)
+        XCTAssertEqual(environment.repository, "acme/widgets")
+        let profile = environment.profile
+        XCTAssertEqual(profile.tools.map(\.name), ["node", "pnpm"], "sorted, invalid values dropped")
+        XCTAssertEqual(profile.tools.first?.value, "24")
+        XCTAssertEqual(profile.setup, ["pnpm install --frozen-lockfile"])
+        XCTAssertEqual(
+            profile.env,
+            [
+                EnvironmentEntry(name: "NODE_OPTIONS", value: "--max-old-space-size=4096"),
+                EnvironmentEntry(name: "WORKERS", value: "4"),
+            ])
+        XCTAssertEqual(profile.notes, ["backend tests need Postgres via docker compose"])
+        XCTAssertEqual(profile.history.first?.by, "Claude Code in session 1 (Billing)")
+        XCTAssertEqual(profile.history.first?.at, 1_790_000_000_000)
+        XCTAssertEqual(profile.updatedAt, 1_790_000_000_000)
+        XCTAssertEqual(environment.detected.map(\.tool), ["pnpm", "node"])
+        XCTAssertEqual(environment.detected.map(\.corepack), [true, false])
+        XCTAssertFalse(profile.isEmpty)
+
+        let empty = try decode(RepositoryEnvironment.self, #"{"repository":"a/b","profile":null}"#)
+        XCTAssertTrue(empty.profile.isEmpty)
+        XCTAssertTrue(empty.detected.isEmpty)
+    }
+
+    func testEnvironmentCalls() async throws {
+        let recorder = CallRecorder()
+        let reply = #"{"repository":"acme/widgets","profile":{"tools":{"node":"24"}},"detected":[]}"#
+        let read = try await api(recorder, result: reply).environment(for: "acme/widgets")
+        XCTAssertEqual(read.profile.tools, [EnvironmentEntry(name: "node", value: "24")])
+        let edited = EnvironmentProfile(
+            tools: [
+                EnvironmentEntry(name: " node ", value: " 24 "), EnvironmentEntry(name: "", value: "x"),
+            ],
+            setup: ["pnpm install", "  "],
+            env: [EnvironmentEntry(name: "CI", value: "1")],
+            notes: ["Postgres via docker compose"])
+        let saved = try await api(recorder, result: reply).setEnvironment(edited, for: "acme/widgets")
+        XCTAssertEqual(saved.repository, "acme/widgets")
+        let calls = await recorder.calls
+        XCTAssertEqual(calls.map(\.0), ["server.environment.get", "server.environment.set"])
+        XCTAssertEqual(calls[0].1, ["repository": "acme/widgets"])
+        XCTAssertEqual(
+            calls[1].1,
+            [
+                "repository": "acme/widgets",
+                "profile": [
+                    "tools": ["node": "24"], "setup": ["pnpm install"], "env": ["CI": "1"],
+                    "notes": ["Postgres via docker compose"],
+                ],
+            ])
+    }
+
     func testServerDisk() throws {
         let disk = try decode(
             ServerDisk.self,

@@ -1,7 +1,8 @@
 import Foundation
 
 // Methods every paired device can call on a difu server (docs/cloud-agents.md):
-// devices, server repositories, repository rules, logins and disk space.
+// devices, server repositories, repository rules, environment profiles,
+// logins and disk space.
 
 extension DifuAPI {
     // MARK: Devices
@@ -60,6 +61,28 @@ extension DifuAPI {
     public func setRules(_ rules: String, for repository: String) async throws {
         try await perform(
             "server.rules.set", ["repository": .string(repository), "rules": .string(rules)])
+    }
+
+    // MARK: Environment profiles
+
+    /// A server repository's environment profile and the versions its files
+    /// declare. `repository` is `owner/name`.
+    public func environment(for repository: String) async throws -> RepositoryEnvironment {
+        try await request(
+            "server.environment.get", ["repository": .string(repository)],
+            as: RepositoryEnvironment.self)
+    }
+
+    /// Replaces the profile's tools, setup commands, variables and notes (the
+    /// server keeps its history) and returns what it saved. Running sessions of
+    /// the repository are told.
+    @discardableResult
+    public func setEnvironment(_ profile: EnvironmentProfile, for repository: String) async throws
+        -> RepositoryEnvironment
+    {
+        try await request(
+            "server.environment.set", ["repository": .string(repository), "profile": profile.json],
+            as: RepositoryEnvironment.self)
     }
 
     // MARK: Logins
