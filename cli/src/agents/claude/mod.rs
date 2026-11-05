@@ -726,10 +726,13 @@ fn command(
             }
         }
         Control::Resume => {
-            let prompt = Prompt::from(
-                "Continue the task from its current state. Inspect prior actions; do not repeat completed work or publication.",
-            );
-            send(store, id, rpc, decoder, &prompt)?;
+            send(
+                store,
+                id,
+                rpc,
+                decoder,
+                &Prompt::from(super::provider::CONTINUE),
+            )?;
         }
         Control::Compact => {
             ensure!(

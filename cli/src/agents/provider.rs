@@ -239,6 +239,11 @@ pub(super) fn shorten(text: &str, max: usize) -> String {
     format!("{}… (shortened)", text.get(..end).unwrap_or_default())
 }
 
+/// What a turn that stopped before it finished continues with, on Continue or
+/// by itself after a service restart. Its last command may have been cut off,
+/// so nothing with outside effects is repeated unchecked.
+pub(super) const CONTINUE: &str = "Continue the task from its current state. Your previous turn stopped before it finished, so its last command may have been cut off, or may have finished without you seeing the result. Inspect prior actions and existing changes, check whether anything with outside effects (a push, merge, publication or message) already happened before repeating it, and do not repeat completed work.";
+
 /// What Claude Code answers when a conversation no longer fits its model's
 /// context, not even to compact it.
 pub(super) const TOO_LONG: &str = "Prompt is too long";

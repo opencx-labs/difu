@@ -1318,9 +1318,7 @@ fn command(
                 rpc,
                 store,
                 id,
-                &Prompt::from(
-                    "Continue the task from its current state. Inspect existing changes and any prior publication before proceeding; do not repeat completed actions.",
-                ),
+                &Prompt::from(super::provider::CONTINUE),
                 false,
                 cancel,
             )?;

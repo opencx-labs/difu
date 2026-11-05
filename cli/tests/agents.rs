@@ -924,26 +924,51 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
         Control::Message {
             attachments: Vec::new(),
             skills: Vec::new(),
-            text: "must not replay".into(),
+            text: "sent after the crash".into(),
             queue: true,
         },
     )?;
-    // Kill the service abruptly; accepted queued work must still not replay.
+    // Exactly what a restart started: the session continues once, then sends
+    // its queue. A session that was not working starts nothing, and the
+    // prompt the interrupted turn began with is not sent again.
+    let continued_once = |before: &str, queued: &str| -> Result<()> {
+        let log = fs::read_to_string(root.join("protocol.jsonl"))?;
+        let turns = log
+            .get(before.len()..)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|v| v.get("method").and_then(|v| v.as_str()) == Some("turn/start"))
+            .filter_map(|v| {
+                v.pointer("/params/input/0/text")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            })
+            .collect::<Vec<_>>();
+        let [resumed, sent] = turns.as_slice() else {
+            anyhow::bail!("Turns after the restart: {turns:?}");
+        };
+        assert!(
+            resumed.starts_with("Continue the task from its current state."),
+            "{resumed}"
+        );
+        assert_eq!(sent, queued);
+        Ok(())
+    };
+    let sent_entry = |s: &Session, text: &str| {
+        s.status == Status::Idle
+            && s.queue.is_empty()
+            && s.entries
+                .iter()
+                .any(|e| e.kind == "userMessage" && e.text == text)
+    };
+    // A crash: the service dies with the session still marked working.
     daemon.0.kill()?;
     daemon.0.wait()?;
     let log_before = fs::read_to_string(root.join("protocol.jsonl"))?;
     let mut daemon = start_service()?;
-    let recovered = session(&storage, &second)?;
-    assert_eq!(recovered.status, Status::Interrupted);
-    assert!(recovered.queue.is_empty());
-    assert!(
-        recovered
-            .entries
-            .iter()
-            .any(|e| e.kind == "unsent" && e.text == "must not replay")
-    );
-    std::thread::sleep(Duration::from_millis(150));
-    assert_eq!(fs::read_to_string(root.join("protocol.jsonl"))?, log_before);
+    let recovered = wait(&storage, &second, |s| sent_entry(s, "sent after the crash"))?;
+    continued_once(&log_before, "sent after the crash")?;
     assert_eq!(session(&storage, &questions)?.pending_question_count(), 3);
     control(
         &storage,
@@ -1045,16 +1070,39 @@ fn durable_agents_keep_approvals_queue_steer_and_recover_without_replay() -> Res
             .count(),
         1
     );
+    // A graceful stop, as an upgrade does: same result, and the queue survives
+    // the worker stopping.
+    control(
+        &storage,
+        &second,
+        message("wait through the upgrade", false),
+    )?;
+    wait(&storage, &second, |s| s.status == Status::Running)?;
+    control(&storage, &second, message("sent after the upgrade", true))?;
+    daemon.stop()?;
+    let log_before = fs::read_to_string(root.join("protocol.jsonl"))?;
+    let mut daemon = start_service()?;
+    let upgraded = wait(&storage, &second, |s| {
+        sent_entry(s, "sent after the upgrade")
+    })?;
+    assert_eq!(upgraded.thread_id, recovered.thread_id);
+    continued_once(&log_before, "sent after the upgrade")?;
     let protocol = fs::read_to_string(root.join("protocol.jsonl"))?;
-    assert!(
-        !protocol
+    let sent = |text: &str| {
+        protocol
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .any(
-                |v| v.pointer("/params/input/0/text").and_then(|v| v.as_str())
-                    == Some("must not replay")
-            )
-    );
+            .filter(|v| v.pointer("/params/input/0/text").and_then(|v| v.as_str()) == Some(text))
+            .count()
+    };
+    for text in [
+        "wait forever",
+        "sent after the crash",
+        "wait through the upgrade",
+        "sent after the upgrade",
+    ] {
+        assert_eq!(sent(text), 1, "{text}");
+    }
     control(
         &storage,
         &id,

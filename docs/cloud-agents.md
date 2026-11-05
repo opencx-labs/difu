@@ -115,6 +115,28 @@ SSH as root, the bootstrap script runs four steps, each safe to repeat:
    such as `CLAUDE_CONFIG_DIR` arrive), reload systemd and restart the
    service.
 
+### Sessions across a restart
+
+Sessions that were working when the service stopped continue by themselves when
+it starts again, on servers and computers alike, so an upgrade needs no manual
+Continue. On SIGTERM or SIGINT the service marks every active session
+(`resume_on_start`, persisted) before it stops the workers; after a crash the
+saved status is still active, which counts the same. An agent that ends during a
+shutdown counts as stopped rather than failed, and the unit's `KillMode=mixed`
+leaves stopping agents to the service.
+
+At the next start such a session is interrupted and then continued with
+`Control::Resume` in its existing conversation. The prompt tells the agent its
+last command may have been cut off, so it checks anything with outside effects
+before repeating it. Its queued messages are kept and sent after that turn; a
+message that was being sent stays marked unsent, and pending approvals are asked
+again. Nothing else is replayed.
+
+A session stays interrupted, with a note saying so, when it has no conversation
+yet, was archived, moved, removed, being cleared or being deleted, or already
+continued by itself three times in ten minutes (a crash loop). A session the user
+interrupted is not working, so it stays interrupted too.
+
 ### Version drift
 
 On a computer, the terminal app replaces an older background service with its
