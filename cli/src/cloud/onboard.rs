@@ -1877,6 +1877,7 @@ mod tests {
         for line in [
             "User=difu",
             "ExecStart=/usr/local/bin/difu serve",
+            "KillMode=mixed",
             "Restart=always",
             "Environment=XDG_RUNTIME_DIR=/run/user/@UID@",
             "Environment=CLAUDE_CONFIG_DIR=@HOME@/.claude",

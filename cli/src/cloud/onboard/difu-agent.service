@@ -17,6 +17,9 @@ Environment=PATH=@HOME@/.local/bin:/usr/local/bin:/usr/bin:/bin
 Environment=CLAUDE_CONFIG_DIR=@HOME@/.claude
 EnvironmentFile=-@HOME@/.config/difu/server.env
 ExecStart=/usr/local/bin/difu serve
+# Only the service gets SIGTERM: it records which sessions were working and
+# stops their agents itself, so they continue after the restart.
+KillMode=mixed
 Restart=always
 RestartSec=5
 

@@ -466,6 +466,14 @@ pub struct Session {
     /// the worker replaces it with a summarized one before reconnecting.
     #[serde(skip)]
     pub summarize_through: Option<usize>,
+    /// This session was working when the service stopped: the next start
+    /// continues it, keeping its queued messages.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub resume_on_start: bool,
+    /// When a service start last continued this session by itself, in
+    /// milliseconds since the epoch; bounds a crash loop.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restart_resumes: Vec<i64>,
     /// What difu's session tools asked to do once the turn ends.
     #[serde(skip)]
     pub scheduled: session_tools::Schedule,
@@ -596,6 +604,8 @@ impl Session {
             messaged_from: None,
             return_to: None,
             summarize_through: None,
+            resume_on_start: false,
+            restart_resumes: Vec::new(),
             scheduled: Default::default(),
             offline: None,
             held: Vec::new(),

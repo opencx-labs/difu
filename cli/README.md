@@ -317,7 +317,7 @@ fresh commit, leaving the local checkout unchanged. A failed fetch stops setup
 rather than using a stale base. Messages sent during setup are saved in the queue and sent in
 order once the worktree and provider are ready. New sessions automatically copy
 missing repository guidance before starting the provider. Failed or interrupted setup retains queued messages as unsent;
-restarting difu never automatically replays them.
+restarting difu does not send them.
 
 Every new session opens the new-session form: **Location** (this Mac or a
 saved server), **Repository**, **Model**, **Reasoning** and **Mode**, each
@@ -382,8 +382,15 @@ and native provider history are untouched.
 Codex model and reasoning inherit your configuration unless overridden. Legacy
 read-only investigation sessions permit app/MCP approval prompts while blocking
 filesystem escalation. In worktrees, Codex's inherited permissions apply. Claude
-permission requests appear in difu's approval panel. A restart never automatically
-replays a task or an uncertain tool approval.
+permission requests appear in difu's approval panel. A restart never replays an
+uncertain tool approval: a session that continues by itself asks again.
+
+Sessions that were working when difu's background service stopped, on this computer
+or on a server, continue by themselves when it starts again, after an update or a
+crash: they keep their conversation, send their queued messages afterwards, and are
+told to check anything with outside effects before repeating it. A session you
+interrupted stays interrupted, and one restarted more than three times in ten
+minutes waits for you.
 
 The session list previews conversations; use **Cmd+K** to search sessions. Selecting or entering a
 session scrolls to its latest messages; scrolling up afterward keeps your reading

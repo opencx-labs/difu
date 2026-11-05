@@ -27,6 +27,8 @@ pub struct Store {
     save_lock: Mutex<()>,
     pub(super) notifications: Option<notifications::Dispatcher>,
     pub(super) shells: shells::Manager,
+    /// Set by SIGTERM and SIGINT: the service is stopping.
+    pub(super) stopping: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Store {
     #[cfg(test)]
@@ -42,6 +44,7 @@ impl Store {
             save_lock: Mutex::new(()),
             notifications: None,
             shells: shells::Manager::default(),
+            stopping: Default::default(),
         }
     }
     pub fn get(&self, id: &str) -> Result<Session> {
@@ -353,34 +356,10 @@ impl Service {
                 })();
                 if let Err(error) = output {
                     let message = format!("{error:#}");
-                    let _ = store.update(&id_owned, |s| {
-                        if token.cancelled() {
-                            if s.status.active() {
-                                s.status = Status::Interrupted;
-                            }
-                            s.error = None;
-                            s.note(
-                                "system",
-                                "Agent connection stopped; workspace edits retained",
-                            );
-                        } else {
-                            s.status = Status::Failed;
-                            s.error = Some(message.clone());
-                            s.note("error", message.clone());
-                        }
-                        for text in std::mem::take(&mut s.queue) {
-                            s.unsent(text);
-                        }
-                        s.pending.retain(Pending::is_async_question);
-                        for entry in &mut s.entries {
-                            if entry.kind == "sending" {
-                                entry.kind = "unsent or unacknowledged".into();
-                            }
-                        }
-                        s.turn_id = None;
-                        s.switching_workspace = false;
-                        s.registration_requests.clear();
-                    });
+                    let cancelled = token.cancelled();
+                    let stopping = store.stopping.load(std::sync::atomic::Ordering::Relaxed);
+                    let _ =
+                        store.update(&id_owned, |s| worker_ended(s, cancelled, stopping, message));
                 }
                 if let Err(error) = store.save(&id_owned) {
                     eprintln!("Cannot save session {id_owned}: {error:#}");
@@ -930,6 +909,50 @@ impl Service {
             }
         }
         self.store.save(id)
+    }
+    /// Continues the sessions that were working when the service stopped, as
+    /// Continue would. One that cannot continue says so and waits for the user.
+    fn resume_restarted(self: &Arc<Self>) -> Result<()> {
+        let due: Vec<String> = self
+            .store
+            .sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Session lock failed"))?
+            .values()
+            .filter(|s| s.resume_on_start)
+            .map(|s| s.id.clone())
+            .collect();
+        if due.is_empty() {
+            return Ok(());
+        }
+        let service = self.clone();
+        thread::Builder::new()
+            .name("difu-resume".into())
+            .spawn(move || {
+                for id in due {
+                    if let Err(error) = service.resume_session(&id) {
+                        let message = format!(
+                            "Could not continue this session after the restart: {error:#}. Send a message or choose Continue to resume."
+                        );
+                        let _ = service.store.update(&id, |s| s.note("error", message));
+                    }
+                    let _ = service.store.save(&id);
+                }
+            })?;
+        Ok(())
+    }
+    fn resume_session(&self, id: &str) -> Result<()> {
+        let session = self.store.get(id)?;
+        self.store.update(id, |s| s.resume_on_start = false)?;
+        // A message from the user got there first.
+        if session.status != Status::Interrupted {
+            return Ok(());
+        }
+        self.handle(Request::Control {
+            id: id.to_owned(),
+            control: Control::Resume,
+        })?;
+        Ok(())
     }
     /// Takes the server sessions whose agent asked to move to this computer
     /// (`difu_move_to_computer`), once their turn is over.
@@ -2506,6 +2529,86 @@ fn ensure_orchestrator(store: &Store) -> Result<()> {
     store.save(super::orchestrator::ID)
 }
 
+/// A worker stopped with an error. A shutdown can end the agent before it
+/// cancels the worker, so `stopping` counts as stopped, not failed.
+fn worker_ended(s: &mut Session, cancelled: bool, stopping: bool, message: String) {
+    if cancelled || stopping {
+        if s.status.active() {
+            s.resume_on_start |= stopping;
+            s.status = Status::Interrupted;
+        }
+        s.error = None;
+        s.note(
+            "system",
+            "Agent connection stopped; workspace edits retained",
+        );
+    } else {
+        s.status = Status::Failed;
+        s.error = Some(message.clone());
+        s.note("error", message);
+    }
+    if !s.resume_on_start {
+        for text in std::mem::take(&mut s.queue) {
+            s.unsent(text);
+        }
+    }
+    s.pending.retain(Pending::is_async_question);
+    for entry in &mut s.entries {
+        if entry.kind == "sending" {
+            entry.kind = "unsent or unacknowledged".into();
+        }
+    }
+    s.turn_id = None;
+    s.switching_workspace = false;
+    s.registration_requests.clear();
+}
+
+/// How many times a session continues by itself within `RESUME_WINDOW`. More
+/// means the restarts are the problem, as in a crash loop, so it waits for the
+/// user instead of spending tokens on every one.
+const RESUME_LIMIT: usize = 3;
+const RESUME_WINDOW: i64 = 10 * 60 * 1000;
+
+/// A session that was working when the service stopped, whether it shut down
+/// (`resume_on_start`) or died (still marked active), is interrupted, and
+/// continues by itself when it has a conversation to continue. `retiring` is a
+/// session that was being cleared or deleted.
+fn after_restart(session: &mut Session, retiring: bool, now: i64) {
+    let working = session.status.active() || session.resume_on_start;
+    session.resume_on_start = false;
+    if working {
+        session.status = Status::Interrupted;
+        session.turn_id = None;
+        session.pending.retain(Pending::is_async_question);
+        session
+            .restart_resumes
+            .retain(|at| now.saturating_sub(*at) < RESUME_WINDOW);
+        let resumable = matches!(session.job, Job::Coding(_))
+            && session.thread_id.is_some()
+            && !retiring
+            && !session.archived
+            && !session.workspace_removed
+            && session.moved_to.is_none();
+        if resumable && session.restart_resumes.len() < RESUME_LIMIT {
+            session.restart_resumes.push(now);
+            session.resume_on_start = true;
+            session.note(
+                "system",
+                "Service restarted. Continuing this session automatically.",
+            );
+        } else {
+            session.note("system", "Service restarted. Work was interrupted; send a message or choose Continue to resume. No prompt or publication action was replayed.");
+        }
+    }
+    // A session that continues sends its queue afterwards; for any other the
+    // messages remain visible but are not sent by a restart.
+    if !session.resume_on_start {
+        for text in std::mem::take(&mut session.queue) {
+            session.unsent(text);
+        }
+    }
+}
+
 pub fn run(storage: Storage) -> Result<()> {
     let home = home(&storage)?;
     let file = OpenOptions::new()
@@ -2536,6 +2639,7 @@ pub fn run(storage: Storage) -> Result<()> {
         }
         let mut session: Session = serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("Cannot restore session {}", path.display()))?;
+        let retiring = session.clearing || session.deletion_progress.is_some();
         session.deletion_progress = None;
         session.clearing = false;
         ensure!(
@@ -2547,23 +2651,15 @@ pub fn run(storage: Storage) -> Result<()> {
         if session.id == super::orchestrator::ID && session.orchestrator_generation == 0 {
             continue;
         }
-        if session.status.active() {
-            session.status = Status::Interrupted;
-            session.turn_id = None;
-            session.pending.retain(Pending::is_async_question);
-            session.note("system", "Service restarted. Work was interrupted; send a message or choose Continue to resume. No prompt or publication action was replayed.");
-        }
+        after_restart(
+            &mut session,
+            retiring,
+            chrono::Utc::now().timestamp_millis(),
+        );
         subagents::restore(&mut session);
         for entry in &mut session.entries {
             if entry.kind == "sending" {
                 entry.kind = "unsent or unacknowledged".into();
-            }
-        }
-        // Queued messages remain visible, but never replay after a service restart.
-        if !session.queue.is_empty() {
-            let queued = std::mem::take(&mut session.queue);
-            for text in queued {
-                session.unsent(text);
             }
         }
         shells::restore(&mut session);
@@ -2588,6 +2684,7 @@ pub fn run(storage: Storage) -> Result<()> {
             save_lock: Mutex::new(()),
             notifications: Some(notifications),
             shells: shells::Manager::default(),
+            stopping: Default::default(),
         }),
         workers: Mutex::new(BTreeMap::new()),
         action_locks: Mutex::new(BTreeMap::new()),
@@ -2600,7 +2697,7 @@ pub fn run(storage: Storage) -> Result<()> {
     ensure_orchestrator(&service.store)?;
     let _pr_cache =
         super::pr_cache::Refresher::start(service.store.storage.clone(), service.store.clone())?;
-    let stopped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = service.store.stopping.clone();
     for signal in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         signal_hook::flag::register(signal, stopped.clone())?;
     }
@@ -2614,6 +2711,7 @@ pub fn run(storage: Storage) -> Result<()> {
         crate::cloud::repos::start(service.store.storage.clone(), stopped.clone());
         service.disk().start();
     }
+    service.resume_restarted()?;
     let mut saved = BTreeMap::new();
     let mut flushed = Instant::now();
     while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2656,6 +2754,15 @@ pub fn run(storage: Storage) -> Result<()> {
             }
         }
     }
+    // Before the workers stop: what is working now continues at the next start.
+    for session in service.store.list()? {
+        if session.status.active() {
+            service
+                .store
+                .update(&session.id, |s| s.resume_on_start = true)?;
+            service.store.save(&session.id)?;
+        }
+    }
     if let Some(federation) = &service.federation {
         federation.stop();
     }
@@ -2675,7 +2782,7 @@ pub fn run(storage: Storage) -> Result<()> {
             .map_err(|_| anyhow::anyhow!("Agent worker stopped unexpectedly"))?;
     }
     service.store.shells.stop_all(&service.store)?;
-    // Persist interrupted state before exit; no queued prompt or mutation is replayed.
+    // Persist interrupted state before exit; the next start decides what continues.
     for session in service.store.list()? {
         if session.status.active() {
             service.store.update(&session.id, |s| {
@@ -2814,6 +2921,7 @@ mod watch_tests {
             save_lock: Mutex::new(()),
             notifications: None,
             shells: shells::Manager::default(),
+            stopping: Default::default(),
         });
         let (client, mut server) = UnixStream::pair()?;
         client.set_read_timeout(Some(Duration::from_secs(2)))?;
@@ -4169,6 +4277,173 @@ mod move_tests {
             anyhow::bail!("server session");
         };
         assert_eq!(read.id, moved);
+        Ok(())
+    }
+
+    /// A session mid-turn in a conversation, on this computer or on a server.
+    fn working(server_mode: bool) -> Session {
+        let mut session = Session::new(
+            "one".into(),
+            Job::Coding(Launch {
+                repository: "/repo".into(),
+                isolated: true,
+                base: "origin/main".into(),
+                prompt: "Build the widget".into(),
+                model: None,
+                effort: None,
+            }),
+        );
+        session.server_mode = server_mode;
+        session.status = Status::Running;
+        session.thread_id = Some("thread".into());
+        session.turn_id = Some("turn".into());
+        session.queue.push(Prompt::from("and then the tests"));
+        session
+    }
+
+    #[test]
+    fn a_shutdown_continues_working_sessions_on_computers_and_servers_alike() -> Result<()> {
+        for server_mode in [false, true] {
+            let mut session = working(server_mode);
+            // The shutdown marks it, then its worker stops.
+            session.resume_on_start = true;
+            worker_ended(&mut session, true, true, "stopped".into());
+            assert_eq!(session.status, Status::Interrupted);
+            assert_eq!(session.queue.len(), 1);
+
+            // Saved and read back by the next start.
+            let mut session: Session = serde_json::from_slice(&serde_json::to_vec(&session)?)?;
+            after_restart(&mut session, false, 1_000);
+            assert!(session.resume_on_start);
+            assert_eq!(session.status, Status::Interrupted);
+            assert!(session.turn_id.is_none());
+            assert_eq!(session.queue, vec![Prompt::from("and then the tests")]);
+            assert!(
+                session
+                    .entries
+                    .iter()
+                    .any(|e| e.text == "Service restarted. Continuing this session automatically.")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn a_crash_continues_a_session_that_was_still_marked_working() {
+        for status in [Status::Running, Status::Waiting, Status::Starting] {
+            let mut session = working(false);
+            session.status = status;
+            after_restart(&mut session, false, 1_000);
+            assert!(session.resume_on_start, "{status:?}");
+            assert_eq!(session.queue.len(), 1);
+        }
+    }
+
+    #[test]
+    fn an_agent_ending_during_a_shutdown_is_stopped_not_failed() {
+        let mut session = working(true);
+        worker_ended(&mut session, false, true, "Claude stream: EOF".into());
+        assert_eq!(session.status, Status::Interrupted);
+        assert!(session.resume_on_start && session.error.is_none());
+        assert_eq!(session.queue.len(), 1);
+
+        // Outside a shutdown the same exit is a failure and nothing continues.
+        let mut session = working(true);
+        worker_ended(&mut session, false, false, "Claude stream: EOF".into());
+        assert_eq!(session.status, Status::Failed);
+        assert!(!session.resume_on_start && session.queue.is_empty());
+        assert!(session.entries.iter().any(|e| e.kind == "unsent"));
+    }
+
+    #[test]
+    fn only_sessions_that_were_working_with_a_conversation_continue() {
+        let unchanged = |change: fn(&mut Session), retiring: bool| {
+            let mut session = working(false);
+            change(&mut session);
+            after_restart(&mut session, retiring, 1_000);
+            assert!(!session.resume_on_start);
+            assert!(session.queue.is_empty());
+            session
+        };
+        // Interrupted by the user, or finished: not working, and no note.
+        for status in [Status::Interrupted, Status::Idle, Status::Failed] {
+            let mut session = working(false);
+            session.status = status;
+            after_restart(&mut session, false, 1_000);
+            assert!(!session.resume_on_start, "{status:?}");
+            assert_eq!(session.status, status);
+            assert!(
+                session
+                    .entries
+                    .iter()
+                    .all(|e| !e.text.starts_with("Service restarted"))
+            );
+        }
+        for session in [
+            unchanged(|s| s.thread_id = None, false),
+            unchanged(|s| s.archived = true, false),
+            unchanged(|s| s.workspace_removed = true, false),
+            unchanged(|s| s.moved_to = Some("box:1".into()), false),
+            unchanged(|_| {}, true),
+        ] {
+            assert_eq!(session.status, Status::Interrupted);
+            assert!(
+                session
+                    .entries
+                    .iter()
+                    .any(|e| e.text.contains("choose Continue"))
+            );
+        }
+    }
+
+    #[test]
+    fn a_crash_loop_stops_continuing_until_the_window_passes() {
+        let mut session = working(false);
+        for restart in 0..RESUME_LIMIT {
+            session.status = Status::Running;
+            session.queue.clear();
+            after_restart(&mut session, false, 1_000 + restart as i64);
+            assert!(session.resume_on_start, "restart {restart}");
+        }
+        session.status = Status::Running;
+        after_restart(&mut session, false, 2_000);
+        assert!(!session.resume_on_start);
+        assert_eq!(session.status, Status::Interrupted);
+
+        session.status = Status::Running;
+        after_restart(&mut session, false, 2_000 + RESUME_WINDOW);
+        assert!(session.resume_on_start);
+    }
+
+    #[test]
+    fn continuing_after_a_restart_leaves_a_session_the_user_got_to_first() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut session = working(false);
+        session.status = Status::Idle;
+        session.turn_id = None;
+        session.resume_on_start = true;
+        let mut archived = working(false);
+        archived.id = "two".into();
+        archived.status = Status::Interrupted;
+        archived.turn_id = None;
+        archived.archived = true;
+        archived.resume_on_start = true;
+        let service = service(
+            Arc::new(Store::fixture(temp.path().into(), vec![session, archived])),
+            None,
+        );
+        service.resume_session("one")?;
+        assert!(!service.store.get("one")?.resume_on_start);
+        assert!(
+            service
+                .workers
+                .lock()
+                .is_ok_and(|workers| workers.is_empty())
+        );
+
+        let refused = service.resume_session("two").err().context("archived")?;
+        assert!(format!("{refused:#}").contains("Unarchive"), "{refused:#}");
+        assert!(!service.store.get("two")?.resume_on_start);
         Ok(())
     }
 
