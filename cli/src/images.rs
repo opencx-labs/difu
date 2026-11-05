@@ -1,7 +1,11 @@
-//! PR image discovery and bounded downloads. No repository code is executed.
+//! PR image discovery, bounded downloads and previews of images changed in a
+//! diff. No repository code is executed.
 mod tables;
 
 use crate::{
+    app::Review,
+    diff::DiffFile,
+    local_diff::Comparison,
     model::{PrDetail, PrKey},
     process::{self, Cancel},
     storage::Storage,
@@ -14,7 +18,7 @@ use std::{
     io::{Cursor, Read, Write},
     net::IpAddr,
     ops::Range,
-    path::Path,
+    path::{Component, Path, PathBuf},
     process::Command,
     time::Duration,
 };
@@ -26,6 +30,11 @@ use url::Url;
 
 const MAX_BYTES: usize = 10 * 1024 * 1024;
 const CACHE_BYTES: u64 = 256 * 1024 * 1024;
+/// How wide a changed image previews in a diff, in cells, so a small icon does
+/// not fill a wide pane.
+const DIFF_WIDTH: usize = 80;
+/// Where diff previews start: the code column, past the gutter.
+const DIFF_INSET: u16 = 2;
 
 thread_local! {
     static DRAWING_DEFERRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -51,6 +60,16 @@ pub struct Request {
     pub label: String,
     pub key: PrKey,
     pub head: String,
+    /// Read from a local checkout instead of downloading.
+    pub local: Option<Local>,
+}
+
+/// A repository file in a local review.
+#[derive(Clone, Debug)]
+pub struct Local {
+    pub root: PathBuf,
+    /// The commit holding it; `None` is the working tree.
+    pub revision: Option<String>,
 }
 impl Request {
     pub fn new(source: String, label: String, pr: &PrDetail) -> Self {
@@ -59,9 +78,11 @@ impl Request {
             label,
             key: pr.key.clone(),
             head: pr.head.clone(),
+            local: None,
         }
     }
     pub fn browser_url(&self) -> Result<Url> {
+        ensure!(self.local.is_none(), "This image is only on this computer");
         if let Ok(url) = Url::parse(&self.source) {
             ensure!(
                 matches!(url.scheme(), "http" | "https"),
@@ -388,7 +409,44 @@ pub fn decode(bytes: &[u8]) -> Result<DynamicImage> {
 }
 
 pub fn load(storage: &Storage, request: &Request, cancel: &Cancel) -> Result<DynamicImage> {
-    cached_image(storage, request, cancel, || download(request, cancel))
+    cached_image(storage, request, cancel, || fetch(request, cancel))
+}
+
+fn fetch(request: &Request, cancel: &Cancel) -> Result<Vec<u8>> {
+    match &request.local {
+        Some(local) => read_local(&request.source, local, cancel),
+        None => download(request, cancel),
+    }
+}
+
+/// A local review's image, from its commit or the working tree. Only plain
+/// files inside the checkout are read, with the preview size limit.
+fn read_local(path: &str, local: &Local, cancel: &Cancel) -> Result<Vec<u8>> {
+    ensure!(
+        Path::new(path)
+            .components()
+            .all(|part| matches!(part, Component::Normal(_))),
+        "Invalid image path"
+    );
+    if let Some(revision) = &local.revision {
+        let output = process::run_limited(
+            crate::repo::git(&local.root).args(["cat-file", "blob", &format!("{revision}:{path}")]),
+            cancel,
+            MAX_BYTES + 1,
+        )?;
+        ensure!(output.code == 0, "Git could not read this image");
+        return Ok(output.stdout);
+    }
+    let file = local.root.join(path);
+    ensure!(
+        fs::symlink_metadata(&file)?.is_file(),
+        "This image is not a regular file"
+    );
+    let mut bytes = Vec::new();
+    fs::File::open(&file)?
+        .take((MAX_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// A PR image's file as downloaded, after the same checks as a preview, for
@@ -406,7 +464,7 @@ pub struct Original {
 /// authentication only for GitHub, 10 MiB, 8192 px per side, PNG, JPEG, WebP
 /// or GIF (whose first frame is what previews show).
 pub fn original(storage: &Storage, request: &Request, cancel: &Cancel) -> Result<Original> {
-    cached_original(storage, request, cancel, || download(request, cancel))
+    cached_original(storage, request, cancel, || fetch(request, cancel))
 }
 fn cached_original(
     storage: &Storage,
@@ -673,35 +731,8 @@ fn rows_with_references(
             ));
             continue;
         }
-        for mut row in prose(&format!("Image: {label} · click to enlarge"), width) {
-            row.action = Some(Action::Image(request.clone()));
-            rows.push(row);
-        }
-        if images.supported() {
-            let width = u16::try_from(width).unwrap_or(u16::MAX);
-            let height = images.preview_height(&request, width);
-            for offset in 0..height {
-                rows.push(TextRow {
-                    images: vec![PreviewRow {
-                        request: request.clone(),
-                        offset,
-                        height,
-                        width,
-                        inset: 0,
-                    }],
-                    action: Some(Action::Image(request.clone())),
-                    ..Default::default()
-                });
-            }
-        } else {
-            rows.extend(prose(
-                "Inline images are unavailable in this terminal.",
-                width,
-            ));
-        }
-        if let Ok(url) = request.browser_url() {
-            rows.push(link("↗ Open image in browser", Action::Link(url.into())));
-        } else {
+        rows.extend(preview(&request, &label, width, 0, images));
+        if request.browser_url().is_err() {
             rows.extend(prose("This image has an unsupported URL.", width));
         }
     }
@@ -709,6 +740,145 @@ fn rows_with_references(
         rows.extend(prose(after, width));
     }
     rows
+}
+
+/// An image's label, its picture (or why there is none) and a browser link.
+fn preview(
+    request: &Request,
+    label: &str,
+    width: usize,
+    inset: u16,
+    images: &State,
+) -> Vec<TextRow> {
+    let mut rows = Vec::new();
+    for mut row in prose(&format!("Image: {label} · click to enlarge"), width) {
+        row.action = Some(Action::Image(request.clone()));
+        rows.push(row);
+    }
+    if images.supported() {
+        let width = u16::try_from(width).unwrap_or(u16::MAX);
+        let height = images.preview_height(request, width);
+        for offset in 0..height {
+            rows.push(TextRow {
+                images: vec![PreviewRow {
+                    request: request.clone(),
+                    offset,
+                    height,
+                    width,
+                    inset,
+                }],
+                action: Some(Action::Image(request.clone())),
+                ..Default::default()
+            });
+        }
+    } else {
+        rows.extend(prose(
+            "Inline images are unavailable in this terminal.",
+            width,
+        ));
+    }
+    if let Ok(url) = request.browser_url() {
+        rows.push(link("↗ Open image in browser", Action::Link(url.into())));
+    }
+    rows
+}
+
+/// Previews of an image a diff changed: the version before and the version
+/// after, each only when it exists. Other files have none.
+pub(crate) fn diff_rows(
+    file: &DiffFile,
+    width: usize,
+    review: &Review,
+    images: &State,
+) -> Vec<TextRow> {
+    let Some(pr) = review.detail.as_deref() else {
+        return Vec::new();
+    };
+    if !changed_image(file) {
+        return Vec::new();
+    }
+    let width = width.min(DIFF_WIDTH);
+    let mut rows = Vec::new();
+    if !file.status.starts_with('A')
+        && let Some(request) = version(&file.old_path, "Before", false, review, pr)
+    {
+        rows.extend(preview(&request, "Before", width, DIFF_INSET, images));
+    }
+    if !file.status.starts_with('D')
+        && let Some(request) = version(&file.path, "After", true, review, pr)
+    {
+        rows.extend(preview(&request, "After", width, DIFF_INSET, images));
+    }
+    rows
+}
+
+/// A binary change to a file difu can preview. SVGs are text, so their diffs
+/// show as code.
+fn changed_image(file: &DiffFile) -> bool {
+    let preview = Path::new(&file.path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|extension| {
+            matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp")
+        });
+    preview
+        && file.hunks.iter().flat_map(|hunk| &hunk.lines).any(|line| {
+            let text = line.text.trim_start();
+            text.starts_with("Binary files ") || text.starts_with("GIT binary patch")
+        })
+}
+
+/// `path` on one side of the review: the PR's base or head on GitHub, or the
+/// local comparison's commits and working tree.
+fn version(
+    path: &str,
+    label: &str,
+    after: bool,
+    review: &Review,
+    pr: &PrDetail,
+) -> Option<Request> {
+    let Some(checkout) = &review.local else {
+        // A relative URL, so `:` in a name cannot read as a scheme.
+        let escaped = path
+            .replace('%', "%25")
+            .replace('#', "%23")
+            .replace('?', "%3F");
+        return Some(Request {
+            source: format!("./{escaped}"),
+            label: label.into(),
+            key: pr.key.clone(),
+            head: if after { &pr.head } else { &pr.base }.clone(),
+            local: None,
+        });
+    };
+    let (revision, head) = match (&checkout.comparison, after) {
+        (Comparison::WorkingTree { .. }, true) => {
+            // Saved edits are new images: they get their own cache entry.
+            let metadata = fs::symlink_metadata(checkout.root.join(path)).ok()?;
+            let modified = metadata.modified().ok()?;
+            let age = modified.duration_since(std::time::UNIX_EPOCH).ok()?;
+            (
+                None,
+                format!("worktree:{}:{}", age.as_nanos(), metadata.len()),
+            )
+        }
+        (Comparison::WorkingTree { head }, false) => (Some(head.clone()), head.clone()),
+        (Comparison::Branch { head, .. }, true) => (Some(head.clone()), head.clone()),
+        (Comparison::Branch { merge_base, .. }, false) => {
+            (Some(merge_base.clone()), merge_base.clone())
+        }
+    };
+    Some(Request {
+        source: path.into(),
+        label: label.into(),
+        key: pr.key.clone(),
+        head,
+        local: Some(Local {
+            root: checkout.root.clone(),
+            revision,
+        }),
+    })
 }
 
 fn inline_size(image: &DynamicImage, picker: &Picker, width: u16) -> Result<Size> {
@@ -903,6 +1073,263 @@ mod tests {
     };
     use ratatui::{Terminal, backend::TestBackend};
     use std::{sync::Arc, time::Instant};
+
+    fn changed(path: &str, old_path: &str, status: &str, meta: &str) -> DiffFile {
+        DiffFile {
+            path: path.into(),
+            old_path: old_path.into(),
+            status: status.into(),
+            hunks: vec![crate::diff::Hunk {
+                id: "f0-meta".into(),
+                header: "File metadata".into(),
+                lines: vec![crate::diff::DiffLine {
+                    kind: crate::diff::LineKind::Meta,
+                    old: None,
+                    new: None,
+                    text: meta.into(),
+                }],
+            }],
+            additions: 0,
+            deletions: 0,
+        }
+    }
+
+    /// Which versions a diff previews: each image row's label, source and commit.
+    fn versions(file: &DiffFile, review: &Review) -> Vec<(String, String, String)> {
+        let mut seen: Vec<(String, String, String)> = Vec::new();
+        for row in diff_rows(file, 200, review, &State::default()) {
+            if let Some(Action::Image(request)) = row.action {
+                let version = (request.label, request.source, request.head);
+                if !seen.contains(&version) {
+                    seen.push(version);
+                }
+            }
+        }
+        seen
+    }
+
+    fn pr_review() -> Review {
+        Review {
+            detail: Some(Arc::new(pr())),
+            ..Review::default()
+        }
+    }
+
+    const BINARY: &str = "Binary files a/logo.png and b/logo.png differ";
+
+    fn version(label: &str, source: &str, head: &str) -> (String, String, String) {
+        (label.into(), source.into(), head.into())
+    }
+
+    #[test]
+    fn a_pr_diff_previews_the_versions_each_change_has() {
+        let review = pr_review();
+        assert_eq!(
+            versions(&changed("logo.png", "logo.png", "M", BINARY), &review),
+            [
+                version("Before", "./logo.png", "base"),
+                version("After", "./logo.png", "abc123")
+            ]
+        );
+        assert_eq!(
+            versions(&changed("logo.png", "logo.png", "A", BINARY), &review),
+            [version("After", "./logo.png", "abc123")]
+        );
+        assert_eq!(
+            versions(&changed("logo.png", "logo.png", "D", BINARY), &review),
+            [version("Before", "./logo.png", "base")]
+        );
+        assert_eq!(
+            versions(&changed("new.PNG", "old.png", "R090", BINARY), &review),
+            [
+                version("Before", "./old.png", "base"),
+                version("After", "./new.PNG", "abc123")
+            ]
+        );
+    }
+
+    #[test]
+    fn only_binary_changes_to_supported_images_get_previews() {
+        let review = pr_review();
+        for file in [
+            changed("notes.txt", "notes.txt", "M", BINARY),
+            changed("logo.svg", "logo.svg", "M", BINARY),
+            changed("logo.png", "logo.png", "R100", "similarity index 100%"),
+        ] {
+            assert!(diff_rows(&file, 200, &review, &State::default()).is_empty());
+        }
+        let file = changed("logo.png", "logo.png", "M", BINARY);
+        assert!(diff_rows(&file, 200, &Review::default(), &State::default()).is_empty());
+    }
+
+    #[test]
+    fn a_repository_image_downloads_through_the_contents_api_at_its_commit() -> Result<()> {
+        let review = pr_review();
+        let file = changed("a b#1.png", "a b#1.png", "M", BINARY);
+        let rows = diff_rows(&file, 200, &review, &State::default());
+        let requests: Vec<_> = rows
+            .into_iter()
+            .filter_map(|row| match row.action {
+                Some(Action::Image(request)) => Some(request),
+                _ => None,
+            })
+            .collect();
+        let before = requests.first().context("before")?;
+        assert_eq!(
+            before.download_url()?.as_str(),
+            "https://api.github.com/repos/example/repo/contents/a%20b%231.png?ref=base"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn previews_stay_within_the_diff_width_and_start_at_the_code_column() -> Result<()> {
+        let images = State {
+            picker: Some(Picker::halfblocks()),
+            ..State::default()
+        };
+        let file = changed("logo.png", "logo.png", "A", BINARY);
+        let rows = diff_rows(&file, 200, &pr_review(), &images);
+        let preview = rows
+            .iter()
+            .find_map(|row| row.images.first())
+            .context("preview")?;
+        assert_eq!(usize::from(preview.width), DIFF_WIDTH);
+        assert_eq!(preview.inset, DIFF_INSET);
+        Ok(())
+    }
+
+    fn git(root: &Path, args: &[&str]) -> Result<String> {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(root).args([
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ]);
+        Ok(process::checked(command.args(args), &Cancel::default())?
+            .trim()
+            .to_owned())
+    }
+
+    fn square(side: u32) -> Result<Vec<u8>> {
+        let mut bytes = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image::RgbaImage::new(side, side))
+            .write_to(&mut bytes, ImageFormat::Png)?;
+        Ok(bytes.into_inner())
+    }
+
+    fn local_review(root: &Path, comparison: Comparison) -> Review {
+        Review {
+            local: Some(crate::local_diff::Checkout {
+                root: root.into(),
+                branch: "feature".into(),
+                comparison,
+            }),
+            detail: Some(Arc::new(pr())),
+            ..Review::default()
+        }
+    }
+
+    fn requests(file: &DiffFile, review: &Review) -> Vec<Request> {
+        let mut seen: Vec<Request> = Vec::new();
+        for row in diff_rows(file, 200, review, &State::default()) {
+            if let Some(Action::Image(request)) = row.action
+                && !seen.iter().any(|known| known.id() == request.id())
+            {
+                seen.push(request);
+            }
+        }
+        seen
+    }
+
+    #[test]
+    fn a_local_diff_reads_commits_and_the_working_tree_without_a_download() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        git(root, &["init", "-q"])?;
+        fs::write(root.join("logo.png"), square(2)?)?;
+        git(root, &["add", "."])?;
+        git(root, &["commit", "-qm", "Add the logo"])?;
+        let head = git(root, &["rev-parse", "HEAD"])?;
+        fs::write(root.join("logo.png"), square(3)?)?;
+
+        let file = changed("logo.png", "logo.png", "M", BINARY);
+        let review = local_review(root, Comparison::WorkingTree { head: head.clone() });
+        let found = requests(&file, &review);
+        let [before, after] = found.as_slice() else {
+            bail!("expected both versions: {found:?}");
+        };
+        let side = |request: &Request| -> Result<u32> {
+            let local = request.local.as_ref().context("local")?;
+            Ok(decode(&read_local(&request.source, local, &Cancel::default())?)?.width())
+        };
+        assert_eq!(side(before)?, 2);
+        assert_eq!(side(after)?, 3);
+        assert!(before.browser_url().is_err() && after.browser_url().is_err());
+
+        // A saved edit is a new image, not the cached one.
+        let saved = after.id();
+        fs::write(root.join("logo.png"), square(4)?)?;
+        let found = requests(&file, &review);
+        let last = found.last().context("after")?;
+        assert_ne!(last.id(), saved);
+        assert_eq!(side(last)?, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn a_local_branch_diff_reads_both_commits() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        git(root, &["init", "-q"])?;
+        fs::write(root.join("logo.png"), square(2)?)?;
+        git(root, &["add", "."])?;
+        git(root, &["commit", "-qm", "Add the logo"])?;
+        let merge_base = git(root, &["rev-parse", "HEAD"])?;
+        fs::write(root.join("logo.png"), square(3)?)?;
+        git(root, &["add", "."])?;
+        git(root, &["commit", "-qm", "Change the logo"])?;
+        let head = git(root, &["rev-parse", "HEAD"])?;
+        // Uncommitted work is not part of a branch comparison.
+        fs::write(root.join("logo.png"), square(4)?)?;
+
+        let review = local_review(root, Comparison::Branch { head, merge_base });
+        let found = requests(&changed("logo.png", "logo.png", "M", BINARY), &review);
+        let sides = found
+            .iter()
+            .map(|request| {
+                let local = request.local.as_ref().context("local")?;
+                Ok(decode(&read_local(&request.source, local, &Cancel::default())?)?.width())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(sides, [2, 3]);
+        Ok(())
+    }
+
+    #[test]
+    fn local_images_stay_inside_the_checkout() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("repo");
+        fs::create_dir(&root)?;
+        let outside = temp.path().join("outside.png");
+        fs::write(&outside, square(2)?)?;
+        std::os::unix::fs::symlink(&outside, root.join("link.png"))?;
+        let local = Local {
+            root,
+            revision: None,
+        };
+        for path in ["../outside.png", "/etc/passwd", "link.png"] {
+            assert!(
+                read_local(path, &local, &Cancel::default()).is_err(),
+                "{path}"
+            );
+        }
+        Ok(())
+    }
+
     fn pr() -> PrDetail {
         PrDetail {
             draft: false,

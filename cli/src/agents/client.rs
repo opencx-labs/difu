@@ -145,13 +145,13 @@ pub fn ensure_running(storage: &Storage) -> Result<()> {
     ensure_version(storage, &std::env::current_exe()?, false)
 }
 
-/// Homebrew invokes this after installing a new binary. A fresh install does not
-/// start a service; an existing older service is replaced even with active jobs.
+/// `--refresh-agent-service`. A fresh install does not start a service; an
+/// existing older service is replaced even with active jobs.
 pub fn refresh_running(storage: &Storage) -> Result<()> {
     ensure_version(storage, &std::env::current_exe()?, true)
 }
 
-fn version_number(version: &str) -> Result<(u64, u64, u64)> {
+pub(crate) fn version_number(version: &str) -> Result<(u64, u64, u64)> {
     let mut parts = version.split('.');
     let major = parts.next().context("Missing major version")?.parse()?;
     let minor = parts.next().context("Missing minor version")?.parse()?;

@@ -513,11 +513,9 @@ Sidebar cards flip their changes too: status, timers, request counts and PRs;
 the selection highlight flips across a card a flap at a time, and a card that
 moves flips from the text that was in its place. Switching between the Agents
 and Reviews tabs flips the whole screen in.
-Every animation eases in and out instead of moving at a constant rate: flips,
-reveals, sweeps, the question panel growing and shrinking, and the inbox
-collapsing start slowly, speed up through the middle, and settle gently, still
-finishing in the same time. A reply that is already flipping in keeps its speed
-when more text streams in.
+Every animation moves at a constant rate. Panels, cards and questions reveal and
+hide at one shared speed, 10 ms per row within the cap below, so opening and
+closing match everywhere.
 **/tweaks** (also in the command palette) changes these four
 values, saved in the difu config; 0 turns an animation off (a reply speed of 0
 turns off the flip for all agent content), and a longest animation of 0 removes
@@ -711,11 +709,11 @@ and **Enter** moves from the tree into the diff. **Up/Down** crosses to the prev
 or next file at a file boundary; **Shift+Up/Down** selects lines within the current
 file. **c / Command+C** copies through the terminal clipboard protocol.
 
-After an upgrade, opening the newer difu automatically replaces an older running
-background service, even when agents are active. Installing with Homebrew leaves
-the service running until that next launch.
-Chats and worktree edits are preserved; send a new message or choose Continue to
-resume interrupted work. Queued messages are not replayed. Older clients do not replace a newer service.
+After an upgrade, the background service replaces itself within about 30 seconds,
+even when agents are active, and working sessions carry on by themselves. Shared
+shells stop with the old service. The new version appears beside the tabs; **/restart** reloads
+difu in place, in the same terminal, keeping the session on show and unsent drafts.
+Older clients do not replace a newer service.
 
 Waiting messages appear below the activity line, with a bright heading and indented
 previews. Messages sent during a tool call appear there immediately, before the
@@ -899,6 +897,11 @@ the selected repository.
 Descriptions and activity comments show inline PNG, JPEG, WebP, and GIF previews
 (the first GIF frame). Click an image to enlarge it; **Esc** returns to the same
 review position. The image modal also offers **o** to open it in your browser.
+Changed images show in diffs too, in PR and local reviews: **Before** and
+**After** previews follow the file's binary change, up to 80 columns wide, and
+click to enlarge. They need the same terminal support as other previews, and
+SVGs show as text.
+
 Previews fill their container width while preserving proportions. Images in
 Markdown and HTML tables stay inside their cells and fill the cell width.
 

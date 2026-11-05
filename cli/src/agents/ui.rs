@@ -8,7 +8,6 @@ mod cloud;
 mod codex_plan_picker;
 mod commands;
 mod defaults;
-mod easing;
 mod flap;
 mod folders;
 mod inbox;
@@ -29,6 +28,7 @@ mod prs;
 pub(crate) mod question_preview;
 mod questions;
 mod remote_control;
+mod restart;
 mod reveal;
 #[cfg(test)]
 pub(crate) mod review_shortcut_tests;
@@ -49,6 +49,7 @@ mod status_icons;
 mod subagents;
 mod terminals;
 mod themes;
+mod timing;
 pub(crate) mod toast;
 mod tool_content;
 pub(in crate::agents) mod transcript;
@@ -420,6 +421,8 @@ pub struct Ui {
     pub(crate) preferences: crate::settings::Preferences,
     shortcut_config: Config,
     pub(crate) cpu_requested: bool,
+    /// `/restart`: the shell reloads difu in place.
+    pub(crate) restart_requested: bool,
     pub(crate) settings_requested: Option<crate::settings::Category>,
     panels: panels::Panels,
     prs: prs::State,
@@ -620,6 +623,7 @@ impl Ui {
             paths_loading: HashSet::new(),
             settings_requested: None,
             cpu_requested: false,
+            restart_requested: false,
             voice: voice::State::new(config.voice_enabled),
             tweaks: config.tweaks,
             theme: crate::theme::index(config.theme.as_deref()),

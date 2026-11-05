@@ -2712,6 +2712,15 @@ pub fn run(storage: Storage) -> Result<()> {
         service.disk().start();
     }
     service.resume_restarted()?;
+    // On a server, systemd runs the service and `difu server upgrade` replaces it.
+    let mut upgrade = service
+        .store
+        .storage
+        .load_config()
+        .is_ok_and(|config| !config.server.enabled)
+        .then(crate::upgrade::Watch::new)
+        .flatten();
+    let mut replacing = false;
     let mut saved = BTreeMap::new();
     let mut flushed = Instant::now();
     while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2738,6 +2747,14 @@ pub fn run(storage: Storage) -> Result<()> {
             continue;
         }
         flushed = Instant::now();
+        if let Some(version) = upgrade
+            .as_mut()
+            .and_then(|watch| watch.poll(Instant::now()))
+        {
+            eprintln!("Replacing this service with difu {version}");
+            replacing = true;
+            stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         if let Err(error) = service.scheduled_moves() {
             eprintln!("Scheduled moves: {error:#}");
         }
@@ -2794,6 +2811,13 @@ pub fn run(storage: Storage) -> Result<()> {
         service.store.save(&session.id)?;
     }
     fs::remove_file(path)?;
+    if replacing && let Some(watch) = &upgrade {
+        return Err(crate::upgrade::replace_service(
+            watch.path(),
+            &service.store.storage,
+        ))
+        .context("Could not start the new agent service");
+    }
     Ok(())
 }
 /// Socket options for one client. The listener is nonblocking and on macOS

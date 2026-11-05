@@ -407,6 +407,7 @@ fn image_with(
         label: String::new(),
         key,
         head: head.into(),
+        local: None,
     };
     // Refuse unsupported URLs before anything is fetched.
     request.download_url()?;

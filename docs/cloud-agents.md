@@ -139,8 +139,14 @@ interrupted is not working, so it stays interrupted too.
 
 ### Version drift
 
-On a computer, the terminal app replaces an older background service with its
-own version. On a server (`config.server.enabled`) it never does: systemd runs
+On a computer, the background service watches the file it runs from. When a
+newer difu lands there, as after `brew upgrade`, it stops gracefully (so working
+sessions continue, see *Sessions across a restart*) and replaces itself with
+the new version, within about 30 seconds. The terminal app shows the new version
+beside its tabs; `/restart` reloads it in place, keeping the session on show and
+unsent drafts. A terminal app of an older version keeps working with the newer
+service until then. A newer terminal app also replaces an older service when it
+opens. On a server (`config.server.enabled`) it never does: systemd runs
 `difu serve` with `Restart=always` and the unit's environment, so a
 replacement started by a terminal app would fight systemd and run without that
 environment. A terminal app (or `--refresh-agent-service`) of a newer version
