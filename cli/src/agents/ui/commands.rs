@@ -31,6 +31,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "Pick a colour theme; Default restores the original colours",
     ),
     (
+        "restart",
+        "Reload difu in place, loading an upgrade; sessions carry on",
+    ),
+    (
         "shell",
         "Open a shared interactive shell in the session worktree",
     ),
@@ -422,6 +426,10 @@ impl Ui {
             "/remote-control" => self.open_remote(),
             "/cloud" => self.open_cloud(None),
             "/voice" => self.toggle_voice(),
+            "/restart" => {
+                self.restart_requested = true;
+                self.modal = None;
+            }
             "/tweaks" => self.open_tweaks(),
             "/theme" => self.open_theme(),
             "/shell" => self.open_terminal(),

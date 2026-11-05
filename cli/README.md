@@ -709,11 +709,11 @@ and **Enter** moves from the tree into the diff. **Up/Down** crosses to the prev
 or next file at a file boundary; **Shift+Up/Down** selects lines within the current
 file. **c / Command+C** copies through the terminal clipboard protocol.
 
-After an upgrade, opening the newer difu automatically replaces an older running
-background service, even when agents are active. Installing with Homebrew leaves
-the service running until that next launch.
-Chats and worktree edits are preserved; send a new message or choose Continue to
-resume interrupted work. Queued messages are not replayed. Older clients do not replace a newer service.
+After an upgrade, the background service replaces itself within about 30 seconds,
+even when agents are active, and working sessions carry on by themselves. Shared
+shells stop with the old service. The new version appears beside the tabs; **/restart** reloads
+difu in place, in the same terminal, keeping the session on show and unsent drafts.
+Older clients do not replace a newer service.
 
 Waiting messages appear below the activity line, with a bright heading and indented
 previews. Messages sent during a tool call appear there immediately, before the

@@ -29,6 +29,7 @@ pub mod storage;
 pub mod theme;
 pub mod tree;
 pub mod ui;
+pub mod upgrade;
 pub mod workflow;
 pub mod workflow_ui;
 pub mod worktrees;

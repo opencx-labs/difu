@@ -137,7 +137,13 @@ fn main() -> Result<()> {
     let args = Args::parse();
     if args.agent_service || args.refresh_agent_service {
         if args.agent_service {
-            nix::unistd::setsid().context("Could not detach the background agent service")?;
+            // A service replacing itself is already its session's leader.
+            match nix::unistd::setsid() {
+                Ok(_) | Err(nix::errno::Errno::EPERM) => {}
+                Err(error) => {
+                    return Err(error).context("Could not detach the background agent service");
+                }
+            }
         }
         let storage = match (args.agent_config, args.agent_cache) {
             (Some(config), Some(cache)) => Storage { config, cache },
@@ -415,7 +421,12 @@ fn main() -> Result<()> {
     );
     ratatui::restore();
     app.reviews.shutdown();
-    result
+    result?;
+    if let Some(path) = app.restart.take() {
+        app.agents.save_for_restart()?;
+        return Err(difu::upgrade::restart_app(&path)).context("Could not restart difu");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

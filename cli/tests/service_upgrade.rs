@@ -231,6 +231,46 @@ fn legacy_and_older_services_upgrade_once_and_preserve_interrupted_work() -> Res
     Ok(())
 }
 
+/// A service replacing itself keeps its process, which is already the leader
+/// of its session, so detaching again must not stop it. A process group leader
+/// is refused the same way.
+#[test]
+fn a_service_that_cannot_detach_again_still_starts() -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    let (_dir, storage) = storage()?;
+    let _cleanup = Cleanup(storage.clone());
+    let mut child = Command::new(env!("CARGO_BIN_EXE_difu"))
+        .arg("--agent-service")
+        .arg("--agent-config")
+        .arg(&storage.config)
+        .arg("--agent-cache")
+        .arg(&storage.cache)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let started = Instant::now();
+    loop {
+        if let Ok(Reply::ServiceVersion { version }) =
+            client::request(&storage, Request::ServiceVersion)
+        {
+            assert_eq!(version, env!("CARGO_PKG_VERSION"));
+            break;
+        }
+        ensure!(
+            child.try_wait()?.is_none(),
+            "The service stopped instead of starting"
+        );
+        ensure!(
+            started.elapsed() < Duration::from_secs(10),
+            "The service did not start"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
 /// On a server, systemd runs `difu serve`. A terminal app or installer of
 /// another difu version keeps that service and warns instead of replacing it.
 #[test]

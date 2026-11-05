@@ -43,6 +43,11 @@ pub struct Shell {
     pub(crate) settings_preview_requested: Option<crate::settings::Preview>,
     /// When the last tab switch started flipping the screen in.
     switched: Option<std::time::Instant>,
+    upgrade: Option<crate::upgrade::Watch>,
+    /// A newer difu installed over this one, waiting for `/restart`.
+    update_ready: Option<String>,
+    /// What to reload as, once the terminal is back: set by `/restart`.
+    pub restart: Option<std::path::PathBuf>,
 }
 impl Shell {
     pub(crate) fn reviews_on_launch(config: &Config, explicit_review: bool) -> bool {
@@ -59,7 +64,7 @@ impl Shell {
         if reviews_started {
             reviews.start(pr);
         }
-        Self {
+        let mut shell = Self {
             reviews,
             notification_client: crate::agents::notifications::client::Client::new(storage.clone()),
             agents: Ui::new(storage, &config),
@@ -75,7 +80,16 @@ impl Shell {
             settings_pending_action: None,
             settings_preview_requested: None,
             switched: None,
-        }
+            upgrade: if cfg!(test) {
+                None
+            } else {
+                crate::upgrade::Watch::new()
+            },
+            update_ready: None,
+            restart: None,
+        };
+        shell.agents.restore_after_restart();
+        shell
     }
     pub fn local(storage: Storage, config: Config, path: std::path::PathBuf) -> Self {
         let mut initial = config.clone();
@@ -112,6 +126,9 @@ impl Shell {
     fn take_settings_request(&mut self) {
         if std::mem::take(&mut self.agents.cpu_requested) {
             self.open_cpu();
+        }
+        if std::mem::take(&mut self.agents.restart_requested) {
+            self.request_restart();
         }
         if let Some(category) = self.agents.settings_requested.take() {
             self.open_settings(Some(category));
@@ -161,7 +178,30 @@ impl Shell {
     pub fn tick(&mut self) {
         self.tick_focused(true);
     }
+    /// Leaves the event loop to reload as the path this program runs from.
+    fn request_restart(&mut self) {
+        match std::env::current_exe() {
+            Ok(path) => {
+                self.restart = Some(
+                    self.upgrade
+                        .as_ref()
+                        .map_or(path, |watch| watch.path().to_owned()),
+                );
+                self.reviews.quit = true;
+            }
+            Err(error) => {
+                self.agents.notice = Some((format!("Could not restart difu: {error:#}"), true));
+            }
+        }
+    }
     pub fn tick_focused(&mut self, focused: bool) {
+        if let Some(version) = self
+            .upgrade
+            .as_mut()
+            .and_then(|watch| watch.poll(std::time::Instant::now()))
+        {
+            self.update_ready = Some(version);
+        }
         self.refresh_settings();
         if let Some(panel) = &mut self.settings {
             panel.connection_tick();
@@ -468,6 +508,19 @@ impl Shell {
             );
             x += width;
         }
+        if let Some(version) = &self.update_ready {
+            let label = format!(" difu {version} installed · /restart ");
+            let x = x.saturating_add(1);
+            frame.render_widget(
+                Paragraph::new(label.as_str()).style(Style::default().fg(ACCENT).bg(BG)),
+                Rect::new(
+                    x,
+                    0,
+                    (label.width() as u16).min(frame.area().width.saturating_sub(x)),
+                    1,
+                ),
+            );
+        }
         self.draw_palette(frame);
         if let Some(panel) = &mut self.settings {
             crate::theme::select(crate::theme::index(panel.preview_config().theme.as_deref()));
@@ -634,6 +687,35 @@ mod settings_integration_tests {
     use super::*;
     use crate::settings::{Category, SettingId, SettingValue};
     use anyhow::{Context, Result};
+    #[test]
+    fn an_installed_upgrade_shows_beside_the_tabs_and_restart_leaves_the_loop() -> Result<()> {
+        let (_dir, mut shell) = fixture()?;
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30))?;
+        let shown = |shell: &mut Shell,
+                     terminal: &mut ratatui::Terminal<ratatui::backend::TestBackend>|
+         -> Result<String> {
+            terminal.draw(|frame| shell.draw(frame))?;
+            let buffer = terminal.backend().buffer();
+            Ok(buffer
+                .content
+                .iter()
+                .take(usize::from(buffer.area.width))
+                .map(ratatui::buffer::Cell::symbol)
+                .collect())
+        };
+        assert!(!shown(&mut shell, &mut terminal)?.contains("/restart"));
+        shell.update_ready = Some("9.9.9".into());
+        let top = shown(&mut shell, &mut terminal)?;
+        assert!(top.contains("difu 9.9.9 installed · /restart"), "{top}");
+
+        assert!(shell.restart.is_none() && !shell.reviews.quit);
+        shell.agents.restart_requested = true;
+        shell.tick();
+        assert!(shell.restart.is_some() && shell.reviews.quit);
+        assert!(!shell.agents.restart_requested);
+        Ok(())
+    }
+
     fn fixture() -> Result<(tempfile::TempDir, Shell)> {
         let dir = tempfile::tempdir()?;
         let storage = Storage {
