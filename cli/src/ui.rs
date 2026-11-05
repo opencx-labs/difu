@@ -1343,6 +1343,16 @@ pub(crate) fn build(app: &App, width: u16) -> Document {
                     append(&mut doc.rows, row);
                 }
             }
+            if !collapsed {
+                for row in crate::images::diff_rows(
+                    file,
+                    width.saturating_sub(2) as usize,
+                    review,
+                    &app.images,
+                ) {
+                    append(&mut doc.rows, row);
+                }
+            }
             doc.files.push(FileSection {
                 start,
                 end: doc.rows.len(),

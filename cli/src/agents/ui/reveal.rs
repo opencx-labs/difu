@@ -929,12 +929,12 @@ mod tests {
             clearing: Typing::start("abcdefghij", tweaks.capped(tweaks.input_clear_ms), t0),
             ..Position::default()
         };
-        // Halfway, half the characters have taken their turn; easing makes the
-        // first ones wait longer, so only the first has settled.
+        // Halfway, half the characters have taken their turn and the first has
+        // settled.
         let half = t0 + Duration::from_millis(250);
         let shown = frame(&mut position, &session, tweaks, half);
         assert!(
-            shown.first().is_some_and(|row| row.ends_with("     ")),
+            shown.first().is_some_and(|row| row.ends_with("    ")),
             "the end has not arrived: {shown:?}"
         );
         assert!(
