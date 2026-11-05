@@ -798,7 +798,7 @@ impl Service {
                 .as_deref()
                 .map(|repository| self.local_clone(id, repository))
                 .transpose()?;
-            let package = match federation.forward(
+            let mut package = match federation.forward(
                 server,
                 &Request::Export {
                     id: remote.to_owned(),
@@ -808,6 +808,8 @@ impl Service {
                 Reply::Error(error) => anyhow::bail!("{error}"),
                 _ => anyhow::bail!("{server} did not send the session"),
             };
+            // The chat names the server as this computer saved it, not its hostname.
+            package.computer = server.to_owned();
             let root = match root {
                 Some(root) if repository.as_deref() == Some(package.repository.as_str()) => root,
                 _ => self.local_clone(id, &package.repository)?,
@@ -885,17 +887,9 @@ impl Service {
         );
         super::moving::check_return(&self.store.get(id)?)?;
         self.stop_worker(id)?;
-        let name = self
-            .remote
-            .status()
-            .ok()
-            .map(|status| status.name)
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(crate::cloud::servers::computer_name);
         let package = super::moving::export_to_computer(
             &self.store.get(id)?,
             &self.store.storage,
-            name,
             &Cancel::default(),
         )?;
         super::moving::fits(&package, super::moving::LIMIT)?;

@@ -206,31 +206,20 @@ fn movable(session: &Session) -> Result<()> {
 /// it: the uncommitted files are captured with a temporary index.
 pub(super) fn export(session: &Session, storage: &Storage, cancel: &Cancel) -> Result<Package> {
     check(session)?;
-    package(
-        session,
-        storage,
-        crate::cloud::servers::computer_name(),
-        cancel,
-    )
+    package(session, storage, cancel)
 }
 
-/// The server side of a move to a computer; `server` is this server's name.
+/// The server side of a move to a computer, which names the server itself.
 pub(super) fn export_to_computer(
     session: &Session,
     storage: &Storage,
-    server: String,
     cancel: &Cancel,
 ) -> Result<Package> {
     check_return(session)?;
-    package(session, storage, server, cancel)
+    package(session, storage, cancel)
 }
 
-fn package(
-    session: &Session,
-    storage: &Storage,
-    computer: String,
-    cancel: &Cancel,
-) -> Result<Package> {
+fn package(session: &Session, storage: &Storage, cancel: &Cancel) -> Result<Package> {
     let Job::Coding(launch) = &session.job else {
         bail!("Only coding sessions can move to a server");
     };
@@ -304,7 +293,7 @@ fn package(
     let state = &session.permission_state;
     Ok(Package {
         source: session.id.clone(),
-        computer,
+        computer: crate::cloud::servers::computer_name(),
         title: session.title.clone(),
         title_manual: session.title_manual,
         provider: session.provider,
