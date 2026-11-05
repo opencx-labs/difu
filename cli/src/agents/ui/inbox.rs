@@ -214,9 +214,7 @@ impl Ui {
             return;
         }
         let tweaks = self.preferences.motion.tweaks(self.tweaks);
-        let duration =
-            Duration::from_millis(u64::from(tweaks.capped(tweaks.input_clear_ms))).mul_f64(0.4);
-        let animate = !duration.is_zero() && self.preferences.motion.screen();
+        let animate = tweaks.capped(tweaks.input_clear_ms) > 0 && self.preferences.motion.screen();
         self.inbox.sections.retain(|section| {
             self.summaries
                 .iter()
@@ -252,6 +250,7 @@ impl Ui {
                 } else if !section.items.is_empty() {
                     // Keep the last rendered box intact as focus advances, then
                     // collapse its contents, borders, and title together.
+                    let duration = timing::reveal(section.rows.len(), tweaks);
                     section.leaving = Some(flap::Collapse::new(now, duration));
                 } else if section.leaving.is_some_and(|leaving| leaving.done(now)) {
                     section.leaving = None;
@@ -271,7 +270,9 @@ impl Ui {
                 }
                 !card
                     .leaving
-                    .get_or_insert_with(|| flap::Collapse::new(now, duration))
+                    .get_or_insert_with(|| {
+                        flap::Collapse::new(now, timing::reveal(card.rows.len(), tweaks))
+                    })
                     .done(now)
             });
             for item in &pending {
@@ -1456,7 +1457,7 @@ mod tests {
             let next = ui.inbox.active.clone();
             let mut previous = before.map(|(_, y)| y);
             let mut moves = 0;
-            for ms in (0..=1500).step_by(25) {
+            for ms in (0..=1500).step_by(10) {
                 let now = start + Duration::from_millis(ms);
                 ui.sync_inbox_at(now);
                 ui.hits.clear();
@@ -1569,7 +1570,7 @@ mod tests {
             assert!(ui.inbox.animating());
             let mut previous = before.map(|(_, y)| y);
             let mut moves = 0;
-            for ms in (0..=1500).step_by(25) {
+            for ms in (0..=1500).step_by(10) {
                 let now = start + Duration::from_millis(ms);
                 ui.sync_inbox_at(now);
                 ui.hits.clear();
@@ -1658,8 +1659,7 @@ mod tests {
             .pending
             .clear();
         ui.sync_inbox_at(start + Duration::from_millis(100));
-        // The question-specific timing is 400ms plus 180ms settling at the
-        // default 500ms cap, slightly faster than the previous 680ms exit.
+        // Its rows take 10 ms each, plus 180 ms settling.
         let done = start + Duration::from_millis(700);
         ui.sync_inbox_at(done);
         assert!(!ui.inbox.animating());

@@ -4,9 +4,9 @@
 //! styles survive and hidden characters keep their cells: wrapping never moves.
 //! In the chat, rows still waiting for their first character take no space, so
 //! entries grow row by row. Timings match Codex's realtime transcript cells.
-//! Characters, cells and rows that take turns over a duration follow the
-//! shared ease-in-out curve: sweeps start and end slowly, rushing the middle.
-use super::{Entry, Position, Session, easing, reveal, transcript};
+//! Characters, cells and rows that take turns over a duration do so at a
+//! constant rate (see [`timing`]).
+use super::{Entry, Position, Session, reveal, timing, transcript};
 use crate::ui::{ACCENT, BG, DIM, PANEL, PURPLE, TEXT};
 use crate::voice::Role;
 use ratatui::{
@@ -38,10 +38,9 @@ pub(super) fn stagger(index: usize) -> Duration {
 }
 
 /// When item `index` of `count` takes its turn in a sweep over `spread` from
-/// `start`. Turns follow the ease-in-out curve, so the first and last items
-/// take theirs slowly and the middle ones bunch up.
+/// `start`, evenly spaced.
 pub(super) fn turn(start: Instant, spread: Duration, index: usize, count: usize) -> Instant {
-    start + easing::offset(spread, index as f64 / count.max(1) as f64)
+    start + timing::offset(spread, index as f64 / count.max(1) as f64)
 }
 
 /// The visible characters of rendered rows in reading order. Whitespace,
@@ -262,7 +261,7 @@ fn cell_glyph(cell: &Cell) -> Option<char> {
 pub(super) const SCREEN_MS: u32 = 250;
 
 /// Flips a whole drawn screen in, in reading order over `duration` from
-/// `started` along the eased sweep, as when switching tabs. Every cell
+/// `started` along the sweep, as when switching tabs. Every cell
 /// participates, including blank padding, backgrounds and borders. Image
 /// escape sequences reveal intact. Returns whether the flip is still playing.
 pub(super) fn screen(
@@ -348,7 +347,7 @@ pub(super) fn region(
 const HIGHLIGHT: Duration = Duration::from_millis(240);
 const FLAP: Duration = Duration::from_millis(90);
 
-/// A sidebar card's highlight flipping on or off, row by row along the eased
+/// A sidebar card's highlight flipping on or off, row by row along the
 /// sweep, mirrored horizontally when moving down: each flap's top half has the
 /// new colour.
 #[derive(Clone, Copy)]
@@ -460,7 +459,7 @@ pub(super) fn vanish(
 }
 
 /// An exit that releases each rendered row after its last tile has flipped away.
-/// Each row takes an equal share of the eased sweep, which keeps short and blank
+/// Each row takes an equal share of the sweep, which keeps short and blank
 /// rows from collapsing in a single jump.
 #[derive(Clone, Copy)]
 pub(super) struct Collapse {
@@ -493,7 +492,7 @@ impl Collapse {
                 |i| {
                     let within = total.saturating_sub(i + 1) as f64 / total as f64;
                     self.started
-                        + easing::offset(self.duration, (order as f64 + within) / count as f64)
+                        + timing::offset(self.duration, (order as f64 + within) / count as f64)
                 },
                 now,
                 self.started,
@@ -640,7 +639,7 @@ impl Board {
             stagger(changed.saturating_sub(1))
         });
     }
-    /// Flips changes in reading order, spreading their eased arrivals over
+    /// Flips changes in reading order, spreading their arrivals over
     /// `spread` of how many characters changed.
     pub(super) fn show_over(
         &mut self,
@@ -801,7 +800,7 @@ impl Flap {
         }
     }
     /// Replaces the text. Characters already shown keep their timing when the
-    /// new text extends the old; new ones arrive in a short eased stagger.
+    /// new text extends the old; new ones arrive in a short stagger.
     pub(super) fn set(&mut self, text: &str, now: Instant) {
         if text == self.text {
             return;
@@ -1210,9 +1209,9 @@ mod tests {
             original.last().map(Line::width)
         );
         assert_ne!(rows.last(), original.last());
-        // Eased, the rows' shares of the sweep end at 232, 368 and 600 ms; each
-        // row leaves once its tiles settle 180 ms later.
-        for (ms, count) in [(412, 3), (413, 2), (547, 2), (548, 1), (779, 1), (780, 0)] {
+        // The rows' shares of the sweep end at 200, 400 and 600 ms; each row
+        // leaves once its tiles settle 180 ms later.
+        for (ms, count) in [(379, 3), (380, 2), (579, 2), (580, 1), (779, 1), (780, 0)] {
             let mut rows = original.clone();
             collapse.apply(&mut rows, started + Duration::from_millis(ms));
             assert_eq!(rows.len(), count, "at {ms} ms");
@@ -1644,7 +1643,7 @@ mod tests {
     }
 
     #[test]
-    fn a_switched_screen_sweeps_in_slowly_then_quickly_then_slowly() {
+    fn a_switched_screen_sweeps_in_evenly() {
         let mut buffer = Buffer::empty(ratatui::layout::Rect::new(0, 0, 10, 2));
         for cell in &mut buffer.content {
             cell.set_symbol("x");
@@ -1661,8 +1660,7 @@ mod tests {
             );
             frame.content.iter().filter(|c| c.symbol() != " ").count()
         };
-        // An even sweep would show 6, 11 and 16 of the 20 cells.
-        assert_eq!([shown(250), shown(500), shown(750)], [4, 11, 17]);
+        assert_eq!([shown(250), shown(500), shown(750)], [6, 11, 16]);
     }
 
     #[test]

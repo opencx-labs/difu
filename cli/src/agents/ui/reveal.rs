@@ -1,7 +1,7 @@
 //! Chat animations from `/tweaks`, played as Codex's split-flap: replies flip
 //! in at their speed, sent and queued messages flip in over their time, and the
 //! composer's text flips away after sending. None takes longer than the cap,
-//! and each eases in and out (see [`easing`]).
+//! and each moves at a constant rate (see [`timing`]).
 //! The flip keeps every character's cell, so wrapping never changes; rows
 //! still waiting for their first character are dropped by [`flap::grow`].
 use super::flap::{self, Look};
@@ -18,23 +18,19 @@ pub(super) struct Reply {
     started: Instant,
     /// When each shown character arrived.
     arrivals: Vec<Instant>,
-    /// The eased reveal toward everything received so far.
+    /// The reveal toward everything received so far.
     glide: Glide,
 }
 
 /// A reply's reveal from `from` characters at `start` to `to` characters
 /// after `window`: the time the reply speed, or the cap, gives that many
-/// characters. It eases in and out like every other animation, but one
-/// already moving when more text arrives keeps its speed instead of slowing
-/// down to start again, and it still lands when the paced reveal would.
+/// characters, at a constant rate like every other animation.
 #[derive(Clone, Copy, Debug)]
 struct Glide {
     start: Instant,
     window: Duration,
     from: f64,
     to: f64,
-    /// How steeply it starts, as [`easing::ease_from`]'s slope.
-    slope: f64,
 }
 impl Glide {
     fn rest(at: Instant) -> Self {
@@ -43,47 +39,24 @@ impl Glide {
             window: Duration::ZERO,
             from: 0.0,
             to: 0.0,
-            slope: 0.0,
         }
     }
-    /// A reveal from `from` characters at `start`, moving at `speed`
-    /// characters per second, to `to` characters after `window`.
-    fn new(start: Instant, window: Duration, from: f64, to: f64, speed: f64) -> Self {
-        let from = from.min(to);
+    /// A reveal from `from` characters at `start` to `to` after `window`.
+    fn new(start: Instant, window: Duration, from: f64, to: f64) -> Self {
         Self {
             start,
             window,
-            from,
+            from: from.min(to),
             to,
-            slope: if to > from {
-                speed * window.as_secs_f64() / (to - from)
-            } else {
-                0.0
-            },
         }
     }
     fn end(&self) -> Instant {
         self.start + self.window
     }
-    /// Linear progress through the window at `now`.
-    fn progress(&self, now: Instant) -> f64 {
-        if self.window.is_zero() {
-            1.0
-        } else {
-            now.saturating_duration_since(self.start).as_secs_f64() / self.window.as_secs_f64()
-        }
-    }
     /// Characters shown at `now`.
     fn shown(&self, now: Instant) -> f64 {
-        self.from + (self.to - self.from) * easing::ease_from(self.progress(now), self.slope)
-    }
-    /// Characters per second at `now`.
-    fn speed(&self, now: Instant) -> f64 {
-        if self.window.is_zero() {
-            return 0.0;
-        }
-        (self.to - self.from) * easing::slope_from(self.progress(now), self.slope)
-            / self.window.as_secs_f64()
+        let elapsed = now.saturating_duration_since(self.start);
+        self.from + (self.to - self.from) * timing::progress(elapsed, self.window)
     }
     /// When the reveal passes `shown` characters.
     fn passes(&self, shown: f64) -> Instant {
@@ -92,12 +65,7 @@ impl Glide {
         } else {
             1.0
         };
-        let t = easing::inverse_from(fraction, self.slope);
-        if t >= 1.0 {
-            self.end()
-        } else {
-            self.start + self.window.mul_f64(t)
-        }
+        self.start + timing::offset(self.window, fraction)
     }
 }
 impl Reply {
@@ -148,7 +116,7 @@ impl Typing {
             duration: Duration::from_millis(u64::from(duration_ms)),
         })
     }
-    /// When character `index` of `total` takes its turn along the eased sweep.
+    /// When character `index` of `total` takes its turn along the sweep.
     fn at(&self, index: usize, total: usize) -> Instant {
         flap::turn(self.started, self.duration, index, total)
     }
@@ -302,12 +270,10 @@ pub(super) fn apply(
             if (reply.glide.to - received).abs() >= 0.5 {
                 // Text arrived since the last frame: plan the rest from there at
                 // the reply speed, or faster so it never trails the stream by
-                // more than the cap, carrying on at the speed it had.
-                let speed = reply.glide.speed(from);
+                // more than the cap.
                 let shown = reply.shown.min(received);
                 let remaining = (received - shown).max(0.0).ceil() as usize;
-                reply.glide =
-                    Glide::new(from, flap::paced(tweaks, remaining), shown, received, speed);
+                reply.glide = Glide::new(from, flap::paced(tweaks, remaining), shown, received);
             }
             let before = reply.shown;
             reply.shown = reply.glide.shown(now).max(before).min(received);
@@ -846,17 +812,17 @@ mod tests {
                 .map(|reply| reply.shown)
                 .context("reply")
         };
-        // 100 characters at 100 per second take a second, eased.
+        // 100 characters at 100 per second take a second, at a constant rate.
         ensure!(shown(&mut position, &session, 0)? == 0.0);
         let quarter = shown(&mut position, &session, 250)?;
-        ensure!(quarter > 10.0 && quarter < 20.0, "slow to start: {quarter}");
+        ensure!((quarter - 25.0).abs() < 0.01, "a quarter: {quarter}");
         let half = shown(&mut position, &session, 500)?;
         ensure!((half - 50.0).abs() < 0.01, "half way: {half}");
-        // More text mid-reveal keeps its speed instead of starting slowly again,
-        // and lands when the paced reveal would: 150 more at 100 per second.
+        // More text mid-reveal carries on at the same rate and lands when the
+        // paced reveal would: 150 more at 100 per second.
         session.entries.last_mut().context("reply")?.text = "x".repeat(200).into();
         let next = shown(&mut position, &session, 516)?;
-        ensure!(next > 52.0, "kept moving: {next}");
+        ensure!((next - 51.6).abs() < 0.01, "kept moving: {next}");
         let reply = position.reply.as_ref().context("reply")?;
         ensure!(reply.finish(200, tweaks) == Some(t0 + Duration::from_millis(2000)));
         let mut previous = next;

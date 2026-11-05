@@ -43,9 +43,7 @@ impl Size {
             self.resizing = Some(Resize {
                 from: self.shown,
                 started: now,
-                duration: Duration::from_millis(u64::from(
-                    tweaks.capped(u32::from(self.shown.abs_diff(target)) * 15),
-                )),
+                duration: timing::reveal(usize::from(self.shown.abs_diff(target)), tweaks),
             });
         }
         if let Some(resize) = &self.resizing {
@@ -54,7 +52,8 @@ impl Size {
                 self.settle();
             } else {
                 let rows = (f64::from(resize.from.abs_diff(target))
-                    * easing::progress(elapsed, resize.duration)) as u16;
+                    * timing::progress(elapsed, resize.duration))
+                .round() as u16;
                 self.shown = if target >= resize.from {
                     resize.from.saturating_add(rows)
                 } else {
@@ -67,8 +66,8 @@ impl Size {
     }
 }
 
-/// Release the question's old space gradually, easing in and out, while keeping
-/// the chat at its end.
+/// Release the question's old space at the speed it opened, while keeping the
+/// chat at its end.
 pub(super) struct Reflow {
     rows: u16,
     started: Instant,
@@ -76,7 +75,7 @@ pub(super) struct Reflow {
 }
 impl Reflow {
     fn remaining(&self, now: Instant) -> u16 {
-        let progress = easing::progress(now.saturating_duration_since(self.started), self.duration);
+        let progress = timing::progress(now.saturating_duration_since(self.started), self.duration);
         (f64::from(self.rows) * (1.0 - progress)).round() as u16
     }
 }
@@ -202,10 +201,11 @@ impl Ui {
             0
         } else {
             if let Some(previous) = position.question_height.take() {
+                let rows = previous.saturating_sub(height);
                 position.question_reflow = Some(Reflow {
-                    rows: previous.saturating_sub(height),
+                    rows,
                     started: now,
-                    duration: Duration::from_millis(u64::from(self.tweaks.capped(110))),
+                    duration: timing::reveal(usize::from(rows), self.tweaks),
                 });
             }
             let Some(reflow) = &position.question_reflow else {
@@ -627,7 +627,7 @@ impl Ui {
                 session: id.clone(),
                 rows: self.question_flip.drawn.clone(),
                 started: Instant::now(),
-                duration: Duration::from_millis(u64::from(clear / 2)),
+                duration: timing::reveal(self.question_flip.drawn.len(), tweaks),
                 settled: false,
             });
         }
@@ -1360,7 +1360,7 @@ mod settings_refresh_tests {
     use super::*;
     use anyhow::Context;
     #[test]
-    fn question_panel_resizes_ease_in_and_out() {
+    fn question_panel_resizes_at_a_constant_rate() {
         let tweaks = crate::storage::Tweaks {
             max_animation_ms: 0,
             ..Default::default()
@@ -1368,10 +1368,9 @@ mod settings_refresh_tests {
         let start = Instant::now();
         let mut size = Size::default();
         let mut at = |ms| size.show(20, 40, tweaks, start + Duration::from_millis(ms));
-        // 20 rows at 15 ms each take 300 ms: slow to start, quick through the
-        // middle and slow to settle.
-        let rows: Vec<u16> = [0, 75, 151, 225, 300].into_iter().map(&mut at).collect();
-        assert_eq!(rows, [0, 3, 10, 16, 20]);
+        // 20 rows at 10 ms each take 200 ms.
+        let rows: Vec<u16> = [0, 50, 100, 150, 200].into_iter().map(&mut at).collect();
+        assert_eq!(rows, [0, 5, 10, 15, 20]);
         assert!(!size.animating());
     }
     #[test]
@@ -1383,10 +1382,9 @@ mod settings_refresh_tests {
             duration: Duration::from_millis(220),
         };
         assert_eq!(reflow.remaining(started), 32);
-        // Eased: slow to start, half gone halfway, slow to finish.
-        assert_eq!(reflow.remaining(started + Duration::from_millis(55)), 27);
+        assert_eq!(reflow.remaining(started + Duration::from_millis(55)), 24);
         assert_eq!(reflow.remaining(started + Duration::from_millis(110)), 16);
-        assert_eq!(reflow.remaining(started + Duration::from_millis(165)), 5);
+        assert_eq!(reflow.remaining(started + Duration::from_millis(165)), 8);
         assert_eq!(reflow.remaining(started + Duration::from_millis(220)), 0);
     }
     #[test]
