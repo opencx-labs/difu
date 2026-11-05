@@ -1,9 +1,11 @@
-//! Moving a coding session from this computer to a saved cloud server. The local
-//! service exports the session (chat, settings, repository, branch, commits and
-//! uncommitted files as a git bundle, the media the chat refers to, HTML
-//! artifacts and attached pull requests) and sends it with `Request::Import`
-//! over the server's `rpc`; the server continues it as a new session in a
-//! normal difu worktree. Design and wire format: docs/cloud-agents.md.
+//! Moving a coding session between this computer and a saved cloud server. The
+//! side it leaves exports the session (chat, settings, repository, branch,
+//! commits and uncommitted files as a git bundle, the media the chat refers to,
+//! HTML artifacts, attached pull requests and a summary of a long chat's earlier
+//! part). To a server, the local service sends it with `Request::Import` over the
+//! server's `rpc`; back to a computer, that computer's service fetches it with
+//! `Request::Export`. The destination continues it as a new session in a normal
+//! difu worktree. Design and wire format: docs/cloud-agents.md.
 use super::{
     Entry, Job, Launch, Session, Status, artifacts::Artifact, permissions, provider, server::Store,
 };
@@ -43,11 +45,25 @@ const IDENTITY: [(&str, &str); 4] = [
     ("GIT_COMMITTER_EMAIL", "difu@localhost"),
 ];
 
+pub(super) const HOME_TOOL: &str = "difu_move_to_computer";
+pub(super) const HOME_INSTRUCTIONS: &str = "Use difu_move_to_computer only when the user explicitly asks to move this session from this server to their computer, and only while they message you from difu on that computer (it fails for messages from the phone). The move happens after your turn ends: that computer continues this conversation as a new local session with this branch, its commits and the uncommitted files, and this server session is archived. Call it alone, reply in one short sentence, and stop. Never move a session on your own initiative.";
+
 pub(super) fn tool() -> Value {
     json!({"type":"function","name":TOOL,"description":"Move this session to one of the user's saved difu cloud servers. Use only when the user explicitly asks to move this session to a server. difu moves it after the current turn ends: the server continues this conversation, branch, commits and uncommitted files as a new session, and this session is archived and stops taking messages. Only this session can be moved. Call alone, then stop.","inputSchema":{"type":"object","properties":{"server":{"type":"string","description":"The saved server's name, as in `difu server list`."}},"required":["server"],"additionalProperties":false}})
 }
 
-/// Everything a server needs to continue a session (`Request::Import`).
+pub(super) fn home_tool() -> Value {
+    json!({"type":"function","name":HOME_TOOL,"description":"Move this server session to the computer the user is messaging from with difu (not the phone). Use only when the user explicitly asks to move this session to their computer. difu moves it after the current turn ends: that computer continues this conversation, branch, commits and uncommitted files as a new local session, and this session is archived and stops taking messages. Only this session can be moved. Call alone, then stop.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}})
+}
+
+/// A computer that can take a server session: a device paired with full access.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Computer {
+    pub id: String,
+    pub name: String,
+}
+
+/// Everything the destination needs to continue a session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Package {
     /// The session on the computer it moved from, and that computer's name.
@@ -94,6 +110,12 @@ pub struct Package {
     /// Pull requests explicitly attached to the session.
     #[serde(default)]
     pub prs: Vec<github::SessionPr>,
+    /// A summary of `entries` before `summarized`, which the handoff carries
+    /// instead of them when the whole chat does not fit.
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub summarized: usize,
 }
 
 /// One of the session's private media copies, by the path the chat uses.
@@ -119,7 +141,7 @@ pub struct MovedArtifact {
     pub data: Option<String>,
 }
 
-/// Why `session` cannot move now.
+/// Why `session` cannot move to a server now.
 pub(super) fn check(session: &Session) -> Result<()> {
     ensure!(
         !session.orchestrator && matches!(session.job, Job::Coding(_)),
@@ -132,6 +154,26 @@ pub(super) fn check(session: &Session) -> Result<()> {
         !session.server_mode,
         "This session already runs on a server"
     );
+    movable(session)
+}
+
+/// Why a server session cannot move to a computer now.
+pub(super) fn check_return(session: &Session) -> Result<()> {
+    ensure!(
+        !session.orchestrator && matches!(session.job, Job::Coding(_)),
+        "Only coding sessions can move to a computer"
+    );
+    if let Some(moved) = &session.moved_to {
+        bail!("This session already moved to {moved}");
+    }
+    ensure!(
+        session.server_mode,
+        "Only sessions on a server can move to a computer"
+    );
+    movable(session)
+}
+
+fn movable(session: &Session) -> Result<()> {
     ensure!(!session.archived, "Unarchive the session before moving it");
     ensure!(
         !session.workspace_removed,
@@ -160,10 +202,24 @@ pub(super) fn check(session: &Session) -> Result<()> {
     Ok(())
 }
 
-/// The local side of a move. Reads the worktree without changing it: the
-/// uncommitted files are captured with a temporary index.
+/// The local side of a move to a server. Reads the worktree without changing
+/// it: the uncommitted files are captured with a temporary index.
 pub(super) fn export(session: &Session, storage: &Storage, cancel: &Cancel) -> Result<Package> {
     check(session)?;
+    package(session, storage, cancel)
+}
+
+/// The server side of a move to a computer, which names the server itself.
+pub(super) fn export_to_computer(
+    session: &Session,
+    storage: &Storage,
+    cancel: &Cancel,
+) -> Result<Package> {
+    check_return(session)?;
+    package(session, storage, cancel)
+}
+
+fn package(session: &Session, storage: &Storage, cancel: &Cancel) -> Result<Package> {
     let Job::Coding(launch) = &session.job else {
         bail!("Only coding sessions can move to a server");
     };
@@ -176,7 +232,8 @@ pub(super) fn export(session: &Session, storage: &Storage, cancel: &Cancel) -> R
         "This session's worktree no longer exists: {}",
         workspace.display()
     );
-    let origin = read(workspace, &["remote", "get-url", "origin"], cancel)
+    // As configured: an `insteadOf` rewrite changes only where it is fetched from.
+    let origin = read(workspace, &["config", "--get", "remote.origin.url"], cancel)
         .context("Moving needs the repository's origin remote on GitHub")?;
     let repository = repo::remote_repository(&origin).with_context(|| {
         format!(
@@ -231,6 +288,8 @@ pub(super) fn export(session: &Session, storage: &Storage, cancel: &Cancel) -> R
         .collect();
     let media = media(storage, &session.id, &entries)?;
     let artifacts = artifacts(session, workspace, cancel)?;
+    let (summary, summarized) = super::summary::earlier(session, &entries, cancel)
+        .map_or((None, 0), |(summary, start)| (Some(summary), start));
     let state = &session.permission_state;
     Ok(Package {
         source: session.id.clone(),
@@ -257,6 +316,8 @@ pub(super) fn export(session: &Session, storage: &Storage, cancel: &Cancel) -> R
         media,
         artifacts,
         prs: super::pr_cache::attached(storage, &session.id),
+        summary,
+        summarized,
     })
 }
 
@@ -302,9 +363,10 @@ pub(super) fn fits(package: &Package, limit: usize) -> Result<()> {
     )
 }
 
-/// The server side of a move: a new session `id` in a normal difu worktree of
-/// `root` (the server's base clone) with the moved work, chat and settings. A
-/// failed import removes the worktree and branch it created.
+/// The destination side of a move: a new session `id` in a normal difu
+/// worktree of `root` (a server's base clone, or a computer's clone of the
+/// repository) with the moved work, chat and settings. A failed import removes
+/// the worktree and branch it created.
 pub(super) fn import(
     package: &Package,
     id: String,
@@ -377,8 +439,20 @@ pub(super) fn import(
         .map(|pr| pr.key.id())
         .collect();
     session.entries = entries;
-    session.note("system", note(package, &branch, &unattached));
-    session.provider_context = provider::handoff(&session.entries, 0);
+    let here = if session.server_mode {
+        "server"
+    } else {
+        "computer"
+    };
+    session.note("system", note(package, &branch, &unattached, here));
+    session.provider_context = match &package.summary {
+        Some(summary) => Some(provider::summarized_handoff(
+            &session.entries,
+            package.summarized,
+            summary,
+        )),
+        None => provider::handoff(&session.entries, 0),
+    };
     Ok(session)
 }
 
@@ -440,6 +514,76 @@ pub(super) fn schedule(store: &Store, id: &str, args: &Value) -> Result<Value> {
     store.save(id)?;
     Ok(
         json!({"scheduled":true,"server":server,"next":"difu moves this session after your turn ends and reports the result in this chat. Reply in one short sentence and stop; do not start other work."}),
+    )
+}
+
+/// Lets `difu_move_to_computer` ask for its server session to move to the
+/// computer the user is messaging from. That computer's service takes it once
+/// the turn ends (`Service::returns`).
+pub(super) fn schedule_home(store: &Store, id: &str, args: &Value) -> Result<Value> {
+    ensure!(
+        args.as_object().is_none_or(serde_json::Map::is_empty),
+        "difu_move_to_computer takes no arguments and can move only this session"
+    );
+    let session = store.get(id)?;
+    ensure!(
+        !session.orchestrator && matches!(session.job, Job::Coding(_)),
+        "Only coding sessions can move to a computer"
+    );
+    ensure!(
+        session.server_mode,
+        "This session already runs on the user's computer"
+    );
+    if let Some(moved) = &session.moved_to {
+        bail!("This session already moved to {moved}");
+    }
+    if let Some(action) = session.scheduled.actions.first() {
+        bail!(
+            "This session will {} when the turn ends; move it afterwards",
+            action.describe()
+        );
+    }
+    let computer = session.messaged_from.clone().context(
+        "The latest message did not come from difu on a computer (it came from the phone or another device), so there is no computer to move to. The user can ask again from difu on the computer that should take this session.",
+    )?;
+    store.update(id, |s| {
+        s.return_to = Some(computer.clone());
+        s.note(
+            "system",
+            format!(
+                "Moving this session to {} when the current turn ends",
+                computer.name
+            ),
+        );
+    })?;
+    store.save(id)?;
+    Ok(
+        json!({"scheduled":true,"computer":computer.name,"next":"difu moves this session to that computer after your turn ends and reports the result in this chat. Reply in one short sentence and stop; do not start other work."}),
+    )
+}
+
+/// The first of `candidates` that is a clone of `repository` (`owner/name`)
+/// by its `origin` remote, to continue a server session on this computer.
+pub(super) fn local_root(
+    repository: &str,
+    candidates: impl IntoIterator<Item = PathBuf>,
+    cancel: &Cancel,
+) -> Result<PathBuf> {
+    let mut seen = std::collections::BTreeSet::new();
+    for root in candidates {
+        if !seen.insert(root.clone()) || !root.is_dir() {
+            continue;
+        }
+        let matches = read(&root, &["config", "--get", "remote.origin.url"], cancel)
+            .ok()
+            .and_then(|origin| repo::remote_repository(&origin))
+            .is_some_and(|origin| origin.eq_ignore_ascii_case(repository));
+        if matches {
+            return Ok(root);
+        }
+    }
+    bail!(
+        "difu on this computer knows no clone of {repository}. Start a session in your clone of it once (or choose it as the default repository), then move the session again"
     )
 }
 
@@ -615,7 +759,7 @@ fn restore(
         )
         .with_context(|| {
             format!(
-                "This server's copy of {} lacks commits the session builds on; make sure its origin/main is on GitHub",
+                "This copy of {} lacks commits the session builds on; make sure its origin/main is on GitHub",
                 package.repository
             )
         })?;
@@ -681,7 +825,7 @@ fn restore(
     })
 }
 
-fn note(package: &Package, branch: &str, unattached: &[String]) -> String {
+fn note(package: &Package, branch: &str, unattached: &[String], here: &str) -> String {
     let commits = match package.commits {
         0 => "no commits".to_owned(),
         1 => "1 commit".to_owned(),
@@ -731,8 +875,13 @@ fn note(package: &Package, branch: &str, unattached: &[String]) -> String {
             unattached.join(", ")
         )
     };
+    let summary = if package.summary.is_some() {
+        " The agent gets a summary of the earlier conversation and the recent chat as is."
+    } else {
+        ""
+    };
     format!(
-        "Moved here from {} (session {}). Branch {branch} has {commits} ahead of origin/main{files}.{extras}{unattached} The next message continues this conversation on this server.",
+        "Moved here from {} (session {}). Branch {branch} has {commits} ahead of origin/main{files}.{extras}{unattached}{summary} The next message continues this conversation on this {here}.",
         package.computer, package.source
     )
 }
@@ -1556,6 +1705,8 @@ pub(crate) mod tests {
                 data: Some("A".repeat(2 << 20)),
             }],
             prs: Vec::new(),
+            summary: None,
+            summarized: 0,
         };
         fits(&package, LIMIT)?;
         let error = fits(&package, 4 << 20).err().context("over the cap")?;

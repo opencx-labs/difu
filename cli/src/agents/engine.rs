@@ -399,7 +399,9 @@ pub(crate) fn apply_event(session: &mut Session, event: &Value) {
                 || session.command_tools
                     && !session.orchestrator
                     && tool.is_some_and(|tool| super::session_tools::TOOLS.contains(&tool))
-                || !session.orchestrator && tool == Some(super::moving::TOOL)
+                || !session.orchestrator
+                    && (tool == Some(super::moving::TOOL)
+                        || tool == Some(super::moving::HOME_TOOL))
                 || super::environment::offered(session) && tool == Some(super::environment::TOOL))
         {
             session.orchestrator_requests.push(Pending {
@@ -1683,7 +1685,7 @@ fn instructions(session: &Session) -> String {
         base
     };
     let base = if session.server_mode {
-        base
+        format!("{base}\n\n{}", super::moving::HOME_INSTRUCTIONS)
     } else {
         format!("{base}\n\n{}", super::moving::INSTRUCTIONS)
     };
@@ -2107,6 +2109,8 @@ pub fn run(
                         super::folders::handle_tool(store, id, &args)
                     } else if tool == Some(super::moving::TOOL) {
                         super::moving::schedule(store, id, &args)
+                    } else if tool == Some(super::moving::HOME_TOOL) {
+                        super::moving::schedule_home(store, id, &args)
                     } else if tool == Some(super::environment::TOOL) {
                         super::environment::handle(store, id, &args)
                     } else if let Some(tool) =

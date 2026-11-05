@@ -182,6 +182,9 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                 super::moving::TOOL => {
                     super::moving::schedule(store, id, args).map(|value| value.to_string())
                 }
+                super::moving::HOME_TOOL => {
+                    super::moving::schedule_home(store, id, args).map(|value| value.to_string())
+                }
                 super::environment::TOOL => {
                     super::environment::handle(store, id, args).map(|value| value.to_string())
                 }
@@ -231,6 +234,7 @@ fn mcp(store: &Store, id: &str, frame: &Value) -> Result<Value> {
                     super::shells::TOOL,
                     super::folders::TOOL,
                     super::moving::TOOL,
+                    super::moving::HOME_TOOL,
                     super::environment::TOOL,
                 ]
                 .contains(&name)
@@ -789,7 +793,7 @@ pub(super) fn instructions(session: &Session) -> String {
         super::shells::instructions(session)
     );
     let instructions = if session.server_mode {
-        instructions
+        format!("{instructions}\n\n{}", super::moving::HOME_INSTRUCTIONS)
     } else {
         format!("{instructions}\n\n{}", super::moving::INSTRUCTIONS)
     };

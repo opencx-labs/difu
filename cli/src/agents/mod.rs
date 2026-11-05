@@ -34,6 +34,7 @@ pub mod slack;
 mod startup;
 mod subagents;
 mod suggestions;
+mod summary;
 mod title;
 pub(crate) mod transport;
 pub mod ui;
@@ -453,6 +454,18 @@ pub struct Session {
     /// turn ends. Never persisted, so a restart never replays a move.
     #[serde(skip)]
     pub move_scheduled: Option<String>,
+    /// On a server: the computer (a full-access device) the latest message came
+    /// from, `None` when it came from a phone. Never persisted.
+    #[serde(skip)]
+    pub messaged_from: Option<moving::Computer>,
+    /// On a server: the computer `difu_move_to_computer` moves this session to
+    /// once its turn ends; that computer's service takes it. Never persisted.
+    #[serde(skip)]
+    pub return_to: Option<moving::Computer>,
+    /// A restarted conversation's handoff covers the chat before this entry;
+    /// the worker replaces it with a summarized one before reconnecting.
+    #[serde(skip)]
+    pub summarize_through: Option<usize>,
     /// What difu's session tools asked to do once the turn ends.
     #[serde(skip)]
     pub scheduled: session_tools::Schedule,
@@ -580,6 +593,9 @@ impl Session {
             voice: false,
             moved_to: None,
             move_scheduled: None,
+            messaged_from: None,
+            return_to: None,
+            summarize_through: None,
             scheduled: Default::default(),
             offline: None,
             held: Vec::new(),
@@ -745,6 +761,7 @@ impl Session {
             // Codex's background shells; the service adds its shared shells.
             shells: self.shells.len(),
             moved_to: self.moved_to.clone(),
+            return_to: self.return_to.as_ref().map(|computer| computer.id.clone()),
             offline: self.offline.clone(),
         }
     }
@@ -799,6 +816,9 @@ pub struct Summary {
     /// The `<server>:<session>` this session moved to.
     #[serde(default)]
     pub moved_to: Option<String>,
+    /// The device id of the computer this server session waits to move to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub return_to: Option<String>,
     /// A server session listed from this computer's cache while its server
     /// is unreachable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1212,6 +1232,29 @@ pub enum Request {
     Import {
         package: Box<moving::Package>,
     },
+    /// Move a server session (`<server>:<session>`) to this computer; replies
+    /// `Launched` with the new local session's id.
+    MoveHere {
+        id: String,
+    },
+    /// On a server, sent by `MoveHere` over `rpc`: the session's package for a
+    /// computer; replies `Exported`.
+    Export {
+        id: String,
+    },
+    /// On a server, sent by `MoveHere` over `rpc` after the computer tried to
+    /// continue the exported session: `moved` is its new local id, or why not.
+    Exported {
+        id: String,
+        computer: String,
+        moved: std::result::Result<String, String>,
+    },
+    /// On a server, sent by its device API before a message: the computer it
+    /// comes from, `None` for a phone.
+    Sender {
+        id: String,
+        computer: Option<moving::Computer>,
+    },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Reply {
@@ -1235,6 +1278,7 @@ pub enum Reply {
     SessionDelta(transport::Delta),
     Unchanged,
     Launched(String),
+    Exported(Box<moving::Package>),
     ChooseRepository,
     Changes(String),
     ChangesContext(Vec<(String, Vec<crate::diff::DiffLine>)>),

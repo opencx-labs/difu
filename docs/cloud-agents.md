@@ -653,9 +653,69 @@ the result.
   artifacts, commits and files, chat, and other.
 
 Not moved: shells and their output, ignored files that are not artifacts, and
-the composer draft. The handoff contains the whole chat, which for very long
-sessions can be large for the provider, as with provider switching. Moving a
-server session back to a computer or on to another server is not supported.
+the composer draft.
+
+### The handoff
+
+The new session's first message carries the chat as context (the *handoff*),
+as after a provider switch. The whole chat is carried when it fits about
+240 KB (roughly 60k tokens), with long messages cut at 12 KB and tool output at
+1.5 KB. A longer chat is compacted before it leaves: the exporting side asks
+the session's own provider and model, in an isolated call without tools or
+session state, to summarize the earlier part (goal, user decisions, work done,
+current state, next steps, pitfalls), and the handoff carries that summary
+plus the newest chat that fits about 200 KB as is. `Package.summary` holds the
+summary and `Package.summarized` the index of the first entry carried as is.
+When the summary cannot be written within five minutes, the handoff carries
+the newest chat that fits, plus the first request and a note counting what was
+left out.
+
+If a Claude conversation still outgrows its model's context ("Prompt is too
+long"), the service starts a fresh one with the same kind of handoff, summary
+included, and sends the failed message again once, provided it never reached
+the model.
+
+## Moving a server session to a computer
+
+A server session can move back to a computer: the computer's difu continues it
+as a new local session in its own clone of the repository, and the server's
+copy is archived (keeping its chat and worktree) and refuses new messages with a
+pointer to the computer. Phones cannot take sessions.
+
+Two ways to start one:
+
+* **Move to this computer** in the session actions menu of a server session.
+  difu opens the local session when the move finishes.
+* The agent tool `difu_move_to_computer` (no arguments), offered in server
+  sessions in place of `difu_move_to_server`, only when the user explicitly
+  asks. It moves the session to the computer the latest message came from: the
+  server records the device of every message (a full-access device's `rpc` for
+  computers, the device API for phones) and the tool fails when the latest one
+  came from a phone. It schedules the move: once the turn has ended, the
+  session's summary carries `return_to` (that device's id), and that
+  computer's service, seeing its own device id in the session list, takes the
+  session; a turn that fails or is interrupted cancels the move. Neither the
+  request nor the device is persisted.
+
+The computer takes a session with `Request::MoveHere` on its own service:
+
+1. It finds its clone of the repository: the session the server copy came from
+   when it moved from this computer, else the most recently used local session
+   or the default repository whose configured `origin` URL is the same GitHub
+   `owner/name`. Without one the move fails before the server is touched.
+2. `Request::Export` over `rpc` stops the server session's agent and returns
+   its package, built exactly as for a move to a server (with a summary of a
+   long chat).
+3. The computer imports it as a server imports a move: a fresh `origin/main`
+   worktree, the bundle, the uncommitted files, media, artifacts and attached
+   pull requests. The branch keeps its name unless it is taken here, for
+   example by the archived session it originally moved from.
+4. `Request::Exported` reports the outcome. On success the server archives its
+   copy (`moved_to` is `<computer> as <local id>`); on failure it reports the
+   error in the server session's chat, which stays as it was.
+
+The conditions are those of a move to a server, except that the session must
+be on a server. Moving a server session on to another server is not supported.
 
 ### Claude Code's shared config
 
@@ -940,7 +1000,9 @@ Three service requests exist for clients whose sessions live elsewhere:
   which also carries the pane size) and typed input (`Human`) are server round
   trips, so a distant server makes the pane less responsive than a local one.
   `difu_shell` runs on the server like every agent tool.
-* A local session can move to a saved server (*Moving a session to a server*).
+* A local session can move to a saved server (*Moving a session to a server*),
+  and a server session back to a computer (*Moving a server session to a
+  computer*).
 * **Cmd+K → `/cloud`** (also `/cloud <name>`) shows every saved server from
   `Request::Servers`: connection state or problem, difu version (a mismatch
   suggests `difu server upgrade <name>`), address, active/total sessions,

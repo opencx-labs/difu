@@ -36,6 +36,28 @@ pub(in crate::agents) fn text(value: &Value) -> String {
         value.to_string()
     }
 }
+/// Why a turn failed, as plain text rather than JSON.
+fn failure(frame: &Value) -> String {
+    let reason = frame
+        .get("errors")
+        .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
+        .or_else(|| frame.get("result"))
+        .or_else(|| frame.get("subtype"));
+    match reason {
+        Some(Value::String(reason)) => reason.clone(),
+        Some(Value::Array(errors)) => errors
+            .iter()
+            .map(|error| {
+                error
+                    .as_str()
+                    .map_or_else(|| error.to_string(), String::from)
+            })
+            .collect::<Vec<_>>()
+            .join("; "),
+        Some(reason) => reason.to_string(),
+        None => "Claude failed".into(),
+    }
+}
 fn kind(block: &Value) -> &'static str {
     match block.get("type").and_then(Value::as_str) {
         Some("text") => "agentMessage",
@@ -520,13 +542,8 @@ impl Decoder {
                         self.state = Some("idle".into());
                     }
                 } else if failed {
-                    let error = frame
-                        .get("errors")
-                        .filter(|v| v.as_array().is_some_and(|a| !a.is_empty()))
-                        .or_else(|| frame.get("result"))
-                        .or_else(|| frame.get("subtype"))
-                        .map(Value::to_string)
-                        .unwrap_or_else(|| "Claude failed".into());
+                    let error = failure(frame);
+                    let too_long = error.contains(super::super::provider::TOO_LONG);
                     session.error = Some(error.clone());
                     session.note("error", error);
                     session.status = Status::Failed;
@@ -542,6 +559,9 @@ impl Decoder {
                         if entry.kind == "sending" {
                             entry.kind = "unsent or unacknowledged".into();
                         }
+                    }
+                    if too_long {
+                        super::super::provider::restart_too_long(session);
                     }
                 }
                 session.token_usage = frame.get("usage").cloned().unwrap_or(Value::Null);
@@ -806,6 +826,59 @@ mod tests {
                 .iter()
                 .any(|e| e.kind == "unsent or unacknowledged" && e.text == "Keep this draft")
         );
+    }
+    #[test]
+    fn a_conversation_too_long_for_claude_restarts_and_sends_the_message_again()
+    -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        let mut session = session();
+        session.thread_id = Some("outgrown".into());
+        session.permission_state.claude_session_started = true;
+        session.permission_state.claude_turn_attempted = true;
+        session.permission_state.claude_turn_acknowledged = true;
+        session.note("userMessage", "Audit the security docs");
+        session.note("mcpToolCall", "x".repeat(400_000));
+        session.note("agentMessage", "56 claims contradict the code");
+        let prompt = super::super::super::Prompt::from("What does AES-256-GCM cover?");
+        let ask = |id: &str| Entry {
+            id: id.into(),
+            kind: "userMessage".into(),
+            text: prompt.text().into(),
+            data: json!({"prompt":prompt}).into(),
+            ..Entry::default()
+        };
+        session.entries.push(ask("ask"));
+        let mut decoder = Decoder::default();
+        decoder.apply(&mut session, &json!({"type":"assistant","message":{"id":"synthetic","model":"<synthetic>","content":[{"type":"text","text":"Prompt is too long"}]}}));
+        decoder.apply(
+            &mut session,
+            &json!({"type":"result","subtype":"success","is_error":true,"result":"Prompt is too long"}),
+        );
+        assert_eq!(session.error.as_deref(), Some("Prompt is too long"));
+        assert!(session.thread_id.is_none() && session.permission_state.reload_pending);
+        assert!(session.summarize_through.is_some());
+        assert!(!session.permission_state.claude_turn_attempted);
+        assert_eq!(session.queue, vec![prompt.clone()]);
+        let handoff = session.provider_context.clone().context("handoff")?;
+        assert!(handoff.len() < 10_000, "{}", handoff.len());
+        assert!(handoff.contains("56 claims") && handoff.contains("(shortened)"));
+        assert!(!handoff.contains("AES-256-GCM"));
+
+        // The message fails again in the fresh conversation: no third attempt.
+        session.queue.clear();
+        session.entries.push(ask("again"));
+        session.thread_id = Some("fresh".into());
+        session.turn_id = Some("again".into());
+        session.status = Status::Running;
+        let mut decoder = Decoder::default();
+        decoder.apply(
+            &mut session,
+            &json!({"type":"result","is_error":true,"errors":["Prompt is too long"]}),
+        );
+        assert!(session.queue.is_empty() && session.thread_id.is_none());
+        let last = session.entries.last().context("note")?;
+        assert!(last.text.ends_with("Send your message again."));
+        Ok(())
     }
     #[test]
     fn native_mode_notifications_and_result_denials_are_observed() {
